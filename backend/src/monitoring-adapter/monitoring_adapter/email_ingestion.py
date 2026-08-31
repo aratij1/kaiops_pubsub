@@ -125,7 +125,11 @@ def fetch_unseen_emails(
             # "UID x:*" can return the mailbox's single highest UID even when
             # it's <= x (RFC 3501 edge case on some servers) — filter it out
             # explicitly rather than trusting the search result verbatim.
-            uids = [uid for uid in data[0].split() if int(uid) > last_uid][:limit]
+            candidate_uids = [uid for uid in data[0].split() if int(uid) > last_uid]
+            # Always advance from the oldest pending UID. This keeps an
+            # explicitly reset checkpoint replay bounded to ``limit`` items
+            # per poll instead of skipping directly to the live edge.
+            uids = candidate_uids[:limit]
             max_uid_seen = last_uid
             for uid in uids:
                 status, msg_data = connection.uid("fetch", uid, "(RFC822)")
@@ -203,6 +207,31 @@ def infer_severity_from_subject(subject: str) -> str:
     return "warning"
 
 
+def infer_affected_service(*values: object, fallback: str = "unresolved-service") -> str:
+    """Extract the affected workload without confusing its transport with it."""
+    text = " ".join(str(value or "") for value in values)
+    patterns = (
+        r"\b(?:service|application|app|component|workload)\s*[:=]\s*([a-z0-9][a-z0-9._-]{1,80})",
+        r"\b(?:on|affecting|for)\s+([a-z0-9][a-z0-9._-]{1,80}-(?:api|service|worker|db|database|frontend|backend))\b",
+        r"\b([a-z0-9][a-z0-9._-]{1,80}-(?:api|service|worker|db|database|frontend|backend))\b",
+    )
+    ignored = {
+        "email-inbox",
+        "email-service",
+        "jira-service",
+        "jira-tickets",
+        "ticket-service",
+    }
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            candidate = match.group(1).strip(" .,:;()[]{}").lower()
+            if candidate and candidate not in ignored:
+                return candidate
+    normalized_fallback = str(fallback or "").strip().lower()
+    return normalized_fallback if normalized_fallback and normalized_fallback not in ignored else "unresolved-service"
+
+
 def email_to_alert_payload(message: dict[str, Any], *, default_service: str = "email-inbox") -> dict[str, Any]:
     """Normalize a fetched email dict into the same mapped-payload shape the
     Prometheus/Alertmanager and Jira ingestion paths produce, so it flows
@@ -212,15 +241,18 @@ def email_to_alert_payload(message: dict[str, Any], *, default_service: str = "e
     subject = str(message.get("subject") or "(no subject)")
     sender = str(message.get("from") or "unknown-sender")
     body = str(message.get("body") or "")
+    affected_service = infer_affected_service(subject, body, fallback=default_service)
     return {
         "source": "email",
         "name": subject,
-        "service": default_service,
+        "service": affected_service,
         "environment": "prod",
         "severity": infer_severity_from_subject(subject),
         "description": body[:500] or subject,
         "labels": {
             "alert_status": "firing",
+            "origin_system": "email",
+            "ingestion_channel": "email",
             "email_from": sender,
             "email_message_id": str(message.get("message_id") or ""),
         },

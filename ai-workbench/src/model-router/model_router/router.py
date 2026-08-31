@@ -8,18 +8,93 @@ import time as _time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import StrEnum
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
-from common.config import Settings, get_settings
 from ai_workbench_common.model_evaluation import VertexEvaluationClient
-from common.models import AlertSeverity
 from ai_workbench_common.prompts import SYSTEM_PROMPT_SRE, render_task_payload_prompt
+from common.config import Settings, get_settings
+from common.models import AlertSeverity
 from common.resilience import CircuitBreaker
+from common.telemetry import (
+    LLM_CACHE_REQUESTS,
+    LLM_COST_USD,
+    LLM_FALLBACKS,
+    LLM_GUARDRAIL_EVENTS,
+    LLM_LATENCY,
+    LLM_TOKENS,
+)
 
 logger = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT_HASH = hashlib.sha256(SYSTEM_PROMPT_SRE.encode("utf-8")).hexdigest()[:16]
+_SENSITIVE_KEY_PARTS = (
+    "api_key", "apikey", "authorization", "credential", "password", "private_key",
+    "secret", "session_cookie", "token",
+)
+
+
+def normalize_azure_openai_endpoint(value: str) -> str:
+    endpoint = str(value or "").strip()
+    if not endpoint:
+        return ""
+    parsed = urlsplit(endpoint)
+    hostname = str(parsed.hostname or "").lower()
+    if parsed.scheme != "https" or not hostname.endswith((".openai.azure.com", ".openai.azure.us", ".openai.azure.cn")):
+        raise ValueError("AZURE_OPENAI_ENDPOINT must be an HTTPS Azure OpenAI resource root")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError("AZURE_OPENAI_ENDPOINT must not contain credentials, query parameters, or fragments")
+    if parsed.path not in {"", "/"}:
+        raise ValueError("AZURE_OPENAI_ENDPOINT must not contain deployment or chat-completion paths")
+    return urlunsplit(("https", parsed.netloc.lower(), "", "", ""))
+
+
+def is_azure_openai_endpoint(value: str) -> bool:
+    parsed = urlsplit(str(value or "").strip())
+    hostname = str(parsed.hostname or "").lower()
+    return hostname.endswith((".openai.azure.com", ".openai.azure.us", ".openai.azure.cn"))
+
+
+def _sanitize_model_payload(value: Any) -> Any:
+    """Remove secret values before evidence is cached or sent to any model provider."""
+    if isinstance(value, dict):
+        sanitized: dict[str, Any] = {}
+        for raw_key, item in value.items():
+            key = str(raw_key)
+            normalized = key.lower().replace("-", "_")
+            sanitized[key] = (
+                "[REDACTED]"
+                if any(part in normalized for part in _SENSITIVE_KEY_PARTS)
+                else _sanitize_model_payload(item)
+            )
+        return sanitized
+    if isinstance(value, list):
+        return [_sanitize_model_payload(item) for item in value]
+    if isinstance(value, tuple):
+        return [_sanitize_model_payload(item) for item in value]
+    return value
+
+
+def _guard_model_request(*, prompt: str, payload: dict[str, Any], settings: Settings) -> dict[str, Any]:
+    if len(prompt) > settings.model_router_max_prompt_chars:
+        LLM_GUARDRAIL_EVENTS.labels("prompt_too_large").inc()
+        raise ValueError(f"prompt exceeds {settings.model_router_max_prompt_chars} characters")
+    sanitized = _sanitize_model_payload(payload)
+    payload_size = len(json.dumps(sanitized, sort_keys=True, default=str).encode("utf-8"))
+    if payload_size > settings.model_router_max_payload_bytes:
+        LLM_GUARDRAIL_EVENTS.labels("payload_too_large").inc()
+        raise ValueError(f"payload exceeds {settings.model_router_max_payload_bytes} bytes")
+    if sanitized != payload:
+        LLM_GUARDRAIL_EVENTS.labels("secret_redacted").inc()
+    return sanitized
+
+
+def _observe_model_usage(provider: str, usage: dict[str, Any]) -> None:
+    LLM_TOKENS.labels(provider, "input").inc(max(0, int(usage.get("input_tokens") or 0)))
+    LLM_TOKENS.labels(provider, "output").inc(max(0, int(usage.get("output_tokens") or 0)))
+    LLM_COST_USD.labels(provider).inc(max(0.0, float(usage.get("total_cost_usd") or 0.0)))
 
 
 def _normalize_prompt(prompt: str) -> str:
@@ -507,6 +582,8 @@ class ModelRouter:
     settings: Settings = field(default_factory=get_settings)
     failover_chain: dict[str, list[str]] = field(
         default_factory=lambda: {
+            "reasoning-critical": ["reasoning-standard", "gpt-5", "azure-openai", "gpt-4o", "gemini", "groq", "local-llama"],
+            "reasoning-standard": ["reasoning-critical", "gpt-5", "azure-openai", "gpt-4o", "gemini", "groq", "local-llama"],
             "azure-openai": ["gpt-4o", "gpt-5", "gemini", "groq", "local-llama"],
             "gpt-5": ["azure-openai", "gpt-4o", "gemini", "groq", "local-llama"],
             "gpt-4o": ["azure-openai", "gpt-5", "gemini", "groq", "local-llama"],
@@ -518,6 +595,9 @@ class ModelRouter:
     prompt_cache: OrderedDict[str, tuple[float, dict[str, Any]]] = field(default_factory=OrderedDict)
     evaluation_client: VertexEvaluationClient = field(default_factory=lambda: VertexEvaluationClient(get_settings()))
     _background_tasks: set[asyncio.Task[None]] = field(default_factory=set, repr=False, compare=False)
+    _policy_cache: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
+    _policy_cache_path: str = field(default="", repr=False, compare=False)
+    _policy_cache_mtime_ns: int = field(default=-1, repr=False, compare=False)
 
     def provider_status(self) -> dict[str, Any]:
         providers: dict[str, dict[str, Any]] = {}
@@ -610,11 +690,42 @@ class ModelRouter:
         task.add_done_callback(self._background_tasks.discard)
 
     def select_model(self, *, severity: AlertSeverity, task: ModelTask) -> str:
+        policy_provider = self._evaluation_policy_provider(severity=severity, task=task)
+        if policy_provider:
+            return policy_provider
         if severity == AlertSeverity.CRITICAL:
-            return _configured_provider_name(self.settings.model_router_critical_provider, "gpt-5")
+            return _configured_provider_name(self.settings.model_router_critical_provider, "reasoning-critical")
         if task == ModelTask.RCA:
-            return _configured_provider_name(self.settings.model_router_rca_provider, "gpt-4o")
+            return _configured_provider_name(self.settings.model_router_rca_provider, "reasoning-standard")
         return _configured_provider_name(self.settings.model_router_default_provider, "gpt-4o")
+
+    def _evaluation_policy_provider(self, *, severity: AlertSeverity, task: ModelTask) -> str | None:
+        """Use only a benchmark-qualified routing override from confirmed incidents."""
+        raw_path = str(self.settings.model_router_evaluation_policy_path or "").strip()
+        if not raw_path:
+            return None
+        try:
+            path = Path(raw_path)
+            mtime_ns = path.stat().st_mtime_ns
+            if raw_path != self._policy_cache_path or mtime_ns != self._policy_cache_mtime_ns:
+                self._policy_cache = json.loads(path.read_text(encoding="utf-8"))
+                self._policy_cache_path = raw_path
+                self._policy_cache_mtime_ns = mtime_ns
+            policy = self._policy_cache
+            if policy.get("contract_version") != "kaims.model-routing-policy.v1":
+                return None
+            routes = policy.get("routes") if isinstance(policy.get("routes"), dict) else {}
+            keys = (f"{severity.value}:{task.value}", f"*:{task.value}", "default")
+            route = next((routes[key] for key in keys if isinstance(routes.get(key), dict)), None)
+            if not route or not route.get("eligible"):
+                return None
+            if int(route.get("cases") or 0) < self.settings.model_router_evaluation_min_cases:
+                return None
+            provider = str(route.get("provider") or "").strip()
+            return provider if provider in self.providers else None
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            logger.warning("model_routing_policy_ignored", extra={"error_type": type(exc).__name__})
+            return None
 
     async def route(
         self,
@@ -624,6 +735,7 @@ class ModelRouter:
         prompt: str,
         payload: dict[str, Any],
     ) -> dict[str, Any]:
+        payload = _guard_model_request(prompt=prompt, payload=payload, settings=self.settings)
         primary = self.select_model(severity=severity, task=task)
         primary_provider = self.providers.get(primary)
         provider_identity = _provider_cache_identity(
@@ -640,8 +752,10 @@ class ModelRouter:
                 ttl_seconds=self.settings.model_router_prompt_cache_ttl_seconds,
             )
         if cached is not None:
+            LLM_CACHE_REQUESTS.labels("hit").inc()
             logger.debug("Prompt cache hit: %s", cache_key[:12])
             return _mark_usage_as_cached(cached)
+        LLM_CACHE_REQUESTS.labels("miss").inc()
         candidates = list(dict.fromkeys([primary, *self.failover_chain.get(primary, [])]))
         errors: list[str] = []
         for provider_name in candidates:
@@ -649,10 +763,16 @@ class ModelRouter:
             if provider is None:
                 errors.append(f"{provider_name}: provider is not registered")
                 continue
+            started = _time.monotonic()
             try:
                 response = await provider.generate(prompt, payload)
                 usage = response.usage.as_dict()
                 usage["task"] = task.value
+                usage["prompt_version"] = _SYSTEM_PROMPT_HASH
+                LLM_LATENCY.labels(provider_name, task.value, "ok").observe(_time.monotonic() - started)
+                _observe_model_usage(provider_name, usage)
+                if provider_name != primary:
+                    LLM_FALLBACKS.labels(primary, provider_name).inc()
                 result = {"model": provider_name, "content": response.content, "usage": usage}
                 result = await self._attach_evaluation(result, payload=payload)
                 if self.settings.model_router_prompt_cache_enabled:
@@ -664,6 +784,7 @@ class ModelRouter:
                     )
                 return result
             except Exception as exc:
+                LLM_LATENCY.labels(provider_name, task.value, "error").observe(_time.monotonic() - started)
                 errors.append(f"{provider_name}: {exc}")
 
         raise RuntimeError("; ".join(errors))
@@ -676,6 +797,7 @@ class ModelRouter:
         prompt: str,
         payload: dict[str, Any],
     ) -> dict[str, Any]:
+        payload = _guard_model_request(prompt=prompt, payload=payload, settings=self.settings)
         provider = self.providers.get(provider_name)
         if provider is None:
             raise RuntimeError(f"{provider_name} provider is not registered")
@@ -693,11 +815,21 @@ class ModelRouter:
                 ttl_seconds=self.settings.model_router_prompt_cache_ttl_seconds,
             )
         if cached is not None:
+            LLM_CACHE_REQUESTS.labels("hit").inc()
             logger.debug("Prompt cache hit (provider): %s", cache_key[:12])
             return _mark_usage_as_cached(cached)
-        response = await provider.generate(prompt, payload)
+        LLM_CACHE_REQUESTS.labels("miss").inc()
+        started = _time.monotonic()
+        try:
+            response = await provider.generate(prompt, payload)
+        except Exception:
+            LLM_LATENCY.labels(provider_name, task.value, "error").observe(_time.monotonic() - started)
+            raise
         usage = response.usage.as_dict()
         usage["task"] = task.value
+        usage["prompt_version"] = _SYSTEM_PROMPT_HASH
+        LLM_LATENCY.labels(provider_name, task.value, "ok").observe(_time.monotonic() - started)
+        _observe_model_usage(provider_name, usage)
         result = {"model": provider_name, "content": response.content, "usage": usage}
         result = await self._attach_evaluation(result, payload=payload)
         if self.settings.model_router_prompt_cache_enabled:
@@ -711,11 +843,37 @@ class ModelRouter:
 
 
 def build_default_providers(settings: Settings) -> dict[str, ModelProvider]:
+    # Some existing installations stored an Azure OpenAI endpoint/key in the
+    # legacy OPENAI_* variables. Detect the endpoint rather than sending an
+    # Azure key to api.openai.com with Bearer authentication. This keeps the
+    # migration backward compatible and selects the adapter with the correct
+    # deployment URL and api-key header.
+    legacy_openai_is_azure = is_azure_openai_endpoint(settings.openai_base_url)
+    configured_azure_endpoint = settings.azure_openai_endpoint or (
+        settings.openai_base_url if legacy_openai_is_azure else ""
+    )
+    azure_endpoint = normalize_azure_openai_endpoint(configured_azure_endpoint)
+    azure_api_key = settings.azure_openai_api_key or (
+        settings.openai_api_key if legacy_openai_is_azure else None
+    )
+    azure_deployment = settings.azure_openai_chat_deployment or settings.openai_gpt4o_model
+    azure_selected = bool(azure_endpoint) or (
+        settings.model_router_reasoning_backend.strip().lower() == "azure-openai"
+        or settings.model_router_default_provider.strip().lower() == "azure-openai"
+    )
+    standard_azure_deployment = (
+        settings.azure_openai_reasoning_standard_deployment or azure_deployment
+    )
+    critical_azure_deployment = (
+        settings.azure_openai_reasoning_critical_deployment or azure_deployment
+    )
+
     local_llama_provider: ModelProvider
     if settings.local_llm_enabled:
         local_llama_provider = OllamaModelProvider(
             name="local-llama",
             endpoint=settings.local_llm_endpoint,
+            model=settings.local_llm_model,
             timeout_seconds=settings.llm_request_timeout_seconds,
         )
     else:
@@ -724,32 +882,65 @@ def build_default_providers(settings: Settings) -> dict[str, ModelProvider]:
             reason="set LOCAL_LLM_ENABLED=true and LOCAL_LLM_ENDPOINT to use Ollama",
         )
 
-    return {
-        "azure-openai": AzureOpenAIModelProvider(
-            name="azure-openai",
-            model=settings.azure_openai_chat_deployment,
-            api_key=settings.azure_openai_api_key,
-            base_url=settings.azure_openai_endpoint,
-            api_version=settings.azure_openai_api_version,
-            timeout_seconds=settings.llm_request_timeout_seconds,
-        ),
-        "gpt-5": OpenAIModelProvider(
-            name="gpt-5",
-            model=settings.openai_gpt5_model,
-            api_key=settings.openai_api_key,
-            base_url=settings.openai_base_url,
+    if azure_selected:
+        standard_reasoning: ModelProvider = AzureOpenAIModelProvider(
+            name="reasoning-standard", model=standard_azure_deployment,
+            api_key=azure_api_key, base_url=azure_endpoint,
+            api_version=settings.azure_openai_api_version, timeout_seconds=settings.llm_request_timeout_seconds,
+        )
+        critical_reasoning: ModelProvider = AzureOpenAIModelProvider(
+            name="reasoning-critical", model=critical_azure_deployment,
+            api_key=azure_api_key, base_url=azure_endpoint,
+            api_version=settings.azure_openai_api_version, timeout_seconds=settings.llm_request_timeout_seconds,
+        )
+    else:
+        standard_reasoning = OpenAIModelProvider(
+            name="reasoning-standard", model=settings.reasoning_standard_model,
+            api_key=settings.openai_api_key, base_url=settings.openai_base_url,
             timeout_seconds=settings.llm_request_timeout_seconds,
             input_cost_per_million=settings.openai_gpt5_input_cost_per_million,
             output_cost_per_million=settings.openai_gpt5_output_cost_per_million,
-        ),
-        "gpt-4o": OpenAIModelProvider(
-            name="gpt-4o",
-            model=settings.openai_gpt4o_model,
-            api_key=settings.openai_api_key,
-            base_url=settings.openai_base_url,
+        )
+        critical_reasoning = OpenAIModelProvider(
+            name="reasoning-critical", model=settings.reasoning_critical_model,
+            api_key=settings.openai_api_key, base_url=settings.openai_base_url,
             timeout_seconds=settings.llm_request_timeout_seconds,
-            input_cost_per_million=settings.openai_gpt4o_input_cost_per_million,
-            output_cost_per_million=settings.openai_gpt4o_output_cost_per_million,
+            input_cost_per_million=settings.openai_gpt5_input_cost_per_million,
+            output_cost_per_million=settings.openai_gpt5_output_cost_per_million,
+        )
+
+    return {
+        "reasoning-standard": standard_reasoning,
+        "reasoning-critical": critical_reasoning,
+        "azure-openai": AzureOpenAIModelProvider(
+            name="azure-openai",
+            model=azure_deployment,
+            api_key=azure_api_key,
+            base_url=azure_endpoint,
+            api_version=settings.azure_openai_api_version,
+            timeout_seconds=settings.llm_request_timeout_seconds,
+        ),
+        "gpt-5": (AzureOpenAIModelProvider if azure_selected else OpenAIModelProvider)(
+            name="gpt-5",
+            model=azure_deployment if azure_selected else settings.openai_gpt5_model,
+            api_key=azure_api_key if azure_selected else settings.openai_api_key,
+            base_url=azure_endpoint if azure_selected else settings.openai_base_url,
+            **({"api_version": settings.azure_openai_api_version} if azure_selected else {
+                "input_cost_per_million": settings.openai_gpt5_input_cost_per_million,
+                "output_cost_per_million": settings.openai_gpt5_output_cost_per_million,
+            }),
+            timeout_seconds=settings.llm_request_timeout_seconds,
+        ),
+        "gpt-4o": (AzureOpenAIModelProvider if azure_selected else OpenAIModelProvider)(
+            name="gpt-4o",
+            model=azure_deployment if azure_selected else settings.openai_gpt4o_model,
+            api_key=azure_api_key if azure_selected else settings.openai_api_key,
+            base_url=azure_endpoint if azure_selected else settings.openai_base_url,
+            **({"api_version": settings.azure_openai_api_version} if azure_selected else {
+                "input_cost_per_million": settings.openai_gpt4o_input_cost_per_million,
+                "output_cost_per_million": settings.openai_gpt4o_output_cost_per_million,
+            }),
+            timeout_seconds=settings.llm_request_timeout_seconds,
         ),
         "claude": UnconfiguredModelProvider(
             name="claude",

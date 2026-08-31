@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import aiomysql
+import asyncio
 import csv
 import hashlib
 import json
 import logging
 import os
 import re
+from datetime import UTC, datetime
 from email import policy
 from email.parser import BytesParser
 from pathlib import Path
@@ -91,11 +93,24 @@ def _code_roots(arguments: dict[str, Any]) -> list[Path]:
     if configured:
         roots = [Path(str(root)) for root in configured if str(root).strip()]
         service = re.sub(r"[^a-zA-Z0-9_-]", "", str(arguments.get("service") or "").strip())
+        service = {
+            "log-ingestion": "monitoring-adapter",
+            "email-inbox": "monitoring-adapter",
+            "common.rabbitmq": "common",
+        }.get(service.lower(), service)
+        service_aliases = [service]
+        if service.lower().startswith("kaiops-"):
+            service_aliases.append(service[7:])
         catalog_root = str(project.get("service_catalog_root") or "").strip()
         if service and catalog_root:
             service_root = Path(catalog_root) / service
             if service_root.is_dir():
                 roots.insert(0, service_root)
+        for root in list(roots):
+            for alias in service_aliases:
+                candidate = root / alias
+                if candidate.is_dir():
+                    roots.insert(0, candidate)
         return list(dict.fromkeys(roots))
     return _roots(
         "DISCOVERY_MCP_CODE_ROOTS",
@@ -120,6 +135,38 @@ def _terms(arguments: dict[str, Any]) -> list[str]:
     for value in values:
         tokens.extend(re.findall(r"[a-zA-Z0-9_.-]{3,}", str(value).lower()))
     return list(dict.fromkeys(tokens))[:24]
+
+
+def _code_search_terms(arguments: dict[str, Any]) -> list[str]:
+    """Keep code retrieval focused on stable service and component tokens."""
+
+    generic_terms = {
+        str(arguments.get("project") or "").strip().lower(),
+        str(arguments.get("application") or "").strip().lower(),
+        str(arguments.get("environment") or "").strip().lower(),
+        "prod", "production", "stage", "staging", "test", "dev", "warning",
+        "failed", "failure", "error", "request", "list", "from", "with",
+        "into", "unable", "resource", "service", "message",
+    }
+    service = str(arguments.get("service") or "").strip().lower()
+    candidates = [service, *_terms(arguments)]
+    selected: list[str] = []
+    for term in candidates:
+        token = str(term or "").strip().lower()
+        if not token or token in generic_terms or token.isdigit():
+            continue
+        if re.fullmatch(r"[0-9a-f]{16,}", token) or re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f-]{27,}", token
+        ):
+            continue
+        if re.match(r"^\d{4}-\d{2}-\d{2}", token):
+            continue
+        if len(token) < 4 or token in selected:
+            continue
+        selected.append(token)
+        if len(selected) >= 8:
+            break
+    return selected
 
 
 def _evidence(kind: str, path: Path, line: int, snippet: str, matched: list[str]) -> dict[str, Any]:
@@ -213,6 +260,16 @@ async def _search_docker_logs(arguments: dict[str, Any], terms: list[str], limit
     tail = max(20, min(int(os.getenv("DOCKER_LOG_DISCOVERY_TAIL", "250")), 2000))
     timeout = httpx.Timeout(max(2.0, min(float(os.getenv("DOCKER_LOG_DISCOVERY_TIMEOUT_SECONDS", "10")), 30.0)))
     evidence: list[dict[str, Any]] = []
+    log_params = {"stdout": "true", "stderr": "true", "timestamps": "true", "tail": str(tail)}
+    for argument_name, docker_name in (("start_time", "since"), ("end_time", "until")):
+        raw_time = str(arguments.get(argument_name) or "").strip()
+        if not raw_time:
+            continue
+        try:
+            parsed_time = datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
+            log_params[docker_name] = str(int(parsed_time.timestamp()))
+        except ValueError:
+            continue
     try:
         async with httpx.AsyncClient(base_url=f"http://{docker_host}", timeout=timeout) as client:
             response = await client.get("/containers/json", params={"all": "true", "limit": str(max_containers)})
@@ -245,7 +302,7 @@ async def _search_docker_logs(arguments: dict[str, Any], terms: list[str], limit
                     continue
                 logs = await client.get(
                     f"/containers/{container_id}/logs",
-                    params={"stdout": "true", "stderr": "true", "timestamps": "true", "tail": str(tail)},
+                    params=log_params,
                 )
                 logs.raise_for_status()
                 container_name = names[0] if names else container_id[:12]
@@ -283,6 +340,8 @@ def _search_text_files(
     ranked: list[tuple[int, int, dict[str, Any]]] = []
     max_files = max(10, min(int(os.getenv("DISCOVERY_MCP_MAX_FILES", "60")), 400))
     excluded_dirs = {".git", ".claiming", "node_modules", "dist", "build", "__pycache__", "ingested_alerts", ".venv", "kaiops.egg-info"}
+    if kind == "code":
+        excluded_dirs.update({".github", ".devcontainer"})
     for root_index, root in enumerate(roots):
         if not root.is_dir():
             continue
@@ -305,13 +364,27 @@ def _search_text_files(
                     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[:5000]
                 except OSError:
                     continue
-                path_lowered = path.as_posix().lower()
+                try:
+                    # Match only the path *inside* the configured project root.
+                    # Absolute roots such as ".../external/telemetry/..." otherwise
+                    # make the generic project term "telemetry" match every file.
+                    path_lowered = path.relative_to(root).as_posix().lower()
+                except ValueError:
+                    path_lowered = path.name.lower()
                 path_matches = [term for term in terms if term in path_lowered]
                 for line_no, line in enumerate(lines, 1):
                     lowered = line.lower()
                     matched = list(dict.fromkeys([*path_matches, *(term for term in terms if term in lowered)]))
                     if matched:
-                        ranked.append((len(matched), -root_index, _evidence(kind, path, line_no, line, matched)))
+                        snippet = line
+                        if kind == "code":
+                            start = max(0, line_no - 4)
+                            end = min(len(lines), line_no + 3)
+                            snippet = "\n".join(
+                                f"{context_line_no + 1}: {lines[context_line_no]}"
+                                for context_line_no in range(start, end)
+                            )
+                        ranked.append((len(matched), -root_index, _evidence(kind, path, line_no, snippet, matched)))
             if scanned >= root_budget:
                 break
         if root_index == 0 and len(ranked) >= limit:
@@ -575,18 +648,112 @@ async def _call_mysql_tool(arguments: dict[str, Any]) -> dict[str, Any]:
     return {"tool": "mysql.search", "query_terms": terms, "result_count": len(rows), "evidence": rows}
 
 
+def _jaeger_operation(value: str) -> str:
+    operation = str(value or "").strip()
+    if not operation:
+        return ""
+    path = operation.split("?", 1)[0]
+    path = re.sub(
+        r"/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+        "/{alert_id}",
+        path,
+    )
+    return path if " " in path else f"GET {path}"
+
+
+def _trace_evidence_summary(trace: dict[str, Any], requested_operation: str = "") -> dict[str, Any]:
+    spans = [span for span in trace.get("spans", []) if isinstance(span, dict)]
+    processes = trace.get("processes") if isinstance(trace.get("processes"), dict) else {}
+    services = sorted({
+        str(process.get("serviceName"))
+        for process in processes.values()
+        if isinstance(process, dict) and process.get("serviceName")
+    })
+    operations = sorted({str(span.get("operationName")) for span in spans if span.get("operationName")})
+    status_codes: list[int] = []
+    error_spans = 0
+    span_rows: list[dict[str, Any]] = []
+    span_index = {str(span.get("spanID") or ""): span for span in spans}
+    dependency_edges: set[tuple[str, str]] = set()
+    safe_tag_names = {
+        "db.system", "db.operation", "server.address", "net.peer.name",
+        "http.route", "http.target", "http.status_code", "http.response.status_code", "span.kind",
+    }
+    for span in spans:
+        tags = {
+            str(tag.get("key")): tag.get("value")
+            for tag in span.get("tags", [])
+            if isinstance(tag, dict) and tag.get("key")
+        }
+        status = tags.get("http.status_code", tags.get("http.response.status_code"))
+        try:
+            if status is not None:
+                status_codes.append(int(status))
+        except (TypeError, ValueError):
+            pass
+        if tags.get("error") is True or any(code >= 500 for code in status_codes[-1:]) or span.get("logs"):
+            error_spans += 1
+        process = processes.get(span.get("processID"), {})
+        service_name = str(process.get("serviceName") or "unknown") if isinstance(process, dict) else "unknown"
+        span_rows.append({
+            "service": service_name,
+            "operation": str(span.get("operationName") or "unknown"),
+            "duration_ms": round(int(span.get("duration") or 0) / 1000, 3),
+            "tags": {key: tags[key] for key in safe_tag_names if tags.get(key) not in (None, "")},
+        })
+        for reference in span.get("references", []):
+            if not isinstance(reference, dict) or reference.get("refType") != "CHILD_OF":
+                continue
+            parent = span_index.get(str(reference.get("spanID") or ""))
+            if not parent:
+                continue
+            parent_process = processes.get(parent.get("processID"), {})
+            parent_service = (
+                str(parent_process.get("serviceName") or "unknown")
+                if isinstance(parent_process, dict)
+                else "unknown"
+            )
+            if parent_service != service_name and "unknown" not in {parent_service, service_name}:
+                dependency_edges.add((parent_service, service_name))
+    duration_us = max((int(span.get("duration") or 0) for span in spans), default=0)
+    signals: list[str] = []
+    if error_spans:
+        signals.append("http_5xx" if any(code >= 500 for code in status_codes) else "error")
+    if duration_us >= 3_000_000:
+        signals.append("high_latency")
+    return {
+        "trace_id": str(trace.get("traceID") or ""),
+        "services": services,
+        "span_count": len(spans),
+        "operations": operations[:20],
+        "requested_operation": requested_operation or None,
+        "duration_ms": round(duration_us / 1000, 3),
+        "http_status_codes": sorted(set(status_codes)),
+        "error_span_count": error_spans,
+        "diagnostic_signals": signals,
+        "slowest_spans": sorted(span_rows, key=lambda row: -row["duration_ms"])[:10],
+        "dependency_edges": [
+            {"upstream": upstream, "downstream": downstream}
+            for upstream, downstream in sorted(dependency_edges)
+        ],
+    }
+
+
 async def _search_telemetry(arguments: dict[str, Any]) -> dict[str, Any]:
     project_id, project = _project_for(arguments)
     telemetry = project.get("telemetry") if isinstance(project.get("telemetry"), dict) else {}
     terms = _terms(arguments)
     service = str(arguments.get("service") or next(iter(terms), "")).strip()
     trace_id = str(arguments.get("trace_id") or "").strip()
+    requested_operation = str(arguments.get("operation") or "").strip()
     limit = max(1, min(int(arguments.get("limit", 8)), 20))
     evidence: list[dict[str, Any]] = []
     sources: list[dict[str, Any]] = []
+    start_time = str(arguments.get("start_time") or "").strip()
+    end_time = str(arguments.get("end_time") or "").strip()
     timeout = httpx.Timeout(max(2.0, min(float(os.getenv("DISCOVERY_MCP_TELEMETRY_TIMEOUT_SECONDS", "6")), 20.0)))
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
         prometheus_url = str(telemetry.get("prometheus_url") or "").rstrip("/")
         if prometheus_url:
             query = f'{{service_name="{service}"}}' if service else "up"
@@ -609,32 +776,49 @@ async def _search_telemetry(arguments: dict[str, Any]) -> dict[str, Any]:
                 if trace_id:
                     response = await client.get(f"{jaeger_url}/api/traces/{trace_id}")
                 else:
+                    trace_params = {"service": service, "limit": str(limit), "lookback": "1h"}
+                    jaeger_operation = _jaeger_operation(requested_operation)
+                    if jaeger_operation:
+                        trace_params["operation"] = jaeger_operation
+                    if start_time and end_time:
+                        try:
+                            trace_params.update({
+                                "start": str(int(
+                                    datetime.fromisoformat(start_time.replace("Z", "+00:00")).timestamp() * 1_000_000
+                                )),
+                                "end": str(int(
+                                    datetime.fromisoformat(end_time.replace("Z", "+00:00")).timestamp() * 1_000_000
+                                )),
+                            })
+                            trace_params.pop("lookback", None)
+                        except ValueError:
+                            pass
                     response = await client.get(
                         f"{jaeger_url}/api/traces",
-                        params={"service": service, "limit": str(limit), "lookback": "1h"},
+                        params=trace_params,
                     )
                 response.raise_for_status()
                 traces = response.json().get("data", [])
                 for index, trace in enumerate(traces[:limit], 1):
                     discovered_trace_id = str(trace.get("traceID") or trace_id or "")
-                    processes = trace.get("processes") if isinstance(trace.get("processes"), dict) else {}
-                    process_services = sorted(
-                        {
-                            str(process.get("serviceName"))
-                            for process in processes.values()
-                            if isinstance(process, dict) and process.get("serviceName")
-                        }
-                    )
-                    snippet = json.dumps(
-                        {
-                            "trace_id": discovered_trace_id,
-                            "services": process_services,
-                            "span_count": len(trace.get("spans", [])) if isinstance(trace.get("spans"), list) else 0,
-                        },
-                        ensure_ascii=False,
-                    )
+                    summary = _trace_evidence_summary(trace, requested_operation)
+                    snippet = json.dumps(summary, ensure_ascii=False)
                     item = _evidence("trace", Path(f"{project_id or 'telemetry'}/jaeger"), index, snippet, terms)
                     item["uri"] = f"jaeger://trace/{discovered_trace_id or index}"
+                    item["diagnostic_signals"] = summary["diagnostic_signals"]
+                    item["trace_id"] = discovered_trace_id
+                    item["duration_ms"] = summary["duration_ms"]
+                    item["operations"] = summary["operations"]
+                    item["http_status_codes"] = summary["http_status_codes"]
+                    item["slowest_spans"] = summary["slowest_spans"]
+                    item["dependency_edges"] = summary["dependency_edges"]
+                    start_times = [
+                        int(span.get("startTime") or 0)
+                        for span in trace.get("spans", [])
+                        if isinstance(span, dict)
+                    ]
+                    if start_times and min(start_times) > 0:
+                        item["observed_at"] = datetime.fromtimestamp(min(start_times) / 1_000_000, tz=UTC).isoformat()
                     evidence.append(item)
                 sources.append({"source": "jaeger", "status": "completed", "result_count": len(traces)})
             except Exception as exc:
@@ -667,6 +851,10 @@ async def _search_telemetry(arguments: dict[str, Any]) -> dict[str, Any]:
                 "sort": [{"@timestamp": {"order": "desc", "unmapped_type": "date"}}],
                 "query": {"bool": {"must": must or [{"match_all": {}}]}},
             }
+            if start_time and end_time:
+                body["query"]["bool"].setdefault("filter", []).append(
+                    {"range": {"@timestamp": {"gte": start_time, "lte": end_time}}}
+                )
             try:
                 response = await client.post(f"{opensearch_url}/{opensearch_index}/_search", json=body)
                 response.raise_for_status()
@@ -695,6 +883,152 @@ async def _search_telemetry(arguments: dict[str, Any]) -> dict[str, Any]:
         "sources": sources,
         "correlation_keys": project.get("correlation_keys", []),
     }
+
+
+async def _search_traces(arguments: dict[str, Any]) -> dict[str, Any]:
+    result = await _search_telemetry(arguments)
+    evidence = [row for row in result.get("evidence", []) if str(row.get("source") or "").lower() == "trace"]
+    return {**result, "tool": "traces.search", "result_count": len(evidence), "evidence": evidence}
+
+
+def _search_changes(arguments: dict[str, Any]) -> dict[str, Any]:
+    terms = _code_search_terms(arguments)
+    limit = max(1, min(int(arguments.get("limit", 8)), 20))
+    rows = _search_text_files(
+        _code_roots(arguments),
+        {".yml", ".yaml", ".json", ".toml", ".xml", ".tf", ".py"},
+        terms,
+        "change",
+        limit,
+    )
+    for row in rows:
+        try:
+            modified_at = Path(str(row.get("path") or "")).stat().st_mtime
+            row["observed_at"] = datetime.fromtimestamp(modified_at, tz=UTC).isoformat()
+        except OSError:
+            pass
+        row["change_evidence_kind"] = "configuration_or_deployment_artifact"
+    return {"tool": "changes.search", "query_terms": terms, "result_count": len(rows), "evidence": rows}
+
+
+def _search_runbooks(arguments: dict[str, Any]) -> dict[str, Any]:
+    terms = list(dict.fromkeys([str(arguments.get("service") or "").lower(), *_terms(arguments)]))
+    terms = [term for term in terms if term]
+    limit = max(1, min(int(arguments.get("limit", 8)), 20))
+    path = Path(
+        os.getenv("DISCOVERY_MCP_PLAYBOOKS_FILE", "/workspace/backend/rag/execution/playbooks.json")
+    )
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        payload = {}
+    rows: list[dict[str, Any]] = []
+    for index, playbook in enumerate(payload.get("playbooks", []) if isinstance(payload, dict) else [], 1):
+        if not isinstance(playbook, dict):
+            continue
+        searchable = json.dumps(playbook, sort_keys=True, ensure_ascii=False, default=str).lower()
+        matched = [term for term in terms if term in searchable]
+        if terms and not matched:
+            continue
+        summary = json.dumps(
+            {
+                "id": playbook.get("id"),
+                "name": playbook.get("name"),
+                "status": playbook.get("status"),
+                "risk_class": playbook.get("risk_class"),
+                "match": playbook.get("match"),
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+        row = _evidence("runbook", path, index, summary, matched)
+        row.update(
+            {
+                "observed_at": playbook.get("approved_at"),
+                "status": str(playbook.get("status") or "unregistered").lower(),
+                "runbook_id": str(playbook.get("governance_id") or ""),
+                "runbook_slug": str(playbook.get("id") or ""),
+                "version": playbook.get("version"),
+                "checksum_sha256": playbook.get("checksum_sha256"),
+            }
+        )
+        rows.append(row)
+    return {"tool": "runbooks.search", "query_terms": terms, "result_count": len(rows[:limit]), "evidence": rows[:limit]}
+
+
+async def _search_runtime_topology(arguments: dict[str, Any], *, health_only: bool) -> dict[str, Any]:
+    tool_name = "dependency-health.search" if health_only else "topology.search"
+    limit = max(1, min(int(arguments.get("limit", 8)), 20))
+    docker_host = str(os.getenv("DOCKER_LOG_DISCOVERY_HOST", "docker-socket-proxy:2375")).strip()
+    if not docker_host:
+        return {"tool": tool_name, "result_count": 0, "evidence": [], "provider_status": "unavailable"}
+    service = str(arguments.get("service") or "").strip().lower()
+    project = str(arguments.get("project") or arguments.get("application") or "").strip().lower()
+    evidence: list[dict[str, Any]] = []
+    observed_at = datetime.now(UTC).isoformat()
+    try:
+        async with httpx.AsyncClient(
+            base_url=f"http://{docker_host}", timeout=httpx.Timeout(8.0), trust_env=False
+        ) as client:
+            response = await client.get("/containers/json", params={"all": "true", "limit": "100"})
+            response.raise_for_status()
+            containers = response.json()
+        for index, container in enumerate(containers, 1):
+            if not isinstance(container, dict):
+                continue
+            labels = container.get("Labels") if isinstance(container.get("Labels"), dict) else {}
+            compose_project = str(labels.get("com.docker.compose.project") or "").lower()
+            compose_service = str(labels.get("com.docker.compose.service") or "").lower()
+            identity = " ".join(
+                [compose_project, compose_service, *(str(item).lower() for item in container.get("Names", []))]
+            )
+            if project and project not in identity and not (project.startswith("kaiops") and "kaiops" in identity):
+                continue
+            if not project and service and service not in identity:
+                continue
+            state = str(container.get("State") or "unknown").lower()
+            status = str(container.get("Status") or "unknown")
+            networks = sorted((container.get("NetworkSettings") or {}).get("Networks", {}).keys())
+            kind = "dependency" if health_only else "topology"
+            snippet = json.dumps(
+                {
+                    "project": compose_project,
+                    "service": compose_service,
+                    "state": state,
+                    "status": status,
+                    "networks": networks,
+                    "related_to": service,
+                },
+                ensure_ascii=False,
+            )
+            row = _evidence(kind, Path(f"docker/{compose_project or 'runtime'}/{compose_service or index}"), 1, snippet, [service] if service else [])
+            row.update(
+                {
+                    "uri": f"docker://{compose_project or 'runtime'}/{compose_service or index}",
+                    "service": compose_service or service,
+                    "runtime_state": state,
+                    "runtime_status": status,
+                    "healthy": state == "running" and "unhealthy" not in status.lower(),
+                    "observed_at": observed_at,
+                    "observation_scope": "current_snapshot",
+                    "requested_window": {
+                        "start": str(arguments.get("start_time") or "") or None,
+                        "end": str(arguments.get("end_time") or "") or None,
+                    },
+                }
+            )
+            evidence.append(row)
+            if len(evidence) >= limit:
+                break
+    except Exception as exc:
+        return {
+            "tool": tool_name,
+            "result_count": 0,
+            "evidence": [],
+            "provider_status": "failed",
+            "provider_error": str(exc)[:240],
+        }
+    return {"tool": tool_name, "result_count": len(evidence), "evidence": evidence, "provider_status": "completed"}
 
 
 TOOLS = [
@@ -734,6 +1068,31 @@ TOOLS = [
         },
     },
     {
+        "name": "traces.search",
+        "description": "Read-only correlated trace search through the onboarded telemetry project.",
+        "inputSchema": {"type": "object", "properties": {"project": {"type": "string"}, "service": {"type": "string"}, "trace_id": {"type": "string"}, "limit": {"type": "integer"}}},
+    },
+    {
+        "name": "topology.search",
+        "description": "Read-only runtime topology discovery through the scoped Docker API proxy.",
+        "inputSchema": {"type": "object", "properties": {"project": {"type": "string"}, "service": {"type": "string"}, "limit": {"type": "integer"}}},
+    },
+    {
+        "name": "dependency-health.search",
+        "description": "Read-only dependency runtime health discovery through the scoped Docker API proxy.",
+        "inputSchema": {"type": "object", "properties": {"project": {"type": "string"}, "service": {"type": "string"}, "limit": {"type": "integer"}}},
+    },
+    {
+        "name": "changes.search",
+        "description": "Read-only bounded search of deployment and configuration change artifacts.",
+        "inputSchema": {"type": "object", "properties": {"terms": {"type": "array"}, "service": {"type": "string"}, "limit": {"type": "integer"}}},
+    },
+    {
+        "name": "runbooks.search",
+        "description": "Read-only lookup of immutable governed runbook catalog entries.",
+        "inputSchema": {"type": "object", "properties": {"terms": {"type": "array"}, "service": {"type": "string"}, "limit": {"type": "integer"}}},
+    },
+    {
         "name": "external.search",
         "description": "Read-only search through the explicitly configured external knowledge provider.",
         "inputSchema": {
@@ -748,15 +1107,20 @@ def _call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     terms = _terms(arguments)
     limit = max(1, min(int(arguments.get("limit", 8)), 20))
     if name == "code.search":
+        terms = _code_search_terms(arguments)
         rows = _search_text_files(
             _code_roots(arguments),
-            CODE_SUFFIXES,
+            CODE_SUFFIXES - {".md"},
             terms,
             "code",
             limit,
         )
     elif name == "tickets.search":
         rows = _search_tickets(terms, limit)
+    elif name == "changes.search":
+        return _search_changes(arguments)
+    elif name == "runbooks.search":
+        return _search_runbooks(arguments)
     else:
         raise ValueError(f"unknown MCP tool: {name}")
     return {"tool": name, "query_terms": terms, "result_count": len(rows), "evidence": rows}
@@ -903,6 +1267,12 @@ async def mcp(request: MCPRequest) -> dict[str, Any]:
                 result = await _call_mysql_tool(safe_arguments)
             elif name == "telemetry.search":
                 result = await _search_telemetry(safe_arguments)
+            elif name == "traces.search":
+                result = await _search_traces(safe_arguments)
+            elif name == "topology.search":
+                result = await _search_runtime_topology(safe_arguments, health_only=False)
+            elif name == "dependency-health.search":
+                result = await _search_runtime_topology(safe_arguments, health_only=True)
             elif name == "tickets.search":
                 result = await _call_ticket_tool(safe_arguments)
             elif name == "logs.search":

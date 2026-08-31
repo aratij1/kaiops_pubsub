@@ -11,6 +11,7 @@ import pytest
 
 from common.config import Settings
 from common.rabbitmq import RabbitMQProducer
+from common.resilience import CircuitOpenError
 
 
 class _FakeExchange:
@@ -87,3 +88,23 @@ async def test_publish_without_start_logs_and_does_not_raise() -> None:
     producer = RabbitMQProducer(Settings())
     # start() was never called, so there are no exchanges yet.
     await producer.publish("some-topic", {"hello": "world"})
+
+
+class _FailingExchange:
+    async def publish(self, _message, routing_key) -> None:  # noqa: ANN001
+        raise ConnectionError("broker unreachable")
+
+
+async def test_publish_opens_circuit_after_repeated_failures(fake_connection: _FakeConnection) -> None:
+    producer = RabbitMQProducer(Settings(RABBITMQ_PUBLISHER_CHANNEL_POOL_SIZE=1))
+    await producer.start()
+    producer._exchanges = [_FailingExchange()]
+    producer._publish_breaker.failure_threshold = 2
+
+    for _ in range(2):
+        with pytest.raises(ConnectionError):
+            await producer.publish("some-topic", {"hello": "world"})
+
+    # Third attempt must fail fast on the breaker, not reach the broker at all.
+    with pytest.raises(CircuitOpenError):
+        await producer.publish("some-topic", {"hello": "world"})

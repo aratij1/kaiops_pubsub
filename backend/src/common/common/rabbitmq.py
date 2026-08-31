@@ -11,9 +11,40 @@ from aio_pika import DeliveryMode, ExchangeType, Message, RobustChannel, RobustC
 
 from common.config import Settings
 from common.logging import get_logger
-from common.message_processing import ProcessedMessageCache, extract_message_identity
+from common.message_processing import ProcessedMessageCache, extract_message_identity, processing_cancelled
+from common.resilience import CircuitBreaker, CircuitOpenError
+from common.telemetry import DEAD_LETTER_EVENTS, QUEUE_AGE, QUEUE_DEPTH
+from opentelemetry import propagate, trace
 
 logger = get_logger(__name__)
+
+# aio_pika's RobustConnection/RobustExchange retry a broken broker connection
+# internally rather than raising promptly, so a publish() call can stall for a
+# long time during an outage instead of failing fast. Bound each publish
+# attempt and count timeouts/errors toward the breaker so a sustained outage
+# fails new publishes immediately instead of piling up stalled callers.
+_PUBLISH_TIMEOUT_SECONDS = 10.0
+
+
+def _is_transient_handler_error(error: str) -> bool:
+    normalized = str(error or "").strip().lower()
+    return any(
+        marker in normalized
+        for marker in (
+            "can't connect to mysql server",
+            "connection refused",
+            "connection reset",
+            "connection timed out",
+            "temporary failure in name resolution",
+            "name or service not known",
+            "server has gone away",
+            "lost connection to mysql",
+            "circuit breaker open",
+            "tool circuit open",
+            "timeout",
+            "timed out",
+        )
+    )
 
 
 def normalize_payload(value: Any) -> Any:
@@ -33,6 +64,7 @@ class RabbitMQProducer:
         self._channels: list[RobustChannel] = []
         self._exchanges: list[RobustExchange] = []
         self._next_exchange_index = 0
+        self._publish_breaker = CircuitBreaker()
 
     async def start(self) -> None:
         if self._connection is not None:
@@ -95,24 +127,39 @@ class RabbitMQProducer:
         if not self._exchanges:
             logger.info("rabbitmq producer unavailable; event logged", extra={"topic": topic, "payload": normalize_payload(event)})
             return
+        if not self._publish_breaker.allow():
+            raise CircuitOpenError("rabbitmq publish circuit breaker open: broker appears unreachable")
         payload = normalize_payload(event)
         envelope = {
             "topic": topic,
             "key": key,
             "payload": payload,
+            "produced_at": datetime.now(timezone.utc).isoformat(),
         }
         body = json.dumps(envelope, default=str).encode("utf-8")
         routing_key = topic
-        await self._next_exchange().publish(
-            Message(
-                body,
-                content_type="application/json",
-                delivery_mode=DeliveryMode.PERSISTENT,
-                type=topic,
-                app_id="kaiops",
-            ),
-            routing_key=routing_key,
-        )
+        trace_headers: dict[str, str] = {}
+        propagate.inject(trace_headers)
+        try:
+            await asyncio.wait_for(
+                self._next_exchange().publish(
+                    Message(
+                        body,
+                        content_type="application/json",
+                        delivery_mode=DeliveryMode.PERSISTENT,
+                        type=topic,
+                        app_id="kaiops",
+                        headers=trace_headers,
+                    ),
+                    routing_key=routing_key,
+                ),
+                timeout=_PUBLISH_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            self._publish_breaker.record_failure()
+            raise
+        else:
+            self._publish_breaker.record_success()
 
 
 class RabbitMQConsumer:
@@ -148,6 +195,9 @@ class RabbitMQConsumer:
                 )
                 queue_name = f"{self._settings.rabbitmq_queue_prefix}.{self._settings.service_name}.{self._topic}"
                 self._queue = await self._channel.declare_queue(queue_name, durable=True)
+                declaration = getattr(self._queue, "declaration_result", None)
+                if declaration is not None:
+                    QUEUE_DEPTH.labels("rabbitmq", queue_name).set(float(getattr(declaration, "message_count", 0) or 0))
                 await self._queue.bind(self._exchange, routing_key=self._topic)
                 self._dlq_routing_key = f"{self._topic}{self._settings.rabbitmq_dlq_suffix}"
                 dlq_queue_name = f"{queue_name}.dlq"
@@ -209,6 +259,7 @@ class RabbitMQConsumer:
 async def consume_forever(
     consumer: RabbitMQConsumer,
     handler: Callable[[dict[str, Any]], Awaitable[None]],
+    failure_handler: Callable[[dict[str, Any], str], Awaitable[None]] | None = None,
 ) -> None:
     processed_cache = ProcessedMessageCache()
     while True:
@@ -233,6 +284,10 @@ async def consume_forever(
                         continue
 
                     identity = extract_message_identity(payload)
+                    if await processing_cancelled(consumer._settings, payload):
+                        logger.warning("cancelled alert removed from rabbitmq processing", extra={"topic": consumer._topic, "message_identity": identity})
+                        await message.ack()
+                        continue
                     if processed_cache.contains(identity):
                         logger.info("skipping duplicate rabbitmq message", extra={"topic": consumer._topic, "message_identity": identity})
                         await message.ack()
@@ -244,12 +299,20 @@ async def consume_forever(
                     dlq_published = False
 
                     last_error = ""
+                    produced_at = decoded.get("produced_at") if isinstance(decoded, dict) else None
+                    if produced_at:
+                        try:
+                            produced = datetime.fromisoformat(str(produced_at).replace("Z", "+00:00"))
+                            QUEUE_AGE.labels("rabbitmq", consumer._topic).observe(max(0.0, (datetime.now(timezone.utc) - produced).total_seconds()))
+                        except (TypeError, ValueError):
+                            pass
+                    parent_context = propagate.extract(dict(getattr(message, "headers", None) or {}))
                     while attempts <= max_retries:
                         try:
-                            await asyncio.wait_for(
-                                handler(payload),
-                                timeout=consumer._settings.rabbitmq_handler_timeout_seconds,
-                            )
+                            with trace.get_tracer("kaiops.rabbitmq").start_as_current_span("rabbitmq.consume", context=parent_context) as span:
+                                span.set_attribute("messaging.system", "rabbitmq")
+                                span.set_attribute("messaging.destination.name", consumer._topic)
+                                await asyncio.wait_for(handler(payload), timeout=consumer._settings.rabbitmq_handler_timeout_seconds)
                             success = True
                             processed_cache.mark(identity)
                             break
@@ -268,7 +331,11 @@ async def consume_forever(
                         continue
 
                     logger.error(
-                        "failed to process rabbitmq message",
+                        "failed to process rabbitmq message: topic=%s identity=%s attempts=%s error=%s",
+                        consumer._topic,
+                        identity,
+                        attempts,
+                        last_error,
                         extra={
                             "topic": consumer._topic,
                             "attempts": attempts,
@@ -277,8 +344,29 @@ async def consume_forever(
                             "message_identity": identity,
                         },
                     )
+                    if (
+                        consumer._settings.rabbitmq_transient_requeue_enabled
+                        and _is_transient_handler_error(last_error)
+                    ):
+                        logger.warning(
+                            "requeueing rabbitmq message after transient dependency failure: topic=%s identity=%s error=%s",
+                            consumer._topic,
+                            identity,
+                            last_error,
+                        )
+                        await asyncio.sleep(min(5.0, max(1.0, float(attempts))))
+                        await message.nack(requeue=True)
+                        continue
                     if consumer._exchange is not None and consumer._dlq_routing_key:
                         try:
+                            if failure_handler is not None:
+                                try:
+                                    await failure_handler(payload, last_error or "handler_failed")
+                                except Exception:
+                                    logger.exception(
+                                        "failed to persist rabbitmq terminal handler state",
+                                        extra={"topic": consumer._topic, "message_identity": identity},
+                                    )
                             envelope = {
                                 "failed_topic": consumer._topic,
                                 "payload": payload,
@@ -298,6 +386,7 @@ async def consume_forever(
                             )
                             processed_cache.mark(identity)
                             dlq_published = True
+                            DEAD_LETTER_EVENTS.labels("rabbitmq", consumer._topic, "handler_failed").inc()
                         except Exception:
                             logger.exception(
                                 "failed to publish rabbitmq dlq message",

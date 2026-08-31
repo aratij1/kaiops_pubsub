@@ -40,13 +40,13 @@ class OrchestratorAgent(BaseAgent):
 
     def select(self, alert: Alert, incident: Incident) -> WorkflowDecision:
         selection = self.orchestrator.select(alert, incident)
-        return self._to_decision(alert=alert, selection=selection)
+        return self._to_decision(alert=alert, incident=incident, selection=selection)
 
     async def select_async(self, alert: Alert, incident: Incident) -> WorkflowDecision:
         selection = await self.orchestrator.select_async(alert, incident)
-        return self._to_decision(alert=alert, selection=selection)
+        return self._to_decision(alert=alert, incident=incident, selection=selection)
 
-    def _to_decision(self, *, alert: Alert, selection: WorkflowSelection) -> WorkflowDecision:
+    def _to_decision(self, *, alert: Alert, incident: Incident, selection: WorkflowSelection) -> WorkflowDecision:
         downstream_agents = [step for step in selection.definition.steps if step.endswith("-agent")]
         policy_version = str(self.policy_engine.policies.get("policy_version", "policy-v1"))
         base_policy_reason = str(getattr(selection, "policy_reason", "confidence and severity policy evaluation"))
@@ -61,6 +61,7 @@ class OrchestratorAgent(BaseAgent):
             requires_approval=selection.requires_approval,
             risk_tier=str(getattr(selection, "risk_tier", "medium")),
             execution_mode=str(getattr(selection, "execution_mode", "human-approval")),
+            incident_id=incident.id,
         )
         return WorkflowDecision(
             workflow=selection.definition.name,

@@ -1,6 +1,6 @@
 export const MONITORING_TOOL_OPTIONS = ["prometheus", "new_relic", "datadog"];
 
-export const ALERT_DOC_KIND_OPTIONS = ["incident", "runbook", "deployment", "change", "dependency", "remediation"];
+export const ALERT_DOC_KIND_OPTIONS = ["incident", "jira", "runbook", "deployment", "change", "dependency", "remediation"];
 
 export const ONBOARDING_SOURCE_DOC_EXTENSIONS = new Set(["txt", "md", "markdown", "json", "csv", "log", "yaml", "yml"]);
 
@@ -21,15 +21,5 @@ export const ONBOARDING_SOURCE_DOC_SAMPLE_FILES = {
   logs: { href: "/source_doc_sample_rca_and_logs.txt", label: "Download logs sample" },
   other: { href: "/source_doc_sample_past_ticket.md", label: "Download evidence sample" },
 };
-
-export const ROLE_ALLOWED_TABS = {
-  administrator: ["home", "stream", "copilot", "approval", "executive", "admin", "trace", "safety", "rag", "closed", "summary"],
-  l1_operator: ["home", "stream"],
-  l2_engineer: ["home", "stream", "copilot", "approval", "trace", "safety", "rag", "closed", "summary"],
-  l3_engineer: ["home", "stream", "copilot", "approval", "executive", "trace", "safety", "rag", "closed", "summary"],
-  executive: ["home", "stream", "copilot", "approval", "executive", "trace", "safety", "rag", "closed", "summary"],
-};
-
-export const APPROVAL_NAV_PRIMARY_ROLES = new Set(["administrator"]);
 
 export const DOCUMENT_PROVIDER_ROLES = new Set(["administrator", "l2_engineer", "l3_engineer"]);

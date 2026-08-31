@@ -5,6 +5,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from common.rag_governance import production_retrievable, validate_governed_metadata
+
 
 INCIDENT_SEVERITIES = {"critical", "high", "warning", "info"}
 KNOWN_SECTIONS = {"runbooks", "incidents", "changes", "dependencies", "deployments", "sops", "onboarding"}
@@ -92,14 +94,22 @@ def validate_file(path: Path, rag_root: Path) -> list[ValidationIssue]:
     section = section_for(path, rag_root)
     metadata = parse_metadata(path)
 
+    if validate_governed_metadata(metadata) is None:
+        issues.append(ValidationIssue("error", path, "missing or invalid canonical RAG governance metadata"))
+
     if section not in KNOWN_SECTIONS:
         issues.append(ValidationIssue("warn", path, f"unknown rag section '{section}'"))
         return issues
 
     required_keys = required_keys_for(section)
+    required_keys = ["tenant_scope", *required_keys]
     missing = [key for key in required_keys if not metadata.get(key, "").strip()]
     if missing:
         issues.append(ValidationIssue("error", path, f"missing required metadata keys: {', '.join(missing)}"))
+
+    tenant_scope = metadata.get("tenant_scope", "").strip()
+    if tenant_scope and tenant_scope.lower() != "global" and not re.match(r"^[A-Za-z0-9._-]{1,128}$", tenant_scope):
+        issues.append(ValidationIssue("error", path, "tenant_scope must be 'global' or a valid tenant identifier"))
 
     expected_kind = expected_kind_for(section)
     if expected_kind:
@@ -141,6 +151,11 @@ def main() -> int:
         help="Optional list of markdown file paths to validate (delta mode)",
     )
     parser.add_argument("--strict", action="store_true", help="Fail on warnings in addition to errors")
+    parser.add_argument(
+        "--require-production-ready",
+        action="store_true",
+        help="Fail when no approved retrievable production document exists",
+    )
     args = parser.parse_args()
 
     rag_root = Path(args.rag_root).resolve()
@@ -170,9 +185,19 @@ def main() -> int:
         print(f"[{issue.level.upper()}] {issue.path}: {issue.message}")
 
     scanned_count = len(targets) if targets is not None else len(list(rag_root.rglob("*.md")))
-    print(f"Scanned {scanned_count} markdown files | errors={len(errors)} warnings={len(warnings)}")
+    scanned_paths = targets if targets is not None else list(rag_root.rglob("*.md"))
+    approved_count = sum(
+        1 for path in scanned_paths if production_retrievable(parse_metadata(path))
+    )
+    print(
+        f"Scanned {scanned_count} markdown files | approved_retrievable={approved_count} "
+        f"errors={len(errors)} warnings={len(warnings)}"
+    )
 
     if errors:
+        return 1
+    if args.require_production_ready and approved_count == 0:
+        print("[ERROR] production RAG readiness requires at least one approved retrievable document")
         return 1
     if args.strict and warnings:
         return 1

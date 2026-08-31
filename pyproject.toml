@@ -7,15 +7,16 @@ dependencies = [
     "aio-pika>=9.4.0",
     "aiokafka>=0.12.0",
     "aiomysql>=0.2.0",
-    "asyncpg>=0.30.0",
     "fastapi>=0.115.0",
-    "httpx>=0.28.0",
+    "httpx[socks]>=0.28.0",
     "langchain>=0.3.0",
     "langgraph>=0.2.0",
     "numpy>=2.0.0",
     "opentelemetry-api>=1.29.0",
     "opentelemetry-exporter-otlp>=1.29.0",
-    "opentelemetry-instrumentation-fastapi>=0.50b0",
+  "opentelemetry-instrumentation-fastapi>=0.50b0",
+  "opentelemetry-instrumentation-httpx>=0.50b0",
+  "opentelemetry-instrumentation-sqlalchemy>=0.50b0",
     "opentelemetry-sdk>=1.29.0",
     "prometheus-client>=0.21.0",
     "pydantic>=2.10.0",
@@ -27,7 +28,10 @@ dependencies = [
     "redis>=5.2.0",
     "azure-servicebus>=7.13.0",
     "azure-monitor-opentelemetry-exporter>=1.0.0b35",
+    "azure-storage-blob>=12.25.0",
+    "boto3>=1.35.0",
     "sqlalchemy[asyncio]>=2.0.0",
+    "temporalio>=1.9.0,<2.0.0",
     "uvicorn[standard]>=0.34.0",
 ]
 
@@ -42,6 +46,8 @@ where = [
     "backend/src/api-gateway",
     "backend/src/application-onboarding",
     "backend/src/alert-intelligence",
+    "backend/src/cloud-operations",
+    "backend/src/connector-hub",
     "ai-workbench/src/context-agent",
     "backend/src/dashboard-generator",
     "backend/src/discovery-service",
@@ -58,6 +64,7 @@ where = [
     "backend/src/audit-service",
     "backend/src/monitoring-adapter",
     "backend/src/notification-service",
+    "backend/src/temporal-pilot",
 ]
 include = [
     "common*",
@@ -65,6 +72,8 @@ include = [
     "api_gateway*",
     "application_onboarding*",
     "alert_intelligence*",
+    "cloud_operations*",
+    "connector_hub*",
     "context_agent*",
     "dashboard_generator*",
     "discovery_service*",
@@ -81,10 +90,12 @@ include = [
     "monitoring_adapter*",
     "notification_service*",
     "evaluation_service*",
+    "temporal_pilot*",
 ]
 
 [project.optional-dependencies]
 dev = [
+    "pip-audit>=2.9.0",
     "pytest>=8.3.0",
     "pytest-asyncio>=0.25.0",
     "ruff>=0.8.0",
@@ -94,11 +105,14 @@ dev = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 pythonpath = [
+    ".",
     "backend/src/common",
     "ai-workbench/src",
     "backend/src/api-gateway",
     "backend/src/application-onboarding",
     "backend/src/alert-intelligence",
+    "backend/src/cloud-operations",
+    "backend/src/connector-hub",
     "ai-workbench/src/context-agent",
     "backend/src/dashboard-generator",
     "backend/src/discovery-service",

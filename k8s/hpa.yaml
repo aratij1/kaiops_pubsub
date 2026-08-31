@@ -1,6 +1,7 @@
 # Cloud-neutral horizontal autoscaling policy.
 # CPU/memory metrics work on any Kubernetes distribution with metrics-server.
-# Queue-lag based scaling should be layered with KEDA or a cloud adapter.
+# Queue-lag based scaling should be layered with KEDA or a cloud adapter — see
+# docs/QUEUE_DEPTH_AUTOSCALING.md and k8s/keda-scaledobject.yaml.example.
 
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler

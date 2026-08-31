@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from common.tenant_identity import require_tenant_id
+from common.remediation_plan import RemediationPlan
 
 
 def utc_now() -> datetime:
@@ -23,10 +26,13 @@ class IncidentStatus(StrEnum):
     OPEN = "open"
     INVESTIGATING = "investigating"
     AWAITING_APPROVAL = "awaiting_approval"
+    APPROVED = "approved"
     REMEDIATING = "remediating"
     VALIDATING = "validating"
+    RESOLVED = "resolved"
     CLOSED = "closed"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 class ApprovalDecision(StrEnum):
@@ -34,14 +40,33 @@ class ApprovalDecision(StrEnum):
     APPROVED = "approved"
     REJECTED = "rejected"
     MODIFIED = "modified"
+    EVIDENCE_REQUESTED = "evidence_requested"
 
 
 class RemediationStatus(StrEnum):
+    DRAFT = "draft"
+    POLICY_CHECKED = "policy_checked"
+    AWAITING_APPROVAL = "awaiting_approval"
+    APPROVED = "approved"
+    DISPATCHING = "dispatching"
+    EXECUTOR_ACCEPTED = "executor_accepted"
     PENDING = "pending"
     RUNNING = "running"
+    VERIFYING = "verifying"
+    PENDING_STABILITY = "pending_stability"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     SKIPPED = "skipped"
+    POLICY_BLOCKED = "policy_blocked"
+    DISPATCH_FAILED = "dispatch_failed"
+    EXECUTION_FAILED = "execution_failed"
+    VALIDATION_FAILED = "validation_failed"
+    ROLLING_BACK = "rolling_back"
+    ROLLED_BACK = "rolled_back"
+    ROLLBACK_FAILED = "rollback_failed"
+    TIMED_OUT = "timed_out"
+    CANCELLED = "cancelled"
+    MANUAL_INTERVENTION_REQUIRED = "manual_intervention_required"
 
 
 class SafetyDecision(StrEnum):
@@ -214,6 +239,7 @@ class MonitoringAuditEvent(BaseEvent):
 
 
 class Alert(BaseEvent):
+    tenant_id: str = "default"
     source: str
     name: str
     service: str
@@ -342,6 +368,7 @@ class JiraIncidentSnapshot(BaseModel):
 
 
 class Incident(BaseEvent):
+    tenant_id: str = "default"
     alert_ids: list[UUID] = Field(default_factory=list)
     service: str
     environment: str = "prod"
@@ -351,10 +378,19 @@ class Incident(BaseEvent):
     summary: str = ""
     owner_team: str | None = None
     ticket_id: str | None = None
+    # Jira enrichment is added after incident creation and is persisted with
+    # the incident projection. Keep these fields in the shared contract so
+    # downstream agents can validate enriched incidents without discarding
+    # their ticket provenance or failing the workflow.
+    jira_key: str | None = None
+    jira_url: str | None = None
+    jira_link: str | None = None
+    jira_status: str | None = None
     closed_at: datetime | None = None
 
 
 class Recommendation(BaseEvent):
+    tenant_id: str
     incident_id: UUID
     root_cause: str
     confidence: float = Field(ge=0.0, le=1.0)
@@ -364,23 +400,49 @@ class Recommendation(BaseEvent):
     rationale: str
     commands: list[str] = Field(default_factory=list)
     risk: str = "medium"
+    remediation_plan: RemediationPlan | None = None
+
+    @field_validator("tenant_id")
+    @classmethod
+    def tenant_must_be_verified(cls, value: str) -> str:
+        return require_tenant_id(value, source="recommendation identity")
 
 
 class Approval(BaseEvent):
+    tenant_id: str
     incident_id: UUID
     recommendation_id: UUID
+    plan_id: UUID | None = None
+    plan_fingerprint: str | None = None
+    approval_expires_at: datetime | None = None
+    approver_role: str | None = None
+    authorization_scope: Literal["dry_run", "execution"] = "execution"
     decision: ApprovalDecision = ApprovalDecision.PENDING
     approver: str | None = None
     channel: str = "web"
     comment: str | None = None
     modified_action: str | None = None
 
+    @field_validator("tenant_id")
+    @classmethod
+    def tenant_must_be_verified(cls, value: str) -> str:
+        return require_tenant_id(value, source="approval identity")
+
 
 class RemediationAction(BaseEvent):
+    tenant_id: str
     incident_id: UUID
     approval_id: UUID | None = None
+    recommendation_id: UUID | None = None
+    resolution_plan_id: UUID | None = None
+    plan_fingerprint: str | None = None
     action_type: str
     target: str
+    # Deterministic sha256(incident_id:recommendation_id:action_type). Stable
+    # across a redelivered approval/resolution message even though `id`
+    # above is a fresh uuid4 every time — used to detect and skip re-executing
+    # a remediation that already ran. None for actions with no execution risk.
+    idempotency_key: str | None = None
     parameters: dict[str, Any] = Field(default_factory=dict)
     status: RemediationStatus = RemediationStatus.PENDING
     started_at: datetime | None = None
@@ -388,11 +450,24 @@ class RemediationAction(BaseEvent):
     output: str = ""
     error: str | None = None
 
+    @field_validator("tenant_id")
+    @classmethod
+    def tenant_must_be_verified(cls, value: str) -> str:
+        return require_tenant_id(value, source="remediation action identity")
+
 
 class ResolutionReport(BaseEvent):
+    tenant_id: str
     incident_id: UUID
+    ticket_id: str | None = None
     recommendation_id: UUID | None = None
+    resolution_plan_id: UUID | None = None
+    plan_fingerprint: str | None = None
+    approval_id: UUID | None = None
     remediation_action_id: UUID | None = None
+    validation_checksum: str | None = None
+    closure_kind: str | None = None
+    closure_status: str | None = None
     root_cause: str
     impact: str
     action_taken: str
@@ -401,6 +476,11 @@ class ResolutionReport(BaseEvent):
     health_restored: bool = False
     knowledge_base_entry: str = ""
     lessons_learned: list[str] = Field(default_factory=list)
+
+    @field_validator("tenant_id")
+    @classmethod
+    def tenant_must_be_verified(cls, value: str) -> str:
+        return require_tenant_id(value, source="resolution report identity")
 
 
 class SafetyCheckResult(BaseModel):

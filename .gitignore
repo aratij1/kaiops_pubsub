@@ -19,6 +19,12 @@ build/
 data/
 logs/local/*.log
 node_modules/
+.tmp/
+.test-tmp*/
+storybook-static/
+test-results/
+playwright-report/
+artifacts/
 
 # Generated UI and runtime artifacts
 .tmp-ui-bundle.js
@@ -41,3 +47,5 @@ backend/rag/changes/**
 backend/rag/dependencies/*.md
 backend/rag/incidents/*-rule-onboarding.md
 backend/rag/runbooks/*-rule-runbook.md
+# Runtime review packets are evidence awaiting governance, never source fixtures.
+backend/rag/_review/**/*.json

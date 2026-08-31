@@ -1,6 +1,8 @@
 x-service-env: &service-env
-  CLOUD_PROVIDER: ${CLOUD_PROVIDER:-local}
-  DEPLOYMENT_PROFILE: ${DEPLOYMENT_PROFILE:-onprem}
+  KAIMS_RELEASE_SHA: ${KAIMS_RELEASE_SHA:-dev}
+  KAIMS_BUILD_TIME: ${KAIMS_BUILD_TIME:-unknown}
+  CLOUD_PROVIDER: ${CLOUD_PROVIDER:-cloud-neutral}
+  DEPLOYMENT_PROFILE: ${DEPLOYMENT_PROFILE:-cloud-neutral}
   CONNECTION_CONFIG_PATH: ${CONNECTION_CONFIG_PATH:-backend/config/kaiops-connections.json}
   KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
   REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
@@ -11,15 +13,36 @@ x-service-env: &service-env
   DB_USER: ${COMPOSE_DB_USER:-kaiops}
   DB_PASSWORD: ${COMPOSE_DB_PASSWORD:-kaiops}
   DB_DATABASE: ${COMPOSE_DB_DATABASE:-kaiops}
+  # Most services are low-throughput workflow stages. Keep their idle pools
+  # small; ingestion services override these values below where concurrency is
+  # useful. This prevents dozens of containers from retaining hundreds of
+  # mostly idle MySQL connections.
+  DB_POOL_SIZE: ${SHARED_DB_POOL_SIZE:-4}
+  DB_MAX_OVERFLOW: ${SHARED_DB_MAX_OVERFLOW:-6}
   JWT_SECRET_KEY: ${JWT_SECRET_KEY:-kaiops-local-demo-secret-key-change-me}
+  AUTH_MODE: ${AUTH_MODE:-local}
+  OIDC_ISSUER: ${OIDC_ISSUER:-}
+  OIDC_AUDIENCE: ${OIDC_AUDIENCE:-}
+  OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-}
+  OIDC_ROLE_CLAIM: ${OIDC_ROLE_CLAIM:-roles}
+  OIDC_TENANT_CLAIM: ${OIDC_TENANT_CLAIM:-tenant_id}
+  OIDC_ROLE_MAPPINGS: ${OIDC_ROLE_MAPPINGS:-{}}
+  OIDC_STEP_UP_VALUES: ${OIDC_STEP_UP_VALUES:-mfa,c2,c3}
   ADMIN_USER_PASSWORD: ${ADMIN_USER_PASSWORD:-Admin@123456}
   EXECUTIVE_USER_PASSWORD: ${EXECUTIVE_USER_PASSWORD:-Executive@123456}
   L3_USER_PASSWORD: ${L3_USER_PASSWORD:-L3Engineer@123456}
   L2_USER_PASSWORD: ${L2_USER_PASSWORD:-L2Engineer@123456}
   L1_USER_PASSWORD: ${L1_USER_PASSWORD:-L1Operator@123456}
+  # The core stack starts a collector and Jaeger so the default exporter is
+  # always reachable. Override this only when exporting to a managed backend.
+  OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
   CONTEXT_AGENT_URL: http://context-agent:8000
   RESOLUTION_AGENT_URL: http://resolution-agent:8000
+  REMEDIATION_EXECUTION_PLATFORM: ${REMEDIATION_EXECUTION_PLATFORM:-docker-compose}
+  REMEDIATION_COMPOSE_PROJECT: ${REMEDIATION_COMPOSE_PROJECT:-${COMPOSE_PROJECT_NAME:-kaiops_azure}}
   APPROVAL_SERVICE_URL: http://approval-service:8000
+  CLOSURE_SERVICE_URL: http://closure-service:8000
+  ORCHESTRATOR_URL: http://orchestrator:8000
   MODEL_ROUTER_URL: http://model-router:8000
   MONITORING_ADAPTER_URL: http://monitoring-adapter:8000
   LANDING_PAD_FILE_WATCHER_ENABLED: ${LANDING_PAD_FILE_WATCHER_ENABLED:-false}
@@ -38,10 +61,12 @@ x-service-env: &service-env
   # Outbound Jira API — distinct from JIRA_WEBHOOK_SECRET (inbound auth).
   # Used by the centralized dedup step to create/update Jira tickets from
   # Prometheus/log/email alerts, making Jira the single source of truth.
-  JIRA_API_BASE_URL: ${JIRA_API_BASE_URL:-}
+  JIRA_API_BASE_URL: ${JIRA_API_BASE_URL:-https://kaiops-test.atlassian.net}
   JIRA_API_EMAIL: ${JIRA_API_EMAIL:-}
   JIRA_API_TOKEN: ${JIRA_API_TOKEN:-}
-  JIRA_PROJECT_KEY: ${JIRA_PROJECT_KEY:-}
+  JIRA_PROJECT_KEY: ${JIRA_PROJECT_KEY:-KAN}
+  JIRA_ISSUE_TYPE: ${JIRA_ISSUE_TYPE:-Bug}
+  JIRA_TRANSITION_MAPPING: ${JIRA_TRANSITION_MAPPING:-{}}
   CENTRALIZED_JIRA_ROUTING_ENABLED: ${CENTRALIZED_JIRA_ROUTING_ENABLED:-false}
   LOG_INGESTION_ENABLED: ${LOG_INGESTION_ENABLED:-false}
   LOG_WATCH_PATHS: ${LOG_WATCH_PATHS:-}
@@ -53,7 +78,9 @@ x-service-env: &service-env
   OPENSEARCH_LOG_DOCKER_API_URL: ${OPENSEARCH_LOG_DOCKER_API_URL:-http://docker-socket-proxy:2375}
   OPENSEARCH_LOG_POLL_INTERVAL_SECONDS: ${OPENSEARCH_LOG_POLL_INTERVAL_SECONDS:-30}
   OPENSEARCH_LOG_LOOKBACK_SECONDS: ${OPENSEARCH_LOG_LOOKBACK_SECONDS:-300}
-  OPENSEARCH_LOG_BATCH_SIZE: ${OPENSEARCH_LOG_BATCH_SIZE:-100}
+  # Hard-capped at 15 by monitoring-adapter; 10 is the safe default.
+  OPENSEARCH_LOG_BATCH_SIZE: ${OPENSEARCH_LOG_BATCH_SIZE:-10}
+  OPENSEARCH_LOG_TIMEOUT_SECONDS: ${OPENSEARCH_LOG_TIMEOUT_SECONDS:-10}
   OPENSEARCH_LOG_TRIGGER_TROUBLESHOOTING: ${OPENSEARCH_LOG_TRIGGER_TROUBLESHOOTING:-true}
   OPENSEARCH_LOG_JIRA_ROUTING_ENABLED: ${OPENSEARCH_LOG_JIRA_ROUTING_ENABLED:-false}
   PROMETHEUS_JIRA_ROUTING_ENABLED: ${PROMETHEUS_JIRA_ROUTING_ENABLED:-false}
@@ -81,33 +108,49 @@ x-service-env: &service-env
   EMAIL_IMAP_SEARCH_CRITERIA: ${EMAIL_IMAP_SEARCH_CRITERIA:-UNSEEN}
   EMAIL_IMAP_MARK_SEEN: ${EMAIL_IMAP_MARK_SEEN:-true}
   EMAIL_POLL_INTERVAL_SECONDS: ${EMAIL_POLL_INTERVAL_SECONDS:-60}
-  EMAIL_POLL_BATCH_SIZE: ${EMAIL_POLL_BATCH_SIZE:-25}
+  # Hard-capped at 15 by monitoring-adapter; 10 is the safe default.
+  EMAIL_POLL_BATCH_SIZE: ${EMAIL_POLL_BATCH_SIZE:-10}
   EMAIL_DEFAULT_SERVICE: ${EMAIL_DEFAULT_SERVICE:-email-inbox}
   EMAIL_ALERT_SUBJECT_REGEX: ${EMAIL_ALERT_SUBJECT_REGEX:-(?i)\b(alert|incident|critical|warning|error|failure|failed|down|sev[1-5]|p[1-5])\b}
   EVALUATION_SERVICE_URL: http://evaluation-service:8000
   API_GATEWAY_URL: http://api-gateway:8000
   APPLICATION_ONBOARDING_URL: http://application-onboarding:8000
+  CLOUD_OPERATIONS_URL: http://cloud-operations:8000
+  CLOUD_OPERATIONS_ENABLED: ${CLOUD_OPERATIONS_ENABLED:-true}
   AI_LAYER_MODE: ${AI_LAYER_MODE:-endpoint}
   AI_LAYER_REQUEST_TIMEOUT_SECONDS: ${AI_LAYER_REQUEST_TIMEOUT_SECONDS:-120}
   AI_LAYER_AUTH_TOKEN: ${AI_LAYER_AUTH_TOKEN:-}
   PROMETHEUS_URL: http://prometheus:9090
   GRAFANA_URL: http://grafana:3000
   OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
   OPENAI_GPT5_MODEL: ${OPENAI_GPT5_MODEL:-gpt-5}
   OPENAI_GPT4O_MODEL: ${OPENAI_GPT4O_MODEL:-gpt-4o}
+  REASONING_STANDARD_MODEL: ${REASONING_STANDARD_MODEL:-gpt-5.6-terra}
+  REASONING_CRITICAL_MODEL: ${REASONING_CRITICAL_MODEL:-gpt-5.6-sol}
+  MODEL_ROUTER_REASONING_BACKEND: ${MODEL_ROUTER_REASONING_BACKEND:-openai}
   GEMINI_API_KEY: ${GEMINI_API_KEY:-}
   GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.5-flash}
   GEMINI_BASE_URL: ${GEMINI_BASE_URL:-https://generativelanguage.googleapis.com/v1beta}
   GROQ_API_KEY: ${GROQ_API_KEY:-}
   GROQ_MODEL: ${GROQ_MODEL:-llama-3.3-70b-versatile}
   GROQ_BASE_URL: ${GROQ_BASE_URL:-https://api.groq.com/openai/v1}
-  LOCAL_LLM_ENABLED: ${LOCAL_LLM_ENABLED:-false}
+  LOCAL_LLM_ENABLED: ${LOCAL_LLM_ENABLED:-true}
+  LOCAL_LLM_ENDPOINT: ${LOCAL_LLM_ENDPOINT:-http://host.docker.internal:11434}
+  LOCAL_LLM_MODEL: ${LOCAL_LLM_MODEL:-qwen2.5:7b}
   LLM_REQUEST_TIMEOUT_SECONDS: ${LLM_REQUEST_TIMEOUT_SECONDS:-120}
-  MODEL_ROUTER_CRITICAL_PROVIDER: ${MODEL_ROUTER_CRITICAL_PROVIDER:-gpt-5}
-  MODEL_ROUTER_RCA_PROVIDER: ${MODEL_ROUTER_RCA_PROVIDER:-gpt-4o}
+  MODEL_ROUTER_CRITICAL_PROVIDER: ${MODEL_ROUTER_CRITICAL_PROVIDER:-reasoning-critical}
+  MODEL_ROUTER_RCA_PROVIDER: ${MODEL_ROUTER_RCA_PROVIDER:-reasoning-standard}
   MODEL_ROUTER_DEFAULT_PROVIDER: ${MODEL_ROUTER_DEFAULT_PROVIDER:-gpt-4o}
-  RCA_EXTERNAL_KNOWLEDGE_ENABLED: ${RCA_EXTERNAL_KNOWLEDGE_ENABLED:-true}
-  RCA_EXTERNAL_TOOLS_ENABLED: ${RCA_EXTERNAL_TOOLS_ENABLED:-true}
+  MODEL_ROUTER_EVALUATION_POLICY_PATH: ${MODEL_ROUTER_EVALUATION_POLICY_PATH:-/app/backend/evaluation/model-routing-policy.json}
+  MODEL_ROUTER_EVALUATION_MIN_CASES: ${MODEL_ROUTER_EVALUATION_MIN_CASES:-50}
+  MODEL_ROUTER_MAX_PROMPT_CHARS: ${MODEL_ROUTER_MAX_PROMPT_CHARS:-60000}
+  MODEL_ROUTER_MAX_PAYLOAD_BYTES: ${MODEL_ROUTER_MAX_PAYLOAD_BYTES:-750000}
+  ALERTS_TABLE_METRIC_INTERVAL_SECONDS: ${ALERTS_TABLE_METRIC_INTERVAL_SECONDS:-300}
+  # Keep the live alert path deterministic and bounded. Operators can opt in
+  # to external enrichment, but local logs/metrics/code remain the default.
+  RCA_EXTERNAL_KNOWLEDGE_ENABLED: ${RCA_EXTERNAL_KNOWLEDGE_ENABLED:-false}
+  RCA_EXTERNAL_TOOLS_ENABLED: ${RCA_EXTERNAL_TOOLS_ENABLED:-false}
   EXTERNAL_KNOWLEDGE_SEARCH_URL: ${EXTERNAL_KNOWLEDGE_SEARCH_URL:-}
   EXTERNAL_KNOWLEDGE_SEARCH_TOKEN: ${EXTERNAL_KNOWLEDGE_SEARCH_TOKEN:-}
   EXTERNAL_KNOWLEDGE_SEARCH_TIMEOUT_SECONDS: ${EXTERNAL_KNOWLEDGE_SEARCH_TIMEOUT_SECONDS:-12}
@@ -116,20 +159,45 @@ x-service-env: &service-env
   LANDING_PAD_INGEST_CONCURRENCY: ${LANDING_PAD_INGEST_CONCURRENCY:-8}
   ALERTMANAGER_DEDUP_TTL_SECONDS: ${ALERTMANAGER_DEDUP_TTL_SECONDS:-900}
   ALERTMANAGER_DEDUP_MAX_ENTRIES: ${ALERTMANAGER_DEDUP_MAX_ENTRIES:-10000}
-  INCIDENT_PROJECTION_INTERVAL_SECONDS: ${INCIDENT_PROJECTION_INTERVAL_SECONDS:-60}
-  INCIDENT_PROJECTION_BATCH_SIZE: ${INCIDENT_PROJECTION_BATCH_SIZE:-100}
-  KAFKA_ENABLED: ${KAFKA_ENABLED:-true}
+  INCIDENT_PROJECTION_INTERVAL_SECONDS: ${INCIDENT_PROJECTION_INTERVAL_SECONDS:-5}
+  INCIDENT_PROJECTION_BATCH_SIZE: ${INCIDENT_PROJECTION_BATCH_SIZE:-500}
+  KAFKA_ENABLED: ${KAFKA_ENABLED:-false}
   EVENT_BUS_PROVIDER: ${EVENT_BUS_PROVIDER:-rabbitmq}
   MESSAGE_BUS_DYNAMIC_ROUTING: "true"
-  MESSAGE_BUS_STREAM_THRESHOLD: "500"
+  MESSAGE_BUS_STREAM_THRESHOLD: ${MESSAGE_BUS_STREAM_THRESHOLD:-250}
   MESSAGE_BUS_DEFAULT_PROVIDER: ${MESSAGE_BUS_DEFAULT_PROVIDER:-rabbitmq}
   MESSAGE_BUS_WORKER_COUNT: ${MESSAGE_BUS_WORKER_COUNT:-1}
+  # Startup repair is observable but non-mutating by default. Set to apply
+  # only after reviewing candidates; even apply replays proof-qualified work.
+  CLOSURE_RECONCILIATION_MODE: ${CLOSURE_RECONCILIATION_MODE:-apply}
+  CLOSURE_RECONCILIATION_BATCH_SIZE: ${CLOSURE_RECONCILIATION_BATCH_SIZE:-100}
+  CLOSURE_RECONCILIATION_INTERVAL_SECONDS: ${CLOSURE_RECONCILIATION_INTERVAL_SECONDS:-15}
+  RESOLUTION_OUTBOX_BATCH_SIZE: ${RESOLUTION_OUTBOX_BATCH_SIZE:-100}
+  RESOLUTION_OUTBOX_POLL_SECONDS: ${RESOLUTION_OUTBOX_POLL_SECONDS:-5}
+  RESOLUTION_OUTBOX_INITIAL_DELAY_SECONDS: ${RESOLUTION_OUTBOX_INITIAL_DELAY_SECONDS:-60}
+  # The Temporal worker is profile-gated. Keep the default incident path on
+  # the always-on message bus unless the temporal-pilot profile is explicitly
+  # enabled; otherwise the orchestrator starts a workflow that no worker runs.
+  TEMPORAL_PILOT_ENABLED: ${TEMPORAL_PILOT_ENABLED:-false}
+  TEMPORAL_ADDRESS: ${TEMPORAL_ADDRESS:-temporal:7233}
+  TEMPORAL_NAMESPACE: ${TEMPORAL_NAMESPACE:-default}
+  TEMPORAL_TASK_QUEUE: ${TEMPORAL_TASK_QUEUE:-kaiops-incident-pilot}
+  TEMPORAL_APPROVAL_TIMEOUT_HOURS: ${TEMPORAL_APPROVAL_TIMEOUT_HOURS:-24}
   KAFKA_CONSUMER_MAX_RETRIES: "3"
   KAFKA_DLQ_SUFFIX: .dlq
   RABBITMQ_URL: ${RABBITMQ_URL:-amqp://${RABBITMQ_DEFAULT_USER:-guest}:${RABBITMQ_DEFAULT_PASS:-guest}@rabbitmq:5672/}
   RABBITMQ_EXCHANGE: ${RABBITMQ_EXCHANGE:-kaiops.events}
   RABBITMQ_QUEUE_PREFIX: ${RABBITMQ_QUEUE_PREFIX:-kaiops}
-  RABBITMQ_CONSUMER_MAX_RETRIES: "3"
+  # Expensive context/RCA handlers must not reserve ten messages per worker.
+  # Small prefetch keeps recent alerts moving and bounds CPU/memory pressure.
+  RABBITMQ_CONSUMER_PREFETCH_COUNT: ${RABBITMQ_CONSUMER_PREFETCH_COUNT:-2}
+  RABBITMQ_HANDLER_TIMEOUT_SECONDS: ${RABBITMQ_HANDLER_TIMEOUT_SECONDS:-60}
+  RABBITMQ_CONSUMER_MAX_RETRIES: ${RABBITMQ_CONSUMER_MAX_RETRIES:-1}
+  # Docker restarts containers concurrently and does not re-apply depends_on
+  # ordering. Give the broker its full cold-start window instead of making
+  # every Python service enter a CPU-heavy restart loop after 60 seconds.
+  RABBITMQ_STARTUP_ATTEMPTS: ${RABBITMQ_STARTUP_ATTEMPTS:-90}
+  RABBITMQ_STARTUP_RETRY_SECONDS: ${RABBITMQ_STARTUP_RETRY_SECONDS:-2}
   RABBITMQ_DLQ_SUFFIX: .dlq
   DATABASE_ENABLED: "true"
   AZURE_SERVICE_BUS_ENABLED: ${AZURE_SERVICE_BUS_ENABLED:-false}
@@ -146,6 +214,9 @@ x-service-env: &service-env
   AZURE_OPENAI_EMBEDDINGS_ENABLED: ${AZURE_OPENAI_EMBEDDINGS_ENABLED:-false}
   AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT:-}
   AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY:-}
+  AZURE_OPENAI_CHAT_DEPLOYMENT: ${AZURE_OPENAI_CHAT_DEPLOYMENT:-gpt-4o}
+  AZURE_OPENAI_REASONING_STANDARD_DEPLOYMENT: ${AZURE_OPENAI_REASONING_STANDARD_DEPLOYMENT:-}
+  AZURE_OPENAI_REASONING_CRITICAL_DEPLOYMENT: ${AZURE_OPENAI_REASONING_CRITICAL_DEPLOYMENT:-}
   AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT: ${AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT:-}
   AZURE_OPENAI_API_VERSION: ${AZURE_OPENAI_API_VERSION:-2024-06-01}
   RAG_EMBEDDING_PROVIDER: ${RAG_EMBEDDING_PROVIDER:-local}
@@ -176,6 +247,9 @@ x-service-env: &service-env
 x-service-build: &service-build
   context: .
   dockerfile: deploy/docker/Dockerfile.service
+  args:
+    KAIMS_RELEASE_SHA: ${KAIMS_RELEASE_SHA:-dev}
+    KAIMS_BUILD_TIME: ${KAIMS_BUILD_TIME:-unknown}
 
 services:
   mysql:
@@ -183,9 +257,14 @@ services:
     restart: unless-stopped
     # Raised from the image default so per-service DB_POOL_SIZE/DB_MAX_OVERFLOW
     # increases (needed for a 10k-alert burst) don't exhaust connections across
-    # the ~24 services sharing this one instance. Verify the effective value
-    # for your environment (SHOW VARIABLES LIKE 'max_connections') and adjust.
-    command: ["--max-connections=${MYSQL_MAX_CONNECTIONS:-400}"]
+    # Shared services use 4+6 connections while the three ingestion-heavy
+    # services retain their explicit larger pools. 450 leaves headroom without
+    # encouraging the high per-connection memory ceiling of the old 900 value.
+    # 2 MiB is bounded per sorting connection and prevents MySQL error 1038 on
+    # legitimate operational queries while their covering indexes are built.
+    command:
+      - "--max-connections=${MYSQL_MAX_CONNECTIONS:-450}"
+      - "--sort-buffer-size=${MYSQL_SORT_BUFFER_SIZE:-2097152}"
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
       MYSQL_DATABASE: ${MYSQL_DATABASE:-kaiops}
@@ -200,10 +279,54 @@ services:
       timeout: 5s
       retries: 20
 
+  migrations:
+    build: *service-build
+    restart: "no"
+    environment: { <<: *service-env, SERVICE_NAME: migrations }
+    command: ["python", "scripts/apply-migrations.py"]
+    working_dir: /app
+    depends_on:
+      mysql: { condition: service_healthy }
+
+  temporal:
+    image: temporalio/auto-setup:1.27.2
+    restart: unless-stopped
+    environment:
+      DB: mysql8
+      DB_PORT: 3306
+      MYSQL_SEEDS: mysql
+      MYSQL_USER: root
+      MYSQL_PWD: ${MYSQL_ROOT_PASSWORD:-root}
+      DYNAMIC_CONFIG_FILE_PATH: /etc/temporal/config/dynamicconfig/docker.yaml
+    ports: ["7233:7233"]
+    depends_on:
+      mysql: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "tctl", "--address", "temporal:7233", "cluster", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  temporal-ui:
+    # Administrative tooling is opt-in so the normal KaiMS runtime does not
+    # reserve memory for a second workflow UI. Start with --profile admin-tools.
+    profiles: ["admin-tools", "full"]
+    image: temporalio/ui:2.34.0
+    restart: unless-stopped
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_CORS_ORIGINS: http://localhost:8501
+    ports: ["8088:8080"]
+    depends_on:
+      temporal: { condition: service_healthy }
+
   redis:
     image: redis:7
     restart: unless-stopped
-    ports: ["6379:6379"]
+    # Keep the container address stable while avoiding collisions with other
+    # local projects that commonly publish Redis on the default host port.
+    ports: ["${KAI_OPS_REDIS_PORT:-6380}:6379"]
     volumes:
       - redis-data:/data
     healthcheck:
@@ -213,6 +336,7 @@ services:
       retries: 20
 
   zookeeper:
+    profiles: ["kafka"]
     image: confluentinc/cp-zookeeper:7.7.1
     restart: unless-stopped
     environment:
@@ -222,6 +346,7 @@ services:
       - zookeeper-log:/var/lib/zookeeper/log
 
   kafka:
+    profiles: ["kafka"]
     image: confluentinc/cp-kafka:7.7.1
     restart: unless-stopped
     depends_on: [zookeeper]
@@ -244,20 +369,33 @@ services:
 
   rabbitmq:
     image: rabbitmq:3.13-management
-    restart: unless-stopped
+    # Core dependency: recover after Docker Desktop/WSL restarts even if a
+    # previous diagnostic session explicitly stopped the container.
+    restart: always
+    init: true
+    stop_grace_period: 90s
+    mem_limit: 1g
+    mem_reservation: 384m
+    cpus: 2.0
     environment:
       RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-guest}
       RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-guest}
+      RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: "+S 2:2 +SDcpu 1 +SDio 1"
     ports: ["5672:5672", "15672:15672"]
     volumes:
-      - rabbitmq-data:/var/lib/rabbitmq
+      # The previous volume is intentionally retained for offline recovery.
+      # A clean broker store avoids boot-locking the platform when persisted
+      # Erlang/RabbitMQ node state is left inconsistent after a VM crash.
+      - rabbitmq-data-recovery:/var/lib/rabbitmq
     healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "ping"]
-      interval: 5s
-      timeout: 10s
-      retries: 20
+      test: ["CMD-SHELL", "rabbitmq-diagnostics -q check_port_connectivity"]
+      interval: 15s
+      timeout: 15s
+      retries: 12
+      start_period: 45s
 
   mysql-exporter:
+    profiles: ["observability", "monitoring-authoring", "full"]
     image: prom/mysqld-exporter:v0.16.0
     restart: unless-stopped
     # Uses a dedicated low-privilege monitoring user (PROCESS, REPLICATION
@@ -276,6 +414,7 @@ services:
       mysql: { condition: service_healthy }
 
   node-exporter:
+    profiles: ["observability", "monitoring-authoring", "full"]
     image: prom/node-exporter:v1.8.1
     restart: unless-stopped
     command:
@@ -290,6 +429,7 @@ services:
     ports: ["9100:9100"]
 
   blackbox-exporter:
+    profiles: ["observability", "monitoring-authoring", "full"]
     image: prom/blackbox-exporter:v0.25.0
     restart: unless-stopped
     command:
@@ -299,6 +439,7 @@ services:
     ports: ["9115:9115"]
 
   kafka-exporter:
+    profiles: ["kafka"]
     image: danielqsj/kafka-exporter:v1.7.0
     restart: unless-stopped
     command:
@@ -308,6 +449,7 @@ services:
       kafka: { condition: service_healthy }
 
   alertmanager:
+    profiles: ["observability", "monitoring-authoring", "full"]
     image: prom/alertmanager:v0.27.0
     restart: unless-stopped
     command:
@@ -320,6 +462,8 @@ services:
       monitoring-adapter: { condition: service_started }
 
   fault-lab:
+    profiles:
+      - fault-lab
     build: ./fault-lab
     restart: unless-stopped
     # Produces the bounded application symptoms (HTTP errors, JSON logs, breached
@@ -329,12 +473,46 @@ services:
     volumes:
       - ./fault-lab/runtime:/app/runtime
 
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.117.0
+    restart: unless-stopped
+    mem_limit: 384m
+    mem_reservation: 192m
+    cpus: 1.0
+    command: ["--config=/etc/otelcol/config.yml"]
+    volumes:
+      - ./observability/otel-collector.yml:/etc/otelcol/config.yml:ro
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+    depends_on:
+      jaeger: { condition: service_started }
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    restart: unless-stopped
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"
+
   prometheus:
+    profiles: ["observability", "monitoring-authoring", "full"]
     image: prom/prometheus:v2.54.1
     restart: unless-stopped
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.path=/prometheus
+      # Bound local-development TSDB growth and memory-mapped index pressure.
+      # Production deployments should override these values from capacity plans.
+      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION_TIME:-3d}
+      - --storage.tsdb.retention.size=${PROMETHEUS_RETENTION_SIZE:-2GB}
+      - --query.max-concurrency=${PROMETHEUS_QUERY_CONCURRENCY:-10}
       - --web.enable-lifecycle
     ports: ["9090:9090"]
     volumes:
@@ -349,13 +527,32 @@ services:
       mysql-exporter: { condition: service_started }
       node-exporter: { condition: service_started }
       blackbox-exporter: { condition: service_started }
-      kafka-exporter: { condition: service_started }
       alertmanager: { condition: service_started }
-      fault-lab: { condition: service_started }
+      otel-collector: { condition: service_started }
+
+  grafana:
+    profiles: ["observability", "full"]
+    image: grafana/grafana:11.2.2
+    restart: unless-stopped
+    ports: ["3000:3000"]
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    volumes:
+      - ./observability/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./observability/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      prometheus: { condition: service_started }
 
   monitoring-adapter:
     image: ${MONITORING_ADAPTER_IMAGE:-kaiops_pubsub-monitoring-adapter:latest}
     build: *service-build
+    # Reap connector/subprocess children and forward stop signals cleanly.
+    init: true
     restart: unless-stopped
     environment:
       <<: *service-env
@@ -364,6 +561,9 @@ services:
       LANDING_PAD_FILE_WATCHER_ENABLED: "false"
       INCIDENT_PROJECTION_WORKER_ENABLED: "false"
       LOG_INGESTION_ENABLED: "false"
+      EMAIL_INGESTION_ENABLED: "false"
+      OPENSEARCH_LOG_INGESTION_ENABLED: "false"
+      JIRA_POLLING_ENABLED: "false"
       # This service is on the ingestion hot path for a 10k-alert burst; give
       # it a larger DB pool than the shared default (paired with mysql's
       # raised max-connections above).
@@ -376,7 +576,6 @@ services:
       - ./backend/rag:/app/rag
       - ${INGESTED_ALERTS_HOST_PATH:-./backend/ingested_alerts}:/app/ingested_alerts
     depends_on:
-      kafka: { condition: service_healthy }
       rabbitmq: { condition: service_healthy }
       mysql: { condition: service_healthy }
       redis: { condition: service_healthy }
@@ -384,14 +583,27 @@ services:
 
   monitoring-ingestion-worker:
     image: ${MONITORING_ADAPTER_IMAGE:-kaiops_pubsub-monitoring-adapter:latest}
+    # Reap child processes from connector probes and file watchers so Docker
+    # can stop/recreate this long-running worker cleanly.
+    init: true
     restart: unless-stopped
     environment:
       <<: *service-env
       SERVICE_NAME: monitoring-ingestion-worker
       LANDING_PAD_FILE_WATCHER_ENABLED: "true"
       INCIDENT_PROJECTION_WORKER_ENABLED: "true"
-      EMAIL_INGESTION_ENABLED: "false"
-      JIRA_POLLING_ENABLED: "false"
+      LOG_INGESTION_ENABLED: "true"
+      LOG_WATCH_PATHS: /app/backend/runtime:/app/fault-lab/runtime:/app/observability
+      # The separate telemetry demo can emit its own exporter retry storm.
+      # Do not recursively convert those infrastructure retries into KaiOps
+      # incidents; enable this explicitly only for a healthy OpenSearch source.
+      # This Compose stack has no OpenSearch service. Do not inherit a host-level
+      # override that makes the worker repeatedly connect to a nonexistent backend.
+      OPENSEARCH_LOG_INGESTION_ENABLED: "false"
+      # Avoid background DNS/retry loops when inherited host variables contain
+      # stale IMAP settings. Enable explicitly for this compose stack.
+      EMAIL_INGESTION_ENABLED: ${KAI_OPS_EMAIL_INGESTION_ENABLED:-false}
+      JIRA_POLLING_ENABLED: ${JIRA_POLLING_ENABLED:-false}
       DB_POOL_SIZE: ${MONITORING_WORKER_DB_POOL_SIZE:-10}
       DB_MAX_OVERFLOW: ${MONITORING_WORKER_DB_MAX_OVERFLOW:-10}
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
@@ -399,11 +611,14 @@ services:
     volumes:
       - ./backend/rag:/app/rag
       - ${INGESTED_ALERTS_HOST_PATH:-./backend/ingested_alerts}:/app/ingested_alerts
+      - ./backend/runtime:/app/backend/runtime:ro
+      - ./fault-lab/runtime:/app/fault-lab/runtime:ro
+      - ./observability:/app/observability:ro
     depends_on:
-      kafka: { condition: service_healthy }
       rabbitmq: { condition: service_healthy }
       mysql: { condition: service_healthy }
       redis: { condition: service_healthy }
+      docker-socket-proxy: { condition: service_started }
 
   application-onboarding:
     build: *service-build
@@ -416,7 +631,27 @@ services:
       rabbitmq: { condition: service_healthy }
       mysql: { condition: service_healthy }
 
+  cloud-operations:
+    build: *service-build
+    restart: unless-stopped
+    environment: { <<: *service-env, SERVICE_NAME: cloud-operations }
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+    working_dir: /app/backend/src/cloud-operations
+    ports: ["8027:8000"]
+    depends_on:
+      rabbitmq: { condition: service_healthy }
+      mysql: { condition: service_healthy }
+
+  connector-hub:
+    build: *service-build
+    restart: unless-stopped
+    environment: { <<: *service-env, SERVICE_NAME: connector-hub }
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+    working_dir: /app/backend/src/connector-hub
+    ports: ["8028:8000"]
+
   discovery-service:
+    profiles: ["monitoring-authoring", "full"]
     build: *service-build
     restart: unless-stopped
     environment:
@@ -438,6 +673,7 @@ services:
       mysql: { condition: service_healthy }
 
   metrics-validation-agent:
+    profiles: ["monitoring-authoring", "full"]
     build: *service-build
     restart: unless-stopped
     environment: { <<: *service-env, SERVICE_NAME: metrics-validation-agent }
@@ -450,6 +686,7 @@ services:
       mysql: { condition: service_healthy }
 
   rule-generation-agent:
+    profiles: ["monitoring-authoring", "full"]
     build: *service-build
     restart: unless-stopped
     environment: { <<: *service-env, SERVICE_NAME: rule-generation-agent }
@@ -462,6 +699,7 @@ services:
       mysql: { condition: service_healthy }
 
   prometheus-config-service:
+    profiles: ["monitoring-authoring", "full"]
     build: *service-build
     restart: unless-stopped
     environment: { <<: *service-env, SERVICE_NAME: prometheus-config-service }
@@ -477,6 +715,7 @@ services:
       prometheus: { condition: service_started }
 
   validation-agent:
+    profiles: ["monitoring-authoring", "full"]
     build: *service-build
     restart: unless-stopped
     environment: { <<: *service-env, SERVICE_NAME: validation-agent }
@@ -490,6 +729,7 @@ services:
       prometheus: { condition: service_started }
 
   dashboard-generator:
+    profiles: ["monitoring-authoring", "full"]
     build: *service-build
     restart: unless-stopped
     environment: { <<: *service-env, SERVICE_NAME: dashboard-generator }
@@ -515,7 +755,10 @@ services:
   api-gateway:
     build: *service-build
     restart: unless-stopped
-    environment: { <<: *service-env, SERVICE_NAME: api-gateway }
+    environment:
+      <<: *service-env
+      SERVICE_NAME: api-gateway
+      SERVICE_INTERNAL_TOKEN: ${SERVICE_INTERNAL_TOKEN:-kaiops-local-service-token-change-me}
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/api-gateway
     ports: ["8010:8000"]
@@ -523,13 +766,14 @@ services:
       test:
         [
           "CMD-SHELL",
-          "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2)\"",
+          "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=8)\"",
         ]
       interval: 5s
-      timeout: 3s
-      retries: 20
-      start_period: 10s
+      timeout: 10s
+      retries: 40
+      start_period: 60s
     depends_on:
+      migrations: { condition: service_completed_successfully }
       monitoring-adapter: { condition: service_started }
       application-onboarding: { condition: service_started }
       approval-service: { condition: service_started }
@@ -546,7 +790,18 @@ services:
       # raised max-connections above).
       DB_POOL_SIZE: ${ALERT_INTELLIGENCE_DB_POOL_SIZE:-20}
       DB_MAX_OVERFLOW: ${ALERT_INTELLIGENCE_DB_MAX_OVERFLOW:-30}
-      MESSAGE_BUS_WORKER_COUNT: ${ALERT_INTELLIGENCE_WORKER_COUNT:-4}
+      MESSAGE_BUS_WORKER_COUNT: ${ALERT_INTELLIGENCE_WORKER_COUNT:-8}
+      # Cheap normalization/correlation can safely reserve a larger batch.
+      # Context and resolution retain the shared prefetch of two so LLM work
+      # remains bounded even during an alert storm.
+      RABBITMQ_CONSUMER_PREFETCH_COUNT: ${ALERT_INTELLIGENCE_PREFETCH_COUNT:-2}
+      ALERT_CORRELATION_CANDIDATE_LIMIT: ${ALERT_CORRELATION_CANDIDATE_LIMIT:-250}
+      # Correlation/qualification already has a deterministic implementation.
+      # One remote model call per raw alert created the ingestion backlog and
+      # delayed context/RCA for newer alerts.
+      DISCOVERY_LLM_ENABLED: ${DISCOVERY_LLM_ENABLED:-false}
+      ALERT_DEDUPLICATION_ENABLED: ${ALERT_DEDUPLICATION_ENABLED:-true}
+      ALERT_DEDUPLICATION_WINDOW_MINUTES: ${ALERT_DEDUPLICATION_WINDOW_MINUTES:-60}
       # MESSAGE_BUS_WORKER_COUNT (shared default above) spins up N competing
       # consumer tasks in this one process/event loop - raising it adds I/O
       # concurrency (more DB round-trips/publishes in flight) but NOT CPU
@@ -558,7 +813,7 @@ services:
     working_dir: /app/backend/src/alert-intelligence
     ports: ["8002:8000"]
     depends_on:
-      kafka: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
       mysql: { condition: service_healthy }
       redis: { condition: service_healthy }
 
@@ -570,36 +825,70 @@ services:
     working_dir: /app/backend/src/orchestrator
     ports: ["8003:8000"]
     depends_on:
-      kafka: { condition: service_healthy }
       rabbitmq: { condition: service_healthy }
       mysql: { condition: service_healthy }
       context-agent: { condition: service_started }
+      resolution-agent: { condition: service_started }
+      temporal: { condition: service_healthy }
 
   context-agent:
     build: *service-build
     restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: ["ALL"]
+    pids_limit: 256
+    mem_limit: ${CONTEXT_AGENT_MEMORY_LIMIT:-1536m}
+    cpus: ${CONTEXT_AGENT_CPU_LIMIT:-1.50}
     environment:
       <<: *service-env
       SERVICE_NAME: context-agent
+      SERVICE_INTERNAL_TOKEN: ${SERVICE_INTERNAL_TOKEN:-kaiops-local-service-token-change-me}
+      # Auto reuses complete cached context. Per event, realtime forces fresh
+      # discovery and historical uses periodic snapshots without live calls.
+      CONTEXT_STRATEGY: ${CONTEXT_STRATEGY:-auto}
+      CONTEXT_KNOWLEDGE_TTL_SECONDS: ${CONTEXT_KNOWLEDGE_TTL_SECONDS:-3600}
+      CONTEXT_MIN_QUALITY_SCORE: ${CONTEXT_MIN_QUALITY_SCORE:-0.70}
+      CONTEXT_MAX_EVIDENCE_PER_SOURCE: ${CONTEXT_MAX_EVIDENCE_PER_SOURCE:-20}
+      CONTEXT_COLLECTION_BUDGET_SECONDS: ${CONTEXT_COLLECTION_BUDGET_SECONDS:-45}
+      CONTEXT_COLLECTION_LEASE_WAIT_SECONDS: ${CONTEXT_COLLECTION_LEASE_WAIT_SECONDS:-30}
+      CONTEXT_RESOLUTION_REUSE_ENABLED: ${CONTEXT_RESOLUTION_REUSE_ENABLED:-true}
+      CONTEXT_RESOLUTION_REUSE_MIN_SCORE: ${CONTEXT_RESOLUTION_REUSE_MIN_SCORE:-0.70}
+      CONTEXT_HISTORICAL_MAX_AGE_SECONDS: ${CONTEXT_HISTORICAL_MAX_AGE_SECONDS:-86400}
+      MESSAGE_BUS_WORKER_COUNT: ${CONTEXT_AGENT_WORKER_COUNT:-2}
       DISCOVERY_MCP_URL: http://discovery-mcp:8000/mcp
-      DISCOVERY_MCP_TIMEOUT_SECONDS: "45"
-      DISCOVERY_MCP_MAX_EVIDENCE: "24"
+      DISCOVERY_MCP_TIMEOUT_SECONDS: ${DISCOVERY_MCP_TIMEOUT_SECONDS:-15}
+      DISCOVERY_MCP_MAX_EVIDENCE: ${DISCOVERY_MCP_MAX_EVIDENCE:-12}
+      # Context retrieves and persists evidence; resolution performs the single
+      # synchronous RCA synthesis. This avoids duplicate LLM calls per alert.
+      CONTEXT_DISCOVERY_MODEL_ANALYSIS_ENABLED: ${CONTEXT_DISCOVERY_MODEL_ANALYSIS_ENABLED:-false}
       CODE_DISCOVERY_ROOTS: /app/backend/src,/app/ai-workbench/src,/app/scripts,/app/config,/app/observability,/app/backend/rag,/app/fault-lab
       LOG_DISCOVERY_ROOTS: /data/fault-lab/runtime,/data/landing,/app/observability,/app/backend/runtime,/app/backend/ingested_alerts
-      DISCOVERY_MAX_FILES: "180"
+      DISCOVERY_MAX_FILES: ${DISCOVERY_MAX_FILES:-60}
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/ai-workbench/src/context-agent
     ports: ["8004:8000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=5)"]
+      interval: 15s
+      timeout: 8s
+      retries: 5
+      start_period: 30s
     volumes:
       - ./backend/rag:/app/rag
+      # Review drafts are runtime state. Keep them on a Docker-managed volume
+      # so hardened/rootless hosts can write them even when the source bind
+      # mount is read-only or owned by the deployment account.
       - ./fault-lab:/data/fault-lab:ro
       - ./backend/ingested_alerts:/data/landing:ro
       - ./observability:/app/observability:ro
       - ./backend/runtime:/app/backend/runtime:ro
       - ./backend/ingested_alerts:/app/backend/ingested_alerts:ro
     depends_on:
+      migrations: { condition: service_completed_successfully }
       discovery-mcp: { condition: service_started }
-      kafka: { condition: service_healthy }
       rabbitmq: { condition: service_healthy }
       mysql: { condition: service_healthy }
 
@@ -613,9 +902,9 @@ services:
       DISCOVERY_MCP_LOG_ROOTS: /data/fault-lab/runtime,/data/landing,/workspace/fault-lab/runtime,/workspace/backend/ingested_alerts,/workspace/observability,/workspace/backend/runtime
       DISCOVERY_MCP_TICKET_ROOTS: /workspace/backend/rag,/data/tickets,/data/landing/documents
       DISCOVERY_MCP_MYSQL_TABLES: alerts,incident_projections,incidents,closed_incidents,onboarding_state
-      DISCOVERY_MCP_MAX_FILES: "60"
-      DISCOVERY_MCP_MAX_TICKET_FILES: "80"
-      DISCOVERY_MCP_MYSQL_MAX_ROWS: "140"
+      DISCOVERY_MCP_MAX_FILES: ${DISCOVERY_MCP_MAX_FILES:-30}
+      DISCOVERY_MCP_MAX_TICKET_FILES: ${DISCOVERY_MCP_MAX_TICKET_FILES:-40}
+      DISCOVERY_MCP_MYSQL_MAX_ROWS: ${DISCOVERY_MCP_MYSQL_MAX_ROWS:-50}
       DISCOVERY_MCP_PROJECTS_FILE: /workspace/backend/config/discovery-projects.json
       DISCOVERY_MCP_TELEMETRY_TIMEOUT_SECONDS: "6"
       # This service's Jira evidence search (discovery-mcp/app.py) uses a
@@ -629,8 +918,8 @@ services:
       JIRA_API_TOKEN: ${JIRA_API_TOKEN:-}
       JIRA_PROJECT_KEY: ${JIRA_PROJECT_KEY:-}
       DOCKER_LOG_DISCOVERY_ENABLED: ${DOCKER_LOG_DISCOVERY_ENABLED:-true}
-      DOCKER_LOG_DISCOVERY_MAX_CONTAINERS: ${DOCKER_LOG_DISCOVERY_MAX_CONTAINERS:-40}
-      DOCKER_LOG_DISCOVERY_TAIL: ${DOCKER_LOG_DISCOVERY_TAIL:-250}
+      DOCKER_LOG_DISCOVERY_MAX_CONTAINERS: ${DOCKER_LOG_DISCOVERY_MAX_CONTAINERS:-12}
+      DOCKER_LOG_DISCOVERY_TAIL: ${DOCKER_LOG_DISCOVERY_TAIL:-80}
       DOCKER_LOG_DISCOVERY_HOST: docker-socket-proxy:2375
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/discovery-mcp
@@ -646,13 +935,14 @@ services:
   # Exposes a *read-only, containers-only* view of the Docker API over TCP so discovery-mcp
   # never touches /var/run/docker.sock directly. A raw socket mount (even with ":ro" on the
   # bind mount) grants the full Docker API -- create/exec/mount -- which is host-root
-  # equivalent; this proxy only allows GET requests against /containers*.
+  # equivalent. The proxy restricts access to /containers*; POST is enabled so
+  # the governed Jenkins allowlist can restart an explicitly named container.
   docker-socket-proxy:
     image: tecnativa/docker-socket-proxy:0.2.0
     restart: unless-stopped
     environment:
       CONTAINERS: 1
-      POST: 0
+      POST: 1
       LOG_LEVEL: warning
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
@@ -664,31 +954,76 @@ services:
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/ai-workbench/src/model-router
     ports: ["8005:8000"]
+    volumes:
+      - ./backend/evaluation:/app/backend/evaluation:ro
     depends_on:
-      kafka: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
       mysql: { condition: service_healthy }
 
   resolution-agent:
     build: *service-build
     restart: unless-stopped
-    environment: { <<: *service-env, SERVICE_NAME: resolution-agent }
+    init: true
+    stop_grace_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: ["ALL"]
+    pids_limit: 256
+    mem_limit: ${RESOLUTION_AGENT_MEMORY_LIMIT:-1536m}
+    cpus: ${RESOLUTION_AGENT_CPU_LIMIT:-1.50}
+    environment:
+      <<: *service-env
+      SERVICE_NAME: resolution-agent
+      CONTEXT_RESOLUTION_REUSE_ENABLED: ${CONTEXT_RESOLUTION_REUSE_ENABLED:-true}
+      CONTEXT_RESOLUTION_REUSE_MIN_SCORE: ${CONTEXT_RESOLUTION_REUSE_MIN_SCORE:-0.70}
+      RESOLUTION_MODEL_PAYLOAD_MAX_BYTES: ${RESOLUTION_MODEL_PAYLOAD_MAX_BYTES:-48000}
+      # Keep the model attempt inside the message-handler budget. The global
+      # defaults are intentionally broader for other services, but an RCA
+      # worker must still have time to persist deterministic fallback output
+      # and acknowledge the event after a provider timeout.
+      LLM_REQUEST_TIMEOUT_SECONDS: ${RESOLUTION_LLM_REQUEST_TIMEOUT_SECONDS:-45}
+      RABBITMQ_HANDLER_TIMEOUT_SECONDS: ${RESOLUTION_HANDLER_TIMEOUT_SECONDS:-180}
+      MESSAGE_BUS_WORKER_COUNT: ${RESOLUTION_AGENT_WORKER_COUNT:-2}
+      # Generate RCA, impact, and remediation analysis through the configured
+      # model router. Evidence validation and execution policy remain
+      # deterministic and authoritative after synthesis.
+      RESOLUTION_DEEP_ANALYSIS_ENABLED: ${RESOLUTION_DEEP_ANALYSIS_ENABLED:-true}
+      RESOLUTION_ITERATIVE_INVESTIGATION_ENABLED: ${RESOLUTION_ITERATIVE_INVESTIGATION_ENABLED:-true}
+      # The investigator can require all ten bounded evidence planes. Keep the
+      # default step budget large enough to query each plane once; a smaller
+      # budget deterministically leaves every local RCA inconclusive.
+      RESOLUTION_INVESTIGATION_MAX_STEPS: ${RESOLUTION_INVESTIGATION_MAX_STEPS:-10}
+      RESOLUTION_INVESTIGATION_MAX_TOOL_CALLS: ${RESOLUTION_INVESTIGATION_MAX_TOOL_CALLS:-12}
+      RESOLUTION_INVESTIGATION_MAX_DURATION_SECONDS: ${RESOLUTION_INVESTIGATION_MAX_DURATION_SECONDS:-90}
+      RESOLUTION_INVESTIGATION_MAX_EVIDENCE: ${RESOLUTION_INVESTIGATION_MAX_EVIDENCE:-40}
+      RESOLUTION_INVESTIGATION_CONCLUSIVE_THRESHOLD: ${RESOLUTION_INVESTIGATION_CONCLUSIVE_THRESHOLD:-0.85}
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/ai-workbench/src/resolution-agent
     ports: ["8006:8000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=5)"]
+      interval: 15s
+      timeout: 8s
+      retries: 5
+      start_period: 30s
     depends_on:
-      kafka: { condition: service_healthy }
+      migrations: { condition: service_completed_successfully }
+      rabbitmq: { condition: service_healthy }
       mysql: { condition: service_healthy }
       model-router: { condition: service_started }
+      discovery-mcp: { condition: service_started }
 
   approval-service:
     build: *service-build
     restart: unless-stopped
-    environment: { <<: *service-env, SERVICE_NAME: approval-service }
+    environment:
+      <<: *service-env
+      SERVICE_NAME: approval-service
+      SERVICE_INTERNAL_TOKEN: ${SERVICE_INTERNAL_TOKEN:-kaiops-local-service-token-change-me}
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/approval-service
-    ports: ["8007:8000"]
+    expose: ["8000"]
     depends_on:
-      kafka: { condition: service_healthy }
       rabbitmq: { condition: service_healthy }
       mysql: { condition: service_healthy }
 
@@ -700,7 +1035,6 @@ services:
     working_dir: /app/backend/src/notification-service
     ports: ["8019:8000"]
     depends_on:
-      kafka: { condition: service_healthy }
       rabbitmq: { condition: service_healthy }
       mysql: { condition: service_healthy }
 
@@ -714,39 +1048,147 @@ services:
     depends_on:
       rabbitmq: { condition: service_healthy }
       mysql: { condition: service_healthy }
+      temporal: { condition: service_healthy }
+
+  temporal-pilot-worker:
+    build: *service-build
+    restart: unless-stopped
+    environment:
+      <<: *service-env
+      SERVICE_NAME: temporal-workflow-worker
+      TEMPORAL_PILOT_ENABLED: "true"
+      REMEDIATION_TEMPORAL_ENABLED: "true"
+      REMEDIATION_TEMPORAL_TASK_QUEUE: kaiops-remediation
+      REMEDIATION_INTERNAL_TOKEN: ${REMEDIATION_INTERNAL_TOKEN:-kaiops-local-temporal-remediation}
+      AI_LAYER_REQUEST_TIMEOUT_SECONDS: "1500"
+    command: ["python", "-m", "temporal_pilot.worker"]
+    working_dir: /app
+    depends_on:
+      mysql: { condition: service_healthy }
+      temporal: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import pathlib; assert any('temporal_pilot.worker' in p.read_bytes().decode('utf-8','ignore') for p in pathlib.Path('/proc').glob('[0-9]*/cmdline'))"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
 
   remediation-engine:
     build: *service-build
     restart: unless-stopped
-    environment: { <<: *service-env, SERVICE_NAME: remediation-engine }
+    environment:
+      <<: *service-env
+      SERVICE_NAME: remediation-engine
+      REMEDIATION_TEMPORAL_ENABLED: "true"
+      REMEDIATION_TEMPORAL_TASK_QUEUE: kaiops-remediation
+      REMEDIATION_INTERNAL_TOKEN: ${REMEDIATION_INTERNAL_TOKEN:-kaiops-local-temporal-remediation}
+      RCA_RESOLUTION_AUTO_COMPLETE_THRESHOLD: ${RCA_RESOLUTION_AUTO_COMPLETE_THRESHOLD:-0.70}
+      JENKINS_USERNAME: ${JENKINS_USERNAME:-kaiops}
+      JENKINS_API_TOKEN: ${JENKINS_API_TOKEN:-kaiops-local-token}
+      REMEDIATION_DEFAULT_EXECUTOR: ${REMEDIATION_DEFAULT_EXECUTOR:-jenkins}
+      REMEDIATION_JENKINS_URL: ${REMEDIATION_JENKINS_URL:-http://jenkins:8080}
+      REMEDIATION_JENKINS_JOB: ${REMEDIATION_JENKINS_JOB:-kaiops-auto-remediation}
+      REMEDIATION_JENKINS_CREDENTIAL_REF: ${REMEDIATION_JENKINS_CREDENTIAL_REF:-vault://kaiops/local/jenkins#api-token}
+      REMEDIATION_EXECUTION_PLATFORM: ${REMEDIATION_EXECUTION_PLATFORM:-docker-compose}
+      REMEDIATION_COMPOSE_PROJECT: ${REMEDIATION_COMPOSE_PROJECT:-${COMPOSE_PROJECT_NAME:-kaiops_azure}}
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/remediation-engine
     ports: ["8008:8000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/executors/readiness', timeout=5)"]
+      interval: 15s
+      timeout: 8s
+      retries: 4
+      start_period: 30s
     depends_on:
-      kafka: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
       mysql: { condition: service_healthy }
+      jenkins: { condition: service_healthy }
+      temporal: { condition: service_healthy }
+      temporal-pilot-worker: { condition: service_healthy }
+
+  jenkins:
+    build:
+      context: ./deploy/jenkins
+      dockerfile: Dockerfile.local
+    restart: unless-stopped
+    environment:
+      JENKINS_BOOTSTRAP_USERNAME: ${JENKINS_USERNAME:-kaiops}
+      JENKINS_BOOTSTRAP_PASSWORD: ${JENKINS_API_TOKEN:-kaiops-local-token}
+      JAVA_OPTS: -Djenkins.install.runSetupWizard=false
+      DOCKER_HOST: tcp://docker-socket-proxy:2375
+    ports: ["${JENKINS_HOST_PORT:-8083}:8080"]
+    volumes:
+      - jenkins-data:/var/jenkins_home
+      - ./deploy/jenkins/Jenkinsfile.auto-remediation:/opt/kaiops/Jenkinsfile.auto-remediation:ro
+      - ./scripts/remediation:/opt/kaiops/scripts/remediation:ro
+    depends_on:
+      docker-socket-proxy: { condition: service_started }
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/login >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 8s
+      retries: 20
+      start_period: 60s
 
   closure-service:
     build: *service-build
     restart: unless-stopped
-    environment: { <<: *service-env, SERVICE_NAME: closure-service }
+    environment:
+      <<: *service-env
+      SERVICE_NAME: closure-service
+      SERVICE_INTERNAL_TOKEN: ${SERVICE_INTERNAL_TOKEN:-kaiops-local-service-token-change-me}
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/closure-service
     ports: ["8009:8000"]
     depends_on:
-      kafka: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+      mysql: { condition: service_healthy }
+
+  knowledge-development-worker:
+    build: *service-build
+    restart: unless-stopped
+    environment:
+      <<: *service-env
+      SERVICE_NAME: knowledge-development-worker
+      KNOWLEDGE_DEVELOPMENT_INTERVAL_SECONDS: ${KNOWLEDGE_DEVELOPMENT_INTERVAL_SECONDS:-21600}
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+    working_dir: /app/backend/src/knowledge-development-worker
+    ports: ["8022:8000"]
+    depends_on:
       mysql: { condition: service_healthy }
 
   ui:
     build:
       context: .
       dockerfile: deploy/docker/Dockerfile.ui
-    ports: ["8501:80"]
+      args:
+        KAIMS_RELEASE_SHA: ${KAIMS_RELEASE_SHA:-dev}
+    # Docker Desktop's IPv6 localhost forwarder can accept connections without
+    # forwarding them. Bind IPv4 explicitly so Windows falls back from ::1.
+    ports: ["${UI_BIND_ADDRESS:-127.0.0.1}:${UI_HOST_PORT:-80}:80"]
     restart: unless-stopped
+    # The static UI must remain available while backend services recover. Its
+    # nginx proxy reports backend failures without preventing the UI/login page
+    # from starting, so backend health is intentionally not a startup gate.
+
+  ui-dev:
+    profiles: ["ui-dev"]
+    image: node:20-alpine
+    working_dir: /app
+    command: ["sh", "-lc", "if [ ! -x node_modules/.bin/vite ]; then npm ci --prefer-offline --no-audit --no-fund; fi; npm run dev"]
+    environment:
+      KAIMS_DEV_API_GATEWAY: http://api-gateway:8000
+      KAIMS_DEV_MONITORING_ADAPTER: http://monitoring-adapter:8000
+      KAIMS_DEV_APPROVAL_SERVICE: http://approval-service:8000
+      CHOKIDAR_USEPOLLING: "true"
+    volumes:
+      - ./frontend/react:/app
+      - ui-dev-node-modules:/app/node_modules
+      - ui-dev-npm-cache:/root/.npm
+    ports: ["8502:8501"]
     depends_on:
       api-gateway: { condition: service_healthy }
-      approval-service: { condition: service_started }
-      monitoring-adapter: { condition: service_started }
 
   # --- Online Boutique (GoogleCloudPlatform/microservices-demo) ---
   # No official docker-compose.yml exists upstream (it's Kubernetes/Skaffold-
@@ -759,10 +1201,12 @@ services:
   # All service names are ob-prefixed to avoid colliding with this
   # project's own redis/mysql/etc.
   ob-redis-cart:
+    profiles: ["demo-online-boutique"]
     image: redis:alpine
     restart: unless-stopped
 
   ob-currencyservice:
+    profiles: ["demo-online-boutique"]
     image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/currencyservice:v0.10.6
     restart: unless-stopped
     environment:
@@ -770,6 +1214,7 @@ services:
       DISABLE_PROFILER: "1"
 
   ob-productcatalogservice:
+    profiles: ["demo-online-boutique"]
     image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/productcatalogservice:v0.10.6
     restart: unless-stopped
     environment:
@@ -777,6 +1222,7 @@ services:
       DISABLE_PROFILER: "1"
 
   ob-paymentservice:
+    profiles: ["demo-online-boutique"]
     image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/paymentservice:v0.10.6
     restart: unless-stopped
     environment:
@@ -784,6 +1230,7 @@ services:
       DISABLE_PROFILER: "1"
 
   ob-shippingservice:
+    profiles: ["demo-online-boutique"]
     image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/shippingservice:v0.10.6
     restart: unless-stopped
     environment:
@@ -791,6 +1238,7 @@ services:
       DISABLE_PROFILER: "1"
 
   ob-emailservice:
+    profiles: ["demo-online-boutique"]
     image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/emailservice:v0.10.6
     restart: unless-stopped
     environment:
@@ -798,12 +1246,14 @@ services:
       DISABLE_PROFILER: "1"
 
   ob-adservice:
+    profiles: ["demo-online-boutique"]
     image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/adservice:v0.10.6
     restart: unless-stopped
     environment:
       PORT: "9555"
 
   ob-cartservice:
+    profiles: ["demo-online-boutique"]
     image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/cartservice:v0.10.6
     restart: unless-stopped
     environment:
@@ -812,6 +1262,7 @@ services:
       - ob-redis-cart
 
   ob-recommendationservice:
+    profiles: ["demo-online-boutique"]
     image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/recommendationservice:v0.10.6
     restart: unless-stopped
     environment:
@@ -822,6 +1273,7 @@ services:
       - ob-productcatalogservice
 
   ob-checkoutservice:
+    profiles: ["demo-online-boutique"]
     image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/checkoutservice:v0.10.6
     restart: unless-stopped
     environment:
@@ -841,6 +1293,7 @@ services:
       - ob-cartservice
 
   ob-frontend:
+    profiles: ["demo-online-boutique"]
     image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/frontend:v0.10.6
     restart: unless-stopped
     ports:
@@ -868,6 +1321,7 @@ services:
       - ob-adservice
 
   ob-loadgenerator:
+    profiles: ["demo-online-boutique"]
     image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/loadgenerator:v0.10.6
     restart: unless-stopped
     environment:
@@ -881,6 +1335,7 @@ services:
   # only genuine metrics source available since Online Boutique has no
   # app-level /metrics endpoint anywhere.
   ob-cadvisor:
+    profiles: ["demo-online-boutique"]
     image: gcr.io/cadvisor/cadvisor:v0.49.1
     restart: unless-stopped
     ports:
@@ -911,6 +1366,7 @@ services:
   # redis/mysql/rabbitmq because it only exists inside that isolated
   # network, not the default one.
   rs-mongodb:
+    profiles: ["demo-robot-shop"]
     image: robotshop/rs-mongodb:2.1.0
     restart: unless-stopped
     networks:
@@ -918,6 +1374,7 @@ services:
         aliases: [mongodb]
 
   rs-redis:
+    profiles: ["demo-robot-shop"]
     image: redis:6.2-alpine
     restart: unless-stopped
     networks:
@@ -925,6 +1382,7 @@ services:
         aliases: [redis]
 
   rs-rabbitmq:
+    profiles: ["demo-robot-shop"]
     image: rabbitmq:3.8-management-alpine
     restart: unless-stopped
     networks:
@@ -932,6 +1390,7 @@ services:
         aliases: [rabbitmq]
 
   rs-mysql:
+    profiles: ["demo-robot-shop"]
     image: robotshop/rs-mysql-db:2.1.0
     restart: unless-stopped
     cap_add:
@@ -941,6 +1400,7 @@ services:
         aliases: [mysql]
 
   rs-catalogue:
+    profiles: ["demo-robot-shop"]
     image: robotshop/rs-catalogue:2.1.0
     restart: unless-stopped
     networks:
@@ -950,6 +1410,7 @@ services:
       - rs-mongodb
 
   rs-user:
+    profiles: ["demo-robot-shop"]
     image: robotshop/rs-user:2.1.0
     restart: unless-stopped
     networks:
@@ -960,6 +1421,7 @@ services:
       - rs-redis
 
   rs-cart:
+    profiles: ["demo-robot-shop"]
     image: robotshop/rs-cart:2.1.0
     restart: unless-stopped
     networks:
@@ -970,6 +1432,7 @@ services:
       - rs-redis
 
   rs-shipping:
+    profiles: ["demo-robot-shop"]
     image: robotshop/rs-shipping:2.1.0
     restart: unless-stopped
     networks:
@@ -979,6 +1442,7 @@ services:
       - rs-mysql
 
   rs-ratings:
+    profiles: ["demo-robot-shop"]
     image: robotshop/rs-ratings:2.1.0
     restart: unless-stopped
     environment:
@@ -990,6 +1454,7 @@ services:
       - rs-mysql
 
   rs-payment:
+    profiles: ["demo-robot-shop"]
     image: robotshop/rs-payment:2.1.0
     restart: unless-stopped
     networks:
@@ -1000,6 +1465,7 @@ services:
       - rs-rabbitmq
 
   rs-dispatch:
+    profiles: ["demo-robot-shop"]
     image: robotshop/rs-dispatch:2.1.0
     restart: unless-stopped
     networks:
@@ -1009,6 +1475,7 @@ services:
       - rs-rabbitmq
 
   rs-web:
+    profiles: ["demo-robot-shop"]
     image: robotshop/rs-web:2.1.0
     restart: unless-stopped
     ports:
@@ -1026,6 +1493,7 @@ services:
   # from source only) — using the standard public locustio/locust image
   # with a minimal locustfile instead, same effect: continuous real traffic.
   rs-load-gen:
+    profiles: ["demo-robot-shop"]
     image: locustio/locust:2.32.4
     restart: unless-stopped
     volumes:
@@ -1040,6 +1508,7 @@ services:
   # exporters also join "default" so the main project's Prometheus (which
   # is not on robot-shop-net) can scrape them.
   rs-mysqld-exporter:
+    profiles: ["demo-robot-shop"]
     image: prom/mysqld-exporter:v0.19.0
     restart: unless-stopped
     # v0.19.0 dropped DATA_SOURCE_NAME env var support in favor of a
@@ -1056,6 +1525,7 @@ services:
       - rs-mysql
 
   rs-redis-exporter:
+    profiles: ["demo-robot-shop"]
     image: oliver006/redis_exporter:v1.88.0
     restart: unless-stopped
     environment:
@@ -1067,6 +1537,7 @@ services:
       - rs-redis
 
   rs-rabbitmq-exporter:
+    profiles: ["demo-robot-shop"]
     image: kbudde/rabbitmq-exporter:1.0.0
     restart: unless-stopped
     environment:
@@ -1081,6 +1552,7 @@ services:
       - rs-rabbitmq
 
   rs-mongodb-exporter:
+    profiles: ["demo-robot-shop"]
     image: percona/mongodb_exporter:0.51.0
     restart: unless-stopped
     command:
@@ -1110,3 +1582,8 @@ volumes:
   zookeeper-log:
   kafka-data:
   rabbitmq-data:
+  rabbitmq-data-recovery:
+  grafana-data:
+  ui-dev-node-modules:
+  ui-dev-npm-cache:
+  jenkins-data:

@@ -22,8 +22,8 @@ class Settings(BaseSettings):
 
     service_name: str = Field(default="kaiops-service", alias="SERVICE_NAME")
     environment: str = Field(default="local", alias="ENVIRONMENT")
-    cloud_provider: str = Field(default="local", alias="CLOUD_PROVIDER")
-    deployment_profile: str = Field(default="onprem", alias="DEPLOYMENT_PROFILE")
+    cloud_provider: str = Field(default="cloud-neutral", alias="CLOUD_PROVIDER")
+    deployment_profile: str = Field(default="cloud-neutral", alias="DEPLOYMENT_PROFILE")
     kafka_bootstrap_servers: str = Field(default="localhost:9092", alias="KAFKA_BOOTSTRAP_SERVERS")
     kafka_group_id: str = Field(default="kaiops", alias="KAFKA_GROUP_ID")
     kafka_consumer_max_retries: int = Field(default=3, alias="KAFKA_CONSUMER_MAX_RETRIES")
@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     rabbitmq_queue_prefix: str = Field(default="kaiops", alias="RABBITMQ_QUEUE_PREFIX")
     rabbitmq_consumer_max_retries: int = Field(default=3, alias="RABBITMQ_CONSUMER_MAX_RETRIES")
     rabbitmq_consumer_prefetch_count: int = Field(default=10, alias="RABBITMQ_CONSUMER_PREFETCH_COUNT")
+    rabbitmq_transient_requeue_enabled: bool = Field(default=False, alias="RABBITMQ_TRANSIENT_REQUEUE_ENABLED")
     rabbitmq_handler_timeout_seconds: float = Field(default=120.0, alias="RABBITMQ_HANDLER_TIMEOUT_SECONDS")
     rabbitmq_dlq_suffix: str = Field(default=".dlq", alias="RABBITMQ_DLQ_SUFFIX")
     rabbitmq_startup_attempts: int = Field(default=30, alias="RABBITMQ_STARTUP_ATTEMPTS")
@@ -53,23 +54,60 @@ class Settings(BaseSettings):
     db_max_overflow: int = Field(default=20, alias="DB_MAX_OVERFLOW")
     db_pool_timeout_seconds: float = Field(default=30.0, alias="DB_POOL_TIMEOUT_SECONDS")
     db_pool_recycle_seconds: int = Field(default=1800, alias="DB_POOL_RECYCLE_SECONDS")
+    alerts_table_metric_interval_seconds: float = Field(
+        default=300.0,
+        alias="ALERTS_TABLE_METRIC_INTERVAL_SECONDS",
+    )
     otlp_endpoint: str | None = Field(default=None, alias="OTEL_EXPORTER_OTLP_ENDPOINT")
     model_router_url: str = Field(default="http://model-router:8000", alias="MODEL_ROUTER_URL")
     context_agent_url: str = Field(default="http://context-agent:8000", alias="CONTEXT_AGENT_URL")
     resolution_agent_url: str = Field(default="http://resolution-agent:8000", alias="RESOLUTION_AGENT_URL")
     approval_service_url: str = Field(default="http://approval-service:8000", alias="APPROVAL_SERVICE_URL")
+    closure_service_url: str = Field(default="http://closure-service:8000", alias="CLOSURE_SERVICE_URL")
+    orchestrator_url: str = Field(default="http://orchestrator:8000", alias="ORCHESTRATOR_URL")
     remediation_engine_url: str = Field(default="http://remediation-engine:8000", alias="REMEDIATION_ENGINE_URL")
     monitoring_adapter_url: str = Field(default="http://monitoring-adapter:8000", alias="MONITORING_ADAPTER_URL")
     evaluation_service_url: str = Field(default="http://evaluation-service:8000", alias="EVALUATION_SERVICE_URL")
+    knowledge_development_url: str = Field(default="http://knowledge-development-worker:8000", alias="KNOWLEDGE_DEVELOPMENT_URL")
     api_gateway_url: str = Field(default="http://api-gateway:8000", alias="API_GATEWAY_URL")
     application_onboarding_url: str = Field(default="http://application-onboarding:8000", alias="APPLICATION_ONBOARDING_URL")
+    cloud_operations_url: str = Field(default="http://cloud-operations:8000", alias="CLOUD_OPERATIONS_URL")
+    cloud_operations_enabled: bool = Field(default=False, alias="CLOUD_OPERATIONS_ENABLED")
+    cloud_execution_simulator_enabled: bool = Field(default=True, alias="CLOUD_EXECUTION_SIMULATOR_ENABLED")
+    cloud_execution_aws_enabled: bool = Field(default=False, alias="CLOUD_EXECUTION_AWS_ENABLED")
+    cloud_execution_azure_enabled: bool = Field(default=False, alias="CLOUD_EXECUTION_AZURE_ENABLED")
+    cloud_azure_kill_switch_engaged: bool = Field(default=True, alias="CLOUD_AZURE_KILL_SWITCH_ENGAGED")
+    cloud_azure_canary_resource_ids: str = Field(default="", alias="CLOUD_AZURE_CANARY_RESOURCE_IDS")
+    cloud_azure_rate_limit_per_minute: int = Field(default=2, alias="CLOUD_AZURE_RATE_LIMIT_PER_MINUTE", ge=1, le=30)
+    cloud_execution_gcp_enabled: bool = Field(default=False, alias="CLOUD_EXECUTION_GCP_ENABLED")
+    cloud_execution_lease_minutes: int = Field(default=15, alias="CLOUD_EXECUTION_LEASE_MINUTES", ge=1, le=120)
+    cloud_credential_session_minutes: int = Field(default=10, alias="CLOUD_CREDENTIAL_SESSION_MINUTES", ge=1, le=60)
     ai_layer_mode: str = Field(default="endpoint", alias="AI_LAYER_MODE")
     ai_layer_request_timeout_seconds: float = Field(default=120.0, alias="AI_LAYER_REQUEST_TIMEOUT_SECONDS")
     ai_layer_auth_token: str = Field(default="", alias="AI_LAYER_AUTH_TOKEN")
+    context_strategy: str = Field(default="auto", alias="CONTEXT_STRATEGY")
+    # Context uses both this outer snapshot lifetime and stricter per-source
+    # freshness windows. Operational signals expire before reviewed knowledge.
+    context_knowledge_ttl_seconds: int = Field(default=3600, alias="CONTEXT_KNOWLEDGE_TTL_SECONDS", ge=60)
+    context_min_quality_score: float = Field(default=0.70, alias="CONTEXT_MIN_QUALITY_SCORE", ge=0.0, le=1.0)
+    context_max_evidence_per_source: int = Field(default=20, alias="CONTEXT_MAX_EVIDENCE_PER_SOURCE", ge=1, le=100)
+    context_collection_budget_seconds: float = Field(default=45.0, alias="CONTEXT_COLLECTION_BUDGET_SECONDS", ge=5.0, le=180.0)
+    context_collection_lease_wait_seconds: int = Field(default=30, alias="CONTEXT_COLLECTION_LEASE_WAIT_SECONDS", ge=0, le=120)
+    context_resolution_reuse_enabled: bool = Field(default=True, alias="CONTEXT_RESOLUTION_REUSE_ENABLED")
+    context_resolution_reuse_min_score: float = Field(default=0.7, alias="CONTEXT_RESOLUTION_REUSE_MIN_SCORE", ge=0.0, le=1.0)
+    object_storage_enabled: bool = Field(default=False, alias="OBJECT_STORAGE_ENABLED")
+    object_storage_provider: str = Field(default="s3", alias="OBJECT_STORAGE_PROVIDER")
+    object_storage_bucket: str = Field(default="kaiops-archive", alias="OBJECT_STORAGE_BUCKET")
+    object_storage_endpoint_url: str = Field(default="", alias="OBJECT_STORAGE_ENDPOINT_URL")
+    object_storage_region: str = Field(default="us-east-1", alias="OBJECT_STORAGE_REGION")
+    object_storage_access_key: str = Field(default="", alias="OBJECT_STORAGE_ACCESS_KEY")
+    object_storage_secret_key: str = Field(default="", alias="OBJECT_STORAGE_SECRET_KEY")
+    azure_blob_connection_string: str = Field(default="", alias="AZURE_BLOB_CONNECTION_STRING")
+    object_storage_signed_url_seconds: int = Field(default=300, alias="OBJECT_STORAGE_SIGNED_URL_SECONDS")
     prometheus_url: str = Field(default="http://prometheus:9090", alias="PROMETHEUS_URL")
     grafana_url: str = Field(default="http://grafana:3000", alias="GRAFANA_URL")
     kafka_enabled: bool = Field(default=True, alias="KAFKA_ENABLED")
-    event_bus_provider: str = Field(default="kafka", alias="EVENT_BUS_PROVIDER")
+    event_bus_provider: str = Field(default="rabbitmq", alias="EVENT_BUS_PROVIDER")
     message_bus_dynamic_routing: bool = Field(default=True, alias="MESSAGE_BUS_DYNAMIC_ROUTING")
     message_bus_stream_threshold: int = Field(default=500, alias="MESSAGE_BUS_STREAM_THRESHOLD")
     message_bus_default_provider: str = Field(default="rabbitmq", alias="MESSAGE_BUS_DEFAULT_PROVIDER")
@@ -96,6 +134,8 @@ class Settings(BaseSettings):
     rag_embedding_batch_size: int = Field(default=24, alias="RAG_EMBEDDING_BATCH_SIZE")
     rag_embedding_max_retries: int = Field(default=3, alias="RAG_EMBEDDING_MAX_RETRIES")
     rag_embedding_retry_backoff_seconds: float = Field(default=1.0, alias="RAG_EMBEDDING_RETRY_BACKOFF_SECONDS")
+    rag_index_retry_limit: int = Field(default=5, alias="RAG_INDEX_RETRY_LIMIT")
+    rag_index_retry_seconds: float = Field(default=30.0, alias="RAG_INDEX_RETRY_SECONDS")
     openai_embedding_model: str = Field(default="text-embedding-3-large", alias="OPENAI_EMBEDDING_MODEL")
     openai_embeddings_timeout_seconds: float = Field(default=15.0, alias="OPENAI_EMBEDDINGS_TIMEOUT_SECONDS")
     rag_embedding_max_input_chars: int = Field(default=12000, alias="RAG_EMBEDDING_MAX_INPUT_CHARS")
@@ -120,26 +160,58 @@ class Settings(BaseSettings):
     orchestration_config_path: str = Field(default="", alias="ORCHESTRATION_CONFIG_PATH")
     connection_config_path: str = Field(default="backend/config/kaiops-connections.json", alias="CONNECTION_CONFIG_PATH")
     message_bus_worker_count: int = Field(default=1, alias="MESSAGE_BUS_WORKER_COUNT")
+    closure_reconciliation_mode: str = Field(default="apply", alias="CLOSURE_RECONCILIATION_MODE")
+    closure_reconciliation_batch_size: int = Field(default=100, alias="CLOSURE_RECONCILIATION_BATCH_SIZE")
+    closure_reconciliation_interval_seconds: float = Field(default=15.0, alias="CLOSURE_RECONCILIATION_INTERVAL_SECONDS")
+    resolution_outbox_batch_size: int = Field(default=100, alias="RESOLUTION_OUTBOX_BATCH_SIZE")
+    resolution_outbox_poll_seconds: float = Field(default=5.0, alias="RESOLUTION_OUTBOX_POLL_SECONDS")
+    resolution_outbox_initial_delay_seconds: float = Field(default=60.0, alias="RESOLUTION_OUTBOX_INITIAL_DELAY_SECONDS")
+    temporal_pilot_enabled: bool = Field(default=False, alias="TEMPORAL_PILOT_ENABLED")
+    temporal_address: str = Field(default="temporal:7233", alias="TEMPORAL_ADDRESS")
+    temporal_namespace: str = Field(default="default", alias="TEMPORAL_NAMESPACE")
+    temporal_task_queue: str = Field(default="kaiops-incident-pilot", alias="TEMPORAL_TASK_QUEUE")
+    remediation_temporal_enabled: bool = Field(default=False, alias="REMEDIATION_TEMPORAL_ENABLED")
+    remediation_temporal_task_queue: str = Field(default="kaiops-remediation", alias="REMEDIATION_TEMPORAL_TASK_QUEUE")
+    remediation_internal_token: str = Field(default="", alias="REMEDIATION_INTERNAL_TOKEN")
+    service_internal_token: str = Field(default="", alias="SERVICE_INTERNAL_TOKEN")
+    event_envelope_signing_required: bool = Field(default=False, alias="EVENT_ENVELOPE_SIGNING_REQUIRED")
+    event_envelope_signing_key: str = Field(default="", alias="EVENT_ENVELOPE_SIGNING_KEY")
+    event_envelope_signing_issuer: str = Field(default="", alias="EVENT_ENVELOPE_SIGNING_ISSUER")
+    temporal_approval_timeout_hours: int = Field(default=24, alias="TEMPORAL_APPROVAL_TIMEOUT_HOURS")
     orchestration_llm_planner_enabled: bool = Field(default=False, alias="ORCHESTRATION_LLM_PLANNER_ENABLED")
     kafka_startup_attempts: int = Field(default=30, alias="KAFKA_STARTUP_ATTEMPTS")
     kafka_startup_retry_seconds: float = Field(default=2.0, alias="KAFKA_STARTUP_RETRY_SECONDS")
     database_enabled: bool = Field(default=True, alias="DATABASE_ENABLED")
     model_gateway_provider: str = Field(default="router", alias="MODEL_GATEWAY_PROVIDER")
     alert_correlation_threshold: float = Field(default=0.72, alias="ALERT_CORRELATION_THRESHOLD")
-    alert_retention_minutes: int = Field(default=30, alias="ALERT_RETENTION_MINUTES")
+    alert_retention_minutes: int = Field(default=60, alias="ALERT_RETENTION_MINUTES")
+    alert_correlation_candidate_limit: int = Field(default=250, alias="ALERT_CORRELATION_CANDIDATE_LIMIT")
+    alert_deduplication_enabled: bool = Field(default=True, alias="ALERT_DEDUPLICATION_ENABLED")
+    alert_deduplication_window_minutes: int = Field(default=60, alias="ALERT_DEDUPLICATION_WINDOW_MINUTES")
     confidence_auto_execute_threshold: float = Field(default=0.9, alias="CONFIDENCE_AUTO_EXECUTE_THRESHOLD")
     confidence_guided_execute_threshold: float = Field(default=0.75, alias="CONFIDENCE_GUIDED_EXECUTE_THRESHOLD")
     auto_execute_min_confidence: float = Field(default=0.8, alias="AUTO_EXECUTE_MIN_CONFIDENCE")
+    # Arch's auto-completion rule: when both the RCA confidence and the
+    # resolution (remediation recommendation) confidence meet this threshold,
+    # the alert flow continues without waiting on manual approval. Below
+    # threshold on either value, the existing approval flow is unchanged.
+    rca_resolution_auto_complete_threshold: float = Field(
+        default=0.70, alias="RCA_RESOLUTION_AUTO_COMPLETE_THRESHOLD"
+    )
     orchestration_approval_severities: str = Field(
         default="high,critical",
         alias="ORCHESTRATION_APPROVAL_SEVERITIES",
     )
     local_llm_endpoint: str = Field(default="http://ollama:11434", alias="LOCAL_LLM_ENDPOINT")
     local_llm_enabled: bool = Field(default=False, alias="LOCAL_LLM_ENABLED")
+    local_llm_model: str = Field(default="qwen2.5:7b", alias="LOCAL_LLM_MODEL")
     openai_api_key: str | None = Field(default=None, alias="OPENAI_API_KEY")
     openai_base_url: str = Field(default="https://api.openai.com/v1", alias="OPENAI_BASE_URL")
     openai_gpt5_model: str = Field(default="gpt-5", alias="OPENAI_GPT5_MODEL")
     openai_gpt4o_model: str = Field(default="gpt-4o", alias="OPENAI_GPT4O_MODEL")
+    reasoning_standard_model: str = Field(default="gpt-5.6-terra", alias="REASONING_STANDARD_MODEL")
+    reasoning_critical_model: str = Field(default="gpt-5.6-sol", alias="REASONING_CRITICAL_MODEL")
+    model_router_reasoning_backend: str = Field(default="openai", alias="MODEL_ROUTER_REASONING_BACKEND")
     gemini_api_key: str | None = Field(default=None, alias="GEMINI_API_KEY")
     gemini_model: str = Field(default="gemini-2.5-flash", alias="GEMINI_MODEL")
     gemini_base_url: str = Field(
@@ -156,13 +228,32 @@ class Settings(BaseSettings):
     # Defaults to "gpt-4o" since that's the deployment already proven live on
     # this endpoint via the evaluation client.
     azure_openai_chat_deployment: str = Field(default="gpt-4o", alias="AZURE_OPENAI_CHAT_DEPLOYMENT")
+    azure_openai_reasoning_standard_deployment: str = Field(
+        default="", alias="AZURE_OPENAI_REASONING_STANDARD_DEPLOYMENT"
+    )
+    azure_openai_reasoning_critical_deployment: str = Field(
+        default="", alias="AZURE_OPENAI_REASONING_CRITICAL_DEPLOYMENT"
+    )
     llm_request_timeout_seconds: float = Field(default=120.0, alias="LLM_REQUEST_TIMEOUT_SECONDS")
     model_router_prompt_cache_enabled: bool = Field(default=True, alias="MODEL_ROUTER_PROMPT_CACHE_ENABLED")
     model_router_prompt_cache_ttl_seconds: float = Field(default=300.0, alias="MODEL_ROUTER_PROMPT_CACHE_TTL_SECONDS")
     model_router_prompt_cache_max_entries: int = Field(default=512, alias="MODEL_ROUTER_PROMPT_CACHE_MAX_ENTRIES")
-    model_router_critical_provider: str = Field(default="gpt-5", alias="MODEL_ROUTER_CRITICAL_PROVIDER")
-    model_router_rca_provider: str = Field(default="gpt-4o", alias="MODEL_ROUTER_RCA_PROVIDER")
+    model_router_max_prompt_chars: int = Field(default=60000, alias="MODEL_ROUTER_MAX_PROMPT_CHARS")
+    model_router_max_payload_bytes: int = Field(default=750000, alias="MODEL_ROUTER_MAX_PAYLOAD_BYTES")
+    resolution_model_payload_max_bytes: int = Field(
+        default=48000,
+        alias="RESOLUTION_MODEL_PAYLOAD_MAX_BYTES",
+        ge=8000,
+        le=250000,
+    )
+    model_router_critical_provider: str = Field(default="reasoning-critical", alias="MODEL_ROUTER_CRITICAL_PROVIDER")
+    model_router_rca_provider: str = Field(default="reasoning-standard", alias="MODEL_ROUTER_RCA_PROVIDER")
     model_router_default_provider: str = Field(default="gpt-4o", alias="MODEL_ROUTER_DEFAULT_PROVIDER")
+    model_router_evaluation_policy_path: str = Field(
+        default="backend/evaluation/model-routing-policy.json",
+        alias="MODEL_ROUTER_EVALUATION_POLICY_PATH",
+    )
+    model_router_evaluation_min_cases: int = Field(default=50, alias="MODEL_ROUTER_EVALUATION_MIN_CASES")
     gateway_request_timeout_seconds: float = Field(default=180.0, alias="GATEWAY_REQUEST_TIMEOUT_SECONDS")
     openai_gpt5_input_cost_per_million: float = Field(default=1.25, alias="OPENAI_GPT5_INPUT_COST_PER_MILLION")
     openai_gpt5_output_cost_per_million: float = Field(default=10.0, alias="OPENAI_GPT5_OUTPUT_COST_PER_MILLION")
@@ -179,6 +270,15 @@ class Settings(BaseSettings):
     auth_failed_login_attempts: int = Field(default=5, alias="AUTH_FAILED_LOGIN_ATTEMPTS")
     auth_lock_minutes: int = Field(default=15, alias="AUTH_LOCK_MINUTES")
     auth_password_expiry_days: int = Field(default=90, alias="AUTH_PASSWORD_EXPIRY_DAYS")
+    auth_mode: str = Field(default="local", alias="AUTH_MODE")
+    oidc_issuer: str = Field(default="", alias="OIDC_ISSUER")
+    oidc_audience: str = Field(default="", alias="OIDC_AUDIENCE")
+    oidc_client_id: str = Field(default="", alias="OIDC_CLIENT_ID")
+    oidc_role_claim: str = Field(default="roles", alias="OIDC_ROLE_CLAIM")
+    oidc_tenant_claim: str = Field(default="tenant_id", alias="OIDC_TENANT_CLAIM")
+    oidc_role_mappings: str = Field(default="", alias="OIDC_ROLE_MAPPINGS")
+    oidc_jwks_cache_seconds: int = Field(default=3600, alias="OIDC_JWKS_CACHE_SECONDS")
+    oidc_step_up_values: str = Field(default="mfa,c2,c3", alias="OIDC_STEP_UP_VALUES")
     trust_x_forwarded_for: bool = Field(default=False, alias="TRUST_X_FORWARDED_FOR")
     admin_user_password: str = Field(default="Admin@123456", alias="ADMIN_USER_PASSWORD")
     executive_user_password: str = Field(default="Executive@123456", alias="EXECUTIVE_USER_PASSWORD")
@@ -203,7 +303,7 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def configure_database_url(self) -> "Settings":
-        profile = str(self.deployment_profile or "onprem").strip().lower()
+        profile = str(self.deployment_profile or "cloud-neutral").strip().lower()
         profile_aliases = {
             "azure": "azure-cloud",
             "aws-cloud": "aws",
@@ -212,11 +312,11 @@ class Settings(BaseSettings):
             "cloud": "cloud-neutral",
         }
         profile = profile_aliases.get(profile, profile)
-        if profile not in {"onprem", "local", "azure-cloud", "aws", "gcp", "cloud-neutral"}:
-            self.deployment_profile = "onprem"
+        if profile not in {"onprem", "local", "private-cloud", "azure-cloud", "aws", "gcp", "cloud-neutral"}:
+            self.deployment_profile = "cloud-neutral"
         else:
             self.deployment_profile = profile
-        provider = str(self.cloud_provider or "").strip().lower() or "local"
+        provider = str(self.cloud_provider or "").strip().lower() or "cloud-neutral"
         provider_aliases = {
             "azure-cloud": "azure",
             "aws-cloud": "aws",
@@ -229,21 +329,48 @@ class Settings(BaseSettings):
         self.cloud_provider = provider_aliases.get(provider, provider)
 
         if self.database_url and self.database_url != _LOCAL_MYSQL_DEFAULT_URL:
+            normalized_url = self.database_url.strip().lower()
+            sqlite_test_url = normalized_url.startswith("sqlite") and self.environment.strip().lower() in {"local", "demo", "test"}
+            if not normalized_url.startswith(("mysql://", "mysql+aiomysql://")) and not sqlite_test_url:
+                raise ValueError("KaiOps production persistence supports only MySQL DATABASE_URL values")
             self._validate_auth_secrets()
             return self
 
-        if self.db.lower() == "mysql":
-            self.database_url = (
-                f"mysql+aiomysql://{quote_plus(self.db_user)}:{quote_plus(self.db_password)}"
-                f"@{self.db_host}:{self.db_port}/{self.db_database}"
-            )
+        if self.db.lower() != "mysql":
+            raise ValueError("DB must be mysql; alternate relational databases are prohibited")
+        self.database_url = (
+            f"mysql+aiomysql://{quote_plus(self.db_user)}:{quote_plus(self.db_password)}"
+            f"@{self.db_host}:{self.db_port}/{self.db_database}"
+        )
 
         self._validate_auth_secrets()
         return self
 
     def _validate_auth_secrets(self) -> None:
-        if self.environment.strip().lower() in {"local", "demo", "test"}:
+        environment = self.environment.strip().lower()
+        auth_mode = self.auth_mode.strip().lower()
+        if auth_mode not in {"local", "oidc"}:
+            raise ValueError("AUTH_MODE must be local or oidc")
+        self.auth_mode = auth_mode
+        if environment in {"local", "demo", "test"}:
             return
+
+        if auth_mode != "oidc":
+            raise ValueError("Production requires AUTH_MODE=oidc; local password authentication is development-only")
+        missing_oidc = [name for name in ("oidc_issuer", "oidc_audience", "oidc_client_id") if not str(getattr(self, name)).strip()]
+        if missing_oidc:
+            raise ValueError(f"Missing production OIDC settings: {', '.join(name.upper() for name in missing_oidc)}")
+        if not self.oidc_issuer.lower().startswith("https://"):
+            raise ValueError("Production OIDC_ISSUER must use HTTPS")
+        if not self.event_envelope_signing_required:
+            raise ValueError("Production requires EVENT_ENVELOPE_SIGNING_REQUIRED=true")
+        if len(self.event_envelope_signing_key) < 32:
+            raise ValueError("Production EVENT_ENVELOPE_SIGNING_KEY must contain at least 32 characters")
+        if not self.event_envelope_signing_issuer.strip():
+            raise ValueError("Production EVENT_ENVELOPE_SIGNING_ISSUER is required")
+        # Local JWT keys and seeded passwords are not authentication inputs in
+        # OIDC mode; do not force operators to create unused production secrets.
+        return
 
         placeholder_fields = [
             field_name

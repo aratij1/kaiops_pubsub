@@ -1,5 +1,9 @@
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
+from datetime import UTC, datetime
+
+import pytest
 
 from common.config import Settings
 from ai_workbench_common.embeddings import HashingEmbeddingModel
@@ -27,22 +31,96 @@ def test_rag_ingestion_writes_reloads_and_searches(tmp_path) -> None:
         services=["payments", "cache"],
         dependencies=["redis"],
         content="Use this runbook when payments cache warmup fails after deployment.",
+        tenant_scope="tenant-a",
+        owner_team="payments-ops",
+        source_system="governed-test-fixture",
+        source_ref="test://payments-cache-warmup",
+        review_status="approved",
+        corpus_classification="TENANT_CURATED",
+        reviewed_by="test-reviewer",
+        approved_by="test-approver",
+        approved_at=datetime.now(UTC).isoformat(),
+        last_reviewed=datetime.now(UTC).isoformat(),
     )
 
     result = module.write_rag_document(request)
 
     assert result["document_count"] == 1
-    assert result["index"]["vector_store"]["provider"] == "file-backed-memory"
+    assert result["index"]["vector_store"]["provider"] == "local-hybrid-vector-index"
     assert result["index"]["embedding_model"]["model"] == "hashing-token-counter-v1"
     assert result["index"]["metadata_embedding_count"] == 1
     assert Path(result["path"]).exists()
-    matches = connector.search("payments cache warmup", limit=3)
+    matches = connector.search("payments cache warmup", limit=3, tenant_id="tenant-a")
     assert matches[0]["title"] == "Payments cache warmup"
     assert matches[0]["kind"] == "runbook"
 
     public_doc = module._public_rag_document(connector.documents[0], connector)
     assert public_doc["embedding_status"] in {"embedded", "metadata-only"}
-    assert public_doc["vector_store"]["provider"] == "file-backed-memory"
+    assert public_doc["vector_store"]["provider"] == "local-hybrid-vector-index"
+
+
+@pytest.mark.asyncio
+async def test_general_ingestion_requires_separate_approval_before_retrieval(tmp_path) -> None:
+    module = load_context_app_module()
+    connector = VectorDBConnector(rag_root=tmp_path)
+    module.agent = ContextIntelligenceAgent(connectors=[connector])
+    module.RagDocumentRequest(
+        kind="runbook",
+        title="Checkout diagnostics",
+        services=["checkout"],
+        content="Collect checkout logs and latency telemetry before selecting remediation.",
+        tenant_scope="tenant-a",
+        owner_team="client-supplied-value",
+        source_system="runbook-registry",
+        source_ref="runbook://checkout/draft",
+        review_status="approved",
+        corpus_classification="TENANT_CURATED",
+        approved_by="forged-client-identity",
+    )
+
+    mutation_routes = [
+        route for route in module.app.routes
+        if getattr(route, "path", None) == "/rag/documents" and "POST" in getattr(route, "methods", set())
+    ]
+    assert mutation_routes == []
+    assert not list(tmp_path.rglob("*.md"))
+    assert connector.search("checkout diagnostics", tenant_id="tenant-a") == []
+
+
+def test_evidence_draft_rejects_unrelated_cross_project_evidence(tmp_path) -> None:
+    module = load_context_app_module()
+    alert = SimpleNamespace(
+        id="11111111-1111-1111-1111-111111111111",
+        name="UptimeRobot monitor down",
+        service="uptimerobot",
+        environment="production",
+        severity=SimpleNamespace(value="critical"),
+        labels={"application": "UptimeRobot", "monitor_id": "monitor-42"},
+        tenant_id="tenant-a",
+    )
+    incident = SimpleNamespace(id="22222222-2222-2222-2222-222222222222")
+    context = SimpleNamespace(metadata={"discovery_report": {
+        "report": {"summary": "Unrelated service failed."},
+        "evidence": [{
+            "evidence_id": "MYSQL-123",
+            "source": "mysql",
+            "snippet": "kaiops remediation engine is unavailable",
+            "uri": "mysql://kaiops/incidents/123",
+        }],
+    }})
+
+    assert module.create_evidence_rag_draft(alert=alert, incident=incident, context=context) is None
+
+
+def test_empty_corpus_is_degraded_and_blocks_execution_readiness(tmp_path) -> None:
+    connector = VectorDBConnector(rag_root=tmp_path)
+    connector.reload()
+
+    index = connector.index_info()
+
+    assert index["status"] == "degraded_empty_corpus"
+    assert index["execution_ready"] is False
+    assert index["approved_retrievable_count"] == 0
 
 
 def test_azure_ai_search_vector_store_builds_hybrid_search_request(monkeypatch) -> None:
@@ -70,6 +148,20 @@ def test_azure_ai_search_vector_store_builds_hybrid_search_request(monkeypatch) 
                         "title": "Payments triage",
                         "content": "Investigate payments latency",
                         "services": ["payments"],
+                        "tenant_scope": "tenant-a",
+                        "review_status": "approved",
+                        "corpus_classification": "TENANT_CURATED",
+                        "owner_team": "payments-ops",
+                        "source_system": "test",
+                        "source_ref": "test://payments",
+                        "content_version": 1,
+                        "created_at": "2026-08-27T00:00:00Z",
+                        "updated_at": "2026-08-27T00:00:00Z",
+                        "last_reviewed": "2026-08-27T00:00:00Z",
+                        "reviewed_by": "reviewer",
+                        "approved_by": "approver",
+                        "approved_at": "2026-08-27T00:00:00Z",
+                        "content_checksum": "sha256:" + "0" * 64,
                     }
                 ]
             }
@@ -100,6 +192,7 @@ def test_azure_ai_search_vector_store_builds_hybrid_search_request(monkeypatch) 
         limit=3,
         preferred_kinds={"runbook"},
         service="payments",
+        tenant_id="tenant-a",
     )
 
     assert matches[0]["title"] == "Payments triage"
@@ -108,6 +201,11 @@ def test_azure_ai_search_vector_store_builds_hybrid_search_request(monkeypatch) 
     assert captured["json"]["vectorQueries"][0]["fields"] == "content_vector"
     assert "kind eq 'runbook'" in captured["json"]["filter"]
     assert "services/any" in captured["json"]["filter"]
+    assert "tenant_scope eq 'tenant-a'" in captured["json"]["filter"]
+    assert "corpus_classification eq 'TENANT_CURATED'" in captured["json"]["filter"]
+    assert "tenant_scope eq 'global'" in captured["json"]["filter"]
+    assert "corpus_classification eq 'PRODUCTION_CURATED'" in captured["json"]["filter"]
+    assert "review_status eq 'approved'" in captured["json"]["filter"]
 
 
 def test_azure_ai_search_vector_store_chunks_and_uploads(monkeypatch) -> None:
@@ -161,3 +259,57 @@ def test_azure_ai_search_vector_store_chunks_and_uploads(monkeypatch) -> None:
     assert "/indexes/kaiops-rag/docs/index" in captured["url"]
     assert captured["json"]["value"][0]["@search.action"] == "mergeOrUpload"
     assert captured["json"]["value"][0]["content_vector"]
+
+
+def test_azure_ai_search_removes_all_chunks_for_quarantined_document(monkeypatch) -> None:
+    requests = []
+    store = AzureAISearchVectorStore(
+        settings=Settings(
+            AZURE_AI_SEARCH_ENABLED=True,
+            AZURE_AI_SEARCH_ENDPOINT="https://search.example.net",
+            AZURE_AI_SEARCH_API_KEY="key",
+            AZURE_AI_SEARCH_INDEX_NAME="kaiops-rag",
+        ),
+        embedding_model=HashingEmbeddingModel(),
+    )
+
+    class _FakeResponse:
+        def __init__(self, payload=None):
+            self._payload = payload or {}
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class _FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, url, headers=None, json=None):
+            requests.append((url, json))
+            if "/docs/search" in url:
+                return _FakeResponse({"value": [
+                    {"id": "runbook-chunk-1", "document_id": "/rag/runbook.md"},
+                    {"id": "runbook-chunk-2", "document_id": "/rag/runbook.md"},
+                ]})
+            return _FakeResponse()
+
+    import context_agent.connectors as connectors_module
+
+    monkeypatch.setattr(connectors_module.httpx, "Client", _FakeClient)
+
+    result = store.delete_document("/rag/runbook.md")
+
+    assert result["deleted"] == 2
+    assert requests[1][1]["value"] == [
+        {"@search.action": "delete", "id": "runbook-chunk-1"},
+        {"@search.action": "delete", "id": "runbook-chunk-2"},
+    ]

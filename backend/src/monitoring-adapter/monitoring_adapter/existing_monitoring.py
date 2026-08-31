@@ -20,6 +20,8 @@ SUPPORTED_MONITORING_PROVIDERS = [
     "zabbix",
     "elastic",
     "jira",
+    "raygun",
+    "uptime_robot",
 ]
 
 
@@ -35,6 +37,7 @@ def normalize_provider_name(value: str) -> str:
         "azure": "azure_monitor",
         "azuremonitor": "azure_monitor",
         "newrelic": "new_relic",
+        "uptimerobot": "uptime_robot",
         "elastic_observability": "elastic",
     }
     normalized = aliases.get(token, token)
@@ -242,6 +245,72 @@ class NewRelicProvider(BaseMonitoringProvider):
         }
 
 
+@dataclass
+class UptimeRobotProvider(BaseMonitoringProvider):
+    provider: str = "uptime_robot"
+
+    def normalize_alert(self, payload: dict[str, Any], mapping: dict[str, Any] | None = None) -> dict[str, Any]:
+        status = _extract_string(payload, ["alertTypeFriendlyName", "status", "alertType"], default="unknown")
+        monitor = _extract_string(payload, ["monitorFriendlyName", "monitor", "name"], default="unknown-monitor")
+        alert_type = str(payload.get("alertType") or "").strip()
+        return {
+            "provider": self.provider,
+            "application": _extract_string(payload, ["application", "project"], default="UptimeRobot"),
+            "environment": _extract_string(payload, ["environment", "env"], default="unknown"),
+            "severity": "critical" if alert_type == "1" or status.lower() == "down" else "info",
+            "alertName": f"{monitor} {status}".strip(),
+            "resource": _extract_string(payload, ["monitorURL", "url", "monitorID"], default=monitor),
+            "labels": {
+                "monitor_id": str(payload.get("monitorID") or ""),
+                "monitor_type": str(payload.get("monitorType") or ""),
+                "monitor_group": str(payload.get("monitorGroup") or ""),
+                "http_status_code": str(payload.get("httpStatusCode") or ""),
+                "vendor_event_status": status,
+            },
+            "annotations": {
+                "summary": str(payload.get("alertDetails") or f"UptimeRobot reported {status} for {monitor}"),
+                "dashboard_url": str(payload.get("dashboardUrl") or ""),
+                "monitor_url": str(payload.get("monitorURL") or ""),
+                "incident_start_time": str(payload.get("incidentStartTime") or ""),
+                "incident_end_time": str(payload.get("incidentEndTime") or ""),
+            },
+            "timestamp": _extract_string(payload, ["alertDateTime", "incidentStartTime", "timestamp"], default=utc_now_iso()),
+            "rawPayload": payload,
+        }
+
+
+@dataclass
+class RaygunProvider(BaseMonitoringProvider):
+    provider: str = "raygun"
+
+    def normalize_alert(self, payload: dict[str, Any], mapping: dict[str, Any] | None = None) -> dict[str, Any]:
+        error = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+        application = payload.get("application") if isinstance(payload.get("application"), dict) else {}
+        instance = error.get("instance") if isinstance(error.get("instance"), dict) else {}
+        tags = instance.get("tags") if isinstance(instance.get("tags"), list) else []
+        environment = next((str(tag).split(":", 1)[1] for tag in tags if str(tag).lower().startswith("env:") and ":" in str(tag)), "unknown")
+        event_type = _extract_string(payload, ["eventType", "event"], default="RaygunEvent")
+        message = _extract_string(error, ["message", "description"], default=event_type)
+        return {
+            "provider": self.provider,
+            "application": _extract_string(application, ["name"], default="Raygun"),
+            "environment": environment,
+            "severity": "high" if str(payload.get("event") or "").lower() == "error_notification" else "info",
+            "alertName": message,
+            "resource": _extract_string(error, ["url"], default=_extract_string(application, ["url"], default="unknown")),
+            "labels": {"event_type": event_type, "vendor_event": str(payload.get("event") or ""), "tags": tags},
+            "annotations": {
+                "summary": message,
+                "error_url": str(error.get("url") or ""),
+                "application_url": str(application.get("url") or ""),
+                "users_affected": str(error.get("usersAffected") or ""),
+                "total_occurrences": str(error.get("totalOccurrences") or ""),
+            },
+            "timestamp": _extract_string(error, ["lastOccurredOn", "firstOccurredOn", "activityDate"], default=utc_now_iso()),
+            "rawPayload": payload,
+        }
+
+
 def provider_registry() -> dict[str, IMonitoringProvider]:
     generic = {
         "grafana": BaseMonitoringProvider("grafana"),
@@ -257,6 +326,8 @@ def provider_registry() -> dict[str, IMonitoringProvider]:
         "prometheus": PrometheusProvider(),
         "datadog": DatadogProvider(),
         "new_relic": NewRelicProvider(),
+        "uptime_robot": UptimeRobotProvider(),
+        "raygun": RaygunProvider(),
         **generic,
     }
 

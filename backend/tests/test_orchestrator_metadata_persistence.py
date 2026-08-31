@@ -44,13 +44,14 @@ async def test_orchestrator_persists_metadata_envelope_before_publish(monkeypatc
     monkeypatch.setattr(orchestrator_app, "IncidentRepository", FakeRepository)
 
     alert = Alert(
+        tenant_id="tenant-a",
         source="prometheus",
         name="PaymentsLatencyHigh",
         service="payments",
         severity=AlertSeverity.CRITICAL,
         description="latency increased",
     )
-    incident = Incident(service="payments", severity=AlertSeverity.CRITICAL, title="payments latency")
+    incident = Incident(tenant_id="tenant-a", service="payments", severity=AlertSeverity.CRITICAL, title="payments latency")
     decision = {
         "message_bus_provider": "rabbitmq",
         "risk_tier": "high",

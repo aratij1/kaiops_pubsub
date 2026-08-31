@@ -17,6 +17,7 @@ class CapturePublisher:
 
 def make_alert(stream_count: int) -> Alert:
     return Alert(
+        tenant_id="tenant-a",
         source="prometheus",
         name="PaymentLatencyHigh",
         service="payments",
@@ -28,6 +29,7 @@ def make_alert(stream_count: int) -> Alert:
 
 def make_incident() -> Incident:
     return Incident(
+        tenant_id="tenant-a",
         service="payments",
         severity=AlertSeverity.CRITICAL,
         title="payments: latency",
@@ -42,7 +44,7 @@ def make_incident() -> Incident:
         (100, "rabbitmq"),
     ],
 )
-async def test_orchestrator_routes_transport_by_stream_count(stream_count: int, expected_provider: str) -> None:
+async def test_orchestrator_keeps_deployment_transport_for_entire_workflow(stream_count: int, expected_provider: str) -> None:
     app = FastAPI()
     kafka_publisher = CapturePublisher()
     rabbitmq_publisher = CapturePublisher()
@@ -60,13 +62,10 @@ async def test_orchestrator_routes_transport_by_stream_count(stream_count: int, 
         alert=alert,
         incident=incident,
         decision=decision,
+        deployment_provider="rabbitmq",
     )
 
     assert decision["message_bus_provider"] == expected_provider
-    assert provider_used == expected_provider
-    if expected_provider == "kafka":
-        assert len(kafka_publisher.events) == 1
-        assert len(rabbitmq_publisher.events) == 0
-    else:
-        assert len(rabbitmq_publisher.events) == 1
-        assert len(kafka_publisher.events) == 0
+    assert provider_used == "rabbitmq"
+    assert len(rabbitmq_publisher.events) == 1
+    assert len(kafka_publisher.events) == 0

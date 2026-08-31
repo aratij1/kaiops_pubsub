@@ -1,5 +1,6 @@
 import importlib.util
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -8,7 +9,7 @@ from context_agent.connectors import VectorDBConnector
 
 
 def load_context_app_module():
-    module_path = Path("backend/src/context-agent/app.py")
+    module_path = Path("ai-workbench/src/context-agent/app.py")
     spec = importlib.util.spec_from_file_location("context_agent_app", module_path)
     assert spec is not None
     assert spec.loader is not None
@@ -52,15 +53,19 @@ def test_knowledge_pack_extracts_required_operational_facts() -> None:
 
 
 @pytest.mark.asyncio
-async def test_knowledge_pack_approval_writes_rag_document(tmp_path) -> None:
+async def test_knowledge_pack_approval_creates_durable_review_draft(tmp_path, sqlite_session_factory) -> None:
     module = load_context_app_module()
     connector = VectorDBConnector(rag_root=tmp_path)
     module.agent = ContextIntelligenceAgent(connectors=[connector])
+    module.settings.database_enabled = True
+    module.app.state.session_factory = sqlite_session_factory
     request = module.KnowledgePackApproveRequest(
         service="checkout-api",
         environment="prod",
         owner_team="platform-ops",
+        tenant_id="tenant-a",
         approved_by="administrator",
+        approval_expires_at=datetime(2099, 1, 1, tzinfo=UTC),
         documents=[
             module.KnowledgePackSourceDocument(
                 name="checkout-triage.md",
@@ -77,9 +82,7 @@ async def test_knowledge_pack_approval_writes_rag_document(tmp_path) -> None:
 
     response = await module.approve_knowledge_pack(request)
 
-    assert response["status"] == "approved"
-    assert response["rag_document"]["document_count"] == 1
-    assert Path(response["rag_document"]["path"]).exists()
-    matches = connector.search("checkout 5xx mysql recovery", limit=3)
-    assert matches[0]["title"] == "checkout-api Knowledge Pack"
-    assert matches[0]["source_system"] == "knowledge-pack"
+    assert response["status"] == "pending_review"
+    assert response["knowledge_draft"]["status"] == "draft"
+    assert response["knowledge_draft"]["created_by"] == "administrator"
+    assert connector.search("checkout 5xx mysql recovery", limit=3, tenant_id="tenant-a") == []

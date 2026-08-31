@@ -74,34 +74,18 @@ test.beforeEach(async ({ page }) => {
   });
 });
 
-test("admin setup keeps source downloads below file inputs and labels adapter contracts", async ({ page }) => {
-  await page.goto("/");
+test("project onboarding exposes a complete monitoring integration contract", async ({ page }) => {
+  test.setTimeout(120_000);
+  await page.goto("/integrations");
   await page.getByLabel("Username").fill("admin");
   await page.getByLabel("Password").fill("admin-password");
   await page.getByRole("button", { name: "Sign In" }).click();
 
-  await page.getByRole("button", { name: /Admin/ }).click();
-  await page.getByRole("button", { name: /Continue setup|Open workflow status|Review generated artifacts/ }).click();
-  await expect(page.getByRole("heading", { name: "Setup Wizard" })).toBeVisible();
-  await page.getByRole("button", { name: "Show full setup" }).click();
-
-  await page.getByText("Source Documents", { exact: true }).click();
-  await expect(page.getByText("Upload Source Documents")).toBeVisible();
-  const sourceCard = page.locator(".source-doc-upload-card").filter({ hasText: "Past Tickets" });
-  await expect(sourceCard.locator("input[type=file]")).toBeVisible();
-  await expect(sourceCard.getByRole("link", { name: "Download past ticket sample" })).toBeVisible();
-
-  await page.getByRole("button", { name: "1) Configure Prometheus Monitoring" }).click();
-  const rulePromptPanelTitle = page.getByText("Generated Rule Prompt", { exact: true });
-  await expect(rulePromptPanelTitle).toBeVisible();
-  await rulePromptPanelTitle.click();
-  await expect(page.getByText("Upload source documents to unlock the generated rule prompt.")).toBeVisible();
-  await page.getByText("Advanced Settings (Optional)").click();
-  await page.locator("label").filter({ hasText: "Deployment" }).first().locator("select").selectOption("azure_cloud");
-  await expect(page.getByLabel("Azure Subscription ID")).toBeVisible();
-
-  await page.getByText("Open Advanced Tools").click();
-  await expect(page.getByText("Monitoring Platform Capabilities")).toBeVisible();
-  await expect(page.getByText("real / partial")).toBeVisible();
-  await expect(page.getByText("simulated / stub")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Connect an application" })).toBeVisible();
+  await expect(page.getByLabel("tenant id")).toBeVisible();
+  await expect(page.getByLabel("owner team")).toBeVisible();
+  await expect(page.getByLabel("Metrics endpoint")).toBeVisible();
+  await expect(page.getByLabel("Operational labels")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Save and start onboarding" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Configured monitoring integrations" })).toBeVisible();
 });

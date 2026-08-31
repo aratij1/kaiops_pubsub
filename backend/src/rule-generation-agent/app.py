@@ -188,8 +188,8 @@ def _build_runbook_document_payload(
             "source": "rule-generation-agent",
             "application_id": str(application.id),
             "context_strategy": "similar-historical-tickets-first",
-            "historical_ticket_count": len(similar_tickets),
-            "historical_ticket_paths": [str(ticket.get("path") or "") for ticket in similar_tickets],
+            "historical_ticket_count": str(len(similar_tickets)),
+            "historical_ticket_paths": ",".join(str(ticket.get("path") or "") for ticket in similar_tickets),
         },
     }
 
@@ -205,7 +205,18 @@ async def _publish_runbook_document(application: ApplicationRegistration, result
     payload = _build_runbook_document_payload(application, result, similar_tickets)
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(f"{settings.context_agent_url}/rag/documents", json=payload)
+            response = await client.post(
+                f"{settings.context_agent_url}/rag/knowledge-drafts",
+                json={
+                    "tenant_scope": str(application.tenant_id),
+                    "created_by": "rule-generation-agent",
+                    "kind": payload.get("kind", "runbook"),
+                    "source_ref": payload.get("source_ref") or f"rule-generation://{application.id}",
+                    "title": payload.get("title"),
+                    "content": payload.get("content"),
+                    "metadata": payload.get("metadata", {}),
+                },
+            )
             response.raise_for_status()
         logger.info("runbook document created", extra={"application": application.name})
     except Exception as exc:

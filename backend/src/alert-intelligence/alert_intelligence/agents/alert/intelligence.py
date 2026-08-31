@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+from collections import OrderedDict
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
@@ -10,6 +12,7 @@ from common.config import get_settings
 from ai_workbench_common.embeddings import HashingEmbeddingModel, cosine_similarity
 from common.models import Alert, AlertSeverity, Incident, IncidentStatus, utc_now
 from common.incident_policy import IncidentSeverityPolicy
+from common.incident_identity import environment_family, is_ephemeral_environment, same_environment_family
 from common.repository_interfaces import AlertHistoryRepository, InMemoryAlertHistoryRepository
 from alert_intelligence.discovery import build_incident_candidate
 
@@ -44,34 +47,95 @@ class AlertIntelligenceAgent(BaseAgent):
     embedding_model: HashingEmbeddingModel = field(default_factory=HashingEmbeddingModel)
     correlation_threshold: float | None = None
     retention_minutes: int | None = None
+    deduplication_enabled: bool | None = None
+    deduplication_window_minutes: int | None = None
     alert_history_repository: AlertHistoryRepository = field(default_factory=InMemoryAlertHistoryRepository)
     name: str = "alert-intelligence-agent"
-    _embedding_cache: dict[str, list[float]] = field(default_factory=dict)
+    # Bounded FIFO cache: an unbounded dict here grows for the life of the
+    # process (one entry per distinct alert text seen), which is a slow
+    # memory leak across a multi-day soak at 10k alerts/day.
+    _embedding_cache: OrderedDict[str, list[float]] = field(default_factory=OrderedDict)
+    _embedding_cache_max_size: int = 5000
 
     def __post_init__(self) -> None:
         settings = get_settings()
         if self.correlation_threshold is None:
             self.correlation_threshold = float(getattr(settings, "alert_correlation_threshold", 0.72))
         if self.retention_minutes is None:
-            self.retention_minutes = int(getattr(settings, "alert_retention_minutes", 30))
+            self.retention_minutes = int(getattr(settings, "alert_retention_minutes", 60))
+        if self.deduplication_enabled is None:
+            self.deduplication_enabled = bool(getattr(settings, "alert_deduplication_enabled", True))
+        if self.deduplication_window_minutes is None:
+            self.deduplication_window_minutes = int(
+                getattr(settings, "alert_deduplication_window_minutes", self.retention_minutes or 60)
+            )
+        self.deduplication_window_minutes = max(1, min(int(self.deduplication_window_minutes), 1440))
+        self.retention_minutes = max(int(self.retention_minutes or 0), self.deduplication_window_minutes)
 
-    async def deduplicate_alerts(self, alert: Alert) -> Alert:
+    async def deduplicate_alerts(self, alert: Alert, candidates: Sequence[Alert] | None = None) -> Alert:
         fingerprint = self._fingerprint(alert)
         alert.fingerprint = fingerprint
-        cutoff = utc_now() - timedelta(minutes=int(self.retention_minutes or 30))
-        matches = [
-            item
-            for item in await self.alert_history_repository.list_recent_alerts()
-            if item.fingerprint == fingerprint and item.starts_at >= cutoff and item.ends_at is None
-        ]
+        alert.metadata["deduplication"] = {
+            "enabled": bool(self.deduplication_enabled),
+            "window_minutes": int(self.deduplication_window_minutes or 60),
+            "fingerprint": fingerprint,
+            "similarity_threshold": float(self.correlation_threshold or 0.72),
+        }
+        if not self.deduplication_enabled:
+            alert.deduplicated_count = 1
+            alert.metadata["deduplication"].update({"matched": False, "disposition": "new_incident"})
+            return alert
+        cutoff = utc_now() - timedelta(minutes=int(self.deduplication_window_minutes or 60))
+        if candidates is None:
+            candidates = await self.alert_history_repository.list_recent_alerts(
+                environment=alert.environment, tenant_id=alert.tenant_id
+            )
+        matches: list[Alert] = []
+        match_details: list[dict[str, Any]] = []
+        for item in candidates:
+            if (
+                item.starts_at < cutoff
+                or (item.ends_at is not None and item.ends_at <= utc_now())
+                or not same_environment_family(alert.environment, item.environment)
+            ):
+                continue
+            exact = item.fingerprint == fingerprint
+            similarity, evidence = self._correlation_score(alert, item)
+            if not exact and similarity < float(self.correlation_threshold or 0.72):
+                continue
+            matches.append(item)
+            match_details.append(
+                {
+                    "alert_id": str(item.id),
+                    "match_type": "exact" if exact else "similar",
+                    "similarity_score": round(similarity, 4),
+                    "evidence": evidence,
+                }
+            )
         alert.deduplicated_count = len(matches) + 1
+        alert.metadata["deduplication"].update(
+            {
+                "matched": bool(matches),
+                "matched_alert_ids": [str(item.id) for item in matches[:20]],
+                "matches": match_details[:20],
+                "match_type": match_details[0]["match_type"] if match_details else None,
+                "similarity_score": match_details[0]["similarity_score"] if match_details else 0.0,
+                "disposition": "duplicate" if matches else "new_incident",
+            }
+        )
         return alert
 
-    async def correlate_alerts(self, alert: Alert) -> Alert:
+    async def correlate_alerts(self, alert: Alert, candidates: Sequence[Alert] | None = None) -> Alert:
+        if candidates is None:
+            candidates = await self.alert_history_repository.list_recent_alerts(
+                environment=alert.environment, tenant_id=alert.tenant_id
+            )
         best_match: Alert | None = None
         best_score = 0.0
         best_evidence: dict[str, Any] = {}
-        for candidate in await self.alert_history_repository.list_recent_alerts():
+        for candidate in candidates:
+            if not same_environment_family(alert.environment, candidate.environment):
+                continue
             candidate_score, evidence = self._correlation_score(alert, candidate)
             if candidate_score > best_score:
                 best_match = candidate
@@ -125,6 +189,7 @@ class AlertIntelligenceAgent(BaseAgent):
         )
         await self.alert_history_repository.record_alert(alert)
         incident = Incident(
+            tenant_id=alert.tenant_id,
             alert_ids=[alert.id],
             service=alert.service,
             environment=alert.environment,
@@ -137,8 +202,20 @@ class AlertIntelligenceAgent(BaseAgent):
         return alert, incident
 
     async def process(self, alert: Alert, llm_discovery: dict[str, Any] | None = None) -> tuple[Alert, Incident]:
-        alert = await self.deduplicate_alerts(alert)
-        alert = await self.correlate_alerts(alert)
+        # Dedup and correlation both need a recent-alert candidate pool; fetch
+        # it once (environment-scoped) instead of two independent unfiltered
+        # history scans per incoming alert.
+        # Run-scoped test environments (for example e2e-<timestamp>) belong
+        # to one operational environment. Fetch the tenant pool for those
+        # environments, then apply the family boundary in both algorithms.
+        candidate_environment = alert.environment
+        if is_ephemeral_environment(alert.environment):
+            candidate_environment = None
+        candidates = await self.alert_history_repository.list_recent_alerts(
+            environment=candidate_environment, tenant_id=alert.tenant_id
+        )
+        alert = await self.deduplicate_alerts(alert, candidates)
+        alert = await self.correlate_alerts(alert, candidates)
         alert = self.classify_severity(alert)
         alert, incident = await self.enrich_alert(alert)
         candidate = build_incident_candidate(alert, incident, llm_discovery)
@@ -177,7 +254,19 @@ class AlertIntelligenceAgent(BaseAgent):
         return isinstance(result, dict) and "alert" in result and "incident" in result
 
     def _fingerprint(self, alert: Alert) -> str:
-        stable = "|".join([alert.source, alert.name, alert.service, alert.environment, alert.labels.get("pod", "")])
+        alert_identity = (
+            self._alert_family(alert.name)
+            if is_ephemeral_environment(alert.environment)
+            else self._norm(alert.name)
+        )
+        stable = "|".join(
+            [
+                self._norm(alert.source),
+                alert_identity,
+                self._norm(alert.service),
+                environment_family(alert.environment),
+            ]
+        )
         return hashlib.sha256(stable.encode("utf-8")).hexdigest()
 
     def _correlation_text(self, alert: Alert) -> str:
@@ -190,7 +279,7 @@ class AlertIntelligenceAgent(BaseAgent):
             self._embed(self._correlation_text(candidate)),
         )
         service_score = self._service_score(alert, candidate)
-        environment_score = 1.0 if self._norm(alert.environment) == self._norm(candidate.environment) else 0.0
+        environment_score = 1.0 if same_environment_family(alert.environment, candidate.environment) else 0.0
         topology_score, topology_evidence = self._token_overlap_score(alert, candidate, _TOPOLOGY_KEYS + _DEPENDENCY_KEYS)
         deployment_score, deployment_evidence = self._token_overlap_score(alert, candidate, _DEPLOYMENT_KEYS)
         metric_score, metric_evidence = self._token_overlap_score(alert, candidate, _METRIC_KEYS)
@@ -319,9 +408,12 @@ class AlertIntelligenceAgent(BaseAgent):
 
     def _embed(self, text: str) -> list[float]:
         cached = self._embedding_cache.get(text)
-        if cached is None:
-            cached = self.embedding_model.embed(text)
-            self._embedding_cache[text] = cached
+        if cached is not None:
+            return cached
+        cached = self.embedding_model.embed(text)
+        self._embedding_cache[text] = cached
+        if len(self._embedding_cache) > self._embedding_cache_max_size:
+            self._embedding_cache.popitem(last=False)
         return cached
 
     def _source_category(self, source: str) -> str:

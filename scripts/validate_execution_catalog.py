@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import json
+import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from uuid import UUID
+
+from update_execution_catalog_checksums import playbook_checksum
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,6 +44,12 @@ def main() -> int:
         if isinstance(connector, dict)
         for operation in connector.get("allowed_operations", [])
     }
+    jenkins_allowlist = (
+        re.compile(r"^kubectl\s+(get|describe|logs)\b.*"),
+        re.compile(r"^kubectl\s+(rollout\s+(restart|undo|status)|scale)\b.*"),
+        re.compile(r"^ansible-playbook\s+playbooks/[A-Za-z0-9_./-]+\.ya?ml\b.*"),
+        re.compile(r'^curl --fail --silent --show-error(?: --output /dev/null)?(?: --retry \d+)?(?: --retry-all-errors)?(?: --retry-connrefused)?(?: --retry-delay \d+)?(?: -X POST)? http://[A-Za-z0-9_.:-]+/[A-Za-z0-9_./?=&-]+$'),
+    )
 
     for command_id, command in command_catalog.items():
         if not isinstance(command, dict):
@@ -57,6 +68,20 @@ def main() -> int:
                 errors.append(f"mutating command {command_id} must set approval_required=true")
             if not str(command.get("rollback") or "").strip():
                 errors.append(f"mutating command {command_id} must define rollback")
+        command_text = str(command.get("command") or "").strip()
+        if command_text.startswith("ansible-playbook "):
+            playbook_path = command_text.split()[1]
+            if not (ROOT / playbook_path).is_file():
+                errors.append(f"command {command_id} references missing Ansible playbook {playbook_path}")
+        allowlist_sample = re.sub(
+            r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}",
+            lambda match: "http://value" if match.group(1).endswith("_url") else "value",
+            command_text,
+        )
+        if command_text.startswith(("kubectl ", "ansible-playbook ", "curl ")) and not any(
+            pattern.fullmatch(allowlist_sample) for pattern in jenkins_allowlist
+        ):
+            errors.append(f"command {command_id} is rejected by the Jenkins command allowlist")
 
     for playbook in playbook_rows:
         if not isinstance(playbook, dict):
@@ -68,12 +93,45 @@ def main() -> int:
             errors.append(f"playbook {playbook_id} must define steps")
             continue
         step_types = {str(step.get("type") or "").strip().lower() for step in steps if isinstance(step, dict)}
+        mutating = "remediation" in step_types
+        if mutating:
+            required_governance = (
+                "governance_id", "version", "status", "owner", "approver", "approved_at",
+                "approval_expires_at", "checksum_sha256", "risk_class",
+            )
+            missing_governance = [key for key in required_governance if playbook.get(key) in (None, "")]
+            if missing_governance:
+                errors.append(
+                    f"executable playbook {playbook_id} missing governance: {', '.join(missing_governance)}"
+                )
+            try:
+                UUID(str(playbook.get("governance_id") or ""))
+            except ValueError:
+                errors.append(f"executable playbook {playbook_id} governance_id must be a UUID")
+            if not isinstance(playbook.get("version"), int) or int(playbook.get("version") or 0) < 1:
+                errors.append(f"executable playbook {playbook_id} version must be a positive integer")
+            if str(playbook.get("status") or "").strip().lower() != "approved":
+                errors.append(f"executable playbook {playbook_id} must have status=approved")
+            if str(playbook.get("risk_class") or "").strip().lower() != str(playbook.get("risk_tier") or "").strip().lower():
+                errors.append(f"executable playbook {playbook_id} risk_class must match risk_tier")
+            if str(playbook.get("checksum_sha256") or "") != playbook_checksum(playbook):
+                errors.append(f"executable playbook {playbook_id} checksum is stale or invalid")
+            try:
+                approved_at = datetime.fromisoformat(str(playbook.get("approved_at") or "").replace("Z", "+00:00"))
+                expires_at = datetime.fromisoformat(str(playbook.get("approval_expires_at") or "").replace("Z", "+00:00"))
+                if approved_at >= expires_at:
+                    errors.append(f"executable playbook {playbook_id} approval expiry must follow approval date")
+                if expires_at <= datetime.now(timezone.utc):
+                    errors.append(f"executable playbook {playbook_id} approval has expired")
+            except ValueError:
+                errors.append(f"executable playbook {playbook_id} approval dates must be ISO-8601 timestamps")
         if playbook_id != "generic-kaiops-triage-playbook" and "diagnostic" not in step_types:
             errors.append(f"playbook {playbook_id} missing diagnostic step")
         if "validation" not in step_types:
             errors.append(f"playbook {playbook_id} missing validation step")
         match = playbook.get("match") if isinstance(playbook.get("match"), dict) else {}
         matched_services = [str(item).strip().lower() for item in match.get("services", []) if str(item).strip()]
+        execution_service = str(playbook.get("execution_service") or "").strip().lower()
         playbook_operations: set[str] = set()
         for step in steps:
             if not isinstance(step, dict):
@@ -87,7 +145,8 @@ def main() -> int:
                 operation = str(command.get("operation") or "").strip()
                 if operation:
                     playbook_operations.add(operation)
-        for service in matched_services:
+        connector_services = [execution_service] if execution_service else matched_services
+        for service in connector_services:
             connector = connector_catalog.get(service) or connector_catalog.get(connectors.get("default_connector"))
             if not isinstance(connector, dict):
                 errors.append(f"playbook {playbook_id} service {service} has no connector or default connector")

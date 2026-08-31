@@ -1,0 +1,39 @@
+/* The incident-store response supplies each segment count and its severity in
+   the title attribute. These explicit fills prevent populated bars from being
+   rendered as transparent inline elements. */
+.ro-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--muted);
+  font-size: .62rem;
+}
+
+.ro-legend i {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  border-radius: 3px;
+}
+
+.ro-bar {
+  border-radius: 7px 7px 2px 2px;
+  background: #e8eef4;
+  box-shadow: 0 3px 9px rgba(18, 54, 84, .18);
+  transition: height .3s ease;
+}
+
+.ro-bar i {
+  display: block;
+  min-height: 3px;
+}
+
+.ro-bar i[title^="Sev 1:"], .ro-legend .sev1 { background: #d92d4b; }
+.ro-bar i[title^="Sev 2:"], .ro-legend .sev2 { background: #f07b32; }
+.ro-bar i[title^="Sev 3:"], .ro-legend .sev3 { background: #e9b72f; }
+.ro-bar i[title^="Sev 4:"], .ro-legend .sev4 { background: #2586d8; }
+
+:root[data-ui-theme="dark"] .ro-bar {
+  background: #263b50;
+  box-shadow: 0 3px 10px rgba(0, 0, 0, .3);
+}

@@ -18,6 +18,7 @@ class UserRead(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: int
+    tenant_id: str = "default"
     username: str
     email: EmailStr
     first_name: str
@@ -36,6 +37,7 @@ class UserRead(BaseModel):
 class UserCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    tenant_id: str = Field(default="default", max_length=128)
     username: str = Field(min_length=3, max_length=64)
     email: EmailStr
     password: str = Field(min_length=12, max_length=255)

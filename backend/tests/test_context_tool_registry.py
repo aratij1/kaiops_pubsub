@@ -23,6 +23,7 @@ async def test_context_agent_connector_tool_executes_with_permissions() -> None:
         service="payments",
         severity=AlertSeverity.CRITICAL,
         description="payment latency after deployment",
+        metadata={"observed_values": {"latency_p95_ms": 420}},
     )
     incident = Incident(service="payments", severity=AlertSeverity.CRITICAL, title="payments latency")
 
@@ -36,7 +37,8 @@ async def test_context_agent_connector_tool_executes_with_permissions() -> None:
     )
 
     assert isinstance(result, dict)
-    assert "latency_p95_ms" in result
+    assert result["latency_p95_ms"] == 420
+    assert result["provenance"] == {"source": "alert-payload", "grounded": True}
 
 
 @pytest.mark.asyncio

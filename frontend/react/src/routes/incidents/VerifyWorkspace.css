@@ -1,0 +1,26 @@
+.verify-workspace { display: grid; gap: 16px; padding: 16px; border: 1px solid var(--line); border-radius: 14px; background: color-mix(in srgb, var(--card) 97%, var(--accent) 3%); }
+.verify-workspace__header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.verify-workspace__header h3 { margin: 3px 0 4px; }
+.verify-workspace__header p { margin: 0; color: var(--muted); font-size: 12px; }
+.verify-workspace__score { display: grid; min-width: 76px; padding: 10px; border: 1px solid var(--line); border-radius: 10px; text-align: center; }
+.verify-workspace__score strong { font-size: 20px; }
+.verify-workspace__score span, .verify-checkpoint__state, .verify-summary-grid span { color: var(--muted); font-size: 9px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; }
+.verify-checkpoints { display: grid; grid-template-columns: repeat(9, minmax(100px, 1fr)); margin: 0; padding: 0; overflow-x: auto; list-style: none; }
+.verify-checkpoint { position: relative; display: grid; grid-template-columns: 26px minmax(0, 1fr); gap: 7px; min-height: 126px; padding: 8px 12px 8px 4px; }
+.verify-checkpoint:not(:last-child)::after { content: ""; position: absolute; top: 21px; right: -4px; width: 12px; height: 2px; background: var(--line); }
+.verify-checkpoint__index { display: grid; width: 26px; height: 26px; place-items: center; border: 2px solid var(--line); border-radius: 50%; background: var(--card); font-size: 10px; font-weight: 900; }
+.verify-checkpoint > div { display: grid; align-content: start; gap: 3px; min-width: 0; }
+.verify-checkpoint strong { font-size: 11px; }
+.verify-checkpoint p, .verify-checkpoint small { margin: 0; color: var(--muted); font-size: 9px; line-height: 1.45; overflow-wrap: anywhere; }
+.verify-checkpoint.is-recorded .verify-checkpoint__index { color: white; border-color: var(--ok); background: var(--ok); }
+.verify-checkpoint.is-recorded .verify-checkpoint__state { color: var(--ok); }
+.verify-checkpoint.is-pending .verify-checkpoint__index { border-color: var(--warning); }
+.verify-checkpoint.is-pending .verify-checkpoint__state { color: #8a6500; }
+.verify-checkpoint.is-missing { opacity: .72; }
+.verify-summary-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.verify-summary-grid article { display: grid; gap: 5px; min-width: 0; padding: 12px; border: 1px solid var(--line); border-left: 4px solid #3b7197; border-radius: 9px; background: var(--card); }
+.verify-summary-grid article.is-stable { border-left-color: var(--ok); }
+.verify-summary-grid article.is-attention { border-left-color: var(--danger); }
+.verify-summary-grid strong { overflow-wrap: anywhere; font-size: 12px; text-transform: capitalize; }
+.verify-summary-grid p { margin: 0; color: var(--muted); font-size: 10px; line-height: 1.45; }
+@media (max-width: 900px) { .verify-checkpoints { grid-template-columns: 1fr; overflow: visible; } .verify-checkpoint { min-height: 74px; } .verify-checkpoint:not(:last-child)::after { top: auto; right: auto; bottom: -5px; left: 17px; width: 2px; height: 12px; } .verify-summary-grid { grid-template-columns: 1fr; } }

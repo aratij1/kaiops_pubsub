@@ -1,9 +1,9 @@
-import json
-
+﻿import json
 import pytest
+from uuid import uuid4
 from ai_workbench_common.models import Context
 from ai_workbench_common.memory_store import InMemoryStore
-from common.models import Alert, AlertSeverity, Incident
+from common.models import Alert, AlertSeverity, Incident, Recommendation
 from context_agent import ContextIntelligenceAgent
 from context_agent.connectors import DiscoveryMCPConnector, VectorDBConnector
 from model_router import ModelRouter
@@ -11,12 +11,65 @@ from model_router.router import ModelProvider, ModelResponse, build_usage
 from resolution_agent import ResolutionIntelligenceAgent
 
 
+@pytest.mark.asyncio
+async def test_resolution_runtime_accepts_explicit_zero_confidence_abstention() -> None:
+    recommendation = Recommendation(
+        root_cause="Insufficient evidence", confidence=0, impact="Unknown",
+        recommended_action="Collect evidence", severity=AlertSeverity.WARNING,
+        tenant_id="tenant-a", incident_id=uuid4(),
+        rationale="No linked evidence supports a hypothesis.",
+        metadata={"rca_status": "insufficient_evidence", "evidence_ids": []},
+    )
+    assert await ResolutionIntelligenceAgent().validate(recommendation) is True
+
+
 class StaticProvider(ModelProvider):
     async def generate(self, prompt: str, payload: dict) -> ModelResponse:
         self._ensure_available()
         self.breaker.record_success()
+        import json
+
+        # Build cited evidence list from payload
+        evidence_ids = []
+        summary = "incident"
+        deployment = "payments-api"
+
+        if isinstance(payload, dict):
+            summary = payload.get("summary", payload.get("service", "incident"))
+            alert_info = payload.get("alert", {})
+            if isinstance(alert_info, dict):
+                labels = alert_info.get("labels", {})
+                if isinstance(labels, dict) and labels.get("deployment"):
+                    deployment = str(labels["deployment"])
+
+            disc_evidence = payload.get("discovery_evidence", [])
+            if isinstance(disc_evidence, list):
+                for item in disc_evidence:
+                    if isinstance(item, dict) and item.get("evidence_id"):
+                        evidence_ids.append(str(item["evidence_id"]))
+
+            # Fallback/default if none found
+            if not evidence_ids and payload.get("alert", {}).get("labels", {}).get("source_event_id"):
+                source_id = payload["alert"]["labels"]["source_event_id"]
+                evidence_ids.append(f"alert:{source_id}")
+
+        content_obj = {
+            "root_cause": f"The alert reports degradation after deployment {deployment}; confirm the rollout diff and timing before treating it as causal.",
+            "confidence_score": 0.85,
+            "evidence_used": evidence_ids,
+            "alternative_causes": [],
+            "grounding_notes": "Grounding based on Deployment context.",
+            "impact_summary": f"Service impact for {summary}",
+            "customer_impact": "Payment latency",
+            "remediation_target": "payments",
+            "recommended_action": "Rollback deployment",
+            "commands": ["kubectl rollout undo deployment/payments-service -n prod"],
+            "validation_queries": [],
+            "rollback_plan": ""
+        }
+
         return ModelResponse(
-            content=f"{self.name}:{prompt}:{payload.get('summary', payload.get('service', 'incident'))}",
+            content=json.dumps(content_obj),
             usage=build_usage(
                 provider=self.name,
                 model=f"{self.name}-model",
@@ -83,6 +136,138 @@ def test_discovery_promotes_application_errors_into_report_findings() -> None:
     assert findings[0]["signals"] == ["timeout", "error"]
 
 
+def test_detected_errors_exclude_unrelated_global_log_signals() -> None:
+    alert = Alert(
+        source="email",
+        name="Payment API unavailable",
+        service="payment",
+        severity=AlertSeverity.CRITICAL,
+        description="Payment requests are failing.",
+        labels={"application": "robot-shop"},
+    )
+    incident = Incident(service="payment", severity=AlertSeverity.CRITICAL, title="payment unavailable")
+    rows = [
+        {
+            "evidence_id": "LOG-rabbitmq",
+            "source": "log",
+            "service": "rabbitmq",
+            "container": "kaiops-rabbitmq",
+            "snippet": "Queue depth critical; threshold exceeded.",
+            "diagnostic_signals": ["resource_exhaustion", "error"],
+            "matched_terms": ["critical"],
+        },
+        {
+            "evidence_id": "LOG-payment",
+            "source": "log",
+            "service": "payment",
+            "container": "robot-shop-payment",
+            "snippet": "Payment provider connection refused.",
+            "diagnostic_signals": ["connection_refused", "error"],
+            "matched_terms": ["payment"],
+        },
+    ]
+
+    findings = DiscoveryMCPConnector._detected_errors(rows, alert, incident)
+
+    assert [row["evidence_id"] for row in findings] == ["LOG-payment"]
+
+
+def test_discovery_routes_metric_alerts_without_unrelated_database_or_ticket_queries() -> None:
+    alert = Alert(
+        source="prometheus",
+        name="CheckoutLatencyHigh",
+        service="checkout",
+        severity=AlertSeverity.HIGH,
+        description="p95 latency is above the service objective",
+    )
+
+    selected, reasons = DiscoveryMCPConnector._plan_discovery_tools(alert)
+
+    assert selected == ["telemetry.search"]
+    assert reasons == ["metric_or_trace_signal"]
+
+
+def test_discovery_expands_route_for_change_database_and_recurring_signals() -> None:
+    alert = Alert(
+        source="logs",
+        name="MySQL regression after deployment",
+        service="orders-mysql",
+        severity=AlertSeverity.CRITICAL,
+        description="Repeated query timeout after release build 42",
+        deduplicated_count=3,
+    )
+
+    selected, reasons = DiscoveryMCPConnector._plan_discovery_tools(alert)
+
+    assert selected == [
+        "logs.search", "tickets.search", "code.search", "mysql.search",
+    ]
+    assert set(reasons) >= {
+        "log_signal", "failure_diagnostics", "change_correlation",
+        "database_diagnostics", "incident_history",
+    }
+
+
+def test_code_review_keeps_only_evidence_linked_unified_diff_patches() -> None:
+    evidence = [
+        {
+            "evidence_id": "CODE-settings",
+            "source": "code",
+            "uri": "code://app/settings.py#L30",
+            "snippet": "29: value = config.get('token')\n30: return value.strip()",
+        },
+        {"evidence_id": "LOG-error", "source": "log", "uri": "log://app.log#L1", "snippet": "token missing"},
+    ]
+    report = {
+        "code_review": {
+            "summary": "One source-grounded issue.",
+            "findings": [
+                {
+                    "title": "Missing null guard",
+                    "severity": "high",
+                    "explanation": "strip() can be called when token is absent.",
+                    "evidence_id": "CODE-settings",
+                    "patch": "--- a/app/settings.py\n+++ b/app/settings.py\n@@ -29,2 +29,2 @@\n-value = config.get('token')\n+value = config.get('token') or ''",
+                },
+                {
+                    "title": "Log-only guess",
+                    "evidence_id": "LOG-error",
+                    "patch": "--- a/unknown.py\n+++ b/unknown.py\n@@ -1 +1 @@\n-bad\n+good",
+                },
+            ],
+        }
+    }
+
+    review = DiscoveryMCPConnector._validated_code_review(report, evidence)
+
+    assert review["status"] == "completed"
+    assert review["reviewed_evidence_ids"] == ["CODE-settings"]
+    assert review["reviewed_sources"] == [
+        {
+            "evidence_id": "CODE-settings",
+            "source_uri": "code://app/settings.py#L30",
+            "snippet": "29: value = config.get('token')\n30: return value.strip()",
+        }
+    ]
+    assert len(review["findings"]) == 1
+    assert review["findings"][0]["source_uri"] == "code://app/settings.py#L30"
+    assert review["findings"][0]["patch"].startswith("--- a/app/settings.py")
+    assert review["proposed_changes"][0]["ready_to_apply"] is True
+    assert review["proposed_changes"][0]["source_uri"] == "code://app/settings.py#L30"
+
+
+def test_code_review_does_not_claim_findings_without_code_evidence() -> None:
+    review = DiscoveryMCPConnector._validated_code_review(
+        {"code_review": {"summary": "Invented", "findings": [{"evidence_id": "LOG-1"}]}},
+        [{"evidence_id": "LOG-1", "source": "log", "snippet": "error"}],
+    )
+
+    assert review["status"] == "not_performed"
+    assert review["findings"] == []
+    assert review["proposed_changes"] == []
+    assert review["insufficient_context"] is True
+
+
 def static_router() -> ModelRouter:
     return ModelRouter(
         providers={
@@ -109,8 +294,21 @@ def test_resolution_agent_extracts_values_from_fenced_json_with_introductory_tex
     assert parsed == "Collector endpoint is unreachable"
 
 
-def test_vector_db_connector_loads_rag_documents() -> None:
-    connector = VectorDBConnector()
+def test_resolution_agent_rejects_malformed_structured_output_as_display_text() -> None:
+    malformed = '{"observed_impact":{"mysql":{"row count high", "connection refused"}}}'
+
+    parsed = ResolutionIntelligenceAgent._extract_model_text(
+        malformed,
+        keys=("impact_summary", "service_impact", "severity_rationale"),
+        fallback_text="Impact is not established from validated evidence.",
+    )
+
+    assert parsed == "Impact is not established from validated evidence."
+
+
+def test_vector_db_connector_loads_rag_documents(governed_rag_root) -> None:
+    connector = VectorDBConnector(rag_root=governed_rag_root)
+    connector.reload()
 
     assert connector.documents
     assert any(doc["kind"] == "runbook" for doc in connector.documents)
@@ -118,9 +316,116 @@ def test_vector_db_connector_loads_rag_documents() -> None:
     assert any(doc["kind"] == "dependency" for doc in connector.documents)
 
 
+def test_context_rag_gate_rejects_weak_untagged_history() -> None:
+    connector = VectorDBConnector()
+
+    assert connector.context_match_relevant(
+        {"services": [], "match_confidence": 0.22, "_metadata_match_score": 0.09},
+        "checkout",
+    ) is False
+    assert connector.context_match_relevant(
+        {"services": ["checkout"], "match_confidence": 0.12, "_metadata_match_score": 0.0},
+        "checkout",
+    ) is True
+    assert connector.context_match_relevant(
+        {"services": ["payments"], "match_confidence": 0.95, "_metadata_match_score": 0.9},
+        "checkout",
+    ) is False
+
+
 @pytest.mark.asyncio
-async def test_context_agent_returns_requested_shape() -> None:
+async def test_resolution_does_not_treat_rag_history_as_current_observation() -> None:
     alert = Alert(
+        tenant_id="tenant-a",
+        source="prometheus",
+        name="CheckoutLatencyHigh",
+        service="checkout",
+        severity=AlertSeverity.HIGH,
+        description="checkout latency is elevated",
+    )
+    incident = Incident(service="checkout", severity=AlertSeverity.HIGH, title=alert.name)
+    context = Context(
+        tenant_id=alert.tenant_id,
+        incident_id=incident.id,
+        alert=alert,
+        metadata={
+            "context_evidence": {
+                "rag": [{
+                    "evidence_id": "RAG-HISTORY",
+                    "source": "rag",
+                    "uri": "rag://history/payments",
+                    "snippet": "Deployment 2.5 caused an older payments incident.",
+                    "epistemic_role": "historical_knowledge",
+                }]
+            }
+        },
+    )
+
+    state = await ResolutionIntelligenceAgent(model_router=static_router()).collect_context({"context": context})
+
+    assert all(row.get("evidence_id") != "RAG-HISTORY" for row in state["gathered_context"]["discovery_evidence"])
+    assert state["gathered_context"]["knowledge_evidence_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_resolution_builds_application_crawl_and_historical_hypotheses() -> None:
+    alert = Alert(
+        tenant_id="tenant-a",
+        source="prometheus",
+        name="CheckoutTimeouts",
+        service="checkout",
+        severity=AlertSeverity.HIGH,
+        description="checkout requests time out after release",
+    )
+    incident = Incident(service="checkout", severity=AlertSeverity.HIGH, title=alert.name)
+    context = Context(
+        tenant_id=alert.tenant_id,
+        incident_id=incident.id,
+        alert=alert,
+        related_incidents=[{
+            "id": "INC-OLD",
+            "title": "Earlier checkout timeout",
+            "root_cause": "Connection pool exhaustion after a configuration change",
+            "resolution": "Restore the prior pool limit",
+            "outcome": "succeeded",
+            "similarity": 0.82,
+        }],
+        recent_changes=[{"id": "CHG-9", "message": "checkout release deployed"}],
+        metadata={
+            "context_evidence": {
+                "logs": [{"evidence_id": "LOG-1", "source": "log", "service": "checkout", "snippet": "pool timeout"}],
+                "code": [{"evidence_id": "CODE-1", "source": "code", "service": "checkout", "snippet": "pool_size = 2"}],
+                "telemetry": [{"evidence_id": "METRIC-1", "source": "prometheus", "service": "checkout", "snippet": "timeouts=42"}],
+                "rag": [{"evidence_id": "RAG-1", "source": "rag", "service": "checkout", "snippet": "reviewed pool runbook"}],
+            },
+            "discovery_report": {
+                "report": {
+                    "hypotheses": [{"cause": "Connection pool exhaustion", "confidence": 0.78, "evidence_ids": ["LOG-1"]}],
+                    "code_review": {"findings": [{"title": "Small pool", "explanation": "Configured pool size is two", "evidence_id": "CODE-1"}]},
+                }
+            },
+        },
+    )
+    agent = ResolutionIntelligenceAgent(model_router=static_router())
+
+    state = await agent.collect_context({"context": context})
+    state = await agent.plan_investigation(state)
+    state = await agent.rank_hypotheses(state)
+
+    report = state["investigation_report"]
+    assert report["coverage"]["logs"] == 1
+    assert report["coverage"]["code"] == 1
+    assert report["coverage"]["telemetry"] >= 1
+    assert report["coverage"]["history"] >= 2
+    assert report["application_evidence_available"] is True
+    assert report["historical_evidence_available"] is True
+    assert any(item["source"] == "historical_incident" for item in state["hypothesis_analysis"]["ranked"])
+
+
+@pytest.mark.asyncio
+async def test_context_agent_returns_requested_shape(governed_rag_root) -> None:
+    alert = Alert(
+        tenant_id="tenant-a",
         source="prometheus",
         name="PaymentLatencyHigh",
         service="payments",
@@ -130,26 +435,36 @@ async def test_context_agent_returns_requested_shape() -> None:
     )
     incident = Incident(service="payments", severity=AlertSeverity.CRITICAL, title="payments latency")
 
-    context = await ContextIntelligenceAgent().collect(alert, incident)
+    connectors = ContextIntelligenceAgent().connectors
+    connectors[-1] = VectorDBConnector(rag_root=governed_rag_root)
+    agent = ContextIntelligenceAgent(connectors=connectors)
+    context = await agent.collect(alert, incident)
 
-    assert context.deployment == "Deployment 2.5"
+    assert context.deployment == "payments-api"
     assert context.runbook
-    assert set(context.dependency_services) >= {"checkout", "ledger", "fraud", "postgres-primary"}
-    assert context.recent_changes
+    assert context.cmdb.get("dependencies", []) == []
+    assert all(str(change.get("id")) != "CHG-1024" for change in context.recent_changes)
     assert context.metadata["rag_documents"] >= 1
     assert any(match["kind"] == "runbook" for match in context.metadata["rag_matches"])
-    assert context.metadata["rag_index"]["vector_store"]["provider"] == "file-backed-memory"
+    assert context.metadata["rag_index"]["vector_store"]["provider"] == "local-hybrid-vector-index"
     assert context.metadata["rag_index"]["embedding_model"]["model"] == "hashing-token-counter-v1"
-    assert context.metadata["context_graph"] == {
-        "enabled": True,
-        "stages": ["validate_event", "collect_connector_evidence", "assemble_context"],
-        "connector_count": 8,
-    }
+    graph = context.metadata["context_graph"]
+    assert graph["enabled"] is True
+    assert graph["stages"] == ["validate_event", "collect_connector_evidence", "assemble_context"]
+    assert graph["connector_count"] == 9
+    assert graph["available_connector_count"] == 9
+    assert graph["collection_plan"]["mode"] == "adaptive"
+    assert all(
+        connector["status"] not in {"failed", "timed_out"}
+        for connector in graph["connectors"].values()
+    )
+    assert graph["degraded"] is False
 
 
 @pytest.mark.asyncio
 async def test_context_agent_persists_multi_source_evidence_manifest() -> None:
     alert = Alert(
+        tenant_id="tenant-a",
         source="prometheus",
         name="TelemetryCollectorUnavailable",
         service="otel-collector",
@@ -161,16 +476,111 @@ async def test_context_agent_persists_multi_source_evidence_manifest() -> None:
 
     context = await ContextIntelligenceAgent().collect(alert, incident)
 
-    assert set(context.metadata["context_sources"]) >= {"logs", "tickets", "code", "rag"}
-    assert all(context.metadata["context_sources"][source]["attempted"] is True for source in ("logs", "tickets", "code", "rag"))
+    assert set(context.metadata["context_sources"]) >= {"logs", "tickets", "code", "telemetry", "database", "rag"}
+    assert all(context.metadata["context_sources"][source]["attempted"] is True for source in ("logs", "telemetry", "rag"))
+    assert all(context.metadata["context_sources"][source]["attempted"] is False for source in ("tickets", "code", "database"))
+    assert all(context.metadata["context_sources"][source]["status"] == "skipped" for source in ("tickets", "code", "database"))
     assert context.metadata["context_sources"]["rag"]["result_count"] == len(context.metadata["rag_matches"])
     assert set(context.metadata["context_evidence"]) >= {"logs", "tickets", "code", "rag"}
-    assert context.metadata["context_evidence"]["rag"]
+    assert all(
+        row.get("epistemic_role") == "historical_knowledge" and row.get("current_observation") is False
+        for row in context.metadata["context_evidence"]["rag"]
+    )
 
 
 @pytest.mark.asyncio
-async def test_resolution_agent_generates_recommendation() -> None:
+async def test_resolution_agent_generates_recommendation(governed_rag_root) -> None:
     alert = Alert(
+        tenant_id="tenant-a",
+        source="prometheus",
+        name="PaymentLatencyHigh",
+        service="payments",
+        severity=AlertSeverity.CRITICAL,
+        description="payment latency after deployment",
+        labels={"deployment": "payments-api"},
+    )
+    incident = Incident(service="payments", severity=AlertSeverity.CRITICAL, title="payments latency")
+    connectors = ContextIntelligenceAgent().connectors
+    connectors[-1] = VectorDBConnector(rag_root=governed_rag_root)
+    agent = ContextIntelligenceAgent(connectors=connectors)
+    context = await agent.collect(alert, incident)
+
+    recommendation = await ResolutionIntelligenceAgent(model_router=static_router()).resolve(context)
+
+    assert "deployment payments-api" in recommendation.root_cause
+    assert "confirm the rollout diff" in recommendation.root_cause
+    assert 0.5 <= recommendation.confidence < 0.9
+    assert "evidence" in recommendation.rationale.lower()
+    assert "latency for payments" in recommendation.impact
+    assert recommendation.recommended_action == "Rollback deployment"
+
+
+@pytest.mark.asyncio
+async def test_resolution_agent_blocks_high_confidence_when_discovery_is_degraded() -> None:
+    alert = Alert(
+        tenant_id="tenant-a",
+        source="prometheus",
+        name="PaymentLatencyHigh",
+        service="payments",
+        severity=AlertSeverity.CRITICAL,
+        description="payment latency after deployment",
+        labels={"deployment": "payments-api"},
+    )
+    incident = Incident(service="payments", severity=AlertSeverity.CRITICAL, title="payments latency")
+    context = await ContextIntelligenceAgent().collect(alert, incident)
+    context.metadata["context_quality"] = {
+        "quality_score": 0.92,
+        "discovery_degraded": True,
+        "execution_ready": False,
+    }
+
+    recommendation = await ResolutionIntelligenceAgent(model_router=static_router()).resolve(context)
+
+    rca = recommendation.metadata["rca_analysis"]
+    plan = recommendation.metadata["execution_plan"]
+    assert rca["confidence_score"] <= 0.49
+    assert rca["context_degraded"] is True
+    assert "discovery_evidence" in rca["missing_evidence"]
+    assert plan["execution_ready"] is False
+    assert any("Discovery evidence is degraded" in reason for reason in plan["readiness_blocks"])
+
+
+@pytest.mark.asyncio
+async def test_resolution_agent_propagates_readiness_and_blocks_mutation_when_rca_is_not_ready() -> None:
+    alert = Alert(
+        tenant_id="tenant-a", source="prometheus", name="PaymentLatencyHigh",
+        service="payments", severity=AlertSeverity.CRITICAL,
+        description="payment latency after deployment", labels={"deployment": "payments-api"},
+    )
+    incident = Incident(service="payments", severity=AlertSeverity.CRITICAL, title="payments latency")
+    context = await ContextIntelligenceAgent().collect(alert, incident)
+    context.metadata["context_quality"].update({
+        "source_coverage_score": 0.375,
+        "rca_readiness_score": 0.46,
+        "rca_ready": False,
+        "impact_readiness_score": 0.41,
+        "impact_ready": False,
+    })
+
+    recommendation = await ResolutionIntelligenceAgent(model_router=static_router()).resolve(context)
+
+    rca = recommendation.metadata["rca_analysis"]
+    impact = recommendation.metadata["impact_analysis"]
+    plan = recommendation.metadata["execution_plan"]
+    assert rca["context_readiness"] == {"score": 0.46, "ready": False, "source_coverage": 0.375}
+    assert impact["context_readiness"] == {"score": 0.41, "ready": False}
+    assert impact["confidence_score"] <= 0.49
+    assert plan["execution_ready"] is False
+    assert any("46% RCA-ready" in reason for reason in plan["readiness_blocks"])
+
+
+@pytest.mark.asyncio
+async def test_resolution_agent_uses_severity_heuristic_risk_when_model_omits_risk_level() -> None:
+    """Default (deterministic fast-path) behavior must be unchanged: the fix step never
+    returns a risk_level, so recommendation.risk keeps falling back to the severity-only
+    heuristic exactly as before this change."""
+    alert = Alert(
+        tenant_id="tenant-a",
         source="prometheus",
         name="PaymentLatencyHigh",
         service="payments",
@@ -183,15 +593,119 @@ async def test_resolution_agent_generates_recommendation() -> None:
 
     recommendation = await ResolutionIntelligenceAgent(model_router=static_router()).resolve(context)
 
-    assert recommendation.root_cause == "Deployment 2.5"
-    assert recommendation.confidence >= 0.9
-    assert recommendation.impact == "Payments latency"
-    assert recommendation.recommended_action == "Rollback deployment"
+    assert recommendation.risk == "high"
+
+
+@pytest.mark.asyncio
+async def test_resolution_agent_prefers_model_risk_level_over_severity_heuristic() -> None:
+    class RiskAwareGateway:
+        async def generate(self, request) -> dict:
+            if request.task == "fix":
+                content = {
+                    "recommended_action": "Restart the affected pod",
+                    "risk_level": "low",
+                    "validation_queries": ["kubectl rollout status deployment/checkout -n prod"],
+                    "rollback_plan": "kubectl rollout undo deployment/checkout -n prod",
+                    "confidence_score": 0.8,
+                }
+            else:
+                content = {"root_cause": "Pod crash loop", "confidence_score": 0.8, "evidence_used": []}
+            return {
+                "model": "test-model",
+                "content": json.dumps(content),
+                "usage": {"provider": "test", "model": "test-model", "task": request.task},
+            }
+
+    alert = Alert(
+        tenant_id="tenant-a",
+        source="prometheus",
+        name="PodCrashLoop",
+        service="checkout",
+        # CRITICAL severity would normally force risk="high" via the old heuristic --
+        # proves the model's risk_level ("low") genuinely overrides it, not just falls
+        # back to matching the same value by coincidence.
+        severity=AlertSeverity.CRITICAL,
+        description="pod crashloop",
+    )
+    incident = Incident(service="checkout", severity=AlertSeverity.CRITICAL, title="pod crash")
+    context = await ContextIntelligenceAgent().collect(alert, incident)
+
+    agent = ResolutionIntelligenceAgent(model_gateway=RiskAwareGateway())
+    agent.deep_analysis_enabled = True
+    recommendation = await agent.resolve(context)
+
+    assert recommendation.risk == "low"
+    assert 0.0 < recommendation.confidence < 0.5
+    assert recommendation.metadata["rca_status"] == "insufficient_evidence"
+    assert recommendation.metadata["execution_plan"]["execution_ready"] is False
+    assert await agent.validate(recommendation) is True
+
+
+@pytest.mark.asyncio
+async def test_resolution_agent_ignores_unrecognized_model_risk_level() -> None:
+    class BadRiskGateway:
+        async def generate(self, request) -> dict:
+            if request.task == "fix":
+                content = {"recommended_action": "Restart the affected pod", "risk_level": "not-a-real-risk-tier"}
+            else:
+                content = {"root_cause": "Pod crash loop", "confidence_score": 0.8, "evidence_used": []}
+            return {
+                "model": "test-model",
+                "content": json.dumps(content),
+                "usage": {"provider": "test", "model": "test-model", "task": request.task},
+            }
+
+    alert = Alert(
+        tenant_id="tenant-a",
+        source="prometheus", name="PodCrashLoop", service="checkout",
+        severity=AlertSeverity.CRITICAL, description="pod crashloop",
+    )
+    incident = Incident(service="checkout", severity=AlertSeverity.CRITICAL, title="pod crash")
+    context = await ContextIntelligenceAgent().collect(alert, incident)
+
+    agent = ResolutionIntelligenceAgent(model_gateway=BadRiskGateway())
+    agent.deep_analysis_enabled = True
+    recommendation = await agent.resolve(context)
+
+    assert recommendation.risk == "high"
+
+
+@pytest.mark.asyncio
+async def test_resolution_agent_adds_validation_and_rollback_without_changing_commands() -> None:
+    """Default (deterministic) fast path: validation_queries/rollback_plan must now be
+    populated, while `commands` -- which remediation-engine reads directly to execute --
+    must be byte-for-byte identical to before this change. Calls the heuristic directly
+    (rather than through the full resolve() pipeline) so the test isn't at the mercy of
+    what a mocked model echoes back as root_cause text."""
+    alert = Alert(
+        tenant_id="tenant-a",
+        source="prometheus",
+        name="PodCrashLoop",
+        service="checkout",
+        severity=AlertSeverity.HIGH,
+        description="pod crashloop detected",
+    )
+    incident = Incident(service="checkout", severity=AlertSeverity.HIGH, title="checkout pod crash loop")
+    context = await ContextIntelligenceAgent().collect(alert, incident)
+
+    agent = ResolutionIntelligenceAgent(model_router=static_router())
+    action, commands, target, validation_queries, rollback_plan = agent._infer_action_and_commands(
+        context, root_cause="pod crashloop detected", model_action=""
+    )
+
+    assert action == "Restart pod"
+    assert commands == ["kubectl rollout restart deployment/checkout -n prod"]
+    assert validation_queries == [
+        "kubectl rollout status deployment/checkout -n prod --timeout=180s",
+        "kubectl get pods -n prod | findstr checkout",
+    ]
+    assert "kubectl rollout undo deployment/checkout -n prod" in rollback_plan
 
 
 @pytest.mark.asyncio
 async def test_resolution_agent_clamps_all_model_fallback_confidence() -> None:
     alert = Alert(
+        tenant_id="tenant-a",
         source="prometheus",
         name="KaiOpsServiceDown",
         service="kaiops-platform",
@@ -213,6 +727,7 @@ async def test_resolution_agent_clamps_all_model_fallback_confidence() -> None:
 @pytest.mark.asyncio
 async def test_resolution_agent_grounds_mysql_exporter_privilege_rca_in_raw_alert() -> None:
     alert = Alert(
+        tenant_id="tenant-a",
         source="logs",
         name="[WARNING] mysql-exporter: Error from scraper",
         service="mysql-exporter",
@@ -229,6 +744,7 @@ async def test_resolution_agent_grounds_mysql_exporter_privilege_rca_in_raw_aler
     )
     incident = Incident(service="mysql-exporter", severity=AlertSeverity.HIGH, title="exporter scrape failure")
     context = Context(
+        tenant_id=alert.tenant_id,
         incident_id=incident.id,
         alert=alert,
         metadata={
@@ -257,6 +773,7 @@ async def test_resolution_agent_grounds_mysql_exporter_privilege_rca_in_raw_aler
 @pytest.mark.asyncio
 async def test_resolution_agent_runtime_persists_reflection_memory() -> None:
     alert = Alert(
+        tenant_id="tenant-a",
         source="prometheus",
         name="PaymentLatencyHigh",
         service="payments",

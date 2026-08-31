@@ -20,7 +20,7 @@ receivers:
   - name: kaiops-landing-pad
     webhook_configs:
       - url: http://monitoring-adapter:8000/alerts/alertmanager
-        send_resolved: false
+        send_resolved: true
   - name: kaiops-landing-pad-realtime
     webhook_configs:
       - url: http://monitoring-adapter:8000/alerts/alertmanager

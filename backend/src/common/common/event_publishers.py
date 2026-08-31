@@ -10,12 +10,13 @@ from uuid import uuid4
 from aiokafka import AIOKafkaProducer
 from pydantic import BaseModel
 
-from common.config import Settings
+from common.config import Settings, get_settings
 from common.logging import get_logger
 from common.models import AgentEventContractV1
 from common.rabbitmq import RabbitMQProducer
 from common.resilience import retry_async
 from common.servicebus import AzureServiceBusProducer
+from common.tenant_identity import require_tenant_id, sign_event_envelope
 
 logger = get_logger(__name__)
 
@@ -46,19 +47,23 @@ def build_event_envelope(
     ai: dict[str, Any] | None = None,
     idempotency: dict[str, Any] | None = None,
     schema_version: str = "1.0",
+    signing_key: str = "",
+    signing_issuer: str = "",
 ) -> dict[str, Any]:
     identity_map = identity if isinstance(identity, dict) else {}
     incident_id = str(identity_map.get("incident_id") or "").strip()
     if not incident_id:
         raise ValueError("identity.incident_id is required for event envelope")
 
+    scope_map = scope if isinstance(scope, dict) else {}
+    scope_map = {**scope_map, "tenant_id": require_tenant_id(scope_map.get("tenant_id"), source="event scope")}
     envelope: dict[str, Any] = {
         "event_id": str(uuid4()),
         "event_type": str(event_type or "incident.event"),
         "schema_version": schema_version,
         "produced_at": _iso_now(),
         "identity": identity_map,
-        "scope": scope if isinstance(scope, dict) else {},
+        "scope": scope_map,
         "state": state if isinstance(state, dict) else {},
         "policy": policy if isinstance(policy, dict) else {},
         "transport": transport if isinstance(transport, dict) else {},
@@ -78,6 +83,15 @@ def build_event_envelope(
 
     if not envelope["idempotency"].get("idempotency_key"):
         envelope["idempotency"]["idempotency_key"] = f"{envelope['event_type']}:{incident_id}"
+    runtime_settings = get_settings()
+    effective_key = signing_key or (
+        runtime_settings.event_envelope_signing_key if runtime_settings.event_envelope_signing_required else ""
+    )
+    effective_issuer = signing_issuer or runtime_settings.event_envelope_signing_issuer or runtime_settings.service_name
+    if runtime_settings.event_envelope_signing_required and not effective_key:
+        raise ValueError("event envelope signing is required but no key is configured")
+    if effective_key:
+        return sign_event_envelope(envelope, key=effective_key, issuer=effective_issuer)
     return envelope
 
 
@@ -142,7 +156,10 @@ def build_orchestration_envelope(
             "parent_event_id": None,
         },
         scope={
-            "tenant_id": "default",
+            "tenant_id": require_tenant_id(
+                getattr(incident, "tenant_id", None) or getattr(alert, "tenant_id", None),
+                source="incident workflow",
+            ),
             "service": service,
             "environment": environment,
             "region": None,
@@ -292,9 +309,7 @@ class RestPublisher(NoOpPublisher):
 
 
 def build_event_publisher(settings: Settings) -> EventPublisher:
-    provider = getattr(settings, "event_bus_provider", "kafka").strip().lower()
-    if not settings.kafka_enabled and provider == "kafka":
-        return NoOpPublisher(settings)
+    provider = selected_event_bus_provider(settings)
     if provider == "noop":
         return NoOpPublisher(settings)
     if provider == "rabbitmq":
@@ -303,4 +318,40 @@ def build_event_publisher(settings: Settings) -> EventPublisher:
         return AzureServiceBusPublisher(settings)
     if provider == "rest":
         return RestPublisher(settings)
-    return KafkaPublisher(settings)
+    if provider == "kafka":
+        return KafkaPublisher(settings)
+    raise ValueError(f"Unsupported EVENT_BUS_PROVIDER '{provider}'")
+
+
+def selected_event_bus_provider(settings: Settings) -> str:
+    aliases = {
+        "azure": "azure-service-bus",
+        "servicebus": "azure-service-bus",
+        "azure_service_bus": "azure-service-bus",
+    }
+    provider = aliases.get(str(getattr(settings, "event_bus_provider", "rabbitmq") or "").strip().lower(), str(getattr(settings, "event_bus_provider", "rabbitmq") or "").strip().lower())
+    if provider == "kafka" and not settings.kafka_enabled:
+        raise ValueError("EVENT_BUS_PROVIDER=kafka requires KAFKA_ENABLED=true")
+    if provider == "azure-service-bus" and (not settings.azure_service_bus_enabled or not str(settings.azure_service_bus_connection_string or "").strip()):
+        raise ValueError("Azure Service Bus requires AZURE_SERVICE_BUS_ENABLED=true and a connection string")
+    if provider not in {"rabbitmq", "kafka", "azure-service-bus", "noop", "rest"}:
+        raise ValueError(f"Unsupported EVENT_BUS_PROVIDER '{provider}'")
+    return provider
+
+
+def build_event_consumer(settings: Settings, topic: str) -> tuple[Any, Any, str]:
+    """Return one deployment-selected consumer and its loop; never switch mid-workflow."""
+    provider = selected_event_bus_provider(settings)
+    if provider == "rabbitmq":
+        from common.rabbitmq import RabbitMQConsumer, consume_forever
+
+        return RabbitMQConsumer(settings, topic), consume_forever, provider
+    if provider == "kafka":
+        from common.kafka import KafkaConsumer, consume_forever
+
+        return KafkaConsumer(settings, topic), consume_forever, provider
+    if provider == "azure-service-bus":
+        from common.servicebus import AzureServiceBusConsumer, consume_forever
+
+        return AzureServiceBusConsumer(settings, topic), consume_forever, provider
+    raise ValueError(f"Provider '{provider}' does not support consumers")

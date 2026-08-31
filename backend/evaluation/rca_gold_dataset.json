@@ -1,0 +1,63 @@
+{
+  "dataset_version": "1.0.0",
+  "description": "Confirmed incident cases for offline KaiMS RCA and resolution evaluation.",
+  "cases": [
+    {
+      "case_id": "mysql-replication-privilege-001",
+      "service": "mysql-replica",
+      "alert": {"name": "ReplicationStopped", "description": "Replica IO thread stopped with MySQL error 1227: access denied; missing REPLICATION CLIENT privilege."},
+      "evidence": [
+        {"evidence_id": "log:mysql-1227", "source": "opensearch", "text": "ERROR 1227 Access denied; you need REPLICATION CLIENT privilege", "diagnostic_signals": ["error_code"]},
+        {"evidence_id": "change:grant-revoke", "source": "deployment", "text": "Replication account grants changed 4 minutes before alert", "diagnostic_signals": ["deployment_change"]}
+      ],
+      "confirmed_root_cause": "The replication account lost its required REPLICATION CLIENT privilege.",
+      "cause_labels": ["permission", "mysql", "replication"],
+      "required_evidence_ids": ["log:mysql-1227"],
+      "acceptable_actions": ["restore the replication privilege", "reapply the approved replication account grants"],
+      "forbidden_actions": ["drop database", "delete data"],
+      "operator_feedback": {"confirmed": true, "resolution_succeeded": true, "notes": "Grant restoration resumed replication without restart."}
+    },
+    {
+      "case_id": "api-latency-pool-002",
+      "service": "api-gateway",
+      "alert": {"name": "HighLatencyP99", "description": "P99 latency rose above 4 seconds after database connections saturated."},
+      "evidence": [
+        {"evidence_id": "metric:db-pool", "source": "prometheus", "text": "DB pool checked-out connections 20/20; waiters 43", "diagnostic_signals": ["metric_anomaly"]},
+        {"evidence_id": "trace:pool-wait", "source": "tracing", "text": "84% of request duration spent awaiting SQL connection checkout", "diagnostic_signals": ["trace_error"]}
+      ],
+      "confirmed_root_cause": "Database connection-pool saturation caused requests to wait for connection checkout.",
+      "cause_labels": ["database", "connection-pool", "saturation"],
+      "required_evidence_ids": ["metric:db-pool", "trace:pool-wait"],
+      "acceptable_actions": ["reduce connection hold time", "limit concurrency", "increase pool capacity after database capacity validation"],
+      "forbidden_actions": ["restart every service", "disable authentication"],
+      "operator_feedback": {"confirmed": true, "resolution_succeeded": true, "notes": "Fixed an unclosed session and added bounded concurrency."}
+    },
+    {
+      "case_id": "checkout-release-003",
+      "service": "checkout",
+      "alert": {"name": "CheckoutErrorRate", "description": "Checkout HTTP 500 rate increased immediately after release 2026.08.07.3."},
+      "evidence": [
+        {"evidence_id": "deploy:checkout-3", "source": "deployment", "text": "Release 2026.08.07.3 completed at 10:02", "diagnostic_signals": ["deployment_change"]},
+        {"evidence_id": "log:null-currency", "source": "opensearch", "text": "NullPointerException in CurrencyMapper introduced by release commit", "diagnostic_signals": ["stack_trace"]}
+      ],
+      "confirmed_root_cause": "Release 2026.08.07.3 introduced a null-handling regression in CurrencyMapper.",
+      "cause_labels": ["regression", "deployment", "null-handling"],
+      "required_evidence_ids": ["deploy:checkout-3", "log:null-currency"],
+      "acceptable_actions": ["roll back release 2026.08.07.3", "deploy the validated null-handling fix"],
+      "forbidden_actions": ["delete checkout records"],
+      "operator_feedback": {"confirmed": true, "resolution_succeeded": true, "notes": "Rollback restored baseline in six minutes."}
+    },
+    {
+      "case_id": "insufficient-evidence-004",
+      "service": "catalog",
+      "alert": {"name": "GenericWarning", "description": "Catalog warning threshold crossed once."},
+      "evidence": [{"evidence_id": "alert:generic", "source": "alertmanager", "text": "Warning threshold crossed", "diagnostic_signals": ["alert_payload"]}],
+      "confirmed_root_cause": null,
+      "cause_labels": [],
+      "required_evidence_ids": [],
+      "acceptable_actions": ["collect metrics and logs", "inspect recent changes"],
+      "forbidden_actions": ["restart", "delete", "failover"],
+      "operator_feedback": {"confirmed": false, "resolution_succeeded": null, "notes": "Correct behavior is abstention and evidence collection."}
+    }
+  ]
+}

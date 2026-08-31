@@ -1,32 +1,54 @@
 from __future__ import annotations
 
 import asyncio
-from collections import deque
+import hashlib
 import json
 import logging
+from collections import deque
+from contextlib import suppress
+from datetime import UTC, datetime, timedelta
 from time import perf_counter
 from typing import Any
-from urllib.parse import urlencode
-from uuid import uuid4
+from urllib.parse import quote, unquote, urlencode, urlparse
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
+import aio_pika
 import httpx
 import pymysql
 from api_gateway import SafetyAnalyzer
-from api_gateway.auth_policy import route_auth_rule
-from api_gateway.modules.users.permissions import AuthContext
+from api_gateway.auth_policy import canonical_route_auth_rule
+from api_gateway.control_routes import build_control_router
+from api_gateway.modules.triage.router import TriageCorrectionCreate as TriageCorrectionCreate
+from api_gateway.modules.triage.router import router as triage_router
+from api_gateway.modules.users.models import SystemRole
+from api_gateway.modules.users.permissions import AuthContext, current_tenant_id, require_roles
 from api_gateway.modules.users.router import router as user_management_router
 from api_gateway.modules.users.service import UserService
+from common.authorization import OperationalRole, role_is_allowed
 from common.config import get_settings
-from common.database import AuditLogRecord
-from common.event_publishers import build_agent_event_contract
+from common.database import (
+    ActionRecord,
+    AlertRecord,
+    ApprovalRecord,
+    AuditLogRecord,
+    IncidentOccurrenceRecord,
+    IncidentProjectionRecord,
+    IncidentRecord,
+    MonitoringConnectionHealthRecord,
+)
+from common.event_publishers import build_agent_event_contract, build_orchestration_envelope
 from common.kafka import normalize_payload
-from common.models import GatewayAuditEvent, SafetyDecision
+from common.models import Alert, GatewayAuditEvent, Incident, SafetyDecision
+from common.repository import IncidentRepository
 from common.service import create_app
 from common.telemetry import REQUEST_LATENCY
-from fastapi import Body, Header, HTTPException, Request
-from fastapi.responses import JSONResponse
+from common.topics import ORCHESTRATION_EVENTS
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 from opentelemetry import trace
-from prometheus_client import Counter, Gauge
+from prometheus_client import REGISTRY, Counter, Gauge
+from pydantic import ValidationError
+from redis.asyncio import Redis
 from sqlalchemy import func, select
 
 REQUEST_BODY = Body(default={})
@@ -36,6 +58,7 @@ settings.service_name = "api-gateway"
 analyzer = SafetyAnalyzer()
 AUDIT_EVENTS: deque[GatewayAuditEvent] = deque(maxlen=200)
 logger = logging.getLogger("api-gateway")
+_GATEWAY_AUDIT_QUEUE_MAXSIZE = 1000
 
 
 def require_object_payload(payload: Any, label: str = "request body") -> dict[str, Any]:
@@ -80,40 +103,86 @@ async def _auth_context_from_request(request: Request) -> AuthContext:
     if user_service is None:
         raise HTTPException(status_code=500, detail="User service is not configured")
 
-    payload = user_service.decode_token(token.strip())
+    payload = await user_service.decode_access_token(token.strip())
     if str(payload.get("type") or "") != "access":
         raise HTTPException(status_code=401, detail="Access token required")
+    external = bool(payload.get("external"))
     session_jti = str(payload.get("sid") or "").strip()
-    if not session_jti:
+    if not external and not session_jti:
         raise HTTPException(status_code=401, detail="Access token is missing session binding")
-    user_id = int(payload.get("sub", "0"))
-    await user_service.ensure_active_session(session_jti=session_jti, user_id=user_id)
+    user_id: int | str = str(payload.get("sub")) if external else int(payload.get("sub", "0"))
+    if not external:
+        await user_service.ensure_active_session(session_jti=session_jti, user_id=int(user_id))
     return AuthContext(
         user_id=user_id,
         role=str(payload.get("role") or ""),
+        tenant_id=str(payload.get("tenant_id") or "default"),
         jwt_id=str(payload.get("jti") or ""),
         session_jti=session_jti,
         token_type="access",
+        external=external,
+        username=str(payload.get("preferred_username") or payload.get("upn") or payload.get("name") or payload.get("sub") or ""),
+        email=str(payload.get("email") or payload.get("preferred_username") or "unknown@kaiops.example.com"),
+        first_name=str(payload.get("given_name") or payload.get("name") or "External"),
+        last_name=str(payload.get("family_name") or "User"),
+        acr=str(payload.get("acr") or ""),
+        amr=tuple(str(item) for item in (payload.get("amr") or []) if item),
     )
 
 
 async def _persist_gateway_audit_event(app: FastAPI, event: GatewayAuditEvent) -> None:
+    """Persist observability data without breaking the proxied business request.
+
+    Gateway audit storage is secondary telemetry. A database outage or an open
+    database circuit must not replace a successful downstream response with a
+    gateway HTTP 500.
+    """
     session_factory = getattr(app.state, "session_factory", None)
     if not settings.database_enabled or session_factory is None:
         return
     payload = event.model_dump(mode="json")
-    async with session_factory() as session:
-        session.add(
-            AuditLogRecord(
-                id=event.id,
-                actor="api-gateway",
-                action="gateway.request",
-                resource_type="gateway",
-                resource_id=str(event.trace_id or event.id),
-                payload=payload,
+    try:
+        async with session_factory() as session:
+            session.add(
+                AuditLogRecord(
+                    id=event.id,
+                    actor="api-gateway",
+                    action="gateway.request",
+                    resource_type="gateway",
+                    resource_id=str(event.trace_id or event.id),
+                    payload=payload,
+                )
             )
+            await session.commit()
+    except Exception as exc:
+        logger.warning(
+            "gateway_audit_persistence_skipped",
+            extra={"trace_id": event.trace_id, "error_type": type(exc).__name__},
         )
-        await session.commit()
+
+
+def _queue_gateway_audit_event(app: FastAPI, event: GatewayAuditEvent) -> None:
+    """Queue secondary telemetry without extending business-request latency."""
+    queue = getattr(app.state, "gateway_audit_queue", None)
+    if queue is None:
+        logger.warning("gateway_audit_queue_unavailable", extra={"trace_id": event.trace_id})
+        return
+    try:
+        queue.put_nowait(event)
+    except asyncio.QueueFull:
+        # The in-memory deque still exposes the most recent diagnostics. A
+        # bounded queue prevents a database outage from becoming a memory leak.
+        logger.warning("gateway_audit_queue_full", extra={"trace_id": event.trace_id})
+
+
+async def _gateway_audit_worker(app: FastAPI) -> None:
+    queue = app.state.gateway_audit_queue
+    while True:
+        event = await queue.get()
+        try:
+            await _persist_gateway_audit_event(app, event)
+        finally:
+            queue.task_done()
 
 
 def _gateway_event_from_audit_payload(payload: dict[str, Any]) -> GatewayAuditEvent | None:
@@ -202,7 +271,18 @@ def _query_alerts_table_row_count() -> float:
             autocommit=True,
         )
         with connection.cursor() as cursor:
-            cursor.execute("SELECT COUNT(*) FROM alerts")
+            # This is an operational capacity gauge, not a billing count. An
+            # exact COUNT(*) repeatedly scans a growing InnoDB table and was a
+            # measurable source of database CPU. information_schema provides
+            # the inexpensive estimate appropriate for this metric.
+            cursor.execute(
+                """
+                SELECT COALESCE(TABLE_ROWS, 0)
+                FROM information_schema.TABLES
+                WHERE TABLE_SCHEMA = %s AND TABLE_NAME = 'alerts'
+                """,
+                (settings.db_database,),
+            )
             row = cursor.fetchone()
             return float((row or [0])[0] or 0)
     except Exception as exc:
@@ -216,6 +296,14 @@ def _query_alerts_table_row_count() -> float:
                 pass
 
 
+async def _sample_alerts_table_row_count() -> None:
+    """Update the gauge off the event loop; Prometheus scrapes stay read-only and fast."""
+    while True:
+        count = await asyncio.to_thread(_query_alerts_table_row_count)
+        ALERTS_TABLE_ROWS.labels(settings.db_database, "alerts").set(count)
+        await asyncio.sleep(max(30.0, settings.alerts_table_metric_interval_seconds))
+
+
 async def startup(app: FastAPI) -> None:
     app.state.proxy_client = httpx.AsyncClient(
         timeout=httpx.Timeout(settings.gateway_request_timeout_seconds, connect=5.0, pool=5.0),
@@ -227,17 +315,41 @@ async def startup(app: FastAPI) -> None:
     else:
         app.state.user_service = UserService(settings=settings, session_factory=None)
 
-    ALERTS_TABLE_ROWS.labels(settings.db_database, "alerts").set_function(_query_alerts_table_row_count)
+    app.state.gateway_audit_queue = asyncio.Queue(maxsize=_GATEWAY_AUDIT_QUEUE_MAXSIZE)
+    app.state.gateway_audit_task = asyncio.create_task(
+        _gateway_audit_worker(app),
+        name="api-gateway-audit-writer",
+    )
+    app.state.alerts_table_metric_task = asyncio.create_task(_sample_alerts_table_row_count())
 
 
 async def shutdown(app: FastAPI) -> None:
+    metric_task = getattr(app.state, "alerts_table_metric_task", None)
+    if metric_task is not None:
+        metric_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await metric_task
     client = getattr(app.state, "proxy_client", None)
     if client is not None:
         await client.aclose()
+    audit_queue = getattr(app.state, "gateway_audit_queue", None)
+    if audit_queue is not None:
+        try:
+            await asyncio.wait_for(audit_queue.join(), timeout=2.0)
+        except TimeoutError:
+            logger.warning("gateway_audit_shutdown_drain_timed_out", extra={"pending": audit_queue.qsize()})
+    audit_task = getattr(app.state, "gateway_audit_task", None)
+    if audit_task is not None:
+        audit_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await audit_task
 
 
 app = create_app(title="KaiMS API Gateway", settings=settings, startup=startup, shutdown=shutdown)
+
+
 app.include_router(user_management_router)
+app.include_router(triage_router)
 
 
 @app.middleware("http")
@@ -245,7 +357,7 @@ async def enforce_operational_auth(request: Request, call_next):
     if settings.environment.strip().lower() in {"local", "demo", "test"}:
         return await call_next(request)
 
-    role_rule = route_auth_rule(request.method, request.url.path)
+    role_rule = canonical_route_auth_rule(request.method, request.url.path)
     if role_rule is False:
         return await call_next(request)
 
@@ -253,22 +365,38 @@ async def enforce_operational_auth(request: Request, call_next):
         auth = await _auth_context_from_request(request)
     except HTTPException as exc:
         return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
-    if role_rule is not None and auth.role not in role_rule:
+    if role_rule is not None and not role_is_allowed(auth.role, role_rule):
         return JSONResponse(status_code=403, content={"detail": "Insufficient role permissions"})
+    if settings.auth_mode == "oidc" and request.method == "POST" and request.url.path in {"/approval/approve", "/approval/modify", "/remediation/execute"}:
+        accepted = {item.strip().lower() for item in settings.oidc_step_up_values.split(",") if item.strip()}
+        observed = {auth.acr.lower(), *(item.lower() for item in auth.amr)}
+        if not accepted.intersection(observed):
+            return JSONResponse(status_code=403, content={"detail": "Step-up authentication is required for this sensitive action"})
     request.state.auth = auth
     return await call_next(request)
 
-GATEWAY_REQUESTS = Counter(
+def _registered_metric(metric_type, name: str, documentation: str, labelnames: list[str] | None = None):
+    """Return an existing process metric when test/module reloads import this app again."""
+    lookup_name = name.removesuffix("_total") if metric_type is Counter else name
+    existing = REGISTRY._names_to_collectors.get(lookup_name)
+    if existing is not None:
+        return existing
+    return metric_type(name, documentation, labelnames or [])
+
+
+GATEWAY_REQUESTS = _registered_metric(Counter,
     "kaiops_gateway_requests_total",
     "API gateway requests by path and safety decision",
     ["path", "decision", "status"],
 )
-GATEWAY_SAFETY_BLOCKS = Counter(
+GATEWAY_SAFETY_BLOCKS = _registered_metric(Counter,
     "kaiops_gateway_safety_blocks_total",
     "API gateway blocked requests by category",
     ["category"],
 )
-ALERTS_TABLE_ROWS = Gauge(
+SSE_CONNECTIONS = _registered_metric(Gauge, "kaiops_sse_connections", "Active authenticated operational SSE connections", ["role"])
+SSE_EVENTS = _registered_metric(Counter, "kaiops_sse_events_total", "Operational SSE events emitted", ["event_type"])
+ALERTS_TABLE_ROWS = _registered_metric(Gauge,
     "kaiops_mysql_alerts_table_rows",
     "Current number of records in MySQL alerts table",
     ["database", "table"],
@@ -279,7 +407,87 @@ def trace_id_from_header(value: str | None) -> str:
     return value or uuid4().hex
 
 
+def _sse_message(event_id: str, event_type: str, payload: dict[str, Any]) -> str:
+    return f"id: {event_id}\nevent: {event_type}\ndata: {json.dumps(payload, default=str, separators=(',', ':'))}\n\n"
+
+
+@app.get("/events/operations")
+async def stream_operational_events(request: Request) -> StreamingResponse:
+    """Emit tenant-scoped change notifications; clients fetch canonical rows through Query caches."""
+    auth = getattr(request.state, "auth", None)
+    tenant_id = auth.tenant_id if auth is not None else "default"
+    role = auth.role if auth is not None else "local-development"
+    last_event_id = str(request.headers.get("last-event-id") or request.query_params.get("last_event_id") or "").strip()
+    try:
+        cursor_ms = int(last_event_id.split("-", 1)[0])
+        cursor = datetime.fromtimestamp(cursor_ms / 1000, UTC)
+    except (TypeError, ValueError, OSError):
+        cursor = datetime.now(UTC) - timedelta(seconds=5)
+
+    async def events():
+        nonlocal cursor
+        SSE_CONNECTIONS.labels(role).inc()
+        sequence = 0
+        try:
+            yield "retry: 2000\n\n"
+            while not await request.is_disconnected():
+                messages: list[str] = []
+                session_factory = getattr(app.state, "session_factory", None)
+                if settings.database_enabled and session_factory is not None:
+                    async with session_factory() as session:
+                        queries = (
+                            ("alert.created", AlertRecord, AlertRecord.id, None),
+                            ("incident.status", IncidentProjectionRecord, IncidentProjectionRecord.incident_id, IncidentProjectionRecord.status),
+                            ("approval.state", ApprovalRecord, ApprovalRecord.id, ApprovalRecord.decision),
+                            ("remediation.progress", ActionRecord, ActionRecord.id, ActionRecord.status),
+                        )
+                        newest = cursor
+                        for event_type, model, identity, state in queries:
+                            stmt = select(model).where(model.tenant_id == tenant_id, model.updated_at > cursor).order_by(model.updated_at.asc()).limit(100)
+                            for row in (await session.execute(stmt)).scalars().all():
+                                updated_at = row.updated_at.replace(tzinfo=UTC) if row.updated_at.tzinfo is None else row.updated_at
+                                newest = max(newest, updated_at)
+                                sequence += 1
+                                event_id = f"{int(updated_at.timestamp() * 1000)}-{sequence}"
+                                payload = {"entity_id": str(getattr(row, identity.key)), "changed_at": updated_at.isoformat(), "tenant_id": tenant_id}
+                                if state is not None:
+                                    payload["state"] = str(getattr(row, state.key))
+                                messages.append(_sse_message(event_id, event_type, payload))
+                                SSE_EVENTS.labels(event_type).inc()
+                        if role == "Administrator":
+                            stmt = select(MonitoringConnectionHealthRecord).where(MonitoringConnectionHealthRecord.updated_at > cursor).order_by(MonitoringConnectionHealthRecord.updated_at.asc()).limit(100)
+                            for row in (await session.execute(stmt)).scalars().all():
+                                updated_at = row.updated_at.replace(tzinfo=UTC) if row.updated_at.tzinfo is None else row.updated_at
+                                newest = max(newest, updated_at)
+                                sequence += 1
+                                event_id = f"{int(updated_at.timestamp() * 1000)}-{sequence}"
+                                messages.append(_sse_message(event_id, "connector.health", {"entity_id": str(row.integration_id), "provider": row.provider, "state": row.status, "changed_at": updated_at.isoformat()}))
+                                SSE_EVENTS.labels("connector.health").inc()
+                        cursor = newest
+                # Never yield while a session/connection is checked out. Slow
+                # or disconnected browsers must not strand pooled DB handles.
+                if messages:
+                    for message in messages:
+                        yield message
+                else:
+                    sequence += 1
+                    now = datetime.now(UTC)
+                    yield _sse_message(f"{int(now.timestamp() * 1000)}-{sequence}", "heartbeat", {"at": now.isoformat(), "queue_health": "polling-fallback"})
+                await asyncio.sleep(5)
+        finally:
+            SSE_CONNECTIONS.labels(role).dec()
+
+    return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache, no-transform", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
+
+
 def preview(payload: Any) -> dict[str, Any]:
+    # Collection responses can contain hundreds of nested alert/evidence
+    # payloads. Audit their shape and count without deep-normalizing the entire
+    # response on the request path; canonical details remain in the source DB.
+    if isinstance(payload, dict) and isinstance(payload.get("rows"), list):
+        return {"rows_count": len(payload["rows"]), "count": payload.get("count")}
+    if isinstance(payload, dict) and isinstance(payload.get("data"), dict) and isinstance(payload["data"].get("rows"), list):
+        return {"rows_count": len(payload["data"]["rows"]), "count": payload["data"].get("count")}
     normalized = normalize_payload(payload)
     if not isinstance(normalized, dict):
         return {"value": str(normalized)[:500]}
@@ -455,10 +663,10 @@ def _enterprise_contract(canonical: dict[str, Any], trace_id: str) -> dict[str, 
             "environment": canonical.get("environment") or "prod",
             "risk_tier": risk_tier,
             "action_roles": {
-                "view": ["Administrator", "L3 Engineer", "L2 Engineer", "L1 Operator", "Executive"],
-                "provide_documents": ["Administrator", "L3 Engineer", "L2 Engineer"],
-                "approve": ["Administrator", "L3 Engineer"],
-                "execute_remediation": ["Administrator", "L3 Engineer"],
+                "view": ["ADMIN", "HITL_APPROVER"],
+                "provide_documents": ["ADMIN"],
+                "approve": ["ADMIN", "HITL_APPROVER"],
+                "execute_remediation": ["ADMIN", "HITL_APPROVER"],
             },
         },
         "observability": {
@@ -531,9 +739,12 @@ async def proxy(
     payload: Any,
     trace_id: str,
     params: dict[str, str] | None = None,
+    timeout_seconds: float | None = None,
 ) -> tuple[int, dict[str, Any]]:
     target_url = f"{target_base.rstrip('/')}/{path.lstrip('/')}"
     headers = {"x-trace-id": trace_id}
+    if settings.service_internal_token:
+        headers["x-kaiops-internal-token"] = settings.service_internal_token
     client = getattr(app.state, "proxy_client", None)
     if client is None:
         raise httpx.ConnectError("API gateway proxy client is not initialized")
@@ -547,9 +758,21 @@ async def proxy(
         "/landing-pad/recent",
         "/onboarding/state",
     }
-    request_timeout = 12.0 if is_fast_read else settings.gateway_request_timeout_seconds
+    if timeout_seconds is not None:
+        request_timeout = max(0.5, float(timeout_seconds))
+    elif normalized_method == "GET" and path.split("?", 1)[0] == "/landing-pad/recent":
+        # Landing-pad scans may include archive + in-memory merge work and can
+        # exceed the generic fast-read budget under active ingestion.
+        request_timeout = max(45.0, float(settings.gateway_request_timeout_seconds))
+    else:
+        request_timeout = 12.0 if is_fast_read else settings.gateway_request_timeout_seconds
     timeout = httpx.Timeout(request_timeout, connect=5.0, pool=5.0)
-    max_attempts = 2 if normalized_method in {"GET", "HEAD", "OPTIONS"} else 1
+    # A ConnectError/ConnectTimeout occurs while establishing the downstream
+    # connection, before an HTTP response exists. Retrying it once is safe for
+    # state-changing requests too and absorbs brief Docker DNS/service-start
+    # races. Read/pool timeouts and HTTP responses are deliberately not retried
+    # because the downstream may already have applied those requests.
+    max_attempts = 2
 
     for attempt in range(1, max_attempts + 1):
         try:
@@ -586,6 +809,7 @@ async def guarded_proxy(
     payload: Any,
     trace_id: str,
     params: dict[str, str] | None = None,
+    timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
     start = perf_counter()
     safety = analyzer.analyze({"path": path, "payload": payload})
@@ -613,7 +837,7 @@ async def guarded_proxy(
                 request_preview=preview(payload),
             )
             AUDIT_EVENTS.appendleft(event)
-            await _persist_gateway_audit_event(app, event)
+            _queue_gateway_audit_event(app, event)
             GATEWAY_REQUESTS.labels(path, safety.decision.value, "blocked").inc()
             REQUEST_LATENCY.labels(settings.service_name, path).observe(latency_ms / 1000)
             raise HTTPException(
@@ -633,6 +857,7 @@ async def guarded_proxy(
                 payload=payload,
                 trace_id=trace_id,
                 params=params,
+                timeout_seconds=timeout_seconds,
             )
             status = "ok"
         except httpx.HTTPStatusError as exc:
@@ -683,11 +908,22 @@ async def guarded_proxy(
             response_preview=preview(response_payload),
         )
         AUDIT_EVENTS.appendleft(event)
-        await _persist_gateway_audit_event(app, event)
+        _queue_gateway_audit_event(app, event)
         GATEWAY_REQUESTS.labels(path, safety.decision.value, status).inc()
         REQUEST_LATENCY.labels(settings.service_name, path).observe(latency_ms / 1000)
 
         if status_code >= 400:
+            downstream = response_payload.get("downstream") if isinstance(response_payload, dict) else None
+            downstream = downstream if isinstance(downstream, dict) else {}
+            downstream_detail = downstream.get("detail") if isinstance(downstream.get("detail"), dict) else {}
+            if downstream_detail.get("retryable") is True:
+                wrapped.update(
+                    {
+                        "retryable": True,
+                        "code": str(downstream_detail.get("code") or f"http_{status_code}"),
+                        "message": str(downstream_detail.get("message") or "The downstream request can be retried."),
+                    }
+                )
             raise HTTPException(status_code=status_code, detail=wrapped)
         return wrapped
 
@@ -703,6 +939,24 @@ async def ingest_alert(
         method="POST",
         path="/alerts",
         target_base=settings.monitoring_adapter_url,
+        payload=payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/evaluations/by-recommendation/{recommendation_id}/feedback")
+async def submit_evaluation_feedback(
+    recommendation_id: str,
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Expose the existing evaluation feedback loop through the authenticated gateway."""
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path=f"/evaluations/by-recommendation/{recommendation_id}/feedback",
+        target_base=settings.evaluation_service_url,
         payload=payload,
         trace_id=trace_id_from_header(x_trace_id),
     )
@@ -761,6 +1015,7 @@ async def update_application(
     request: Request,
     payload: dict[str, Any] = REQUEST_BODY,
     x_trace_id: str | None = Header(default=None),
+    _: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),  # noqa: B008
 ) -> dict[str, Any]:
     return await guarded_proxy(
         request=request,
@@ -777,6 +1032,7 @@ async def delete_application(
     application_id: str,
     request: Request,
     x_trace_id: str | None = Header(default=None),
+    _: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
 ) -> dict[str, Any]:
     return await guarded_proxy(
         request=request,
@@ -861,8 +1117,9 @@ async def get_recent_alerts(
     request: Request,
     limit: int = 50,
     x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
 ) -> dict[str, Any]:
-    path = f"/alerts/recent?{urlencode({'limit': str(limit)})}"
+    path = f"/alerts/recent?{urlencode({'limit': str(limit), 'tenant_id': tenant_id})}"
     return await guarded_proxy(
         request=request,
         method="GET",
@@ -873,13 +1130,101 @@ async def get_recent_alerts(
     )
 
 
+@app.post("/evaluations")
+async def create_evaluation_record(
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    return await guarded_proxy(request=request, method="POST", path="/evaluations", target_base=settings.evaluation_service_url, payload={**payload, "tenant_id": tenant_id}, trace_id=trace_id_from_header(x_trace_id))
+
+
+@app.get("/evaluations")
+async def list_evaluation_records(
+    request: Request,
+    incident_id: str | None = None,
+    agent: str | None = None,
+    limit: int = 100,
+    x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    query = urlencode({key: value for key, value in {"incident_id": incident_id, "agent": agent, "limit": limit, "tenant_id": tenant_id}.items() if value is not None})
+    return await guarded_proxy(request=request, method="GET", path=f"/evaluations?{query}", target_base=settings.evaluation_service_url, payload={}, trace_id=trace_id_from_header(x_trace_id))
+
+
+@app.get("/evaluations/{evaluation_id}")
+async def get_evaluation_record(
+    evaluation_id: str,
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    query = urlencode({"tenant_id": tenant_id})
+    return await guarded_proxy(request=request, method="GET", path=f"/evaluations/{evaluation_id}?{query}", target_base=settings.evaluation_service_url, payload={}, trace_id=trace_id_from_header(x_trace_id))
+
+
+@app.post("/evaluations/autonomy/assess")
+async def assess_autonomy_evidence(
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    return await guarded_proxy(request=request, method="POST", path="/evaluations/autonomy/assess", target_base=settings.evaluation_service_url, payload={**payload, "tenant_id": tenant_id}, trace_id=trace_id_from_header(x_trace_id))
+
+
+@app.post("/evaluations/retention/sweep")
+async def sweep_expired_evaluation_records(
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path="/evaluations/retention/sweep",
+        target_base=settings.evaluation_service_url,
+        payload={**payload, "tenant_id": auth.tenant_id},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
 @app.get("/alerts/all")
 async def get_all_alerts(
     request: Request,
     limit: int = 500,
+    compact: bool = False,
     x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
 ) -> dict[str, Any]:
-    path = f"/alerts/all?{urlencode({'limit': str(limit)})}"
+    # tenant_id resolves to "default" for a caller with no/invalid bearer
+    # token (this endpoint doesn't otherwise require auth, matching
+    # api_gateway.auth_policy's read-routes-open convention) and to the
+    # authenticated caller's own tenant otherwise — see current_tenant_id.
+    path = f"/alerts/all?{urlencode({'limit': str(limit), 'tenant_id': tenant_id, 'compact': 'true' if compact else 'false'})}"
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=path,
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+        # Source-balanced alert reads include incident context and can exceed
+        # the generic 12-second fast-read budget during active ingestion.
+        timeout_seconds=45.0,
+    )
+
+
+@app.get("/alerts/{alert_id}/processed-result")
+async def get_alert_processed_result(
+    alert_id: str,
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    path = f"/alerts/{quote(alert_id, safe='')}/processed-result?{urlencode({'tenant_id': tenant_id})}"
     return await guarded_proxy(
         request=request,
         method="GET",
@@ -895,8 +1240,9 @@ async def get_alert_applications(
     request: Request,
     limit: int = 5000,
     x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
 ) -> dict[str, Any]:
-    path = f"/alerts/applications?{urlencode({'limit': str(limit)})}"
+    path = f"/alerts/applications?{urlencode({'limit': str(limit), 'tenant_id': tenant_id})}"
     return await guarded_proxy(
         request=request,
         method="GET",
@@ -913,24 +1259,56 @@ async def get_alert_linked_documents(
     request: Request,
     limit: int = 500,
     x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
 ) -> dict[str, Any]:
     trace_id = trace_id_from_header(x_trace_id)
     safe_limit = max(1, min(int(limit), 1000))
-    alerts_path = f"/alerts/all?{urlencode({'limit': str(safe_limit)})}"
-    _, alerts_payload = await proxy(
-        method="GET",
-        path=alerts_path,
-        target_base=settings.monitoring_adapter_url,
-        payload={},
-        trace_id=trace_id,
-    )
-    _, docs_payload = await proxy(
-        method="GET",
-        path="/rag/documents",
-        target_base=settings.context_agent_url,
-        payload={},
-        trace_id=trace_id,
-    )
+    alerts_path = f"/alerts/all?{urlencode({'limit': str(safe_limit), 'tenant_id': tenant_id})}"
+    alerts_degraded = False
+    try:
+        _, alerts_payload = await proxy(
+            method="GET",
+            path=alerts_path,
+            target_base=settings.monitoring_adapter_url,
+            payload={},
+            trace_id=trace_id,
+            timeout_seconds=2.0,
+        )
+    except httpx.HTTPError as exc:
+        alerts_degraded = True
+        alerts_payload = {"rows": []}
+        logger.warning(
+            "linked_documents_alert_lookup_degraded alert_id=%s trace_id=%s error_type=%s",
+            str(alert_id or "").strip(),
+            trace_id,
+            type(exc).__name__,
+        )
+    documents_degraded = alerts_degraded
+    documents_warning = ""
+    try:
+        _, docs_payload = await proxy(
+            method="GET",
+            path=f"/rag/documents?{urlencode({'tenant_scope': tenant_id})}",
+            target_base=settings.context_agent_url,
+            payload={},
+            trace_id=trace_id,
+            # Evidence enrichment is optional and must never hold the
+            # incident workspace open behind a saturated context service.
+            timeout_seconds=2.0,
+        )
+    except (httpx.HTTPError, ValueError, TypeError) as exc:
+        # Document evidence enriches the RCA view but is not required to show
+        # the alert or its stored analysis. Keep the primary experience usable
+        # when the context service is saturated or temporarily unavailable.
+        documents_degraded = True
+        documents_warning = "Document evidence is temporarily unavailable. The stored RCA result is still available."
+        docs_payload = {"documents": []}
+        logger.warning(
+            "linked_documents_degraded alert_id=%s trace_id=%s error_type=%s",
+            str(alert_id or "").strip(),
+            trace_id,
+            type(exc).__name__,
+        )
     alerts_data = _payload_data(alerts_payload)
     docs_data = _payload_data(docs_payload)
     rows = alerts_data.get("rows") or alerts_data.get("alerts") or []
@@ -955,7 +1333,15 @@ async def get_alert_linked_documents(
         ),
         None,
     )
-    if selected_alert is None:
+    if selected_alert is None and alerts_degraded:
+        selected_alert = {
+            "id": normalized_id,
+            "alert_id": normalized_id,
+            "name": "Alert details temporarily unavailable",
+            "service": "unknown",
+            "source": "degraded-alert-lookup",
+        }
+    elif selected_alert is None:
         raise HTTPException(status_code=404, detail={"message": "alert not found", "alert_id": normalized_id, "trace_id": trace_id})
 
     canonical = _canonical_alert_contract(selected_alert)
@@ -976,6 +1362,8 @@ async def get_alert_linked_documents(
             "source": "api-gateway.alert-linked-documents",
             "contract_version": "kaiops.alert-document-link.v1",
             "match_reasons": sorted({str(doc.get("match_reason") or "") for doc in linked_documents if doc.get("match_reason")}),
+            "degraded": documents_degraded,
+            "warning": documents_warning,
         },
         **contract,
     }
@@ -1263,8 +1651,9 @@ async def get_closed_incidents(
     request: Request,
     limit: int = 100,
     x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
 ) -> dict[str, Any]:
-    path = f"/incidents/closed?{urlencode({'limit': str(limit)})}"
+    path = f"/incidents/closed?{urlencode({'limit': str(limit), 'tenant_id': tenant_id})}"
     return await guarded_proxy(
         request=request,
         method="GET",
@@ -1275,18 +1664,59 @@ async def get_closed_incidents(
     )
 
 
+@app.post("/incidents/{incident_id}/manual-remediation/assign")
+async def assign_incident_manual_remediation(
+    incident_id: str,
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path=f"/incidents/{incident_id}/manual-remediation/assign",
+        target_base=settings.monitoring_adapter_url,
+        payload=payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/incidents/{incident_id}/manual-remediation/complete")
+async def complete_incident_manual_remediation(
+    incident_id: str,
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path=f"/incidents/{incident_id}/manual-remediation/complete",
+        target_base=settings.monitoring_adapter_url,
+        payload=payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
 @app.get("/incidents/metadata")
 async def get_incident_metadata(
     request: Request,
     limit: int = 100,
+    include_enrichment: bool = True,
     risk_tier: str | None = None,
     execution_mode: str | None = None,
     transport_provider: str | None = None,
     status: str | None = None,
     service: str | None = None,
+    incident_id: str | None = None,
     x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
 ) -> dict[str, Any]:
-    params: dict[str, str] = {"limit": str(limit)}
+    params: dict[str, str] = {
+        "limit": str(limit),
+        "include_enrichment": "true" if include_enrichment else "false",
+        "tenant_id": tenant_id,
+    }
     if risk_tier:
         params["risk_tier"] = str(risk_tier)
     if execution_mode:
@@ -1297,6 +1727,8 @@ async def get_incident_metadata(
         params["status"] = str(status)
     if service:
         params["service"] = str(service)
+    if incident_id:
+        params["incident_id"] = str(incident_id)
     path = f"/incidents/metadata?{urlencode(params)}"
     return await guarded_proxy(
         request=request,
@@ -1313,13 +1745,624 @@ async def get_incident_stage_completeness(
     incident_id: str,
     request: Request,
     x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
 ) -> dict[str, Any]:
-    path = f"/incidents/{incident_id}/stage-completeness"
+    path = (
+        f"/incidents/{quote(incident_id, safe='')}/stage-completeness?"
+        f"{urlencode({'tenant_id': tenant_id})}"
+    )
     return await guarded_proxy(
         request=request,
         method="GET",
         path=path,
         target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+def tenant_scoped_analysis_payload(payload: dict[str, Any], tenant_id: str) -> dict[str, Any]:
+    """Bind browser-triggered analysis to the authenticated tenant.
+
+    Context and resolution contracts repeat tenant identity at the envelope,
+    alert, and incident levels. Never trust any of those browser-supplied
+    values when the gateway already owns a verified session identity.
+    """
+    normalized = dict(payload)
+    normalized["tenant_id"] = tenant_id
+    if isinstance(normalized.get("alert"), dict):
+        normalized["alert"] = {**normalized["alert"], "tenant_id": tenant_id}
+    if isinstance(normalized.get("incident"), dict):
+        normalized["incident"] = {**normalized["incident"], "tenant_id": tenant_id}
+    return normalized
+
+
+async def _publish_analysis_regeneration_command(
+    *,
+    request_id: str,
+    tenant_id: str,
+    alert: Alert,
+    incident: Incident,
+    decision: dict[str, Any],
+    expected_recommendation_id: UUID,
+) -> tuple[str, str, bool]:
+    """Durably hand an operator-requested analysis rerun to the event pipeline."""
+    transport_provider = str(getattr(settings, "event_bus_provider", "rabbitmq") or "rabbitmq")
+    event_envelope = build_orchestration_envelope(
+        alert=alert,
+        incident=incident,
+        decision=decision,
+        transport_provider=transport_provider,
+        channel=ORCHESTRATION_EVENTS,
+    )
+    event_envelope.update({
+        "event_id": request_id,
+        "event_type": "incident.analysis.regeneration.requested",
+    })
+    event_envelope["idempotency"] = {
+        "idempotency_key": f"incident.analysis.regeneration.requested:{request_id}",
+        "fingerprint": request_id,
+    }
+    event_contract = build_agent_event_contract(
+        flow_id=str(decision.get("flow_id") or incident.id),
+        incident_id=str(incident.id),
+        trace_id=str(incident.trace_id or alert.trace_id or ""),
+        correlation_id=str(alert.correlation_id or "") or None,
+        agent="api-gateway",
+        payload={
+            "analysis_request_id": request_id,
+            "analysis_mode": decision.get("analysis_mode"),
+            "context_strategy": decision.get("context_strategy"),
+            "topic": ORCHESTRATION_EVENTS,
+        },
+        metadata={"operator_requested": True},
+        reasoning="Authenticated operator requested incident analysis regeneration.",
+        evidence_ids=[str(alert.id), str(incident.id)],
+    )
+    command = {
+        "alert": alert.model_dump(mode="json"),
+        "incident": incident.model_dump(mode="json"),
+        "decision": decision,
+        "analysis_request": {
+            "id": request_id,
+            "mode": decision.get("analysis_mode"),
+            "requested_at": datetime.now(UTC).isoformat(),
+        },
+        "transport": transport_provider,
+        "event_envelope": event_envelope,
+        "event_contract": event_contract,
+    }
+    outbox_event_id = f"analysis-regeneration:{request_id}"
+    stored = False
+    session_factory = getattr(app.state, "session_factory", None)
+    if settings.database_enabled and session_factory is not None:
+        async with session_factory() as session:
+            repository = IncidentRepository(session)
+            lifecycle, created = await repository.create_or_reuse_analysis_request(
+                request_id=UUID(request_id),
+                tenant_id=tenant_id,
+                incident_id=incident.id,
+                alert_id=alert.id,
+                expected_recommendation_id=expected_recommendation_id,
+                mode=str(decision.get("analysis_mode") or "smart"),
+            )
+            if not created:
+                await session.commit()
+                return lifecycle.delivery, str(lifecycle.request_id), False
+            stored = await repository.enqueue_resolution_event(
+                event_id=outbox_event_id,
+                aggregate_id=str(incident.id),
+                topic=ORCHESTRATION_EVENTS,
+                partition_key=str(alert.service or incident.id),
+                payload=command,
+                tenant_id=tenant_id,
+                available_after_seconds=0,
+            )
+            await session.commit()
+
+    try:
+        await app.state.producer.publish(ORCHESTRATION_EVENTS, command, key=str(alert.service or incident.id))
+    except Exception as exc:
+        if not stored or session_factory is None:
+            raise HTTPException(status_code=503, detail="Analysis command broker is unavailable") from exc
+        async with session_factory() as session:
+            repository = IncidentRepository(session)
+            await repository.mark_resolution_event_retry(outbox_event_id, str(exc))
+            lifecycle = await repository.get_analysis_request(UUID(request_id), tenant_id=tenant_id)
+            if lifecycle is not None:
+                lifecycle.status = "queued"
+                lifecycle.delivery = "queued"
+            await session.commit()
+        logger.warning(
+            "analysis_regeneration_queued request_id=%s incident_id=%s error_type=%s",
+            request_id,
+            incident.id,
+            type(exc).__name__,
+        )
+        return "queued", request_id, True
+
+    if stored and session_factory is not None:
+        async with session_factory() as session:
+            repository = IncidentRepository(session)
+            await repository.mark_resolution_event_published(outbox_event_id)
+            lifecycle = await repository.get_analysis_request(UUID(request_id), tenant_id=tenant_id)
+            if lifecycle is not None:
+                lifecycle.status = "published"
+                lifecycle.delivery = "published"
+            await session.commit()
+    return "published", request_id, True
+
+
+def _analysis_recommendation_id(*, incident_id: UUID, request_id: UUID) -> UUID:
+    """Match the Resolution Agent's stable identity for one analysis request."""
+    return uuid5(NAMESPACE_URL, f"kaims:recommendation:{incident_id}:{request_id}:v2")
+
+
+async def _load_analysis_regeneration_subject(
+    *,
+    alert_id: str,
+    tenant_id: str,
+    session_factory: Any,
+) -> tuple[Alert, Incident, dict[str, Any], str | None]:
+    """Load only the three canonical rows required to enqueue analysis.
+
+    The processed-result projection deliberately hydrates the entire incident
+    cockpit and is therefore unsuitable for command acceptance or polling.
+    """
+    try:
+        alert_uuid = UUID(str(alert_id))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail="Alert was not found in the authenticated tenant") from exc
+
+    async with session_factory() as session:
+        alert_record = (
+            await session.execute(
+                select(AlertRecord).where(
+                    AlertRecord.id == alert_uuid,
+                    AlertRecord.tenant_id == tenant_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if alert_record is None:
+            raise HTTPException(status_code=404, detail="Alert was not found in the authenticated tenant")
+
+        projection_record = (
+            await session.execute(
+                select(IncidentProjectionRecord)
+                .where(
+                    IncidentProjectionRecord.alert_id == alert_uuid,
+                    IncidentProjectionRecord.tenant_id == tenant_id,
+                )
+                .order_by(
+                    IncidentProjectionRecord.latest_event_at.desc(),
+                    IncidentProjectionRecord.updated_at.desc(),
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if projection_record is None:
+            occurrence_record = (
+                await session.execute(
+                    select(IncidentOccurrenceRecord)
+                    .where(
+                        IncidentOccurrenceRecord.occurrence_id == alert_uuid,
+                        IncidentOccurrenceRecord.tenant_id == tenant_id,
+                    )
+                    .order_by(IncidentOccurrenceRecord.observed_at.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if occurrence_record is not None:
+                projection_record = (
+                    await session.execute(
+                        select(IncidentProjectionRecord).where(
+                            IncidentProjectionRecord.incident_id == occurrence_record.canonical_incident_id,
+                            IncidentProjectionRecord.tenant_id == tenant_id,
+                        )
+                    )
+                ).scalar_one_or_none()
+        if projection_record is None:
+            raise HTTPException(
+                status_code=409,
+                detail="The alert does not have a persisted incident yet; refresh after correlation completes",
+            )
+
+        incident_record = (
+            await session.execute(
+                select(IncidentRecord).where(
+                    IncidentRecord.id == projection_record.incident_id,
+                    IncidentRecord.tenant_id == tenant_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if incident_record is None:
+            raise HTTPException(
+                status_code=409,
+                detail="The incident projection is incomplete; refresh after persistence completes",
+            )
+
+        # Historical rows contain source-specific keys that are intentionally
+        # forbidden by the canonical command models. Reconstruct the command
+        # from typed columns and copy only compatible enrichment instead of
+        # validating the complete stored source payload as an Alert/Incident.
+        stored_alert = dict(alert_record.payload) if isinstance(alert_record.payload, dict) else {}
+        stored_incident = dict(incident_record.payload) if isinstance(incident_record.payload, dict) else {}
+        valid_severities = {"info", "warning", "high", "critical"}
+        alert_severity = str(alert_record.severity or "warning").strip().lower()
+        incident_severity = str(incident_record.severity or alert_severity).strip().lower()
+        if alert_severity not in valid_severities:
+            alert_severity = "warning"
+        if incident_severity not in valid_severities:
+            incident_severity = alert_severity
+        valid_statuses = {
+            "open", "investigating", "awaiting_approval", "approved", "remediating",
+            "validating", "resolved", "closed", "failed", "cancelled",
+        }
+        incident_status = str(incident_record.status or "investigating").strip().lower().replace("-", "_")
+        if incident_status not in valid_statuses:
+            incident_status = "investigating"
+        stored_annotations = (
+            stored_alert.get("annotations") if isinstance(stored_alert.get("annotations"), dict) else {}
+        )
+
+        def persisted_alert_time(*keys: str) -> datetime | None:
+            for key in keys:
+                value = stored_annotations.get(key) or stored_alert.get(key)
+                if isinstance(value, datetime):
+                    parsed = value
+                elif isinstance(value, str) and value.strip():
+                    try:
+                        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+                    except ValueError:
+                        continue
+                else:
+                    continue
+                if parsed.year <= 1:
+                    continue
+                return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+            return None
+
+        # The source observation time is part of the alert identity.  Never
+        # let Alert's default factory replace it with regeneration time, or a
+        # historical RCA will query the wrong telemetry and trace window.
+        alert_started_at = persisted_alert_time("startsAt", "starts_at", "observed_at", "timestamp")
+        alert_started_at = alert_started_at or alert_record.created_at
+        alert_ends_at = persisted_alert_time("endsAt", "ends_at")
+        alert_payload = {
+            "id": str(alert_record.id),
+            "created_at": alert_record.created_at,
+            "tenant_id": tenant_id,
+            "source": alert_record.source,
+            "name": alert_record.name,
+            "service": alert_record.service,
+            "environment": alert_record.environment,
+            "severity": alert_severity,
+            "description": str(
+                stored_alert.get("description") or stored_alert.get("summary") or alert_record.name
+            ),
+            "starts_at": alert_started_at,
+            "ends_at": alert_ends_at,
+            "fingerprint": alert_record.fingerprint,
+            "correlation_id": alert_record.correlation_id,
+            "labels": stored_alert.get("labels") if isinstance(stored_alert.get("labels"), dict) else {},
+            "annotations": stored_annotations,
+        }
+        alert_ids = []
+        for candidate in stored_incident.get("alert_ids") or []:
+            try:
+                alert_ids.append(str(UUID(str(candidate))))
+            except (TypeError, ValueError):
+                continue
+        if str(alert_record.id) not in alert_ids:
+            alert_ids.append(str(alert_record.id))
+        incident_payload = {
+            "id": str(incident_record.id),
+            "created_at": incident_record.created_at,
+            "tenant_id": tenant_id,
+            "alert_ids": alert_ids,
+            "service": incident_record.service,
+            "environment": incident_record.environment,
+            "severity": incident_severity,
+            "status": incident_status,
+            "title": incident_record.title,
+            "summary": str(stored_incident.get("summary") or stored_alert.get("description") or incident_record.title),
+            "owner_team": str(stored_incident.get("owner_team") or stored_incident.get("owner") or "") or None,
+            "ticket_id": incident_record.ticket_id,
+        }
+        projection_payload = (
+            projection_record.projection_payload
+            if isinstance(projection_record.projection_payload, dict)
+            else {}
+        )
+        persisted_decision = (
+            projection_payload.get("decision")
+            if isinstance(projection_payload.get("decision"), dict)
+            else {}
+        )
+        decision = {
+            "requires_approval": projection_record.requires_approval,
+            "risk_tier": projection_record.risk_tier,
+            "execution_mode": projection_record.execution_mode,
+            "policy_version": projection_record.policy_version,
+            "policy_reason": projection_record.policy_reason,
+            **persisted_decision,
+        }
+        previous_recommendation_id = (
+            str(projection_record.recommendation_id)
+            if projection_record.recommendation_id is not None
+            else None
+        )
+        previous_rca_version = 0
+        if projection_record.recommendation_id is not None:
+            previous_payload = (
+                await session.execute(
+                    select(AuditLogRecord.payload).where(
+                        AuditLogRecord.id == projection_record.recommendation_id,
+                        AuditLogRecord.tenant_id == tenant_id,
+                        AuditLogRecord.resource_id == str(projection_record.incident_id),
+                        AuditLogRecord.action == "recommendation.generated",
+                    )
+                )
+            ).scalar_one_or_none()
+            previous_metadata = (
+                previous_payload.get("metadata")
+                if isinstance(previous_payload, dict) and isinstance(previous_payload.get("metadata"), dict)
+                else {}
+            )
+            try:
+                previous_rca_version = max(0, int(previous_metadata.get("rca_version") or 0))
+            except (TypeError, ValueError):
+                previous_rca_version = 0
+        decision["rca_version"] = previous_rca_version + 1
+
+    try:
+        return (
+            Alert.model_validate(alert_payload),
+            Incident.model_validate(incident_payload),
+            decision,
+            previous_recommendation_id,
+        )
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="Persisted alert or incident context is incomplete; reload the incident before regenerating analysis",
+        ) from exc
+
+
+@app.post("/analysis/alerts/{alert_id}/regenerate", status_code=202)
+async def regenerate_alert_analysis(
+    alert_id: str,
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    """Queue one tenant-scoped RCA regeneration without browser-side orchestration."""
+    mode = str(payload.get("mode") or "smart").strip().lower()
+    strategies = {"smart": "auto", "fresh": "realtime", "cache": "historical"}
+    if mode not in strategies:
+        raise HTTPException(status_code=422, detail="mode must be one of: smart, fresh, cache")
+
+    session_factory = getattr(request.app.state, "session_factory", None)
+    if session_factory is None:
+        raise HTTPException(status_code=503, detail="Database is unavailable for analysis regeneration")
+    alert, incident, existing_decision, previous_recommendation_id = await _load_analysis_regeneration_subject(
+        alert_id=alert_id,
+        tenant_id=tenant_id,
+        session_factory=session_factory,
+    )
+    request_id = str(uuid4())
+    decision = {
+        "workflow": "guided-remediation",
+        "requires_approval": True,
+        "risk_tier": "high",
+        "execution_mode": "supervised",
+        "policy_version": "policy-v1",
+        "policy_reason": "Operator-requested analysis follows the governed incident path.",
+        **existing_decision,
+        "flow_id": str(existing_decision.get("flow_id") or incident.id),
+        "analysis_request_id": request_id,
+        "analysis_mode": mode,
+        "context_strategy": strategies[mode],
+        "force_full_analysis": mode == "fresh",
+        "regeneration_requested": True,
+        "rca_version": max(1, int(existing_decision.get("rca_version") or 1)),
+    }
+    expected_recommendation_id = _analysis_recommendation_id(
+        incident_id=incident.id,
+        request_id=UUID(request_id),
+    )
+    publish_result = await _publish_analysis_regeneration_command(
+        request_id=request_id,
+        tenant_id=tenant_id,
+        alert=alert,
+        incident=incident,
+        decision=decision,
+        expected_recommendation_id=expected_recommendation_id,
+    )
+    if isinstance(publish_result, tuple):
+        delivery, effective_request_id, created = publish_result
+    else:  # Compatibility for alternate publishers and focused test doubles.
+        delivery, effective_request_id, created = str(publish_result), request_id, True
+    if effective_request_id != request_id:
+        request_id = effective_request_id
+        expected_recommendation_id = _analysis_recommendation_id(
+            incident_id=incident.id, request_id=UUID(request_id)
+        )
+    return {
+        "request_id": request_id,
+        "status": "accepted" if created else "coalesced",
+        "delivery": delivery,
+        "alert_id": str(alert.id),
+        "incident_id": str(incident.id),
+        "previous_recommendation_id": previous_recommendation_id,
+        "expected_recommendation_id": str(expected_recommendation_id),
+        "analysis_mode": mode,
+        "context_strategy": strategies[mode],
+        "poll_after_ms": 2500,
+    }
+
+
+@app.get("/analysis/requests/{request_id}/status")
+async def get_analysis_request_status(
+    request_id: str,
+    incident_id: str,
+    request: Request,
+    tenant_id: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    """Check one indexed audit identity instead of rebuilding the incident cockpit."""
+    try:
+        request_uuid = UUID(request_id)
+        incident_uuid = UUID(incident_id)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="request_id and incident_id must be UUIDs") from exc
+
+    expected_recommendation_id = _analysis_recommendation_id(
+        incident_id=incident_uuid,
+        request_id=request_uuid,
+    )
+    session_factory = getattr(request.app.state, "session_factory", None)
+    if session_factory is None:
+        raise HTTPException(status_code=503, detail="Database is unavailable for analysis status")
+
+    async with session_factory() as session:
+        repository = IncidentRepository(session)
+        lifecycle = await repository.get_analysis_request(request_uuid, tenant_id=tenant_id)
+        if lifecycle is not None:
+            if lifecycle.incident_id != incident_uuid:
+                raise HTTPException(status_code=404, detail="Analysis request was not found for this incident")
+            if await repository.expire_analysis_request(lifecycle):
+                await session.commit()
+            return {
+                "request_id": str(lifecycle.request_id),
+                "incident_id": str(lifecycle.incident_id),
+                "recommendation_id": str(lifecycle.recommendation_id or lifecycle.expected_recommendation_id),
+                "status": lifecycle.status,
+                "ready": lifecycle.status == "complete",
+                "terminal": lifecycle.status in {"complete", "failed", "timed_out", "superseded"},
+                "retryable": lifecycle.status in {"failed", "timed_out"},
+                "delivery": lifecycle.delivery,
+                "terminal_reason": lifecycle.terminal_reason,
+                "created_at": lifecycle.created_at,
+                "updated_at": lifecycle.updated_at,
+                "completed_at": lifecycle.completed_at,
+            }
+        recommendation_id = (
+            await session.execute(
+                select(AuditLogRecord.id)
+                .where(
+                    AuditLogRecord.id == expected_recommendation_id,
+                    AuditLogRecord.tenant_id == tenant_id,
+                    AuditLogRecord.resource_type == "incident",
+                    AuditLogRecord.resource_id == str(incident_uuid),
+                    AuditLogRecord.action == "recommendation.generated",
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+
+    ready = recommendation_id is not None
+    return {
+        "request_id": str(request_uuid),
+        "incident_id": str(incident_uuid),
+        "recommendation_id": str(expected_recommendation_id),
+        "status": "complete" if ready else "running",
+        "ready": ready,
+    }
+
+
+@app.post("/analysis/context/collect")
+async def collect_analysis_context(
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    publish_events: bool = False,
+    x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path="/collect",
+        target_base=settings.context_agent_url,
+        payload=tenant_scoped_analysis_payload(payload, tenant_id),
+        params={"publish_events": "true" if publish_events else "false"},
+        trace_id=trace_id_from_header(x_trace_id),
+        timeout_seconds=190.0,
+    )
+
+
+@app.post("/analysis/resolution/resolve")
+async def resolve_analysis_context(
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    publish_events: bool = True,
+    x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path="/resolve",
+        target_base=settings.resolution_agent_url,
+        payload=tenant_scoped_analysis_payload(payload, tenant_id),
+        params={"publish_events": "true" if publish_events else "false"},
+        trace_id=trace_id_from_header(x_trace_id),
+        timeout_seconds=190.0,
+    )
+
+
+@app.post("/analysis/resolution-catalog/relevant")
+async def relevant_analysis_resolutions(
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path="/resolution-catalog/relevant",
+        target_base=settings.resolution_agent_url,
+        payload={**payload, "tenant_id": tenant_id},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/analysis/resolution-catalog/select")
+async def select_analysis_resolution(
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+    auth: AuthContext = Depends(require_roles(
+        SystemRole.ADMINISTRATOR.value,
+        SystemRole.L2_ENGINEER.value,
+        SystemRole.L3_ENGINEER.value,
+    )),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path="/resolution-catalog/select",
+        target_base=settings.resolution_agent_url,
+        payload={**payload, "tenant_id": auth.tenant_id, "actor": auth.username or str(auth.user_id)},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.get("/resolution/investigations/{incident_id}")
+async def get_resolution_investigation(
+    incident_id: str,
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    """Return the latest durable iterative investigation for an incident."""
+    path = f"/investigations/{quote(incident_id, safe='')}?{urlencode({'tenant_id': tenant_id})}"
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=path,
+        target_base=settings.resolution_agent_url,
         payload={},
         trace_id=trace_id_from_header(x_trace_id),
     )
@@ -1329,9 +2372,10 @@ async def get_incident_stage_completeness(
 async def get_landing_pad_recent(
     request: Request,
     limit: int = 20,
+    include_archive: bool = False,
     x_trace_id: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    path = f"/landing-pad/recent?{urlencode({'limit': str(limit)})}"
+    path = f"/landing-pad/recent?{urlencode({'limit': str(limit), 'include_archive': str(include_archive).lower()})}"
     return await guarded_proxy(
         request=request,
         method="GET",
@@ -1340,6 +2384,55 @@ async def get_landing_pad_recent(
         payload={},
         trace_id=trace_id_from_header(x_trace_id),
     )
+
+
+@app.get("/landing-pad/archive")
+async def get_landing_pad_archive(
+    request: Request,
+    limit: int = 100,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=f"/landing-pad/archive?{urlencode({'limit': str(limit)})}",
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.get("/landing-pad/objects/{object_id}/access")
+async def get_landing_pad_object_access(
+    object_id: str,
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=f"/landing-pad/objects/{object_id}/access",
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.get("/landing-pad/objects/{object_id}/download")
+async def download_landing_pad_object(object_id: str, request: Request) -> StreamingResponse:
+    """Stream an authorized object without buffering it in the gateway."""
+    target_url = f"{settings.monitoring_adapter_url.rstrip('/')}/landing-pad/objects/{object_id}/download"
+
+    async def content():
+        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=5.0)) as client:
+            async with client.stream("GET", target_url, headers={"X-Trace-Id": trace_id_from_header(request.headers.get("x-trace-id"))}) as response:
+                if response.status_code >= 400:
+                    body = await response.aread()
+                    raise HTTPException(status_code=response.status_code, detail=body.decode("utf-8", errors="replace"))
+                async for chunk in response.aiter_bytes():
+                    yield chunk
+
+    return StreamingResponse(content(), media_type="application/octet-stream", headers={"Content-Disposition": f'attachment; filename="{object_id}"'})
 
 
 @app.get("/landing-pad/input")
@@ -1438,6 +2531,381 @@ async def get_monitoring_integrations(
         payload={},
         trace_id=trace_id_from_header(x_trace_id),
     )
+
+
+@app.get("/cloud-ops/connections")
+async def list_cloud_connections(
+    request: Request,
+    project_id: str | None = None,
+    x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    params = {"tenant_id": tenant_id}
+    if project_id:
+        params["project_id"] = project_id
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=f"/connections?{urlencode(params)}",
+        target_base=settings.cloud_operations_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/cloud-ops/connections")
+async def create_cloud_connection(
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path="/connections",
+        target_base=settings.cloud_operations_url,
+        payload={**payload, "tenant_id": auth.tenant_id},
+        trace_id=trace_id_from_header(x_trace_id),
+        timeout_seconds=15.0,
+    )
+
+
+@app.get("/cloud-ops/capabilities")
+async def list_cloud_capabilities(
+    request: Request,
+    provider: str = "simulator",
+    x_trace_id: str | None = Header(default=None),
+    _: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=f"/capabilities?{urlencode({'provider': provider})}",
+        target_base=settings.cloud_operations_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.get("/cloud-ops/onboarding/templates")
+async def list_cloud_onboarding_templates(
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+    _: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path="/onboarding/templates",
+        target_base=settings.cloud_operations_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/cloud-ops/connections/{connection_id}/validate")
+async def validate_cloud_connection(
+    connection_id: str,
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
+) -> dict[str, Any]:
+    scoped_payload = {**payload, "tenant_id": auth.tenant_id, "actor": auth.username or "admin"}
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path=f"/connections/{quote(connection_id, safe='')}/validate",
+        target_base=settings.cloud_operations_url,
+        payload=scoped_payload,
+        trace_id=trace_id_from_header(x_trace_id),
+        timeout_seconds=15.0,
+    )
+
+
+@app.post("/cloud-ops/connections/{connection_id}/discover")
+async def discover_cloud_resources(
+    connection_id: str,
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
+) -> dict[str, Any]:
+    scoped_payload = {**payload, "tenant_id": auth.tenant_id, "actor": auth.username or "admin"}
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path=f"/connections/{quote(connection_id, safe='')}/discover",
+        target_base=settings.cloud_operations_url,
+        payload=scoped_payload,
+        trace_id=trace_id_from_header(x_trace_id),
+        timeout_seconds=30.0,
+    )
+
+
+@app.get("/cloud-ops/resources")
+async def list_cloud_resources(
+    request: Request,
+    project_id: str | None = None,
+    service_id: str | None = None,
+    environment: str | None = None,
+    x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    params = {"tenant_id": tenant_id}
+    if project_id:
+        params["project_id"] = project_id
+    if service_id:
+        params["service_id"] = service_id
+    if environment:
+        params["environment"] = environment
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=f"/resources?{urlencode(params)}",
+        target_base=settings.cloud_operations_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.get("/cloud-ops/cockpit")
+async def cloud_operations_cockpit(
+    request: Request,
+    project_id: str | None = None,
+    environment: str | None = None,
+    x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    params = {"tenant_id": tenant_id}
+    if project_id:
+        params["project_id"] = project_id
+    if environment:
+        params["environment"] = environment
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=f"/cockpit?{urlencode(params)}",
+        target_base=settings.cloud_operations_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/cloud-ops/services/{service_id}/map")
+async def map_cloud_service_resources(
+    service_id: str,
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
+) -> dict[str, Any]:
+    scoped_payload = {**payload, "tenant_id": auth.tenant_id, "owner": payload.get("owner") or auth.username or "admin"}
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path=f"/services/{quote(service_id, safe='')}/map",
+        target_base=settings.cloud_operations_url,
+        payload=scoped_payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.get("/cloud-ops/services/{service_id}/360")
+async def cloud_service_360(
+    service_id: str,
+    request: Request,
+    project_id: str,
+    environment: str | None = None,
+    x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    params = {"tenant_id": tenant_id, "project_id": project_id}
+    if environment:
+        params["environment"] = environment
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=f"/services/{quote(service_id, safe='')}/360?{urlencode(params)}",
+        target_base=settings.cloud_operations_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.get("/cloud-ops/services/{service_id}/topology")
+async def cloud_service_topology(
+    service_id: str,
+    request: Request,
+    project_id: str,
+    environment: str | None = None,
+    x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    params = {"tenant_id": tenant_id, "project_id": project_id}
+    if environment:
+        params["environment"] = environment
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=f"/services/{quote(service_id, safe='')}/topology?{urlencode(params)}",
+        target_base=settings.cloud_operations_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.put("/cloud-ops/services/{service_id}/onboarding")
+async def upsert_cloud_service_onboarding(
+    service_id: str,
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
+) -> dict[str, Any]:
+    scoped_payload = {**payload, "tenant_id": auth.tenant_id, "actor": auth.username or "admin"}
+    return await guarded_proxy(
+        request=request,
+        method="PUT",
+        path=f"/services/{quote(service_id, safe='')}/onboarding",
+        target_base=settings.cloud_operations_url,
+        payload=scoped_payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/cloud-ops/services/{service_id}/readiness/recalculate")
+async def recalculate_cloud_service_readiness(
+    service_id: str,
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
+) -> dict[str, Any]:
+    scoped_payload = {**payload, "tenant_id": auth.tenant_id, "actor": auth.username or "admin"}
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path=f"/services/{quote(service_id, safe='')}/readiness/recalculate",
+        target_base=settings.cloud_operations_url,
+        payload=scoped_payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/cloud-ops/plans/compile")
+async def compile_cloud_plan(
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request, method="POST", path="/plans/compile", target_base=settings.cloud_operations_url,
+        payload={**payload, "tenant_id": auth.tenant_id, "actor": auth.username or "admin"},
+        trace_id=trace_id_from_header(x_trace_id), timeout_seconds=15.0,
+    )
+
+
+@app.get("/cloud-ops/plans/{plan_id}")
+async def get_cloud_plan(
+    plan_id: str, request: Request, x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request, method="GET",
+        path=f"/plans/{quote(plan_id, safe='')}?{urlencode({'tenant_id': tenant_id})}",
+        target_base=settings.cloud_operations_url, payload={}, trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/cloud-ops/plans/{plan_id}/simulate")
+async def simulate_cloud_plan(
+    plan_id: str, request: Request, payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request, method="POST", path=f"/plans/{quote(plan_id, safe='')}/simulate",
+        target_base=settings.cloud_operations_url,
+        payload={**payload, "tenant_id": auth.tenant_id, "actor": auth.username or "admin"},
+        trace_id=trace_id_from_header(x_trace_id), timeout_seconds=15.0,
+    )
+
+
+@app.post("/cloud-ops/plans/{plan_id}/approval")
+async def approve_cloud_plan(
+    plan_id: str, request: Request, payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request, method="POST", path=f"/plans/{quote(plan_id, safe='')}/approval",
+        target_base=settings.cloud_operations_url,
+        payload={**payload, "tenant_id": auth.tenant_id, "actor": auth.username or "admin"},
+        trace_id=trace_id_from_header(x_trace_id), timeout_seconds=15.0,
+    )
+
+
+@app.post("/cloud-ops/plans/{plan_id}/execute")
+async def execute_cloud_plan(
+    plan_id: str, request: Request, payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request, method="POST", path=f"/plans/{quote(plan_id, safe='')}/execute",
+        target_base=settings.cloud_operations_url,
+        payload={**payload, "tenant_id": auth.tenant_id, "actor": auth.username or "admin"},
+        trace_id=trace_id_from_header(x_trace_id), timeout_seconds=60.0,
+    )
+
+
+@app.post("/cloud-ops/executions/{execution_id}/rollback")
+async def rollback_cloud_execution(
+    execution_id: str, request: Request, payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request, method="POST", path=f"/executions/{quote(execution_id, safe='')}/rollback",
+        target_base=settings.cloud_operations_url,
+        payload={**payload, "tenant_id": auth.tenant_id, "actor": auth.username or "admin"},
+        trace_id=trace_id_from_header(x_trace_id), timeout_seconds=60.0,
+    )
+
+
+@app.put("/cloud-ops/governance/policy")
+async def put_cloud_execution_policy(
+    request: Request, payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None), auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
+) -> dict[str, Any]:
+    return await guarded_proxy(request=request, method="PUT", path="/governance/policy", target_base=settings.cloud_operations_url, payload={**payload, "tenant_id": auth.tenant_id, "actor": auth.username or "admin"}, trace_id=trace_id_from_header(x_trace_id))
+
+
+@app.post("/cloud-ops/governance/maintenance-windows")
+async def post_cloud_maintenance_window(
+    request: Request, payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None), auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
+) -> dict[str, Any]:
+    return await guarded_proxy(request=request, method="POST", path="/governance/maintenance-windows", target_base=settings.cloud_operations_url, payload={**payload, "tenant_id": auth.tenant_id, "actor": auth.username or "admin"}, trace_id=trace_id_from_header(x_trace_id))
+
+
+@app.post("/cloud-ops/governance/leases/recover")
+async def recover_cloud_execution_leases(
+    request: Request, payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None), auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
+) -> dict[str, Any]:
+    return await guarded_proxy(request=request, method="POST", path="/governance/leases/recover", target_base=settings.cloud_operations_url, payload={**payload, "tenant_id": auth.tenant_id}, trace_id=trace_id_from_header(x_trace_id))
+
+
+@app.get("/cloud-ops/providers/status")
+async def get_cloud_provider_status(
+    request: Request, x_trace_id: str | None = Header(default=None),
+    _: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    return await guarded_proxy(request=request, method="GET", path="/providers/status", target_base=settings.cloud_operations_url, payload={}, trace_id=trace_id_from_header(x_trace_id))
 
 
 @app.post("/monitoring/integrations")
@@ -1655,6 +3123,297 @@ async def get_monitoring_health(
     )
 
 
+@app.delete("/alerts/applications/{project_name}")
+async def delete_observed_alert_application(
+    project_name: str,
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="DELETE",
+        path=f"/alerts/applications/{quote(project_name, safe='')}?{urlencode({'tenant_id': auth.tenant_id})}",
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.get("/knowledge-development/status")
+async def knowledge_development_status(request: Request, x_trace_id: str | None = Header(default=None)) -> dict[str, Any]:
+    return await guarded_proxy(request=request, method="GET", path="/status", target_base=settings.knowledge_development_url, payload={}, trace_id=trace_id_from_header(x_trace_id))
+
+
+@app.get("/knowledge-development/configuration")
+async def knowledge_development_configuration(request: Request, x_trace_id: str | None = Header(default=None)) -> dict[str, Any]:
+    return await guarded_proxy(request=request, method="GET", path="/configuration", target_base=settings.knowledge_development_url, payload={}, trace_id=trace_id_from_header(x_trace_id))
+
+
+@app.put("/knowledge-development/configuration")
+async def update_knowledge_development_configuration(request: Request, payload: dict[str, Any] = REQUEST_BODY, x_trace_id: str | None = Header(default=None)) -> dict[str, Any]:
+    return await guarded_proxy(request=request, method="PUT", path="/configuration", target_base=settings.knowledge_development_url, payload=payload, trace_id=trace_id_from_header(x_trace_id))
+
+
+@app.post("/knowledge-development/run")
+async def run_knowledge_development(request: Request, x_trace_id: str | None = Header(default=None)) -> dict[str, Any]:
+    return await guarded_proxy(request=request, method="POST", path="/run", target_base=settings.knowledge_development_url, payload={}, trace_id=trace_id_from_header(x_trace_id), timeout_seconds=180)
+
+
+@app.get("/knowledge-development/report")
+async def knowledge_development_report(request: Request, x_trace_id: str | None = Header(default=None), auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value))) -> dict[str, Any]:
+    return await guarded_proxy(request=request, method="GET", path=f"/report?{urlencode({'tenant_id': auth.tenant_id})}", target_base=settings.knowledge_development_url, payload={}, trace_id=trace_id_from_header(x_trace_id), timeout_seconds=30)
+
+
+@app.get("/operations/queue-health")
+async def get_queue_health() -> dict[str, Any]:
+    """Return live RabbitMQ readiness and backlog data for the command center.
+
+    Broker telemetry is intentionally bounded and read-only. A failed management
+    probe returns a useful degraded contract instead of turning dashboard load
+    into an HTTP 500.
+    """
+    broker_url = urlparse(str(settings.rabbitmq_url or ""))
+    if broker_url.scheme not in {"amqp", "amqps"} or not broker_url.hostname:
+        return {"status": "not_configured", "provider": "rabbitmq", "healthy": False, "queues": 0, "messages": 0, "ready": 0, "unacknowledged": 0}
+    scheme = "https" if broker_url.scheme == "amqps" else "http"
+    management_url = f"{scheme}://{broker_url.hostname}:15672/api/queues"
+    username = unquote(broker_url.username or "guest")
+    password = unquote(broker_url.password or "guest")
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(2.0)) as client:
+            response = await client.get(management_url, auth=(username, password))
+            response.raise_for_status()
+        rows = response.json()
+        queues = rows if isinstance(rows, list) else []
+        messages = sum(int(row.get("messages") or 0) for row in queues if isinstance(row, dict))
+        ready = sum(int(row.get("messages_ready") or 0) for row in queues if isinstance(row, dict))
+        unacknowledged = sum(int(row.get("messages_unacknowledged") or 0) for row in queues if isinstance(row, dict))
+        idle_consumers = sum(1 for row in queues if isinstance(row, dict) and int(row.get("consumers") or 0) == 0 and int(row.get("messages") or 0) > 0)
+        status = "attention" if unacknowledged > 0 or idle_consumers > 0 else "healthy"
+        return {"status": status, "provider": "rabbitmq", "healthy": status == "healthy", "queues": len(queues), "messages": messages, "ready": ready, "unacknowledged": unacknowledged, "queues_without_consumers": idle_consumers}
+    except (httpx.HTTPError, ValueError, TypeError) as exc:
+        logger.warning("RabbitMQ management health probe failed: %s", exc)
+        return {"status": "unreachable", "provider": "rabbitmq", "healthy": False, "queues": 0, "messages": 0, "ready": 0, "unacknowledged": 0}
+
+
+def _rabbit_management() -> tuple[str, tuple[str, str]]:
+    broker_url = urlparse(str(settings.rabbitmq_url or ""))
+    if broker_url.scheme not in {"amqp", "amqps"} or not broker_url.hostname:
+        raise HTTPException(status_code=503, detail="RabbitMQ management is not configured")
+    scheme = "https" if broker_url.scheme == "amqps" else "http"
+    return f"{scheme}://{broker_url.hostname}:15672/api", (unquote(broker_url.username or "guest"), unquote(broker_url.password or "guest"))
+
+
+def _queue_job_id(queue_name: str, body: bytes) -> str:
+    """Return a stable, opaque identity without exposing queued payload data."""
+    digest = hashlib.sha256(queue_name.encode("utf-8") + b"\0" + body).hexdigest()
+    return f"job-{digest[:24]}"
+
+
+async def _mutate_ready_queue_job(*, queue_name: str, job_id: str, rerun: bool, scan_limit: int = 100) -> bool:
+    """Acknowledge one exact ready message, optionally republishing it at the queue tail.
+
+    Non-matching messages are rejected with requeue=True. Messages already
+    owned by a consumer are never interrupted or acknowledged here.
+    """
+    connection = await aio_pika.connect_robust(settings.rabbitmq_url, timeout=10)
+    pending: list[aio_pika.IncomingMessage] = []
+    try:
+        channel = await connection.channel()
+        bounded_limit = max(1, min(scan_limit, 100))
+        await channel.set_qos(prefetch_count=bounded_limit)
+        queue = await channel.declare_queue(queue_name, passive=True)
+        for _ in range(bounded_limit):
+            message = await queue.get(fail=False, timeout=2)
+            if message is None:
+                break
+            if _queue_job_id(queue_name, message.body) != job_id:
+                pending.append(message)
+                continue
+            if rerun:
+                replacement = aio_pika.Message(
+                    body=message.body,
+                    headers=dict(message.headers or {}),
+                    content_type=message.content_type,
+                    content_encoding=message.content_encoding,
+                    delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+                    correlation_id=message.correlation_id,
+                    message_id=message.message_id,
+                    timestamp=message.timestamp,
+                    type=message.type,
+                    app_id=message.app_id,
+                )
+                await channel.default_exchange.publish(replacement, routing_key=queue_name, mandatory=True)
+            await message.ack()
+            for skipped in pending:
+                await skipped.reject(requeue=True)
+            pending.clear()
+            return True
+        for skipped in pending:
+            await skipped.reject(requeue=True)
+        pending.clear()
+        return False
+    finally:
+        for skipped in pending:
+            with suppress(Exception):
+                await skipped.reject(requeue=True)
+        await connection.close()
+
+
+async def _queue_audit(request: Request, action: str, resource_id: str, payload: dict[str, Any]) -> None:
+    auth = getattr(request.state, "auth", None)
+    session_factory = getattr(request.app.state, "session_factory", None)
+    if not settings.database_enabled or session_factory is None:
+        return
+    async with session_factory() as session:
+        session.add(AuditLogRecord(tenant_id=getattr(auth, "tenant_id", "default"), actor=getattr(auth, "username", "administrator"), action=action, resource_type="processing_queue", resource_id=resource_id, payload=payload))
+        await session.commit()
+
+
+@app.get("/operations/queues")
+async def list_processing_queues(request: Request, _: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value))) -> dict[str, Any]:
+    base, auth = _rabbit_management()
+    async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
+        response = await client.get(f"{base}/queues", auth=auth)
+        response.raise_for_status()
+    prefix = f"{settings.rabbitmq_queue_prefix}."
+    rows = []
+    for row in response.json() if isinstance(response.json(), list) else []:
+        name = str(row.get("name") or "")
+        if not name.startswith(prefix):
+            continue
+        parts = name.split(".")
+        rows.append({"name": name, "consumer_service": parts[1] if len(parts) > 2 else "unknown", "stage": ".".join(parts[2:]) if len(parts) > 2 else name, "ready": int(row.get("messages_ready") or 0), "in_flight": int(row.get("messages_unacknowledged") or 0), "total": int(row.get("messages") or 0), "consumers": int(row.get("consumers") or 0), "state": row.get("state") or "unknown", "dead_letter": name.endswith(".dlq")})
+    rows.sort(key=lambda item: (-item["total"], item["name"]))
+    scalable = [
+        {
+            "queue": row["name"],
+            "service": row["consumer_service"],
+            "current_consumers": row["consumers"],
+            "recommended_consumers": min(16, max(row["consumers"] + 1, (row["ready"] + 4) // 5)),
+            "reason": "ready backlog exceeds two messages per active consumer",
+        }
+        for row in rows
+        if not row["dead_letter"]
+        and row["ready"] > max(5, row["consumers"] * 2)
+    ]
+    return {
+        "provider": "rabbitmq",
+        "queues": rows,
+        "summary": {
+            "queues": len(rows),
+            "ready": sum(row["ready"] for row in rows),
+            "in_flight": sum(row["in_flight"] for row in rows),
+            "dead_letter": sum(row["total"] for row in rows if row["dead_letter"]),
+            "worker_action": "scale" if scalable else "hold",
+            "scale_recommendations": scalable,
+        },
+    }
+
+
+@app.post("/operations/queues/{queue_name}/sample")
+async def sample_processing_queue(queue_name: str, request: Request, count: int = 25, _: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value))) -> dict[str, Any]:
+    if not queue_name.startswith(f"{settings.rabbitmq_queue_prefix}."):
+        raise HTTPException(status_code=403, detail="Queue is outside the KaiMS namespace")
+    base, auth = _rabbit_management()
+    path = f"{base}/queues/%2F/{quote(queue_name, safe='')}/get"
+    body = {"count": max(1, min(count, 100)), "ackmode": "ack_requeue_true", "encoding": "auto", "truncate": 50000}
+    async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+        response = await client.post(path, auth=auth, json=body)
+        response.raise_for_status()
+    messages = []
+    for item in response.json() if isinstance(response.json(), list) else []:
+        raw = item.get("payload")
+        try: decoded = json.loads(raw) if isinstance(raw, str) else raw
+        except json.JSONDecodeError: decoded = {"raw": str(raw)[:500]}
+        payload = decoded.get("payload") if isinstance(decoded, dict) and isinstance(decoded.get("payload"), dict) else decoded
+        raw_bytes = raw.encode("utf-8") if isinstance(raw, str) else json.dumps(raw, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        messages.append({"job_id": _queue_job_id(queue_name, raw_bytes), "alert_id": str((payload or {}).get("alert_id") or (payload or {}).get("id") or ""), "incident_id": str((payload or {}).get("incident_id") or ""), "name": str((payload or {}).get("name") or (payload or {}).get("alert_name") or "Queued event"), "service": str((payload or {}).get("service") or "unknown"), "severity": str((payload or {}).get("severity") or "unknown"), "redelivered": bool(item.get("redelivered")), "payload_bytes": int(item.get("payload_bytes") or 0)})
+    return {"queue": queue_name, "messages": messages, "sampled": len(messages), "note": "Messages were inspected and requeued; no processing state changed."}
+
+
+async def _queue_job_action(queue_name: str, job_id: str, request: Request, payload: dict[str, Any], *, rerun: bool) -> dict[str, Any]:
+    if not queue_name.startswith(f"{settings.rabbitmq_queue_prefix}."):
+        raise HTTPException(status_code=403, detail="Queue is outside the KaiMS namespace")
+    verb = "RERUN" if rerun else "REMOVE"
+    reason = str(payload.get("reason") or "").strip()
+    if not job_id.startswith("job-") or len(reason) < 8 or payload.get("confirmation") != f"{verb} {job_id}":
+        raise HTTPException(status_code=422, detail=f"A meaningful reason and exact {verb} confirmation are required")
+    found = await _mutate_ready_queue_job(queue_name=queue_name, job_id=job_id, rerun=rerun)
+    if not found:
+        raise HTTPException(status_code=409, detail="The selected job is no longer ready in the inspected queue window. Refresh before trying again.")
+    action = "rerun" if rerun else "removed"
+    await _queue_audit(request, f"queue.job.{action}", job_id, {"queue": queue_name, "reason": reason})
+    return {"status": action, "queue": queue_name, "job_id": job_id, "effect": "The job was moved to the queue tail for another attempt." if rerun else "Only the selected ready job was removed."}
+
+
+@app.post("/operations/queues/{queue_name}/jobs/{job_id}/rerun")
+async def rerun_processing_queue_job(queue_name: str, job_id: str, request: Request, payload: dict[str, Any] = REQUEST_BODY, _: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value))) -> dict[str, Any]:
+    return await _queue_job_action(queue_name, job_id, request, payload, rerun=True)
+
+
+@app.delete("/operations/queues/{queue_name}/jobs/{job_id}")
+async def remove_processing_queue_job(queue_name: str, job_id: str, request: Request, payload: dict[str, Any] = REQUEST_BODY, _: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value))) -> dict[str, Any]:
+    return await _queue_job_action(queue_name, job_id, request, payload, rerun=False)
+
+
+@app.post("/operations/queues/cancel-alert")
+async def cancel_queued_alert(request: Request, payload: dict[str, Any] = REQUEST_BODY, _: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value))) -> dict[str, Any]:
+    alert_id = str(payload.get("alert_id") or "").strip()
+    reason = str(payload.get("reason") or "").strip()
+    if not alert_id or len(reason) < 8 or payload.get("confirmation") != f"STOP {alert_id}":
+        raise HTTPException(status_code=422, detail="Alert ID, a meaningful reason, and exact STOP confirmation are required")
+    client = Redis.from_url(settings.redis_url, decode_responses=True)
+    try:
+        await client.sadd("kaims:cancelled-processing", alert_id)
+        await client.hset(
+            "kaims:cancelled-processing:metadata",
+            alert_id,
+            json.dumps({"reason": reason, "cancelled_at": datetime.now(UTC).isoformat()}),
+        )
+    finally:
+        await client.aclose()
+    await _queue_audit(request, "queue.alert.cancelled", alert_id, {"reason": reason})
+    return {"status": "cancelled", "alert_id": alert_id, "effect": "Queued stages will acknowledge and quarantine matching work. A currently executing handler may finish its current atomic operation."}
+
+
+@app.delete("/operations/queues/{queue_name}/messages")
+async def purge_processing_queue(queue_name: str, request: Request, payload: dict[str, Any] = REQUEST_BODY, _: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value))) -> dict[str, Any]:
+    if not queue_name.startswith(f"{settings.rabbitmq_queue_prefix}."):
+        raise HTTPException(status_code=403, detail="Queue is outside the KaiMS namespace")
+    if payload.get("confirmation") != f"PURGE {queue_name}" or len(str(payload.get("reason") or "").strip()) < 8:
+        raise HTTPException(status_code=422, detail="A meaningful reason and exact queue purge confirmation are required")
+    base, auth = _rabbit_management()
+    async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+        response = await client.delete(f"{base}/queues/%2F/{quote(queue_name, safe='')}/contents", auth=auth)
+        response.raise_for_status()
+    await _queue_audit(request, "queue.messages.purged", queue_name, {"reason": payload["reason"]})
+    return {"status": "purged", "queue": queue_name, "effect": "Ready messages were removed. In-flight messages were not interrupted."}
+
+
+@app.delete("/operations/queues/purge-all/ready-messages")
+async def purge_all_processing_queues(request: Request, payload: dict[str, Any] = REQUEST_BODY, _: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value))) -> dict[str, Any]:
+    reason = str(payload.get("reason") or "").strip()
+    if payload.get("confirmation") != "PURGE ALL READY JOBS" or len(reason) < 12:
+        raise HTTPException(status_code=422, detail="A detailed reason and exact PURGE ALL READY JOBS confirmation are required")
+    base, auth = _rabbit_management()
+    prefix = f"{settings.rabbitmq_queue_prefix}."
+    purged: list[str] = []
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+        listing = await client.get(f"{base}/queues", auth=auth)
+        listing.raise_for_status()
+        for row in listing.json() if isinstance(listing.json(), list) else []:
+            name = str(row.get("name") or "")
+            if not name.startswith(prefix) or int(row.get("messages_ready") or 0) <= 0:
+                continue
+            response = await client.delete(f"{base}/queues/%2F/{quote(name, safe='')}/contents", auth=auth)
+            response.raise_for_status()
+            purged.append(name)
+    await _queue_audit(request, "queue.all_ready_messages.purged", "all", {"reason": reason, "queues": purged})
+    return {"status": "purged", "queues": purged, "queue_count": len(purged), "effect": "All ready KaiMS messages were removed. In-flight messages were not interrupted."}
+
+
 @app.get("/monitoring/audit")
 async def get_monitoring_audit(
     request: Request,
@@ -1831,8 +3590,29 @@ async def approval_action(
     payload: dict[str, Any] = REQUEST_BODY,
     x_trace_id: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    if action not in {"approve", "reject", "modify"}:
+    if action not in {"approve", "reject", "modify", "request-evidence", "auto-assign"}:
         raise HTTPException(status_code=404, detail="unknown approval action")
+    auth = getattr(request.state, "auth", None)
+    if auth is None:
+        # Local/demo mode permits anonymous reads, so the global middleware
+        # does not populate request.state.auth. Approval mutations still need
+        # a validated token because tenant and approver identity must never be
+        # accepted from the request body.
+        auth = await _auth_context_from_request(request)
+    if action == "auto-assign":
+        payload = {**payload, "tenant_id": auth.tenant_id}
+    else:
+        # Approval identity and tenant are security context, never editable
+        # request data. Legacy role names remain accepted during migration but
+        # are recorded as one of the two supported business roles.
+        payload = {
+            **payload,
+            "tenant_id": auth.tenant_id,
+            "approver": auth.email or auth.username or str(auth.user_id),
+            "approver_role": "admin"
+            if role_is_allowed(auth.role, {OperationalRole.ADMIN.value})
+            else "hitl-reviewer",
+        }
     return await guarded_proxy(
         request=request,
         method="POST",
@@ -1843,34 +3623,363 @@ async def approval_action(
     )
 
 
-@app.post("/remediation/execute")
-async def remediation_execute(
+@app.get("/incidents/groups")
+async def get_incident_groups(
     request: Request,
-    payload: dict[str, Any] = REQUEST_BODY,
+    limit: int = 25,
+    cursor: str | None = None,
+    risk_tier: str | None = None,
+    execution_mode: str | None = None,
+    status: str | None = None,
+    service: str | None = None,
     x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
 ) -> dict[str, Any]:
+    params: dict[str, str] = {"limit": str(max(1, min(int(limit), 100))), "tenant_id": tenant_id}
+    for key, value in {
+        "cursor": cursor,
+        "risk_tier": risk_tier,
+        "execution_mode": execution_mode,
+        "status": status,
+        "service": service,
+    }.items():
+        if value:
+            params[key] = str(value)
     return await guarded_proxy(
         request=request,
-        method="POST",
-        path="/execute",
-        target_base=settings.remediation_engine_url,
-        payload=payload,
+        method="GET",
+        path=f"/incidents/groups?{urlencode(params)}",
+        target_base=settings.monitoring_adapter_url,
+        payload={},
         trace_id=trace_id_from_header(x_trace_id),
     )
 
 
-@app.post("/rag/documents")
-async def ingest_rag_document(
+@app.get("/incidents/{incident_id}")
+async def get_incident_by_id(
+    incident_id: str,
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=f"/incidents/{quote(incident_id, safe='')}?{urlencode({'tenant_id': tenant_id})}",
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.get("/incidents/inbox/feed")
+async def get_unified_incident_inbox(
+    request: Request,
+    limit: int = 25,
+    cursor: str | None = None,
+    project_id: str | None = None,
+    risk_tier: str | None = None,
+    execution_mode: str | None = None,
+    transport_provider: str | None = None,
+    status: str | None = None,
+    service: str | None = None,
+    inbox_view: str = "all",
+    record_type: str = "all",
+    severity: str | None = None,
+    x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    params = {
+        "tenant_id": tenant_id,
+        "limit": str(max(1, min(int(limit), 100))),
+        "inbox_view": inbox_view,
+        "record_type": record_type,
+    }
+    for key, value in {
+        "cursor": cursor,
+        "project_id": project_id,
+        "risk_tier": risk_tier,
+        "execution_mode": execution_mode,
+        "transport_provider": transport_provider,
+        "status": status,
+        "service": service,
+        "severity": severity,
+    }.items():
+        if value:
+            params[key] = str(value)
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=f"/incidents/inbox/feed?{urlencode(params)}",
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.get("/rag/evidence-drafts")
+async def list_evidence_rag_drafts(
+    request: Request,
+    alert_id: str | None = None,
+    status: str | None = None,
+    document_kind: str | None = None,
+    x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    params = {
+        key: value
+        for key, value in {"alert_id": alert_id, "status": status, "document_kind": document_kind, "tenant_scope": tenant_id}.items()
+        if value
+    }
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path="/rag/evidence-drafts",
+        target_base=settings.context_agent_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+        params=params,
+    )
+
+
+@app.post("/rag/evidence-drafts")
+async def create_evidence_rag_draft(
     request: Request,
     payload: dict[str, Any] = REQUEST_BODY,
     x_trace_id: str | None = Header(default=None),
+    auth: AuthContext = Depends(require_roles(  # noqa: B008
+        SystemRole.ADMINISTRATOR.value,
+        SystemRole.L2_ENGINEER.value,
+        SystemRole.L3_ENGINEER.value,
+    )),
 ) -> dict[str, Any]:
     return await guarded_proxy(
         request=request,
         method="POST",
-        path="/rag/documents",
+        path="/rag/evidence-drafts",
         target_base=settings.context_agent_url,
-        payload=payload,
+        payload={
+            **payload,
+            "tenant_scope": auth.tenant_id,
+            "created_by": auth.email or auth.username or str(auth.user_id),
+        },
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.put("/rag/evidence-drafts/{draft_id}")
+async def review_evidence_rag_draft(
+    draft_id: str,
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+    auth: AuthContext = Depends(require_roles(  # noqa: B008
+        SystemRole.ADMINISTRATOR.value,
+        SystemRole.L2_ENGINEER.value,
+        SystemRole.L3_ENGINEER.value,
+    )),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="PUT",
+        path=f"/rag/evidence-drafts/{quote(draft_id, safe='')}",
+        target_base=settings.context_agent_url,
+        payload={
+            **payload,
+            "tenant_scope": auth.tenant_id,
+            "reviewed_by": auth.email or auth.username or str(auth.user_id),
+        },
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/rag/evidence-drafts/{draft_id}/approve")
+async def approve_evidence_rag_draft(
+    draft_id: str,
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),  # noqa: B008
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path=f"/rag/evidence-drafts/{quote(draft_id, safe='')}/approve",
+        target_base=settings.context_agent_url,
+        payload={
+            **payload,
+            "tenant_scope": auth.tenant_id,
+            "approved_by": auth.email or auth.username or str(auth.user_id),
+        },
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.get("/incidents/{incident_id}/context-gaps")
+async def get_incident_context_gaps(
+    incident_id: str,
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request, method="GET", path=f"/incidents/{incident_id}/context-gaps",
+        payload=None,
+        target_base=settings.context_agent_url, params={"tenant_id": tenant_id},
+        trace_id=trace_id_from_header(x_trace_id), timeout_seconds=30.0,
+    )
+
+
+@app.post("/incidents/{incident_id}/context-gaps/{requirement_id}/responses")
+async def post_incident_context_gap_response(
+    incident_id: str,
+    requirement_id: str,
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    auth = getattr(request.state, "auth", None)
+    if auth is None:
+        # Local/demo mode bypasses the global operational-auth middleware, but
+        # governed evidence mutations still require a validated server-side
+        # identity just like approval mutations do.
+        auth = await _auth_context_from_request(request)
+    responder_id = str(auth.email or auth.username or auth.user_id)
+    governed_payload = {
+        **payload,
+        # These fields are audit evidence and may never be asserted by the browser.
+        "responder_id": responder_id,
+        "responded_at": datetime.now(UTC).isoformat(),
+    }
+    return await guarded_proxy(
+        request=request, method="POST",
+        path=f"/incidents/{incident_id}/context-gaps/{requirement_id}/responses",
+        target_base=settings.context_agent_url, payload=governed_payload, params={"tenant_id": tenant_id},
+        trace_id=trace_id_from_header(x_trace_id), timeout_seconds=30.0,
+    )
+
+
+@app.post("/incidents/{incident_id}/hitl/jira")
+async def create_incident_hitl_jira_assignment(
+    incident_id: str,
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    scoped_payload = {**payload, "tenant_id": tenant_id, "incident_id": incident_id}
+    return await guarded_proxy(
+        request=request, method="POST", path="/api/v1/jira/hitl-assignments",
+        target_base=settings.monitoring_adapter_url, payload=scoped_payload,
+        trace_id=trace_id_from_header(x_trace_id), timeout_seconds=45.0,
+    )
+
+
+@app.get("/rag/knowledge-drafts")
+async def list_knowledge_rag_drafts(
+    request: Request,
+    status: str | None = None,
+    x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request, method="GET", path="/rag/knowledge-drafts",
+        target_base=settings.context_agent_url, payload={},
+        params={"tenant_scope": tenant_id, **({"status": status} if status else {})},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/rag/knowledge-drafts")
+async def create_knowledge_rag_draft(
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+    auth: AuthContext = Depends(require_roles(  # noqa: B008
+        SystemRole.ADMINISTRATOR.value, SystemRole.L2_ENGINEER.value, SystemRole.L3_ENGINEER.value,
+    )),
+) -> dict[str, Any]:
+    actor = auth.email or auth.username or str(auth.user_id)
+    clean = {key: value for key, value in payload.items() if key not in {
+        "tenant_id", "tenant_scope", "created_by", "reviewed_by", "approved_by", "review_status",
+    }}
+    source_ref = str(clean.get("source_ref") or "").strip()
+    if not source_ref:
+        source_system = str(clean.get("source_system") or "kaims-knowledge").strip()
+        source_identity = str(
+            clean.get("alert_id") or clean.get("application_id") or clean.get("title") or "document"
+        )
+        source_ref = f"{source_system}://{source_identity}"
+    metadata = clean.get("metadata") if isinstance(clean.get("metadata"), dict) else {}
+    normalized = {
+        "kind": str(clean.get("kind") or "application").strip().lower(),
+        "source_ref": source_ref,
+        "title": str(clean.get("title") or clean.get("alert_type") or "Operational knowledge").strip(),
+        "content": str(clean.get("content") or clean.get("summary") or "").strip(),
+        "metadata": {**metadata, **{
+            key: value for key, value in clean.items()
+            if key not in {"kind", "source_ref", "title", "content", "metadata"}
+        }},
+    }
+    return await guarded_proxy(
+        request=request, method="POST", path="/rag/knowledge-drafts",
+        target_base=settings.context_agent_url,
+        payload={**normalized, "tenant_scope": auth.tenant_id, "created_by": actor},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.put("/rag/knowledge-drafts/{draft_id}")
+async def review_knowledge_rag_draft(
+    draft_id: str, request: Request, payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+    auth: AuthContext = Depends(require_roles(  # noqa: B008
+        SystemRole.ADMINISTRATOR.value, SystemRole.L2_ENGINEER.value, SystemRole.L3_ENGINEER.value,
+    )),
+) -> dict[str, Any]:
+    actor = auth.email or auth.username or str(auth.user_id)
+    return await guarded_proxy(
+        request=request, method="PUT", path=f"/rag/knowledge-drafts/{quote(draft_id, safe='')}",
+        target_base=settings.context_agent_url,
+        payload={**payload, "tenant_scope": auth.tenant_id, "reviewed_by": actor},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/rag/knowledge-drafts/{draft_id}/approve")
+async def approve_knowledge_rag_draft(
+    draft_id: str, request: Request, payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),  # noqa: B008
+) -> dict[str, Any]:
+    actor = auth.email or auth.username or str(auth.user_id)
+    return await guarded_proxy(
+        request=request, method="POST",
+        path=f"/rag/knowledge-drafts/{quote(draft_id, safe='')}/approve",
+        target_base=settings.context_agent_url,
+        payload={"expected_row_version": payload.get("expected_row_version"),
+                 "tenant_scope": auth.tenant_id, "approved_by": actor},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/rag/governed-documents/{document_id}/retry-index")
+async def retry_governed_rag_index(
+    document_id: str,
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),  # noqa: B008
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path=f"/rag/governed-documents/{quote(document_id, safe='')}/retry-index",
+        target_base=settings.context_agent_url,
+        payload={
+            "tenant_scope": auth.tenant_id,
+            "requested_by": auth.email or auth.username or str(auth.user_id),
+        },
         trace_id=trace_id_from_header(x_trace_id),
     )
 
@@ -1914,8 +4023,14 @@ async def approve_knowledge_pack(
     request: Request,
     payload: Any = REQUEST_BODY,
     x_trace_id: str | None = Header(default=None),
+    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),  # noqa: B008
 ) -> dict[str, Any]:
     payload = await knowledge_pack_payload_from_request(request, payload, "Knowledge Pack approval payload")
+    payload = {
+        **payload,
+        "tenant_id": auth.tenant_id,
+        "approved_by": auth.email or auth.username or str(auth.user_id),
+    }
     return await guarded_proxy(
         request=request,
         method="POST",
@@ -1930,15 +4045,33 @@ async def approve_knowledge_pack(
 async def list_rag_documents(
     request: Request,
     x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
 ) -> dict[str, Any]:
-    return await guarded_proxy(
-        request=request,
-        method="GET",
-        path="/rag/documents",
-        target_base=settings.context_agent_url,
-        payload={},
-        trace_id=trace_id_from_header(x_trace_id),
-    )
+    trace_id = trace_id_from_header(x_trace_id)
+    try:
+        return await guarded_proxy(
+            request=request,
+            method="GET",
+            path=f"/rag/documents?{urlencode({'tenant_scope': tenant_id})}",
+            target_base=settings.context_agent_url,
+            payload={},
+            trace_id=trace_id,
+            # Knowledge inventory enriches Copilot but must never hold the
+            # application open while the context agent rebuilds its index.
+            timeout_seconds=5.0,
+        )
+    except HTTPException as exc:
+        if exc.status_code != 502:
+            raise
+        logger.warning("rag_documents_degraded trace_id=%s", trace_id)
+        return {
+            "trace_id": trace_id,
+            "data": {
+                "documents": [],
+                "degraded": True,
+                "warning": "Knowledge inventory is temporarily unavailable. Other Copilot workflows remain available.",
+            },
+        }
 
 
 @app.get("/rag/documents/content")
@@ -1946,6 +4079,7 @@ async def get_rag_document_content(
     request: Request,
     path: str,
     x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
 ) -> dict[str, Any]:
     return await guarded_proxy(
         request=request,
@@ -1954,23 +4088,7 @@ async def get_rag_document_content(
         target_base=settings.context_agent_url,
         payload={},
         trace_id=trace_id_from_header(x_trace_id),
-        params={"path": path},
-    )
-
-
-@app.put("/rag/documents")
-async def update_rag_document(
-    request: Request,
-    payload: dict[str, Any] = REQUEST_BODY,
-    x_trace_id: str | None = Header(default=None),
-) -> dict[str, Any]:
-    return await guarded_proxy(
-        request=request,
-        method="PUT",
-        path="/rag/documents",
-        target_base=settings.context_agent_url,
-        payload=payload,
-        trace_id=trace_id_from_header(x_trace_id),
+        params={"path": path, "tenant_scope": tenant_id},
     )
 
 
@@ -2024,9 +4142,10 @@ async def search_rag(
     query: str,
     request: Request,
     limit: int = 8,
+    tenant_id: str = Depends(current_tenant_id),
     x_trace_id: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    query_string = urlencode({"query": query, "limit": limit})
+    query_string = urlencode({"query": query, "limit": limit, "tenant_id": tenant_id})
     return await guarded_proxy(
         request=request,
         method="GET",
@@ -2052,87 +4171,16 @@ async def flow_catalog(
     )
 
 
-@app.post("/model/route")
-async def model_route(
-    request: Request,
-    payload: dict[str, Any] = REQUEST_BODY,
-    x_trace_id: str | None = Header(default=None),
-) -> dict[str, Any]:
-    return await guarded_proxy(
-        request=request,
-        method="POST",
-        path="/route",
-        target_base=settings.model_router_url,
-        payload=payload,
-        trace_id=trace_id_from_header(x_trace_id),
+app.include_router(
+    build_control_router(
+        settings=settings,
+        guarded_proxy=guarded_proxy,
+        raw_proxy=proxy,
+        trace_id_from_header=trace_id_from_header,
+        analyzer=analyzer,
+        load_recent_events=lambda limit: _load_recent_gateway_audit_events(app, limit),
+        build_audit_contract=_build_gateway_audit_contract,
+        load_audit_summary=lambda: _load_gateway_audit_summary(app),
+        auth_context_from_request=_auth_context_from_request,
     )
-
-
-@app.post("/model/route/provider/{provider_name}")
-async def model_route_provider(
-    provider_name: str,
-    request: Request,
-    payload: dict[str, Any] = REQUEST_BODY,
-    x_trace_id: str | None = Header(default=None),
-) -> dict[str, Any]:
-    return await guarded_proxy(
-        request=request,
-        method="POST",
-        path=f"/route/provider/{provider_name}",
-        target_base=settings.model_router_url,
-        payload=payload,
-        trace_id=trace_id_from_header(x_trace_id),
-    )
-
-
-@app.get("/model/providers/status")
-async def model_providers_status(
-    request: Request,
-    x_trace_id: str | None = Header(default=None),
-) -> dict[str, Any]:
-    return await guarded_proxy(
-        request=request,
-        method="GET",
-        path="/providers/status",
-        target_base=settings.model_router_url,
-        payload={},
-        trace_id=trace_id_from_header(x_trace_id),
-    )
-
-
-@app.get("/approval/incident/{incident_id}")
-async def get_incident(
-    incident_id: str,
-    request: Request,
-    x_trace_id: str | None = Header(default=None),
-) -> dict[str, Any]:
-    return await guarded_proxy(
-        request=request,
-        method="GET",
-        path=f"/incident/{incident_id}",
-        target_base=settings.approval_service_url,
-        payload={},
-        trace_id=trace_id_from_header(x_trace_id),
-    )
-
-
-@app.post("/security/check")
-async def security_check(payload: dict[str, Any] = REQUEST_BODY) -> dict[str, Any]:
-    safety = analyzer.analyze(payload)
-    return {"safety": safety.model_dump(mode="json")}
-
-
-@app.get("/observability/recent")
-async def recent_events(limit: int = 25) -> dict[str, Any]:
-    events = await _load_recent_gateway_audit_events(app, limit)
-    response_rows: list[dict[str, Any]] = []
-    for event in events:
-        row = event.model_dump(mode="json")
-        row["event_contract"] = _build_gateway_audit_contract(event)
-        response_rows.append(row)
-    return {"events": response_rows}
-
-
-@app.get("/observability/summary")
-async def observability_summary() -> dict[str, Any]:
-    return await _load_gateway_audit_summary(app)
+)

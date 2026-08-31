@@ -1,20 +1,37 @@
 from __future__ import annotations
 
 from api_gateway.modules.users.models import SystemRole
+from common.authorization import OperationalRole
 
 ADMIN_ROLE = SystemRole.ADMINISTRATOR.value
+HITL_COMPATIBILITY_ROLES = {
+    ADMIN_ROLE,
+    SystemRole.L2_ENGINEER.value,
+    SystemRole.L3_ENGINEER.value,
+}
 DOCUMENT_PROVIDER_ROLES = {
     SystemRole.ADMINISTRATOR.value,
     SystemRole.L2_ENGINEER.value,
     SystemRole.L3_ENGINEER.value,
 }
 AUTHENTICATED_WRITE_RULES: tuple[tuple[set[str] | None, str, set[str] | None], ...] = (
+    (None, "/evaluations", None),
+    ({"GET"}, "/events/operations", None),
     (None, "/applications", {ADMIN_ROLE}),
     (None, "/onboarding", {ADMIN_ROLE}),
     (None, "/monitoring", {ADMIN_ROLE}),
+    (None, "/operations/queues", {ADMIN_ROLE}),
     ({"POST", "PUT", "DELETE", "PATCH"}, "/rag", DOCUMENT_PROVIDER_ROLES),
     ({"POST", "PUT", "DELETE", "PATCH"}, "/model", {ADMIN_ROLE}),
-    ({"POST", "PUT", "DELETE", "PATCH"}, "/approval", None),
+    (None, "/approval/capacity", {ADMIN_ROLE}),
+    (None, "/approval/assignments", {ADMIN_ROLE}),
+    (None, "/approval/auto-assign", {ADMIN_ROLE}),
+    ({"GET"}, "/approval/incident", None),
+    ({"POST"}, "/incidents", {ADMIN_ROLE, SystemRole.L3_ENGINEER.value}),
+    ({"POST"}, "/analysis", None),
+    ({"POST", "PUT", "DELETE", "PATCH"}, "/approval", HITL_COMPATIBILITY_ROLES),
+    ({"POST", "PUT", "DELETE", "PATCH"}, "/remediation", HITL_COMPATIBILITY_ROLES),
+    ({"POST"}, "/copilot", None),
 )
 
 
@@ -27,3 +44,20 @@ def route_auth_rule(method: str, path: str) -> set[str] | None | bool:
         if normalized_path == prefix or normalized_path.startswith(f"{prefix}/"):
             return roles
     return False
+
+
+def canonical_route_auth_rule(method: str, path: str) -> set[str] | None | bool:
+    """Return the two-role policy used for live authorization.
+
+    ``route_auth_rule`` remains the legacy projection for compatibility with
+    older policy consumers during the migration window.
+    """
+    rule = route_auth_rule(method, path)
+    if rule is False or rule is None:
+        return rule
+    canonical: set[str] = set()
+    if SystemRole.ADMINISTRATOR.value in rule:
+        canonical.add(OperationalRole.ADMIN.value)
+    if rule.intersection({SystemRole.L2_ENGINEER.value, SystemRole.L3_ENGINEER.value}):
+        canonical.add(OperationalRole.HITL_APPROVER.value)
+    return canonical

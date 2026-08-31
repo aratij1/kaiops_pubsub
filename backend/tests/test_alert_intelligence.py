@@ -1,6 +1,8 @@
 from alert_intelligence import AlertIntelligenceAgent
 from common.models import Alert, AlertSeverity
+from common.repository_interfaces import InMemoryAlertHistoryRepository
 import pytest
+from datetime import timedelta
 
 
 def make_alert(description: str = "payment latency above threshold") -> Alert:
@@ -22,8 +24,26 @@ async def test_alert_intelligence_deduplicates_and_classifies() -> None:
 
     assert first.severity == AlertSeverity.CRITICAL
     assert second.deduplicated_count == 2
+    assert first.metadata["deduplication"]["disposition"] == "new_incident"
+    assert second.metadata["deduplication"]["disposition"] == "duplicate"
     assert second.correlation_id == first.correlation_id
     assert first_incident.owner_team == "payments-sre"
+
+
+@pytest.mark.asyncio
+async def test_same_alert_from_replaced_pod_is_an_exact_duplicate() -> None:
+    agent = AlertIntelligenceAgent(deduplication_window_minutes=60)
+    first = make_alert()
+    first.labels["pod"] = "payments-api-7f44b7d6dd-abc12"
+    first, _ = await agent.process(first)
+
+    replacement = make_alert()
+    replacement.labels["pod"] = "payments-api-7f44b7d6dd-xyz89"
+    replacement, _ = await agent.process(replacement)
+
+    assert replacement.fingerprint == first.fingerprint
+    assert replacement.metadata["deduplication"]["disposition"] == "duplicate"
+    assert replacement.metadata["deduplication"]["match_type"] == "exact"
 
 
 @pytest.mark.asyncio
@@ -95,3 +115,150 @@ async def test_alert_intelligence_does_not_correlate_unrelated_services() -> Non
 
     assert unrelated.correlation_id != first.correlation_id
     assert unrelated.metadata["correlation"]["matched"] is False
+
+
+@pytest.mark.asyncio
+async def test_process_fetches_alert_history_once_per_alert() -> None:
+    """Dedup and correlation previously issued two independent unfiltered
+    history scans per incoming alert. process() must now share a single
+    environment-scoped fetch between both steps."""
+
+    class CountingRepository(InMemoryAlertHistoryRepository):
+        def __init__(self) -> None:
+            super().__init__()
+            self.list_calls: list[str | None] = []
+
+        async def list_recent_alerts(self, *, environment: str | None = None, tenant_id: str | None = None):
+            self.list_calls.append(environment)
+            return await super().list_recent_alerts(environment=environment, tenant_id=tenant_id)
+
+    repository = CountingRepository()
+    agent = AlertIntelligenceAgent(alert_history_repository=repository)
+
+    await agent.process(make_alert())
+
+    assert repository.list_calls == ["prod"]
+
+
+def test_embedding_cache_is_bounded() -> None:
+    """The embedding cache used to be an unbounded dict that grew for the
+    life of the process. It must now evict the oldest entry once the cap is
+    exceeded instead of leaking memory across a long-running soak."""
+    agent = AlertIntelligenceAgent()
+    agent._embedding_cache_max_size = 3
+
+    agent._embed("alert-text-1")
+    agent._embed("alert-text-2")
+    agent._embed("alert-text-3")
+    agent._embed("alert-text-4")
+
+    assert len(agent._embedding_cache) == 3
+    assert "alert-text-1" not in agent._embedding_cache
+    assert "alert-text-4" in agent._embedding_cache
+
+
+@pytest.mark.asyncio
+async def test_alert_deduplication_can_be_disabled() -> None:
+    repository = InMemoryAlertHistoryRepository()
+    agent = AlertIntelligenceAgent(alert_history_repository=repository, deduplication_enabled=False)
+    original = make_alert()
+    await repository.record_alert(original)
+
+    duplicate = make_alert()
+    enriched = await agent.deduplicate_alerts(duplicate, [original])
+
+    assert enriched.deduplicated_count == 1
+    assert enriched.metadata["deduplication"]["enabled"] is False
+
+
+@pytest.mark.asyncio
+async def test_similar_alert_within_configured_hour_is_duplicate() -> None:
+    repository = InMemoryAlertHistoryRepository()
+    agent = AlertIntelligenceAgent(
+        alert_history_repository=repository,
+        deduplication_window_minutes=60,
+        correlation_threshold=0.2,
+    )
+    original = make_alert("checkout payment latency high")
+    original.fingerprint = agent._fingerprint(original)
+    await repository.record_alert(original)
+    similar = Alert(
+        source="prometheus",
+        name="CheckoutLatencyDegraded",
+        service="payments",
+        severity=AlertSeverity.WARNING,
+        description="payment response latency degraded in checkout",
+        labels={"deployment": "payments-api", "team": "payments-sre"},
+        starts_at=original.starts_at + timedelta(minutes=59),
+    )
+
+    enriched = await agent.deduplicate_alerts(similar, [original])
+
+    assert enriched.metadata["deduplication"]["disposition"] == "duplicate"
+    assert enriched.metadata["deduplication"]["match_type"] == "similar"
+
+
+@pytest.mark.asyncio
+async def test_similar_alert_outside_configured_hour_is_new() -> None:
+    agent = AlertIntelligenceAgent(deduplication_window_minutes=60, correlation_threshold=0.2)
+    original = make_alert("checkout payment latency high")
+    original.fingerprint = agent._fingerprint(original)
+    original.starts_at = original.starts_at - timedelta(minutes=61)
+    similar = Alert(
+        source="prometheus",
+        name="CheckoutLatencyDegraded",
+        service="payments",
+        severity=AlertSeverity.WARNING,
+        description="payment response latency degraded in checkout",
+        labels={"deployment": "payments-api", "team": "payments-sre"},
+    )
+
+    enriched = await agent.deduplicate_alerts(similar, [original])
+
+    assert enriched.metadata["deduplication"]["disposition"] == "new_incident"
+
+
+@pytest.mark.asyncio
+async def test_active_e2e_runs_share_one_incident_family() -> None:
+    agent = AlertIntelligenceAgent(deduplication_window_minutes=60)
+    first = Alert(
+        source="prometheus",
+        name="KaiOps discovery unavailable 20260819085345",
+        service="kaiops-discovery-mcp",
+        environment="e2e-20260819085345",
+        severity=AlertSeverity.CRITICAL,
+        description="discovery endpoint is unreachable",
+        ends_at=make_alert().starts_at + timedelta(minutes=10),
+    )
+    first, _ = await agent.process(first)
+    second = Alert(
+        source="prometheus",
+        name="KaiOps discovery unavailable 20260819085721",
+        service="kaiops-discovery-mcp",
+        environment="e2e-20260819085721",
+        severity=AlertSeverity.CRITICAL,
+        description="discovery endpoint is unreachable",
+        starts_at=first.starts_at + timedelta(minutes=4),
+        ends_at=first.starts_at + timedelta(minutes=14),
+    )
+
+    second, _ = await agent.process(second)
+
+    assert second.metadata["deduplication"]["disposition"] == "duplicate"
+    assert second.metadata["deduplication"]["match_type"] == "exact"
+    assert second.correlation_id == first.correlation_id
+
+
+@pytest.mark.asyncio
+async def test_environment_family_does_not_cross_production_and_staging() -> None:
+    agent = AlertIntelligenceAgent(deduplication_window_minutes=60)
+    production = make_alert()
+    production.environment = "production"
+    production, _ = await agent.process(production)
+    staging = make_alert()
+    staging.environment = "staging"
+
+    staging, _ = await agent.process(staging)
+
+    assert staging.metadata["deduplication"]["disposition"] == "new_incident"
+    assert staging.correlation_id != production.correlation_id

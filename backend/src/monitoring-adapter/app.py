@@ -1,6 +1,7 @@
 from __future__ import annotations
+
 import asyncio
-from collections import deque
+import base64
 import hashlib
 import heapq
 import json
@@ -8,35 +9,49 @@ import os
 import re
 import sys
 import uuid
-from datetime import datetime, timedelta, timezone
-from functools import lru_cache
+from collections import deque
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Literal
-from urllib.parse import urlparse
+from urllib.parse import quote
 from uuid import UUID
 
-from common.config import get_settings
+import httpx
+from ai_workbench_common.model_evaluation import build_quality_evaluation
+from ai_workbench_common.prompts import PROMPT_SUMMARIZE_RCA
 from common.ai_layer_client import AiLayerClient
+from common.config import get_settings
 from common.database import create_engine, create_schema, create_session_factory
+from common.context_enrichment_contract import HitlJiraRequest, JiraClosureRequest, JiraRegressionRequest, TicketClosurePolicy
 from common.event_publishers import build_agent_event_contract, build_event_envelope
 from common.logging import get_logger
-from ai_workbench_common.model_evaluation import build_quality_evaluation
 from common.models import (
     Alert,
     AlertSeverity,
-    EvidenceReference,
-    RawAlert,
-    Incident,
-    IncidentStatus,
     Approval,
     ApprovalDecision,
+    EvidenceReference,
+    Incident,
+    IncidentStatus,
+    RawAlert,
     Recommendation,
     RemediationAction,
     RemediationStatus,
     ResolutionReport,
 )
-from common.repository import IncidentRepository
+from common.jira_governance import (
+    governed_jira_action,
+    jira_actor_id,
+    jira_issue_status,
+    jira_webhook_event_id,
+    kaims_may_close_ticket,
+    validate_jira_approval,
+)
+from common.hitl_routing import resolve_hitl_assignee
+from common.object_storage import build_object_storage
+from common.orchestration.execution_plan import resolve_execution_plan
+from common.repository import ContextEnrichmentRepository, IncidentRepository, ObjectStorageRepository
 from common.service import create_app
 from common.telemetry import EVENT_CONTRACTS_EMITTED, EVENT_PUBLISH_LATENCY
 from common.topics import (
@@ -46,50 +61,13 @@ from common.topics import (
     ALERT_RECEIVED,
     APPROVAL_REQUESTED,
     AUTOMATION_EXECUTED,
-    JIRA_INVESTIGATIONS,
     RAW_ALERTS,
     RESOLUTION_GENERATED,
 )
-from ai_workbench_common.prompts import PROMPT_SUMMARIZE_RCA
-import httpx
 from fastapi import BackgroundTasks, Body, Header, HTTPException, Query
-from pydantic import BaseModel, Field, model_validator
-from monitoring_adapter.state import (
-    ALERT_SEVERITY_OVERRIDES_FILE,
-    FLOW_CATALOG_FILE,
-    ONBOARDING_CONNECTIVITY_FILE,
-    SCENARIOS,
-    SCENARIOS_TEXT_FILE,
-    alert_severity_overrides_path,
-    default_flow_catalog_entries,
-    ensure_flow_catalog_exists,
-    flow_catalog_path,
-    load_alert_severity_overrides,
-    list_scenarios,
-    load_onboarding_connectivity,
-    load_scenarios_from_text_file,
-    merged_scenarios,
-    onboarding_connectivity_path,
-    rag_root_path,
-    remove_alert_severity_override,
-    resolve_flow_id,
-    save_alert_severity_overrides,
-    save_onboarding_connectivity,
-    scenario_source_rows,
-    scenarios_text_path,
-    severity_from_string,
-    slugify,
-    upsert_alert_severity_override,
-)
-from monitoring_adapter.onboarding_pipelines import (
-    ExistingRulePipelineRequest,
-    NewRuleOnboardingRequest,
-    build_prometheus_rules_yaml,
-    capabilities_catalog,
-    find_pipeline_rows,
-    run_existing_rule_pipeline,
-    run_new_rule_pipeline,
-)
+from fastapi.responses import StreamingResponse
+from monitoring_adapter.dedup import compute_fingerprint
+from monitoring_adapter.email_ingestion import EmailPollState, ImapConfig, email_to_alert_payload, fetch_unseen_emails
 from monitoring_adapter.existing_monitoring import (
     apply_field_mapping,
     build_webhook_path,
@@ -100,12 +78,10 @@ from monitoring_adapter.existing_monitoring import (
     normalize_provider_name,
     verify_hmac_signature,
 )
+from monitoring_adapter.jira_admission import JiraAdmissionState
+from monitoring_adapter.jira_client import JiraClient, JiraClientError
 from monitoring_adapter.landing_pad_normalizer import normalize_landing_pad_alert
 from monitoring_adapter.landing_pad_sources import SUPPORTED_SUFFIXES, load_landing_pad_file
-from monitoring_adapter.email_ingestion import EmailPollState, ImapConfig, email_to_alert_payload, fetch_unseen_emails
-from monitoring_adapter.dedup import compute_fingerprint
-from monitoring_adapter.jira_client import JiraClient, JiraClientError
-from monitoring_adapter.jira_admission import JiraAdmissionState
 from monitoring_adapter.log_ingestion import (
     LogWatchState,
     OpenSearchLogState,
@@ -113,6 +89,45 @@ from monitoring_adapter.log_ingestion import (
     fetch_opensearch_error_logs,
     log_line_to_alert_payload,
 )
+from monitoring_adapter.onboarding_pipelines import (
+    ExistingRulePipelineRequest,
+    NewRuleOnboardingRequest,
+    build_prometheus_rules_yaml,
+    capabilities_catalog,
+    find_pipeline_rows,
+    run_existing_rule_pipeline,
+    run_new_rule_pipeline,
+)
+from monitoring_adapter.onboarding_sources import (
+    OnboardingMonitoringSource,
+    normalize_email_endpoint,
+    normalize_http_endpoint,
+)
+from monitoring_adapter.project_inventory import (
+    activation_readiness_blockers,
+    collect_alert_applications,
+    record_successful_test_alert,
+)
+from monitoring_adapter.state import (
+    ALERT_SEVERITY_OVERRIDES_FILE,
+    alert_severity_overrides_path,
+    flow_catalog_path,
+    list_scenarios,
+    load_alert_severity_overrides,
+    load_onboarding_connectivity,
+    merged_scenarios,
+    rag_root_path,
+    remove_alert_severity_override,
+    resolve_flow_id,
+    save_onboarding_connectivity,
+    scenario_source_rows,
+    scenarios_text_path,
+    severity_from_string,
+    slugify,
+    upsert_alert_severity_override,
+)
+from monitoring_adapter.workflow_routes import build_workflow_router
+from pydantic import BaseModel, Field, model_validator
 
 ALERT_BODY = Body(...)
 
@@ -296,10 +311,26 @@ JIRA_WEBHOOK_SECRET = str(os.getenv("JIRA_WEBHOOK_SECRET", "") or "").strip()
 # Jira's own webhook (unchanged, JIRA_WEBHOOK_SECRET above) becomes the
 # only door back into the landing pad. Off by default so this can be
 # rolled out only once real Jira credentials are configured.
-JIRA_API_BASE_URL = str(os.getenv("JIRA_API_BASE_URL", "") or "").strip()
+JIRA_API_BASE_URL = str(
+    os.getenv("JIRA_API_BASE_URL", "https://kaiops-test.atlassian.net") or ""
+).strip()
 JIRA_API_EMAIL = str(os.getenv("JIRA_API_EMAIL", "") or "").strip()
 JIRA_API_TOKEN = str(os.getenv("JIRA_API_TOKEN", "") or "").strip()
-JIRA_PROJECT_KEY = str(os.getenv("JIRA_PROJECT_KEY", "") or "").strip()
+JIRA_PROJECT_KEY = str(os.getenv("JIRA_PROJECT_KEY", "KAN") or "").strip()
+JIRA_ISSUE_TYPE = str(os.getenv("JIRA_ISSUE_TYPE", "Bug") or "").strip()
+try:
+    JIRA_TRANSITION_MAPPING = json.loads(os.getenv("JIRA_TRANSITION_MAPPING", "{}") or "{}")
+except json.JSONDecodeError:
+    JIRA_TRANSITION_MAPPING = {}
+if not isinstance(JIRA_TRANSITION_MAPPING, dict):
+    JIRA_TRANSITION_MAPPING = {}
+JIRA_TRANSITION_MAPPING = {
+    "approved": str(JIRA_TRANSITION_MAPPING.get("approved") or "approved"),
+    "rejected": str(JIRA_TRANSITION_MAPPING.get("rejected") or "rejected"),
+    "resolved": str(JIRA_TRANSITION_MAPPING.get("resolved") or "resolved"),
+    "closed": str(JIRA_TRANSITION_MAPPING.get("closed") or "closed"),
+    "reopened": str(JIRA_TRANSITION_MAPPING.get("reopened") or "reopened"),
+}
 CENTRALIZED_JIRA_ROUTING_ENABLED = str(os.getenv("CENTRALIZED_JIRA_ROUTING_ENABLED", "false")).strip().lower() in {
     "1",
     "true",
@@ -327,7 +358,9 @@ OPENSEARCH_LOG_POLL_INTERVAL_SECONDS = max(
     10.0, float(os.getenv("OPENSEARCH_LOG_POLL_INTERVAL_SECONDS", "30") or 30)
 )
 OPENSEARCH_LOG_LOOKBACK_SECONDS = max(30, int(os.getenv("OPENSEARCH_LOG_LOOKBACK_SECONDS", "300") or 300))
-OPENSEARCH_LOG_BATCH_SIZE = max(1, min(int(os.getenv("OPENSEARCH_LOG_BATCH_SIZE", "100") or 100), 500))
+# Keep telemetry admission deliberately small. The poll worker awaits every
+# record in this batch before it is allowed to request the next one.
+OPENSEARCH_LOG_BATCH_SIZE = max(1, min(int(os.getenv("OPENSEARCH_LOG_BATCH_SIZE", "10") or 10), 15))
 OPENSEARCH_LOG_STATE_FILE = LANDING_PAD_INPUT_DIR.parent / "opensearch_log_ingestion_state.json"
 EMAIL_POLL_STATE_FILE = LANDING_PAD_INPUT_DIR.parent / "email_ingestion_state.json"
 OPENSEARCH_LOG_TRIGGER_TROUBLESHOOTING = str(
@@ -422,7 +455,9 @@ EMAIL_IMAP_USE_SSL = str(os.getenv("EMAIL_IMAP_USE_SSL", "true")).strip().lower(
 EMAIL_IMAP_SEARCH_CRITERIA = str(os.getenv("EMAIL_IMAP_SEARCH_CRITERIA", "UNSEEN") or "UNSEEN").strip().upper()
 EMAIL_IMAP_MARK_SEEN = str(os.getenv("EMAIL_IMAP_MARK_SEEN", "true")).strip().lower() in {"1", "true", "yes", "on"}
 EMAIL_POLL_INTERVAL_SECONDS = max(15.0, float(os.getenv("EMAIL_POLL_INTERVAL_SECONDS", "60") or 60))
-EMAIL_POLL_BATCH_SIZE = max(1, min(int(os.getenv("EMAIL_POLL_BATCH_SIZE", "25") or 25), 100))
+# Bound IMAP admission so a busy mailbox cannot flood downstream processing.
+# The worker awaits every message before it polls for another batch.
+EMAIL_POLL_BATCH_SIZE = max(1, min(int(os.getenv("EMAIL_POLL_BATCH_SIZE", "10") or 10), 15))
 EMAIL_DEFAULT_SERVICE = str(os.getenv("EMAIL_DEFAULT_SERVICE", "email-inbox") or "email-inbox").strip()
 EMAIL_ALERT_SUBJECT_REGEX = str(
     os.getenv(
@@ -445,7 +480,7 @@ WORKER_FAILURE_THRESHOLD = max(1, int(os.getenv("WORKER_FAILURE_THRESHOLD", "5")
 _ALLOWED_PROJECT_ENVIRONMENTS = {"dev", "staging", "prod"}
 _ALLOWED_ONBOARDING_PROVIDERS = {"prometheus", "new_relic", "datadog"}
 _ALLOWED_ACTIVE_PROVIDERS = {"prometheus", "new_relic", "datadog", "azure_service_bus"}
-_ALLOWED_DEPLOYMENT_MODES = {"on_prem", "azure_cloud"}
+_ALLOWED_DEPLOYMENT_MODES = {"cloud_neutral", "on_prem", "private_cloud", "azure_cloud", "aws_cloud", "gcp_cloud"}
 ONBOARDING_RULE_EVENTS = "onboarding-rule-events"
 
 
@@ -460,7 +495,7 @@ def _recent_date_partition_dirs(base: Path, *, days: int) -> list[Path]:
     Bounds directory scans (dedup checks, recent-file listings) to a fixed
     number of small partitions instead of walking a growing multi-year archive.
     """
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     directories: list[Path] = []
     seen: set[Path] = set()
     for offset in range(days):
@@ -501,7 +536,7 @@ def _persist_alert_to_landing_pad(
 ) -> str | None:
     try:
         base_dir = LANDING_PAD_PROCESSED_DIR if status == "processed" else LANDING_PAD_FAILED_DIR
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         # Must match the YYYY/MM/DD scheme every reader scans
         # (_collect_partitioned_json_files / _recent_date_partition_dirs /
         # the dedup check / GET /landing-pad/recent) — a prior source-named
@@ -509,10 +544,13 @@ def _persist_alert_to_landing_pad(
         # those readers.
         target_dir = _date_partition_dir(base_dir, now)
         target_dir.mkdir(parents=True, exist_ok=True)
-        alert_name = slugify(str(mapped_payload.get("name") or "prometheus-alert"))
+        # Preserve the title in the payload while bounding the filesystem path.
+        # Keep the complete path below legacy Windows MAX_PATH even when the
+        # landing-pad root itself is deeply nested (CI workspaces commonly are).
+        alert_name = slugify(str(mapped_payload.get("name") or "prometheus-alert"))[:32] or "alert"
         labels = mapped_payload.get("labels", {}) if isinstance(mapped_payload.get("labels"), dict) else {}
         fingerprint = str(labels.get("alert_fingerprint") or "no-fingerprint").strip() or "no-fingerprint"
-        safe_fingerprint = re.sub(r"[^a-zA-Z0-9_-]", "-", fingerprint)[:24]
+        safe_fingerprint = re.sub(r"[^a-zA-Z0-9_-]", "-", fingerprint)[:16]
         file_name = f"{now.strftime('%Y%m%dT%H%M%S%fZ')}_{alert_name}_{safe_fingerprint}.json"
         out_path = target_dir / file_name
         payload = {
@@ -568,7 +606,7 @@ def _record_live_stream_event(
     to the same in-memory buffer GET /landing-pad/recent serves, so it shows
     up in the Live Stream UI. These actions have their own system of record
     (jira_ticket_links, SMTP) and don't need a landing-pad file — only visibility."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     RECENT_INGESTION_EVENTS.appendleft(
         {
             "file": None,
@@ -598,7 +636,7 @@ def _record_live_stream_event(
 
 def _write_alert_to_landing_pad_input(mapped_payload: dict[str, Any], raw_alert: dict[str, Any]) -> Path:
     LANDING_PAD_INPUT_DIR.mkdir(parents=True, exist_ok=True)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     alert_name = slugify(str(mapped_payload.get("name") or "prometheus-alert"))
     labels = mapped_payload.get("labels", {}) if isinstance(mapped_payload.get("labels"), dict) else {}
     fingerprint = str(labels.get("alert_fingerprint") or uuid.uuid4().hex).strip() or uuid.uuid4().hex
@@ -608,7 +646,7 @@ def _write_alert_to_landing_pad_input(mapped_payload: dict[str, Any], raw_alert:
     tmp_path = out_path.with_suffix(".tmp")
     payload = {
         "received_at": now.isoformat(),
-        "source": "prometheus-alertmanager",
+        "source": str(mapped_payload.get("source") or "prometheus-alertmanager"),
         "status": "received",
         "alert": mapped_payload,
         "raw": raw_alert,
@@ -632,17 +670,28 @@ def _landing_pad_file_rows(source_dir: Path, limit: int, *, partitioned: bool = 
             for path in source_dir.rglob("*")
             if path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES
         ]
-    files = heapq.nlargest(limit, candidates, key=lambda path: path.stat().st_mtime)
+    def _safe_mtime(path: Path) -> float:
+        try:
+            return path.stat().st_mtime
+        except FileNotFoundError:
+            return float("-inf")
+
+    files = [path for path in heapq.nlargest(limit, candidates, key=_safe_mtime) if _safe_mtime(path) != float("-inf")]
     rows: list[dict[str, Any]] = []
     for path in files:
+        try:
+            stat_info = path.stat()
+        except FileNotFoundError:
+            # The watcher may move files between discovery and parse; skip stale entries.
+            continue
         entry: dict[str, Any] = {
             "file": path.name,
             "path": str(path),
-            "modified_at": datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat(),
-            "size_bytes": int(path.stat().st_size),
+            "modified_at": datetime.fromtimestamp(stat_info.st_mtime, tz=UTC).isoformat(),
+            "size_bytes": int(stat_info.st_size),
         }
         try:
-            if path.suffix.lower() == ".json" and path.stat().st_size <= LANDING_PAD_SCAN_MAX_PARSE_BYTES:
+            if path.suffix.lower() == ".json" and stat_info.st_size <= LANDING_PAD_SCAN_MAX_PARSE_BYTES:
                 payload = json.loads(path.read_text(encoding="utf-8"))
                 alert = payload.get("alert") if isinstance(payload, dict) and isinstance(payload.get("alert"), dict) else payload
             elif path.suffix.lower() == ".json":
@@ -664,6 +713,14 @@ def _landing_pad_file_rows(source_dir: Path, limit: int, *, partitioned: bool = 
                     "name": alert.get("name") if isinstance(alert, dict) else None,
                     "service": alert.get("service") if isinstance(alert, dict) else None,
                     "severity": alert.get("severity") if isinstance(alert, dict) else None,
+                    "application": alert.get("application") if isinstance(alert, dict) else None,
+                    "project": alert.get("project") if isinstance(alert, dict) else None,
+                    "project_name": alert.get("project_name") if isinstance(alert, dict) else None,
+                    "origin_system": alert.get("origin_system") if isinstance(alert, dict) else None,
+                    "ingestion_channel": alert.get("ingestion_channel") if isinstance(alert, dict) else None,
+                    "source_path": alert.get("source_path") if isinstance(alert, dict) else None,
+                    "labels": labels,
+                    "annotations": annotations,
                     "alert_status": labels.get("alert_status") or labels.get("status"),
                     "alertname": labels.get("alertname"),
                     "summary": annotations.get("summary"),
@@ -694,6 +751,44 @@ def _landing_pad_input_files(limit: int) -> list[Path]:
     return heapq.nsmallest(limit, candidates, key=lambda path: path.stat().st_mtime)
 
 
+def _landing_pad_recent_input_snapshot(limit: int) -> list[dict[str, Any]]:
+    """Build a recent feed from landing-pad input/replayed/failed files.
+
+    This keeps Live Stream useful across monitoring-adapter restarts when the
+    in-memory ring buffer is empty.
+    """
+    safe_limit = max(1, min(int(limit), 200))
+    pending_rows = _landing_pad_file_rows(LANDING_PAD_INPUT_DIR, safe_limit)
+    additional_rows: list[dict[str, Any]] = []
+    for directory in LANDING_PAD_ADDITIONAL_INPUT_DIRS:
+        additional_rows.extend(_landing_pad_file_rows(directory, safe_limit))
+    replayed_rows = _landing_pad_file_rows(LANDING_PAD_INPUT_REPLAYED_DIR, safe_limit, partitioned=True)
+    failed_rows = _landing_pad_file_rows(LANDING_PAD_INPUT_FAILED_DIR, safe_limit, partitioned=True)
+
+    combined: list[dict[str, Any]] = []
+
+    def _push(rows: list[dict[str, Any]], *, status: str, bucket: str) -> None:
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            normalized = dict(row)
+            normalized.setdefault("status", status)
+            normalized.setdefault("source", "landing-pad-file")
+            normalized["bucket"] = bucket
+            combined.append(normalized)
+
+    _push(pending_rows, status="pending", bucket="pending")
+    _push(additional_rows, status="pending", bucket="pending")
+    _push(replayed_rows, status="processed", bucket="replayed")
+    _push(failed_rows, status="failed", bucket="failed")
+
+    combined.sort(
+        key=lambda row: str(row.get("modified_at") or row.get("received_at") or ""),
+        reverse=True,
+    )
+    return combined[:safe_limit]
+
+
 def _mapped_alerts_from_landing_pad_payload(payload: dict[str, Any]) -> list[tuple[dict[str, Any], dict[str, Any]]]:
     if isinstance(payload.get("alert"), dict):
         raw_alert = payload.get("raw") if isinstance(payload.get("raw"), dict) else payload["alert"]
@@ -710,8 +805,6 @@ def _mapped_alerts_from_landing_pad_payload(payload: dict[str, Any]) -> list[tup
         if not isinstance(item, dict):
             continue
         status = str(item.get("status") or payload.get("status") or "firing").strip().lower()
-        if status != "firing":
-            continue
         labels = item.get("labels", {}) if isinstance(item.get("labels"), dict) else {}
         annotations = item.get("annotations", {}) if isinstance(item.get("annotations"), dict) else {}
         merged_labels = {**common_labels, **labels}
@@ -750,7 +843,7 @@ def _mapped_alerts_from_landing_pad_payload(payload: dict[str, Any]) -> list[tup
 
 
 def _archive_landing_pad_input_file(path: Path, target_dir: Path) -> str:
-    partition_dir = _date_partition_dir(target_dir, datetime.now(timezone.utc))
+    partition_dir = _date_partition_dir(target_dir, datetime.now(UTC))
     partition_dir.mkdir(parents=True, exist_ok=True)
     original_name = path.name.split("_", 1)[1] if path.parent.name == ".claiming" and "_" in path.name else path.name
     target_path = partition_dir / original_name
@@ -772,8 +865,8 @@ def _landing_pad_input_is_stale(path: Path, *, original_parent: Path) -> bool:
         return False
     if original_parent.resolve() != LANDING_PAD_INPUT_DIR.resolve():
         return False
-    modified_at = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
-    age_seconds = (datetime.now(timezone.utc) - modified_at).total_seconds()
+    modified_at = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
+    age_seconds = (datetime.now(UTC) - modified_at).total_seconds()
     return age_seconds > LANDING_PAD_FILE_WATCHER_STALE_HOURS * 3600
 
 
@@ -836,7 +929,7 @@ def _recover_stale_claims() -> int:
     parent dir, never `.claiming/`). This sweep recovers those orphans.
     """
     recovered = 0
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     for directory in [LANDING_PAD_INPUT_DIR, *LANDING_PAD_ADDITIONAL_INPUT_DIRS]:
         claim_dir = directory / ".claiming"
         if not claim_dir.is_dir():
@@ -845,7 +938,7 @@ def _recover_stale_claims() -> int:
             if not claimed_path.is_file():
                 continue
             try:
-                modified_at = datetime.fromtimestamp(claimed_path.stat().st_mtime, tz=timezone.utc)
+                modified_at = datetime.fromtimestamp(claimed_path.stat().st_mtime, tz=UTC)
                 age_seconds = (now - modified_at).total_seconds()
                 if age_seconds <= LANDING_PAD_CLAIM_STALE_MINUTES * 60:
                     continue
@@ -1001,6 +1094,12 @@ class OnboardingProject(BaseModel):
     owner_team: str
     environment: str
     region: str
+    description: str = ""
+    business_service: str = ""
+    owner_email: str = ""
+    criticality: str = "medium"
+    cost_center: str = ""
+    repository_url: str = ""
 
     @model_validator(mode="after")
     def _validate_project(self) -> "OnboardingProject":
@@ -1016,15 +1115,32 @@ class OnboardingProject(BaseModel):
             raise ValueError("project.environment must be one of dev, staging, prod")
         if not self.region:
             raise ValueError("project.region is required")
+        self.description = str(self.description or "").strip()
+        self.business_service = str(self.business_service or "").strip()
+        self.owner_email = str(self.owner_email or "").strip()
+        self.criticality = str(self.criticality or "medium").strip().lower()
+        if self.criticality not in {"low", "medium", "high", "critical"}:
+            raise ValueError("project.criticality must be one of low, medium, high, critical")
+        self.cost_center = str(self.cost_center or "").strip()
+        self.repository_url = str(self.repository_url or "").strip()
         return self
 
 
 class OnboardingConnectivityPayload(BaseModel):
     project: OnboardingProject
-    deployment_mode: str = "on_prem"
+    deployment_mode: str = "cloud_neutral"
     prometheus_url: str = ""
     new_relic_url: str = ""
     datadog_url: str = ""
+    monitoring_sources: list[OnboardingMonitoringSource] = Field(default_factory=list)
+    healthcheck_url: str = ""
+    logs_url: str = ""
+    traces_url: str = ""
+    telemetry_url: str = ""
+    ticketing_url: str = ""
+    email_url: str = ""
+    network_zone: str = ""
+    context_strategy: str = "auto"
     azure_subscription_id: str = ""
     azure_resource_group: str = ""
     azure_service_bus_namespace: str = ""
@@ -1082,8 +1198,8 @@ class OnboardingConnectivityPayload(BaseModel):
             user_assignments[normalized_user] = list(dict.fromkeys(normalized_projects))
         normalized["user_assignments"] = user_assignments
 
-        deployment_mode = str(normalized.get("deployment_mode", "on_prem")).strip().lower().replace("-", "_")
-        normalized["deployment_mode"] = deployment_mode or "on_prem"
+        deployment_mode = str(normalized.get("deployment_mode", "cloud_neutral")).strip().lower().replace("-", "_")
+        normalized["deployment_mode"] = deployment_mode or "cloud_neutral"
 
         normalized["azure_subscription_id"] = str(normalized.get("azure_subscription_id", "")).strip()
         normalized["azure_resource_group"] = str(normalized.get("azure_resource_group", "")).strip()
@@ -1099,23 +1215,28 @@ class OnboardingConnectivityPayload(BaseModel):
 
     @staticmethod
     def _normalize_endpoint(value: str, field_name: str) -> str:
-        endpoint = str(value or "").strip()
-        if not endpoint:
-            return ""
-        parsed = urlparse(endpoint)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise ValueError(f"{field_name} must be a valid http(s) URL")
-        return endpoint
+        return normalize_http_endpoint(value, field_name)
 
     @model_validator(mode="after")
     def _validate_payload(self) -> "OnboardingConnectivityPayload":
-        self.deployment_mode = str(self.deployment_mode or "on_prem").strip().lower().replace("-", "_")
+        self.deployment_mode = str(self.deployment_mode or "cloud_neutral").strip().lower().replace("-", "_")
         if self.deployment_mode not in _ALLOWED_DEPLOYMENT_MODES:
-            raise ValueError("deployment_mode must be one of on_prem, azure_cloud")
+            raise ValueError("deployment_mode must be one of cloud_neutral, on_prem, private_cloud, azure_cloud, aws_cloud, gcp_cloud")
 
         self.prometheus_url = self._normalize_endpoint(self.prometheus_url, "prometheus_url")
         self.new_relic_url = self._normalize_endpoint(self.new_relic_url, "new_relic_url")
         self.datadog_url = self._normalize_endpoint(self.datadog_url, "datadog_url")
+        self.healthcheck_url = self._normalize_endpoint(self.healthcheck_url, "healthcheck_url")
+        self.logs_url = self._normalize_endpoint(self.logs_url, "logs_url")
+        self.traces_url = self._normalize_endpoint(self.traces_url, "traces_url")
+        self.telemetry_url = self._normalize_endpoint(self.telemetry_url, "telemetry_url")
+        self.ticketing_url = self._normalize_endpoint(self.ticketing_url, "ticketing_url")
+        self.email_url = normalize_email_endpoint(self.email_url)
+        self.network_zone = str(self.network_zone or "").strip()
+        self.context_strategy = str(self.context_strategy or "auto").strip().lower()
+        self.context_strategy = {"continuous": "auto", "immediate": "realtime"}.get(self.context_strategy, self.context_strategy)
+        if self.context_strategy not in {"auto", "realtime", "historical"}:
+            raise ValueError("context_strategy must be one of auto, realtime, historical")
         self.azure_subscription_id = str(self.azure_subscription_id or "").strip()
         self.azure_resource_group = str(self.azure_resource_group or "").strip()
         self.azure_service_bus_namespace = str(self.azure_service_bus_namespace or "").strip()
@@ -1143,10 +1264,19 @@ class OnboardingConnectivityPayload(BaseModel):
 
 class OnboardingConnectivitySnapshot(BaseModel):
     project: dict[str, Any] = Field(default_factory=dict)
-    deployment_mode: str = "on_prem"
+    deployment_mode: str = "cloud_neutral"
     prometheus_url: str = ""
     new_relic_url: str = ""
     datadog_url: str = ""
+    monitoring_sources: list[dict[str, Any]] = Field(default_factory=list)
+    healthcheck_url: str = ""
+    logs_url: str = ""
+    traces_url: str = ""
+    telemetry_url: str = ""
+    ticketing_url: str = ""
+    email_url: str = ""
+    network_zone: str = ""
+    context_strategy: str = "auto"
     azure_subscription_id: str = ""
     azure_resource_group: str = ""
     azure_service_bus_namespace: str = ""
@@ -1214,6 +1344,7 @@ class OnboardingCompletePayload(BaseModel):
 
 
 OnboardingProject.model_rebuild()
+OnboardingMonitoringSource.model_rebuild()
 OnboardingConnectivityPayload.model_rebuild()
 OnboardingConnectivitySnapshot.model_rebuild()
 OnboardingConnectivityResponse.model_rebuild()
@@ -1307,6 +1438,7 @@ def _build_local_metadata_envelope(
     severity = str(incident.get("severity") or alert.get("severity") or "warning").strip().lower()
     correlation_id = str(alert.get("correlation_id") or "").strip() or None
     provider = str(transport_provider or decision.get("message_bus_provider") or "rabbitmq").strip().lower() or "rabbitmq"
+    tenant_id = str(incident.get("tenant_id") or alert.get("tenant_id") or "").strip()
 
     return build_event_envelope(
         event_type=event_type,
@@ -1319,7 +1451,7 @@ def _build_local_metadata_envelope(
             "parent_event_id": None,
         },
         scope={
-            "tenant_id": "default",
+            "tenant_id": tenant_id,
             "service": service,
             "environment": environment,
             "region": None,
@@ -1396,7 +1528,24 @@ async def _landing_pad_file_watcher() -> None:
         try:
             _recover_stale_claims()
             paths = _landing_pad_input_files(LANDING_PAD_FILE_WATCHER_BATCH_SIZE)
-            await asyncio.gather(*(_process_landing_pad_input_file(path) for path in paths), return_exceptions=True)
+            results = await asyncio.gather(
+                *(_process_landing_pad_input_file(path) for path in paths),
+                return_exceptions=True,
+            )
+            failures = [
+                result
+                for result in results
+                if isinstance(result, Exception)
+                or (isinstance(result, dict) and result.get("status") in {"failed", "failed_all_rows"})
+            ]
+            if failures:
+                samples = [
+                    str(result) if isinstance(result, Exception) else str(result.get("error") or result.get("status"))
+                    for result in failures[:3]
+                ]
+                raise RuntimeError(
+                    f"landing-pad batch failed for {len(failures)}/{len(results)} files: {'; '.join(samples)}"
+                )
             _record_worker_success("landing_pad_file_watcher")
         except Exception as exc:
             _record_worker_failure("landing_pad_file_watcher", exc)
@@ -1414,7 +1563,7 @@ def _sweep_landing_pad_archive_once() -> dict[str, int]:
     counter dict so callers (worker loop or the manual trigger endpoint) can
     report how much was moved.
     """
-    cutoff = datetime.now(timezone.utc).timestamp() - (LANDING_PAD_ARCHIVE_AFTER_DAYS * 86400)
+    cutoff = datetime.now(UTC).timestamp() - (LANDING_PAD_ARCHIVE_AFTER_DAYS * 86400)
     moved = 0
     errors = 0
     for base_dir in (LANDING_PAD_PROCESSED_DIR, LANDING_PAD_FAILED_DIR):
@@ -1443,7 +1592,10 @@ async def _landing_pad_archive_worker() -> None:
     stop_event = app.state.monitoring_adapter_stop_event
     while not stop_event.is_set():
         try:
-            result = _sweep_landing_pad_archive_once()
+            # Archive trees can contain tens of thousands of files. Filesystem
+            # traversal is synchronous, so running it on the API event loop
+            # previously froze alert reads and health traffic for seconds.
+            result = await asyncio.to_thread(_sweep_landing_pad_archive_once)
             if result["moved"]:
                 logger.info("landing pad archive sweep moved %s file(s)", result["moved"])
             _record_worker_success("landing_pad_archive_worker")
@@ -1520,7 +1672,13 @@ async def _email_poll_worker() -> None:
                 await _process_polled_email(message)
                 if message_id:
                     _EMAIL_SESSION_MESSAGE_IDS.add(message_id)
-            logger.info("email_poll_complete mailbox=%s fetched=%s", EMAIL_IMAP_MAILBOX, len(messages))
+            logger.info(
+                "email_poll_complete mailbox=%s fetched=%s batch_limit=%s next_poll_seconds=%s",
+                EMAIL_IMAP_MAILBOX,
+                len(messages),
+                EMAIL_POLL_BATCH_SIZE,
+                EMAIL_POLL_INTERVAL_SECONDS,
+            )
             _record_worker_success("email_poll_worker")
         except Exception as exc:
             _record_worker_failure("email_poll_worker", exc)
@@ -1550,6 +1708,33 @@ async def _process_log_line(record: dict[str, Any]) -> None:
             logger.exception("failed to route log alert through jira: %s", record.get("source_path"))
         return
     if not NONACTIONABLE_ALERT_PUBLISH_ENABLED:
+        source_path = str(record.get("source_path") or "").lower()
+        telemetry_log = source_path.startswith("opensearch://otel-") or "opentelemetry" in source_path or "astronomy" in source_path
+        origin_system = "telemetry" if telemetry_log else "logs"
+        labels = dict(mapped_payload.get("labels") or {})
+        labels.setdefault("origin_system", origin_system)
+        labels.setdefault("ingestion_channel", "logs")
+        if telemetry_log:
+            labels.setdefault("project_name", "telemetry")
+            labels.setdefault("application", "telemetry")
+            mapped_payload.setdefault("project_name", "telemetry")
+            mapped_payload.setdefault("application", "telemetry")
+        mapped_payload["labels"] = labels
+        mapped_payload.setdefault("origin_system", origin_system)
+        mapped_payload.setdefault("ingestion_channel", "logs")
+        mapped_payload.setdefault("source", "logs")
+
+        # Keep log/telemetry detections visible in /landing-pad/recent even
+        # when Jira routing and nonactionable publishing are disabled.
+        _persist_alert_to_landing_pad(mapped_payload, record, status="processed")
+        _record_live_stream_event(
+            origin_system=origin_system,
+            name=str(mapped_payload.get("name") or "log-alert"),
+            service=str(mapped_payload.get("service") or ""),
+            severity=str(mapped_payload.get("severity") or "warning"),
+            description=str(mapped_payload.get("description") or ""),
+            source="logs",
+        )
         logger.info(
             "jira_pipeline stage=classification outcome=live_stream_only source=logs log_source=%s "
             "reason=jira routing disabled",
@@ -1601,6 +1786,17 @@ async def _opensearch_log_poll_worker() -> None:
             )
             for record in records:
                 await _process_log_line(record)
+                document_id = str(record.get("document_id") or "")
+                if document_id:
+                    seen = state.load()
+                    seen[document_id] = str(record.get("timestamp") or datetime.now(UTC).isoformat())
+                    state.save(seen)
+            logger.info(
+                "opensearch_log_batch_complete fetched=%s batch_limit=%s next_poll_seconds=%s",
+                len(records),
+                OPENSEARCH_LOG_BATCH_SIZE,
+                OPENSEARCH_LOG_POLL_INTERVAL_SECONDS,
+            )
             _record_worker_success("opensearch_log_poll_worker")
         except Exception as exc:
             _record_worker_failure("opensearch_log_poll_worker", exc)
@@ -1620,14 +1816,50 @@ async def _jira_poll_worker() -> None:
         return
     while not stop_event.is_set():
         try:
-            issues = await client.list_recent_issues(limit=JIRA_POLL_BATCH_SIZE)
+            session_factory = getattr(app.state, "session_factory", None)
+            cursors = []
+            if settings.database_enabled and session_factory is not None:
+                async with session_factory() as session:
+                    cursors = await ContextEnrichmentRepository(session).list_jira_sync_cursors(
+                        jira_project_key=JIRA_PROJECT_KEY,
+                    )
+            earliest = min(
+                (row.last_jira_updated_timestamp for row in cursors if row.last_jira_updated_timestamp),
+                default=datetime.now(UTC) - timedelta(minutes=5),
+            )
+            overlap_start = earliest - timedelta(minutes=2)
+            issues = await client.search_updated_issues(
+                updated_since=overlap_start, limit=JIRA_POLL_BATCH_SIZE,
+            )
             ingested = 0
-            for issue in reversed(issues):
+            for issue in issues:
                 fields = issue.get("fields") if isinstance(issue.get("fields"), dict) else {}
                 version = f"{issue.get('key')}:{fields.get('updated') or fields.get('created') or ''}"
                 if version in _JIRA_SESSION_VERSIONS:
                     continue
-                payload = {"webhookEvent": "jira:poll", "issue": issue, "event_origin": "jira"}
+                payload = {
+                    "webhookEvent": "jira:poll", "issue": issue,
+                    "event_origin": "jira-reconciliation", "timestamp": fields.get("updated"),
+                }
+                governed = await _process_governed_jira_event(payload)
+                tenant_id, project_key, issue_key = _governed_jira_scope(payload)
+                if tenant_id and project_key == JIRA_PROJECT_KEY and session_factory is not None:
+                    updated_raw = str(fields.get("updated") or "").replace("Z", "+00:00")
+                    try:
+                        updated_at = datetime.fromisoformat(updated_raw)
+                    except ValueError:
+                        updated_at = datetime.now(UTC)
+                    async with session_factory() as session:
+                        await ContextEnrichmentRepository(session).save_jira_sync_cursor(
+                            tenant_id=tenant_id, jira_project_key=project_key, poll_status="succeeded",
+                            last_successful_poll_at=datetime.now(UTC),
+                            last_jira_updated_timestamp=updated_at, last_issue_key=issue_key,
+                            poll_error=None,
+                        )
+                        await session.commit()
+                if governed:
+                    _JIRA_SESSION_VERSIONS.add(version)
+                    continue
                 mapped_payload, _ = _jira_payload_to_alert_payload(payload)
                 alert = _build_alert_from_payload(mapped_payload)
                 labels = fields.get("labels") if isinstance(fields.get("labels"), list) else []
@@ -1774,6 +2006,7 @@ def build_sample_alert(flow_id: str = "payment-latency", trace_id: str | None = 
     scenarios = merged_scenarios()
     scenario = scenarios.get(flow_id, scenarios["payment-latency"])
     return Alert(
+        tenant_id="local-demo",
         source=scenario["source"],
         name=str(scenario.get("alert_name") or scenario["name"]),
         service=scenario["service"],
@@ -1835,7 +2068,13 @@ def _build_onboarding_rule_seed(connectivity: OnboardingConnectivityPayload, sel
         "business_owner": str(project.owner_team or "").strip(),
         "technical_owner": str(project.owner_team or "").strip(),
         "technology_stack": [],
-        "cloud_provider": "azure" if connectivity.deployment_mode == "azure_cloud" else "on_prem",
+        "cloud_provider": {
+            "azure_cloud": "azure",
+            "aws_cloud": "aws",
+            "gcp_cloud": "gcp",
+            "private_cloud": "private-cloud",
+            "on_prem": "on-prem",
+        }.get(connectivity.deployment_mode, "cloud-neutral"),
         "region": str(project.region or "").strip(),
         "monitoring_platforms": [selected_tool],
         "notification_platforms": ["slack", "teams", "pagerduty"],
@@ -2315,10 +2554,19 @@ async def persist_onboarding_connectivity(payload: dict[str, Any]) -> None:
     project_name = _normalize_project_name(project)
     provider_statuses = payload.get("provider_statuses", {}) if isinstance(payload.get("provider_statuses"), dict) else {}
     connectivity_payload = {
-        "deployment_mode": str(payload.get("deployment_mode", "on_prem")).strip().lower().replace("-", "_"),
+        "deployment_mode": str(payload.get("deployment_mode", "cloud_neutral")).strip().lower().replace("-", "_"),
         "prometheus_url": str(payload.get("prometheus_url", "")).strip(),
         "new_relic_url": str(payload.get("new_relic_url", "")).strip(),
         "datadog_url": str(payload.get("datadog_url", "")).strip(),
+        "monitoring_sources": payload.get("monitoring_sources", []) if isinstance(payload.get("monitoring_sources"), list) else [],
+        "healthcheck_url": str(payload.get("healthcheck_url", "")).strip(),
+        "logs_url": str(payload.get("logs_url", "")).strip(),
+        "traces_url": str(payload.get("traces_url", "")).strip(),
+        "telemetry_url": str(payload.get("telemetry_url", "")).strip(),
+        "ticketing_url": str(payload.get("ticketing_url", "")).strip(),
+        "email_url": str(payload.get("email_url", "")).strip(),
+        "network_zone": str(payload.get("network_zone", "")).strip(),
+        "context_strategy": str(payload.get("context_strategy", "auto")).strip(),
         "azure_subscription_id": str(payload.get("azure_subscription_id", "")).strip(),
         "azure_resource_group": str(payload.get("azure_resource_group", "")).strip(),
         "azure_service_bus_namespace": str(payload.get("azure_service_bus_namespace", "")).strip(),
@@ -2331,7 +2579,7 @@ async def persist_onboarding_connectivity(payload: dict[str, Any]) -> None:
         "active_provider": _normalize_provider_name(str(payload.get("active_provider", ""))) if payload.get("active_provider") else None,
     }
     selected_provider = _normalize_provider_name(str(payload.get("active_provider", "project")))
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
 
     async with session_factory() as session:
         repo = IncidentRepository(session)
@@ -2398,7 +2646,7 @@ async def persist_onboarding_pipeline_result(result: dict[str, Any]) -> None:
         "summary": result.get("summary") or result.get("approval_package") or {},
         "event_contract": result.get("event_contract") or {},
         "result": result,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(UTC).isoformat(),
     }
 
     async with session_factory() as session:
@@ -2414,7 +2662,7 @@ async def persist_onboarding_pipeline_result(result: dict[str, Any]) -> None:
             test_message=f"{provider_name} workflow persisted",
             project_payload=project,
             connectivity_payload=payload,
-            last_tested_at=datetime.now(timezone.utc),
+            last_tested_at=datetime.now(UTC),
         )
         await session.commit()
 
@@ -2523,7 +2771,7 @@ async def run_local_payment_workflow(
     enriched_alert, incident = await AlertIntelligenceAgent().process(alert)
     incident.trace_id = trace_id
     await persist_step(lambda repo: repo.save_alert(enriched_alert), lambda repo: repo.save_incident(incident))
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     await persist_step(
         *[
             track_agent_work_operation(
@@ -2582,7 +2830,7 @@ async def run_local_payment_workflow(
                 "metrics": alert_event["metrics"],
             },
             started_at=now,
-            completed_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(UTC),
         )
     )
     context_task = asyncio.create_task(ai_client.collect_context(alert=enriched_alert, incident=incident))
@@ -2634,7 +2882,7 @@ async def run_local_payment_workflow(
                 "metrics": orchestrator_event["metrics"],
             },
             started_at=now,
-            completed_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(UTC),
         )
     )
     orchestration_envelope = _build_local_metadata_envelope(
@@ -2698,7 +2946,7 @@ async def run_local_payment_workflow(
                 "metrics": context_event["metrics"],
             },
             started_at=now,
-            completed_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(UTC),
         )
     )
     model_errors: list[dict[str, str]] = []
@@ -2711,6 +2959,7 @@ async def run_local_payment_workflow(
         recommendation = await ai_client.resolve(context=context)
     except Exception as exc:
         recommendation = Recommendation(
+            tenant_id=alert.tenant_id,
             incident_id=incident.id,
             root_cause=cleaned_resolution["root_cause"],
             confidence=0.72,
@@ -2772,6 +3021,25 @@ async def run_local_payment_workflow(
         "stream_count": decision.stream_count,
         "stream_threshold": decision.stream_threshold,
     }
+    execution_plan = resolve_execution_plan(
+        alert=enriched_alert,
+        workflow_name=decision.workflow,
+        requires_approval=True,
+        risk_tier=decision.risk_tier,
+        execution_mode="human-approval",
+        resolution_hints=" ".join((recommendation.root_cause, recommendation.recommended_action)),
+        evidence_basis=list(recommendation.metadata.get("evidence_ids", [])),
+        incident_id=incident.id,
+        root_cause=recommendation.root_cause,
+        confidence=recommendation.confidence,
+    )
+    recommendation.metadata["execution_plan"] = execution_plan
+    recommendation.metadata["remediation_target"] = execution_plan.get("remediation_target", "")
+    recommendation.metadata["runbook_id"] = execution_plan.get("runbook_governance_id") or ""
+    recommendation.metadata["runbook_slug"] = execution_plan.get("playbook_id") or ""
+    recommendation.metadata["runbook_version"] = execution_plan.get("playbook_version")
+    recommendation.metadata["runbook_status"] = execution_plan.get("runbook_status") or ""
+    recommendation.metadata["runbook_checksum"] = execution_plan.get("runbook_checksum") or ""
     recommendation.metadata["evaluation"] = build_quality_evaluation(
         prediction={
             "root_cause": recommendation.root_cause,
@@ -2889,7 +3157,7 @@ async def run_local_payment_workflow(
                 "llm_errors": resolution_event.get("llm_errors", []),
             },
             started_at=now,
-            completed_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(UTC),
         )
     )
     requires_human_approval = enriched_alert.severity in {AlertSeverity.HIGH, AlertSeverity.CRITICAL}
@@ -2898,7 +3166,10 @@ async def run_local_payment_workflow(
         incident=incident.model_dump(mode="json"),
         alert=enriched_alert.model_dump(mode="json"),
         decision=decision.__dict__,
-        status="awaiting_approval" if (requires_human_approval and not auto_approve) else "remediating",
+        # Producing an RCA recommendation does not mean an executor has started.
+        # Execution state is advanced to remediating only by the remediation
+        # engine after a durable action has been dispatched.
+        status="awaiting_approval" if (requires_human_approval and not auto_approve) else "approved",
         payload={
             "recommendation_id": str(recommendation.id),
             "flow_id": str(getattr(decision, "flow_id", "") or ""),
@@ -2919,6 +3190,7 @@ async def run_local_payment_workflow(
 
     if requires_human_approval and not auto_approve:
         pending_approval = Approval(
+            tenant_id=context.tenant_id,
             incident_id=incident.id,
             recommendation_id=recommendation.id,
             decision=ApprovalDecision.PENDING,
@@ -2930,6 +3202,7 @@ async def run_local_payment_workflow(
                 "policy_version": decision.policy_version,
                 "policy_reason": decision.policy_reason,
                 "orchestration_decision": recommendation.metadata.get("orchestration_decision", {}),
+                "execution_plan": execution_plan,
             },
         )
         approval_event = {
@@ -3048,11 +3321,20 @@ async def run_local_payment_workflow(
             "next_step": "Awaiting user approval for high-risk action. Approve in Approval tab to continue workflow.",
         }
 
+    local_execution_ready = bool(
+        execution_plan.get("execution_ready") is True
+        and isinstance(execution_plan.get("actions"), list)
+        and len(execution_plan["actions"]) == 1
+    )
     approval = Approval(
+        tenant_id=context.tenant_id,
         incident_id=incident.id,
         recommendation_id=recommendation.id,
-        decision=ApprovalDecision.APPROVED,
-        approver="kaiops-demo",
+        plan_id=execution_plan.get("plan_id"),
+        plan_fingerprint=execution_plan.get("plan_fingerprint"),
+        approval_expires_at=execution_plan.get("expiry"),
+        decision=ApprovalDecision.APPROVED if local_execution_ready else ApprovalDecision.PENDING,
+        approver="kaiops-demo" if local_execution_ready else None,
         channel="web",
         comment=scenario["remediation_comment"],
         trace_id=trace_id,
@@ -3067,6 +3349,11 @@ async def run_local_payment_workflow(
             "target": recommendation.metadata.get("remediation_target") or context.alert.service,
             "recommended_action": recommendation.recommended_action,
             "recommended_commands": recommendation.commands,
+            "execution_plan": execution_plan,
+            "runbook_id": recommendation.metadata.get("runbook_id", ""),
+            "runbook_version": recommendation.metadata.get("runbook_version"),
+            "runbook_status": recommendation.metadata.get("runbook_status", ""),
+            "runbook_checksum": recommendation.metadata.get("runbook_checksum", ""),
         },
     )
     await persist_step(lambda repo: repo.save_approval(approval))
@@ -3105,13 +3392,35 @@ async def run_local_payment_workflow(
                 "metrics": approval_event["metrics"],
             },
             started_at=now,
-            completed_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(UTC),
         )
     )
     engine = RemediationEngine()
-    action = engine.build_action(approval)
-    action.parameters.update({"root_cause": recommendation.root_cause, "impact": recommendation.impact})
-    action = await engine.execute(action)
+    if local_execution_ready:
+        action = engine.build_action(approval)
+        action.parameters.update({"root_cause": recommendation.root_cause, "impact": recommendation.impact})
+        action = await engine.execute(action)
+    else:
+        action = RemediationAction(
+            tenant_id=context.tenant_id,
+            incident_id=incident.id,
+            approval_id=approval.id,
+            action_type="diagnostic_completion",
+            target=str(execution_plan.get("remediation_target") or context.alert.service),
+            status=RemediationStatus.SKIPPED,
+            output="Execution was not performed because the governed plan is not execution-ready.",
+            parameters={
+                "policy_version": decision.policy_version,
+                "policy_reason": decision.policy_reason,
+                "root_cause": recommendation.root_cause,
+                "impact": recommendation.impact,
+                "diagnostic_closure": True,
+                "diagnostic_details": {
+                    "readiness_blocks": list(execution_plan.get("readiness_blocks") or []),
+                },
+                "execution_plan": execution_plan,
+            },
+        )
     action.trace_id = trace_id
     await persist_step(
         lambda repo: repo.save_action(action),
@@ -3151,7 +3460,7 @@ async def run_local_payment_workflow(
                 "metrics": remediation_event["metrics"],
             },
             started_at=now,
-            completed_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(UTC),
         )
     )
     closure_report = await ClosureValidationAgent().validate(action)
@@ -3196,7 +3505,7 @@ async def run_local_payment_workflow(
                 "metrics": closure_event["metrics"],
             },
             started_at=now,
-            completed_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(UTC),
         )
     )
     metrics = {
@@ -3313,9 +3622,12 @@ async def continue_pending_workflow(
         "approved": ApprovalDecision.APPROVED,
         "reject": ApprovalDecision.REJECTED,
         "rejected": ApprovalDecision.REJECTED,
-        "modify": ApprovalDecision.MODIFIED,
-        "modified": ApprovalDecision.MODIFIED,
     }
+    if token in {"modify", "modified"}:
+        raise HTTPException(
+            status_code=409,
+            detail="Free-text approval modifications are disabled; generate and approve a new typed plan.",
+        )
     approval_decision = decision_map.get(token)
     if approval_decision is None:
         raise HTTPException(status_code=400, detail="Invalid approval decision")
@@ -3374,10 +3686,20 @@ async def continue_pending_workflow(
 
     incident_data = pending.get("incident", {}) if isinstance(pending.get("incident"), dict) else {}
     recommendation_metadata = recommendation_data.get("metadata", {}) if isinstance(recommendation_data.get("metadata"), dict) else {}
+    approved_plan = recommendation_metadata.get("execution_plan") if isinstance(recommendation_metadata.get("execution_plan"), dict) else {}
     recommended_commands = recommendation_data.get("commands") if isinstance(recommendation_data.get("commands"), list) else []
     approval = Approval(
+        tenant_id=str(
+            approved_plan.get("tenant_id")
+            or recommendation_data.get("tenant_id")
+            or incident_data.get("tenant_id")
+            or ""
+        ),
         incident_id=incident_uuid,
         recommendation_id=recommendation_uuid,
+        plan_id=approved_plan.get("plan_id"),
+        plan_fingerprint=approved_plan.get("plan_fingerprint"),
+        approval_expires_at=approved_plan.get("expiry"),
         decision=approval_decision,
         approver=(approver or "sre@example.com").strip() or "sre@example.com",
         channel=(channel or "web").strip() or "web",
@@ -3424,10 +3746,15 @@ async def continue_pending_workflow(
             "recommended_commands": [
                 str(item).strip() for item in recommended_commands if str(item).strip()
             ],
+            "execution_plan": approved_plan,
+            "runbook_id": str(recommendation_metadata.get("runbook_id") or ""),
+            "runbook_version": recommendation_metadata.get("runbook_version"),
+            "runbook_status": str(recommendation_metadata.get("runbook_status") or ""),
+            "runbook_checksum": str(recommendation_metadata.get("runbook_checksum") or ""),
         },
     )
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     await persist_step(
         lambda repo: repo.save_approval(approval),
         track_agent_work_operation(
@@ -3440,7 +3767,7 @@ async def continue_pending_workflow(
             ticket_id=str(pending.get("ticket_id") or "") or None,
             details={"decision": approval.decision.value, "channel": approval.channel},
             started_at=now,
-            completed_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(UTC),
         ),
     )
 
@@ -3448,6 +3775,7 @@ async def continue_pending_workflow(
 
     if approval.decision == ApprovalDecision.REJECTED:
         action = RemediationAction(
+            tenant_id=approval.tenant_id,
             incident_id=incident_uuid,
             approval_id=approval.id,
             action_type="manual-review",
@@ -3457,6 +3785,7 @@ async def continue_pending_workflow(
             trace_id=approval_trace_id,
         )
         closure_report = ResolutionReport(
+            tenant_id=str(action.tenant_id),
             incident_id=incident_uuid,
             recommendation_id=recommendation_uuid,
             remediation_action_id=action.id,
@@ -3479,8 +3808,6 @@ async def continue_pending_workflow(
                 "impact": str(recommendation_data.get("impact", "N/A")),
             }
         )
-        if approval.decision == ApprovalDecision.MODIFIED and approval.modified_action:
-            action.action_type = approval.modified_action
         action = await engine.execute(action)
         action.trace_id = approval_trace_id
 
@@ -3505,7 +3832,7 @@ async def continue_pending_workflow(
             ticket_id=str(pending.get("ticket_id") or "") or None,
             details={"status": action.status.value, "target": action.target},
             started_at=now,
-            completed_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(UTC),
         ),
         track_agent_work_operation(
             incident_id_value=incident_uuid,
@@ -3520,7 +3847,7 @@ async def continue_pending_workflow(
                 "alerts_cleared": closure_report.alerts_cleared,
             },
             started_at=now,
-            completed_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(UTC),
         ),
     )
 
@@ -3579,7 +3906,7 @@ async def continue_pending_workflow(
     final_incident_payload = {
         **incident_data,
         "status": final_incident_status.value,
-        "closed_at": datetime.now(timezone.utc).isoformat() if closure_report.health_restored else incident_data.get("closed_at"),
+        "closed_at": datetime.now(UTC).isoformat() if closure_report.health_restored else incident_data.get("closed_at"),
     }
     final_incident = Incident.model_validate(final_incident_payload)
     metrics = {
@@ -3708,7 +4035,7 @@ def _record_closed_incident(
             "root_cause": str(closure_report.get("root_cause") or "N/A"),
             "impact": str(closure_report.get("impact") or "N/A"),
             "trace_id": str(trace_id or closure_report.get("trace_id") or ""),
-            "closed_at": datetime.now(timezone.utc).isoformat(),
+            "closed_at": datetime.now(UTC).isoformat(),
         }
     )
 
@@ -3754,13 +4081,19 @@ def _build_alert_from_payload(payload: dict[str, Any], trace_id: str | None = No
 
     labels.setdefault("support_tier", _severity_to_support_tier(severity_value))
 
+    source_value = str(payload.get("source", payload.get("generatorURL", "unknown")) or "unknown")
+    name_value = str(payload.get("name", payload.get("alertname", labels.get("alertname", "unknown-alert"))) or "unknown-alert")
+    service_value = str(payload.get("service", labels.get("service", labels.get("job", "unknown"))) or "unknown")
+    environment_value = str(payload.get("environment", labels.get("env", labels.get("environment", "prod"))) or "prod")
+    description_value = str(payload.get("description", annotations.get("summary", "")) or "")
+
     return Alert(
-        source=payload.get("source", payload.get("generatorURL", "unknown")),
-        name=payload.get("name", payload.get("alertname", labels.get("alertname", "unknown-alert"))),
-        service=payload.get("service", labels.get("service", labels.get("job", "unknown"))),
-        environment=payload.get("environment", labels.get("env", labels.get("environment", "prod"))),
+        source=source_value,
+        name=name_value,
+        service=service_value,
+        environment=environment_value,
         severity=AlertSeverity(severity_value),
-        description=payload.get("description", annotations.get("summary", "")),
+        description=description_value,
         labels=labels,
         annotations=annotations,
         correlation_id=str(payload.get("correlation_id") or labels.get("incident_correlation_id") or "") or None,
@@ -3911,7 +4244,7 @@ async def _publish_lifecycle_events(normalized: dict[str, Any], trace_id: str | 
         "labels": normalized.get("labels", {}),
         "annotations": normalized.get("annotations", {}),
         "normalized": normalized,
-        "ts": datetime.now(timezone.utc).isoformat(),
+        "ts": datetime.now(UTC).isoformat(),
     }
     for topic in (
         ALERT_RECEIVED,
@@ -4020,7 +4353,7 @@ def _integration_health_snapshot(
         "provider": provider,
         "validation": validation,
         "detail": detail or {},
-        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(UTC).isoformat(),
     }
     return {
         "status": "healthy" if test_ok and bool(validation.get("valid", False)) else "degraded",
@@ -4131,7 +4464,7 @@ async def create_monitoring_integration(payload: dict[str, Any] = ALERT_BODY) ->
             authentication_ok=health["authentication_ok"],
             webhook_ok=health["webhook_ok"],
             last_received_alert_at=None,
-            last_successful_test_at=datetime.now(timezone.utc),
+            last_successful_test_at=datetime.now(UTC),
             rate_limit_remaining=None,
             payload=health["payload"],
         )
@@ -4255,7 +4588,7 @@ async def validate_monitoring_integration(integration_id: str, payload: dict[str
             authentication_ok=health["authentication_ok"],
             webhook_ok=health["webhook_ok"],
             last_received_alert_at=None,
-            last_successful_test_at=datetime.now(timezone.utc),
+            last_successful_test_at=datetime.now(UTC),
             rate_limit_remaining=None,
             payload=health["payload"],
         )
@@ -4292,7 +4625,8 @@ async def register_monitoring_webhook(integration_id: str, payload: dict[str, An
         provider = normalize_provider_name(str(row.get("provider") or ""))
         adapter = get_provider_adapter(provider)
         webhook_path = str(row.get("webhook_path") or build_webhook_path(provider))
-        webhook_url = f"{public_base_url}{webhook_path}"
+        separator = "&" if "?" in webhook_path else "?"
+        webhook_url = f"{public_base_url}{webhook_path}{separator}integration_id={quote(integration_id, safe='')}"
         registration = adapter.register_webhook(row.get("config_payload", {}), webhook_url)
         await repo.save_monitoring_webhook_endpoint(
             endpoint_id=str(uuid.uuid4()),
@@ -4369,6 +4703,10 @@ async def test_monitoring_alert(integration_id: str, payload: dict[str, Any] = A
     alert = _build_alert_from_payload(mapped_payload)
     await _publish_ingested_alert(alert)
     await _publish_lifecycle_events(normalized)
+    async with session_factory() as session:
+        repo = IncidentRepository(session)
+        await record_successful_test_alert(repo, integration_id=integration_id, provider=provider, alert_id=str(alert.id))
+        await session.commit()
     await _persist_monitoring_audit(
         tenant_id=str(integration.get("tenant_id") or "default"),
         actor="api",
@@ -4390,6 +4728,19 @@ async def activate_monitoring_integration(integration_id: str) -> dict[str, Any]
         row = await repo.get_monitoring_integration(integration_id)
         if row is None:
             raise HTTPException(status_code=404, detail="Monitoring integration not found")
+        health_rows = await repo.list_monitoring_connection_health(tenant_id=str(row.get("tenant_id") or "default"))
+        latest_health = next((item for item in health_rows if item.get("integration_id") == integration_id), None)
+        blockers = activation_readiness_blockers(row, latest_health)
+        if blockers:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "activation_readiness_failed",
+                    "message": "Project monitoring remains in DRAFT until all activation checks pass.",
+                    "blockers": blockers,
+                    "next_steps": ["Validate the connector and credentials.", "Send and verify a test alert."],
+                },
+            )
         await repo.save_monitoring_integration(
             integration_id=integration_id,
             tenant_id=str(row.get("tenant_id") or "default"),
@@ -4459,10 +4810,11 @@ async def _ingest_provider_alert(
     x_trace_id: str | None,
     x_signature: str | None,
     x_webhook_token: str | None,
+    integration_id_hint: str | None = None,
 ) -> dict[str, Any]:
     provider = normalize_provider_name(provider_hint)
     tenant_id = str(payload.get("tenant_id") or "default")
-    integration_id = str(payload.get("integration_id") or "").strip() or None
+    integration_id = str(integration_id_hint or payload.get("integration_id") or "").strip() or None
 
     session_factory = _db_required()
     mappings: list[dict[str, Any]] = []
@@ -4482,10 +4834,28 @@ async def _ingest_provider_alert(
     auth_valid = True if not expected_token else (str(x_webhook_token or "") == expected_token)
     body_as_string = json.dumps(payload, sort_keys=True)
     signature_valid = verify_hmac_signature(hmac_secret, body_as_string, x_signature)
+    verification_configured = bool(expected_token or hmac_secret)
+    event_mode = str(payload.get("event_mode") or payload.get("eventMode") or "real").strip().lower()
+    synthetic = event_mode in {"synthetic", "test", "validation", "simulation"}
+    authenticity = (
+        "synthetic"
+        if synthetic
+        else "verified"
+        if integration is not None and verification_configured and auth_valid and signature_valid
+        else "unverified"
+    )
 
     adapter = get_provider_adapter(provider)
     normalized = adapter.normalize_alert(payload, None)
     normalized = apply_field_mapping(normalized, mappings)
+    normalized_labels = normalized.get("labels") if isinstance(normalized.get("labels"), dict) else {}
+    normalized["labels"] = {
+        **normalized_labels,
+        "event_authenticity": authenticity,
+        "event_mode": event_mode,
+        "provider": provider,
+        "integration_id": integration_id or "",
+    }
 
     mapped_payload = {
         "source": provider,
@@ -4494,11 +4864,10 @@ async def _ingest_provider_alert(
         "environment": str(normalized.get("environment") or "prod"),
         "severity": str(normalized.get("severity") or "warning"),
         "description": str((normalized.get("annotations") or {}).get("summary") or normalized.get("alertName") or f"{provider}-alert"),
-        "labels": normalized.get("labels", {}),
+        "labels": normalized["labels"],
         "annotations": normalized.get("annotations", {}),
     }
     alert = _build_alert_from_payload(mapped_payload, trace_id=x_trace_id)
-    await _publish_ingested_alert(alert)
     received_id, normalized_id = await _persist_received_and_normalized(
         tenant_id=tenant_id,
         provider=provider,
@@ -4508,6 +4877,35 @@ async def _ingest_provider_alert(
         signature_valid=signature_valid,
         auth_valid=auth_valid,
     )
+    if authenticity != "verified":
+        reason = (
+            "Synthetic/test payloads are retained for validation but never promoted as real incidents."
+            if synthetic
+            else "A registered integration with a valid webhook token or HMAC signature is required."
+        )
+        await _persist_monitoring_audit(
+            tenant_id=tenant_id,
+            actor="landing-pad",
+            action="webhook.quarantine",
+            provider=provider,
+            outcome="quarantined",
+            message=reason,
+            payload={"received_alert_id": received_id, "normalized_alert_id": normalized_id, "authenticity": authenticity},
+            integration_id=integration_id,
+        )
+        return {
+            "provider": provider,
+            "integration_id": integration_id,
+            "received_alert_id": received_id,
+            "normalized_alert_id": normalized_id,
+            "signature_valid": signature_valid,
+            "auth_valid": auth_valid,
+            "authenticity": authenticity,
+            "status": "quarantined",
+            "reason": reason,
+        }
+
+    await _publish_ingested_alert(alert)
     await _publish_lifecycle_events(normalized, trace_id=x_trace_id)
     await _persist_monitoring_audit(
         tenant_id=tenant_id,
@@ -4533,84 +4931,117 @@ async def _ingest_provider_alert(
         "normalized_alert_id": normalized_id,
         "signature_valid": signature_valid,
         "auth_valid": auth_valid,
+        "authenticity": authenticity,
         "status": "accepted",
     }
 
 
 @app.post("/api/v1/alerts/prometheus")
-async def ingest_prometheus_alert(payload: dict[str, Any] = ALERT_BODY, x_trace_id: str | None = Header(default=None), x_signature: str | None = Header(default=None), x_webhook_token: str | None = Header(default=None)) -> dict[str, Any]:
+async def ingest_prometheus_alert(payload: dict[str, Any] = ALERT_BODY, integration_id: str | None = None, x_trace_id: str | None = Header(default=None), x_signature: str | None = Header(default=None), x_webhook_token: str | None = Header(default=None)) -> dict[str, Any]:
     return await _ingest_provider_alert(
         provider_hint="prometheus",
         payload=payload,
         x_trace_id=x_trace_id,
         x_signature=x_signature,
         x_webhook_token=x_webhook_token,
+        integration_id_hint=integration_id,
     )
 
 
 @app.post("/api/v1/alerts/datadog")
-async def ingest_datadog_alert(payload: dict[str, Any] = ALERT_BODY, x_trace_id: str | None = Header(default=None), x_signature: str | None = Header(default=None), x_webhook_token: str | None = Header(default=None)) -> dict[str, Any]:
+async def ingest_datadog_alert(payload: dict[str, Any] = ALERT_BODY, integration_id: str | None = None, x_trace_id: str | None = Header(default=None), x_signature: str | None = Header(default=None), x_webhook_token: str | None = Header(default=None)) -> dict[str, Any]:
     return await _ingest_provider_alert(
         provider_hint="datadog",
         payload=payload,
         x_trace_id=x_trace_id,
         x_signature=x_signature,
         x_webhook_token=x_webhook_token,
+        integration_id_hint=integration_id,
     )
 
 
 @app.post("/api/v1/alerts/newrelic")
-async def ingest_newrelic_alert(payload: dict[str, Any] = ALERT_BODY, x_trace_id: str | None = Header(default=None), x_signature: str | None = Header(default=None), x_webhook_token: str | None = Header(default=None)) -> dict[str, Any]:
+async def ingest_newrelic_alert(payload: dict[str, Any] = ALERT_BODY, integration_id: str | None = None, x_trace_id: str | None = Header(default=None), x_signature: str | None = Header(default=None), x_webhook_token: str | None = Header(default=None)) -> dict[str, Any]:
     return await _ingest_provider_alert(
         provider_hint="new_relic",
         payload=payload,
         x_trace_id=x_trace_id,
         x_signature=x_signature,
         x_webhook_token=x_webhook_token,
+        integration_id_hint=integration_id,
     )
 
 
 @app.post("/api/v1/alerts/dynatrace")
-async def ingest_dynatrace_alert(payload: dict[str, Any] = ALERT_BODY, x_trace_id: str | None = Header(default=None), x_signature: str | None = Header(default=None), x_webhook_token: str | None = Header(default=None)) -> dict[str, Any]:
+async def ingest_dynatrace_alert(payload: dict[str, Any] = ALERT_BODY, integration_id: str | None = None, x_trace_id: str | None = Header(default=None), x_signature: str | None = Header(default=None), x_webhook_token: str | None = Header(default=None)) -> dict[str, Any]:
     return await _ingest_provider_alert(
         provider_hint="dynatrace",
         payload=payload,
         x_trace_id=x_trace_id,
         x_signature=x_signature,
         x_webhook_token=x_webhook_token,
+        integration_id_hint=integration_id,
     )
 
 
 @app.post("/api/v1/alerts/azure-monitor")
-async def ingest_azure_monitor_alert(payload: dict[str, Any] = ALERT_BODY, x_trace_id: str | None = Header(default=None), x_signature: str | None = Header(default=None), x_webhook_token: str | None = Header(default=None)) -> dict[str, Any]:
+async def ingest_azure_monitor_alert(payload: dict[str, Any] = ALERT_BODY, integration_id: str | None = None, x_trace_id: str | None = Header(default=None), x_signature: str | None = Header(default=None), x_webhook_token: str | None = Header(default=None)) -> dict[str, Any]:
     return await _ingest_provider_alert(
         provider_hint="azure_monitor",
         payload=payload,
         x_trace_id=x_trace_id,
         x_signature=x_signature,
         x_webhook_token=x_webhook_token,
+        integration_id_hint=integration_id,
     )
 
 
 @app.post("/api/v1/alerts/splunk")
-async def ingest_splunk_alert(payload: dict[str, Any] = ALERT_BODY, x_trace_id: str | None = Header(default=None), x_signature: str | None = Header(default=None), x_webhook_token: str | None = Header(default=None)) -> dict[str, Any]:
+async def ingest_splunk_alert(payload: dict[str, Any] = ALERT_BODY, integration_id: str | None = None, x_trace_id: str | None = Header(default=None), x_signature: str | None = Header(default=None), x_webhook_token: str | None = Header(default=None)) -> dict[str, Any]:
     return await _ingest_provider_alert(
         provider_hint="splunk",
         payload=payload,
         x_trace_id=x_trace_id,
         x_signature=x_signature,
         x_webhook_token=x_webhook_token,
+        integration_id_hint=integration_id,
     )
 
 
 @app.post("/api/v1/alerts/generic")
-async def ingest_generic_provider_alert(provider: str = "prometheus", payload: dict[str, Any] = ALERT_BODY, x_trace_id: str | None = Header(default=None), x_signature: str | None = Header(default=None), x_webhook_token: str | None = Header(default=None)) -> dict[str, Any]:
+async def ingest_generic_provider_alert(provider: str = "prometheus", integration_id: str | None = None, payload: dict[str, Any] = ALERT_BODY, x_trace_id: str | None = Header(default=None), x_signature: str | None = Header(default=None), x_webhook_token: str | None = Header(default=None)) -> dict[str, Any]:
     return await _ingest_provider_alert(
         provider_hint=provider,
         payload=payload,
         x_trace_id=x_trace_id,
         x_signature=x_signature,
         x_webhook_token=x_webhook_token,
+        integration_id_hint=integration_id,
+    )
+
+
+@app.post("/api/v1/alerts/{provider}")
+async def ingest_registered_provider_alert(
+    provider: str,
+    payload: dict[str, Any] = ALERT_BODY,
+    integration_id: str | None = None,
+    x_trace_id: str | None = Header(default=None),
+    x_signature: str | None = Header(default=None),
+    x_webhook_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Receive a registered provider's native payload.
+
+    The integration id is embedded in the generated webhook URL. Payloads are
+    promoted to the incident pipeline only when the integration's token/HMAC
+    check succeeds; everything else is retained as quarantined evidence.
+    """
+    return await _ingest_provider_alert(
+        provider_hint=provider,
+        payload=payload,
+        x_trace_id=x_trace_id,
+        x_signature=x_signature,
+        x_webhook_token=x_webhook_token,
+        integration_id_hint=integration_id,
     )
 
 
@@ -4722,6 +5153,7 @@ async def ingest_alertmanager_webhook(payload: dict = ALERT_BODY, x_trace_id: st
 
     received = len(alerts_payload)
     queued_rows: list[dict[str, Any]] = []
+    observed_rows: list[dict[str, Any]] = []
     skipped_rows: list[dict[str, Any]] = []
 
     for item in alerts_payload:
@@ -4740,18 +5172,19 @@ async def ingest_alertmanager_webhook(payload: dict = ALERT_BODY, x_trace_id: st
             or merged_labels.get("source")
             or "prometheus"
         ).strip().lower() or "prometheus"
+        event_mode = str(merged_labels.get("event_mode") or merged_labels.get("test_mode") or "real").strip().lower()
+        alert_name = str(merged_labels.get("alertname") or "prometheus-alert")
+        synthetic = event_mode in {"synthetic", "test", "validation", "simulation"} or "ingestion validation" in alert_name.lower()
+        # This handler is the dedicated Alertmanager webhook receiver, so every
+        # request genuinely arrives via Alertmanager regardless of the
+        # display-oriented "source" label an individual alert rule sets (e.g.
+        # "robot-shop", "online-boutique") for categorization in the UI.
+        # Authenticity must not be derived from that label, or every rule that
+        # sets a descriptive source gets wrongly quarantined as unverified.
+        native_alertmanager_origin = True
+        authenticity = "synthetic" if synthetic else "internal-observed" if native_alertmanager_origin else "unverified"
         delivery_key = _alertmanager_delivery_key(item, merged_labels, status)
 
-        if status != "firing":
-            skipped_rows.append(
-                {
-                    "status": status,
-                    "alertname": str(merged_labels.get("alertname") or "unknown-alert"),
-                    "service": str(merged_labels.get("service") or merged_labels.get("job") or "unknown"),
-                    "reason": "Only firing alerts are sent to landing pad",
-                }
-            )
-            continue
         if not _claim_alertmanager_delivery(delivery_key):
             skipped_rows.append(
                 {
@@ -4765,7 +5198,7 @@ async def ingest_alertmanager_webhook(payload: dict = ALERT_BODY, x_trace_id: st
 
         mapped_payload = {
             "source": origin_system,
-            "name": str(merged_labels.get("alertname") or "prometheus-alert"),
+            "name": alert_name,
             "service": str(merged_labels.get("service") or merged_labels.get("job") or merged_labels.get("instance") or "kaiops-platform"),
             "environment": str(merged_labels.get("environment") or merged_labels.get("env") or "prod"),
             "severity": str(merged_labels.get("severity") or "warning").lower(),
@@ -4777,6 +5210,8 @@ async def ingest_alertmanager_webhook(payload: dict = ALERT_BODY, x_trace_id: st
                 "transport": "alertmanager",
                 "alert_status": status,
                 "alert_fingerprint": str(item.get("fingerprint") or ""),
+                "event_mode": event_mode,
+                "event_authenticity": authenticity,
             },
             "annotations": {
                 **merged_annotations,
@@ -4785,7 +5220,36 @@ async def ingest_alertmanager_webhook(payload: dict = ALERT_BODY, x_trace_id: st
                 "generatorURL": str(item.get("generatorURL") or ""),
             },
         }
+        if authenticity in {"synthetic", "unverified"}:
+            landing_pad_file = _persist_alert_to_landing_pad(mapped_payload, item, status="processed")
+            skipped_rows.append({
+                "status": "quarantined",
+                "alertname": mapped_payload["name"],
+                "service": mapped_payload["service"],
+                "authenticity": authenticity,
+                "landing_pad_file": landing_pad_file,
+                "reason": "Synthetic validation is not a real incident." if synthetic else f"{origin_system} must use its registered provider webhook endpoint.",
+            })
+            continue
+        if status != "firing":
+            # Resolved/inactive notifications are operationally important: they
+            # close the lifecycle in the intake stream even though they must not
+            # start a new investigation. Persist them as observations only.
+            landing_pad_file = _persist_alert_to_landing_pad(mapped_payload, item, status="processed")
+            observed_rows.append(
+                {
+                    "status": status,
+                    "alertname": mapped_payload["name"],
+                    "service": mapped_payload["service"],
+                    "landing_pad_file": landing_pad_file,
+                    "investigation_started": False,
+                }
+            )
+            continue
         if CENTRALIZED_JIRA_ROUTING_ENABLED or PROMETHEUS_JIRA_ROUTING_ENABLED:
+            # Keep the firing signal visible immediately. Incident creation
+            # and Jira deduplication still remain centralized below.
+            landing_pad_file = _persist_alert_to_landing_pad(mapped_payload, item, status="processed")
             # Prometheus no longer shortcuts into the landing pad — it
             # routes through centralized dedup and Jira create-or-update.
             # Jira's own webhook (unchanged) is what eventually reaches the
@@ -4798,6 +5262,7 @@ async def ingest_alertmanager_webhook(payload: dict = ALERT_BODY, x_trace_id: st
                             "status": status,
                             "alertname": mapped_payload["name"],
                             "service": mapped_payload["service"],
+                            "landing_pad_file": landing_pad_file,
                             "jira_issue_key": result.get("jira_issue_key"),
                             "jira_action": result.get("action"),
                         }
@@ -4825,34 +5290,30 @@ async def ingest_alertmanager_webhook(payload: dict = ALERT_BODY, x_trace_id: st
                 )
             continue
 
-        try:
-            landing_pad_input_file = _write_alert_to_landing_pad_input(mapped_payload, item)
-            queued_rows.append(
-                {
-                    "status": status,
-                    "alertname": mapped_payload["name"],
-                    "service": mapped_payload["service"],
-                    "landing_pad_input_file": str(landing_pad_input_file),
-                }
-            )
-        except Exception as exc:
+        # In file-routing mode the watcher may be disabled, delayed, or busy
+        # with another connector. Process the landed alert before acknowledging
+        # Alertmanager so HTTP 200 means the durable feed and message bus have
+        # actually accepted it. Deferring this step created a silent gap where
+        # Alertmanager showed a firing alert but Live Stream and Incidents never
+        # received it.
+        landing_pad_file = _persist_alert_to_landing_pad(mapped_payload, item, status="processed")
+        result = await _ingest_one_alertmanager_alert(mapped_payload, item, status)
+        if result.get("kind") == "ingested":
+            for row in result.get("rows", []):
+                queued_rows.append({**row, "landing_pad_file": landing_pad_file})
+        else:
             _ALERTMANAGER_RECENT_DELIVERIES.pop(delivery_key, None)
-            logger.exception("failed to enqueue alertmanager alert")
-            _persist_alert_to_landing_pad(mapped_payload, item, status="failed", error=str(exc))
-            skipped_rows.append(
-                {
-                    "status": status,
-                    "alertname": mapped_payload["name"],
-                    "service": mapped_payload["service"],
-                    "reason": f"landing pad enqueue failed: {exc}",
-                }
-            )
+            skipped_rows.append({**result, "landing_pad_file": landing_pad_file})
 
     return {
         "received": received,
+        "ingested": len(queued_rows),
         "queued": len(queued_rows),
         "skipped": len(skipped_rows),
+        "alerts": queued_rows,
         "rows": queued_rows,
+        "observed": len(observed_rows),
+        "observed_rows": observed_rows,
         "skipped_rows": skipped_rows,
     }
 
@@ -4865,7 +5326,153 @@ def _jira_api_client() -> JiraClient | None:
         email=JIRA_API_EMAIL,
         api_token=JIRA_API_TOKEN,
         project_key=JIRA_PROJECT_KEY,
+        issue_type=JIRA_ISSUE_TYPE,
     )
+
+
+@app.post("/api/v1/jira/hitl-assignments")
+async def create_hitl_jira_assignment(request: HitlJiraRequest) -> dict[str, Any]:
+    client = _jira_api_client()
+    session_factory = getattr(app.state, "session_factory", None)
+    if client is None or session_factory is None:
+        raise HTTPException(status_code=503, detail="Jira lifecycle integration is not configured")
+    if request.routing.jira_project_key != JIRA_PROJECT_KEY:
+        raise HTTPException(status_code=409, detail="HITL routing project does not match configured Jira project")
+    assignment = await resolve_hitl_assignee(
+        request.tenant_id, {"id": request.incident_id}, request.approval_type,
+        request.severity, routing=request.routing,
+    )
+    description = "\n".join([
+        "KaiMS governed human decision request",
+        f"Incident: {request.incident_id}", f"Recommendation: {request.recommendation_id}",
+        f"RCA version: {request.rca_version}",
+        f"Context snapshot: {request.context_snapshot_id}",
+        f"Context fingerprint: {request.context_fingerprint}",
+        f"Resolution selection: {request.resolution_selection_id}",
+        f"Execution plan: {request.execution_plan_id}",
+        f"Plan fingerprint: {request.plan_fingerprint}", f"Risk: {request.risk}",
+        f"Rollback: {request.rollback_plan}",
+        f"Approval expiry: {request.approval_expires_at.isoformat()}",
+    ])
+    try:
+        issue_key, operation = await client.create_or_update_incident(
+            incident_id=str(request.incident_id), summary=request.summary,
+            description=description, severity=request.severity,
+            labels={"tenant": request.tenant_id, "service": request.service,
+                    "environment": request.environment},
+        )
+        await client.assign_issue(issue_key, account_id=assignment.assignee)
+        await client.add_comment(issue_key, description)
+        if request.evidence_summary_url.startswith(("https://", "http://")):
+            await client.add_remote_link(
+                issue_key, url=request.evidence_summary_url,
+                title=f"KaiMS evidence for {request.incident_id}",
+            )
+        approval_transition = str(request.routing.jira_transition_mapping.get("approval_pending") or "")
+        if approval_transition:
+            await client.transition_issue(issue_key, transition_id=approval_transition)
+    except JiraClientError as exc:
+        raise HTTPException(status_code=502, detail="Jira rejected the governed HITL request") from exc
+    async with session_factory() as session:
+        binding = await ContextEnrichmentRepository(session).bind_jira_incident(
+            tenant_id=request.tenant_id, incident_id=request.incident_id,
+            jira_issue_key=issue_key, jira_project_key=request.routing.jira_project_key,
+            assignee_id=assignment.assignee,
+            assignee_group=assignment.assignee if assignment.assignment_type == "group" else None,
+            recommendation_id=request.recommendation_id, rca_version=request.rca_version,
+            context_snapshot_id=request.context_snapshot_id,
+            context_fingerprint=request.context_fingerprint,
+            resolution_selection_id=request.resolution_selection_id,
+            execution_plan_id=request.execution_plan_id, plan_fingerprint=request.plan_fingerprint,
+            approval_expires_at=request.approval_expires_at,
+            ownership=request.closure_policy.ownership,
+            closure_policy=request.closure_policy.model_dump(mode="json"),
+        )
+        await session.commit()
+    return {"operation": operation, "jira_issue_key": issue_key,
+            "assignment": assignment.model_dump(mode="json"), "binding": binding}
+
+
+@app.post("/api/v1/jira/closure")
+async def synchronize_jira_closure(request: JiraClosureRequest) -> dict[str, Any]:
+    client = _jira_api_client()
+    session_factory = getattr(app.state, "session_factory", None)
+    if client is None or session_factory is None:
+        raise HTTPException(status_code=503, detail="Jira lifecycle integration is not configured")
+    async with session_factory() as session:
+        repo = ContextEnrichmentRepository(session)
+        binding = await repo.get_jira_incident_binding(
+            tenant_id=request.tenant_id, jira_issue_key=request.jira_issue_key,
+            jira_project_key=JIRA_PROJECT_KEY,
+        )
+        if binding is None or binding["incident_id"] != str(request.incident_id):
+            raise HTTPException(status_code=404, detail="Tenant-scoped Jira incident binding not found")
+        allowed, blockers = kaims_may_close_ticket(
+            TicketClosurePolicy.model_validate(binding["closure_policy"]),
+            request.model_dump(mode="json"),
+        )
+        if not allowed:
+            raise HTTPException(status_code=409, detail={"message": "Jira closure is blocked", "blockers": blockers})
+        try:
+            await client.add_comment(
+                request.jira_issue_key,
+                "[kaiops-managed-update] Remediation and authoritative validation succeeded; "
+                "the configured stability window passed.",
+            )
+            await client.transition_issue(request.jira_issue_key, transition_id=request.transition_id)
+            issue = await client.get_issue(request.jira_issue_key)
+            fields = issue.get("fields") if isinstance(issue.get("fields"), dict) else {}
+            status = fields.get("status") if isinstance(fields.get("status"), dict) else {}
+            confirmed = str(status.get("name") or status.get("id") or "")
+            if confirmed.lower() != request.expected_jira_status.lower():
+                raise JiraClientError("Jira did not confirm the configured closure state")
+        except JiraClientError:
+            result = await repo.update_jira_binding_status(
+                tenant_id=request.tenant_id, jira_issue_key=request.jira_issue_key,
+                status="closure_pending_sync", jira_status=binding["jira_status"],
+            )
+            await session.commit()
+            return {"closed": False, "retryable": True, "binding": result}
+        result = await repo.update_jira_binding_status(
+            tenant_id=request.tenant_id, jira_issue_key=request.jira_issue_key,
+            status="closed", jira_status=confirmed,
+        )
+        await session.commit()
+    return {"closed": True, "retryable": False, "binding": result}
+
+
+@app.post("/api/v1/jira/regressions")
+async def reopen_jira_for_regression(request: JiraRegressionRequest) -> dict[str, Any]:
+    client = _jira_api_client()
+    session_factory = getattr(app.state, "session_factory", None)
+    if client is None or session_factory is None:
+        raise HTTPException(status_code=503, detail="Jira lifecycle integration is not configured")
+    async with session_factory() as session:
+        repo = ContextEnrichmentRepository(session)
+        binding = await repo.get_jira_incident_binding(
+            tenant_id=request.tenant_id, jira_issue_key=request.jira_issue_key,
+            jira_project_key=JIRA_PROJECT_KEY,
+        )
+        if binding is None or binding["incident_id"] != str(request.incident_id):
+            raise HTTPException(status_code=404, detail="Tenant-scoped Jira incident binding not found")
+        policy = TicketClosurePolicy.model_validate(binding["closure_policy"])
+        if not policy.reopen_on_regression:
+            raise HTTPException(status_code=409, detail="Jira reopening is disabled by closure policy")
+        try:
+            await client.add_comment(
+                request.jira_issue_key,
+                "[kaiops-managed-update] Regression detected: " + request.reason,
+            )
+            await client.transition_issue(request.jira_issue_key, transition_id=request.transition_id)
+            next_status = "reopened"
+        except JiraClientError:
+            next_status = "reopen_pending_sync"
+        result = await repo.update_jira_binding_status(
+            tenant_id=request.tenant_id, jira_issue_key=request.jira_issue_key,
+            status=next_status, jira_status=next_status,
+        )
+        await session.commit()
+    return {"reopened": next_status == "reopened", "retryable": next_status != "reopened", "binding": result}
 
 
 def _jira_issue_description(
@@ -5255,6 +5862,86 @@ def _is_kaiops_managed_jira_update(payload: dict[str, Any]) -> bool:
     )
 
 
+def _governed_jira_scope(payload: dict[str, Any]) -> tuple[str, str, str]:
+    issue = payload.get("issue") if isinstance(payload.get("issue"), dict) else {}
+    fields = issue.get("fields") if isinstance(issue.get("fields"), dict) else {}
+    labels = fields.get("labels") if isinstance(fields.get("labels"), list) else []
+    project = fields.get("project") if isinstance(fields.get("project"), dict) else {}
+    tenant_label = next(
+        (str(label) for label in labels if str(label).startswith("kaiops-tenant-")), ""
+    )
+    tenant_id = tenant_label.removeprefix("kaiops-tenant-").strip()
+    return tenant_id, str(project.get("key") or "").strip(), str(issue.get("key") or "").strip()
+
+
+async def _process_governed_jira_event(payload: dict[str, Any]) -> bool:
+    tenant_id, project_key, issue_key = _governed_jira_scope(payload)
+    session_factory = getattr(app.state, "session_factory", None)
+    if not tenant_id or not project_key or not issue_key or session_factory is None:
+        return False
+    if project_key != JIRA_PROJECT_KEY:
+        return False
+    event_id = jira_webhook_event_id(payload)
+    actor_id = jira_actor_id(payload)
+    if not actor_id and payload.get("event_origin") == "jira-reconciliation":
+        issue = payload.get("issue") if isinstance(payload.get("issue"), dict) else {}
+        fields = issue.get("fields") if isinstance(issue.get("fields"), dict) else {}
+        assignee = fields.get("assignee") if isinstance(fields.get("assignee"), dict) else {}
+        actor_id = str(assignee.get("accountId") or "").strip()
+    jira_status = jira_issue_status(payload)
+    action = governed_jira_action(jira_status, JIRA_TRANSITION_MAPPING)
+    async with session_factory() as session:
+        repo = ContextEnrichmentRepository(session)
+        binding = await repo.get_jira_incident_binding(
+            tenant_id=tenant_id, jira_issue_key=issue_key, jira_project_key=project_key,
+        )
+        if binding is None:
+            return False
+        current_identity = await repo.current_governed_identity(
+            tenant_id=tenant_id, incident_id=binding["incident_id"],
+        )
+        outcome = "observed"
+        next_status = "pending"
+        if action in {"approved", "rejected"}:
+            valid, reason = validate_jira_approval(
+                binding=binding, actor_id=actor_id, action=action,
+                current_identity=current_identity,
+            )
+            outcome = "accepted" if valid else "rejected"
+            next_status = action if valid else "stale" if reason.startswith("stale") else "unauthorized"
+        elif action in {"resolved", "closed"}:
+            authorized = actor_id == str(binding.get("assignee_id") or "")
+            human_owned = binding.get("ownership") == "human"
+            outcome = "accepted" if authorized and human_owned else "rejected"
+            next_status = action if outcome == "accepted" else "closure_blocked"
+        elif action == "reopened":
+            outcome, next_status = "accepted", "reopened"
+        created, _ = await repo.record_jira_webhook_outcome(
+            tenant_id=tenant_id, event_id=event_id, jira_issue_key=issue_key,
+            action=action, actor_id=actor_id or None, outcome=outcome, payload=payload,
+        )
+        if not created:
+            await session.rollback()
+            return True
+        await repo.update_jira_binding_status(
+            tenant_id=tenant_id, jira_issue_key=issue_key, status=next_status,
+            jira_status=jira_status,
+        )
+        await session.commit()
+    if next_status == "stale":
+        client = _jira_api_client()
+        if client is not None:
+            try:
+                await client.add_comment(
+                    issue_key,
+                    "This approval is stale because the KaiMS evidence or execution plan changed. "
+                    "A new approval request has been created.",
+                )
+            except JiraClientError:
+                logger.exception("failed to comment stale approval on Jira issue %s", issue_key)
+    return True
+
+
 async def _process_jira_webhook(payload: dict[str, Any], trace_id: str | None) -> None:
     """Runs after the HTTP response has already been sent (via BackgroundTasks)
     so the webhook receiver can ack Jira with 200 immediately instead of
@@ -5263,6 +5950,12 @@ async def _process_jira_webhook(payload: dict[str, Any], trace_id: str | None) -
     if _is_kaiops_managed_jira_update(payload):
         issue = payload.get("issue", {}) if isinstance(payload, dict) else {}
         logger.info("ignored KaiOps-originated Jira webhook issue=%s", issue.get("key"))
+        return
+    try:
+        if await _process_governed_jira_event(payload):
+            return
+    except Exception:
+        logger.exception("failed to process governed Jira lifecycle event")
         return
     try:
         mapped_payload, issue_key = _jira_payload_to_alert_payload(payload)
@@ -5369,90 +6062,107 @@ async def delete_alert_severity_override(
 
 
 @app.get("/alerts/recent")
-async def get_recent_alerts(limit: int = 50) -> dict[str, Any]:
+async def get_recent_alerts(limit: int = 50, tenant_id: str | None = None) -> dict[str, Any]:
     safe_limit = max(1, min(int(limit), 200))
     session_factory = getattr(app.state, "session_factory", None)
     if settings.database_enabled and session_factory is not None:
         async with session_factory() as session:
             repo = IncidentRepository(session)
-            rows = await repo.list_alerts(limit=safe_limit, include_incident_context=False)
+            rows = await repo.list_alerts(
+                limit=safe_limit,
+                include_incident_context=False,
+                tenant_id=tenant_id,
+            )
         return {"rows": rows, "count": len(rows)}
 
     rows = list(RECENT_ALERTS)[:safe_limit]
     return {"rows": rows, "count": len(rows)}
 
 
+def _compact_alert_row(row: dict[str, Any]) -> dict[str, Any]:
+    fields = {
+        "id", "alert_id", "incident_id", "correlation_id", "trace_id",
+        "fingerprint", "alert_fingerprint", "name", "alert_name", "service",
+        "application", "project", "project_name", "environment", "source",
+        "source_channel", "severity", "status", "alert_status", "description",
+        "origin_system", "ingestion_channel", "deduplicated_count", "incident_disposition",
+        "created_at", "updated_at", "received_at", "first_seen", "last_seen",
+        "starts_at", "ends_at", "occurrence_count", "assignee", "owner",
+        "ticket_id", "jira_key", "jira_url", "ticket_key", "issue_key", "file", "path", "error", "labels", "annotations",
+    }
+    compact = {key: value for key, value in row.items() if key in fields}
+    labels = row.get("labels") if isinstance(row.get("labels"), dict) else {}
+    annotations = row.get("annotations") if isinstance(row.get("annotations"), dict) else {}
+    label_fields = {
+        "alertname", "service", "job", "application", "project", "project_name",
+        "environment", "severity", "fingerprint", "alert_fingerprint",
+        "source_alert_id", "ticket_id", "ticket_key", "issue_key", "jira_issue_key",
+    }
+    compact["labels"] = {key: value for key, value in labels.items() if key in label_fields}
+    compact["annotations"] = {
+        key: value for key, value in annotations.items() if key in {"summary", "description"}
+    }
+    return compact
+
+
 @app.get("/alerts/all")
-async def get_all_alerts(limit: int = 500) -> dict[str, Any]:
+async def get_all_alerts(limit: int = 500, tenant_id: str | None = None, compact: bool = False) -> dict[str, Any]:
     safe_limit = max(1, min(int(limit), 5000))
     session_factory = getattr(app.state, "session_factory", None)
     if settings.database_enabled and session_factory is not None:
         async with session_factory() as session:
             repo = IncidentRepository(session)
-            rows = await repo.list_alerts(limit=safe_limit, include_incident_context=False)
+            if compact:
+                # Canonical identifiers are persisted in the alert payload;
+                # avoid incident/source N+1 enrichment for each UI refresh.
+                rows = await repo.list_alerts(
+                    limit=safe_limit,
+                    include_incident_context=False,
+                    tenant_id=tenant_id,
+                )
+            else:
+                rows = await repo.list_alerts_source_balanced(limit=safe_limit, tenant_id=tenant_id)
+        if compact:
+            rows = [_compact_alert_row(row) for row in rows]
         return {"rows": rows, "count": len(rows)}
 
     rows = list(RECENT_ALERTS)[:safe_limit]
+    if compact:
+        rows = [_compact_alert_row(row) for row in rows]
     return {"rows": rows, "count": len(rows)}
 
 
-def _alert_application_candidates(row: dict[str, Any]) -> list[str]:
-    labels = row.get("labels", {}) if isinstance(row.get("labels"), dict) else {}
-    candidates = [
-        row.get("application"),
-        row.get("project"),
-        row.get("project_name"),
-        row.get("service"),
-        labels.get("application"),
-        labels.get("project"),
-        labels.get("project_name"),
-        labels.get("deployment"),
-        labels.get("namespace"),
-        labels.get("job"),
-    ]
-    return [str(value or "").strip() for value in candidates if str(value or "").strip()]
-
-
-def _is_displayable_alert_application(value: str) -> bool:
-    normalized = str(value or "").strip()
-    if not normalized:
-        return False
-    if "/" in normalized or ":" in normalized:
-        return False
-    if re.match(r"^(unknown|default|prod|dev|staging|warning|critical|high|info)$", normalized, re.IGNORECASE):
-        return False
-    if re.match(
-        r"^(prometheus|alertmanager|blackbox|node-exporter|mysql|redis|rabbitmq|kafka|zookeeper)$",
-        normalized,
-        re.IGNORECASE,
-    ):
-        return False
-    return True
-
-
 @app.get("/alerts/applications")
-async def get_alert_applications(limit: int = 5000) -> dict[str, Any]:
+async def get_alert_applications(limit: int = 5000, tenant_id: str = "default") -> dict[str, Any]:
     safe_limit = max(1, min(int(limit), 10000))
     session_factory = getattr(app.state, "session_factory", None)
     if settings.database_enabled and session_factory is not None:
         async with session_factory() as session:
             repo = IncidentRepository(session)
-            rows = await repo.list_alerts(limit=safe_limit)
+            # Project discovery only needs the persisted alert payload. Avoid
+            # incident/projection enrichment, which turns this lightweight
+            # inventory endpoint into several large follow-up queries.
+            rows = await repo.list_alerts(limit=safe_limit, include_incident_context=False, tenant_id=tenant_id)
     else:
         rows = list(RECENT_ALERTS)[:safe_limit]
 
-    seen: set[str] = set()
-    applications: list[str] = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        for candidate in _alert_application_candidates(row):
-            if not _is_displayable_alert_application(candidate):
-                continue
-            if candidate in seen:
-                continue
-            seen.add(candidate)
-            applications.append(candidate)
+    applications = collect_alert_applications(rows)
+    suppressed: set[str] = set()
+    if settings.database_enabled and session_factory is not None:
+        async with session_factory() as session:
+            repo = IncidentRepository(session)
+            state_rows = await repo.list_onboarding_state(tenant_id=tenant_id)
+        suppression_providers = {
+            "observed_project_suppression",
+            f"observed_project_suppression:{tenant_id.strip().lower()}",
+        }
+        suppressed = {
+            str(row.get("project_name") or "").strip().lower()
+            for row in state_rows
+            if str(row.get("provider_name") or "").strip().lower()
+            in suppression_providers
+        }
+    applications = [name for name in applications if name.strip().lower() not in suppressed]
 
     return {
         "rows": [{"name": name} for name in applications],
@@ -5461,15 +6171,40 @@ async def get_alert_applications(limit: int = 5000) -> dict[str, Any]:
     }
 
 
+@app.delete("/alerts/applications/{project_name}")
+async def suppress_observed_alert_application(project_name: str, tenant_id: str = "default") -> dict[str, Any]:
+    normalized = str(project_name or "").strip()
+    if not normalized:
+        raise HTTPException(status_code=422, detail="project name is required")
+    session_factory = _db_required()
+    async with session_factory() as session:
+        repo = IncidentRepository(session)
+        await repo.save_onboarding_state(
+            tenant_id=tenant_id,
+            project_name=normalized,
+            provider_name="observed_project_suppression",
+            project_payload={"name": normalized, "tenant_id": tenant_id, "inventory_visibility": "suppressed"},
+            connectivity_payload={"source": "alert_observation", "historical_alerts_preserved": True},
+            test_status="suppressed",
+            test_message="Removed from Project Management observed inventory by an administrator",
+        )
+        await session.commit()
+    return {
+        "name": normalized,
+        "status": "removed_from_inventory",
+        "historical_alerts_preserved": True,
+    }
+
+
 @app.get("/alerts/{alert_id}/processed-result")
-async def get_processed_result(alert_id: str) -> dict[str, Any]:
+async def get_processed_result(alert_id: str, tenant_id: str) -> dict[str, Any]:
     session_factory = getattr(app.state, "session_factory", None)
     if not settings.database_enabled or session_factory is None:
         raise HTTPException(status_code=503, detail="Database is not enabled for processed results")
 
     async with session_factory() as session:
         repo = IncidentRepository(session)
-        result = await repo.get_processed_result_by_alert_id(alert_id)
+        result = await repo.get_processed_result_by_alert_id(alert_id, tenant_id=tenant_id)
 
     if not result:
         raise HTTPException(status_code=404, detail="No processed result found for alert")
@@ -5573,7 +6308,7 @@ def post_landing_pad_event(payload: dict = Body(...)) -> dict[str, Any]:
 
 
 @app.get("/landing-pad/recent")
-def get_landing_pad_recent(limit: int = 20, include_archive: bool = False) -> dict[str, Any]:
+async def get_landing_pad_recent(limit: int = 20, include_archive: bool = False) -> dict[str, Any]:
     """Read landing-pad audit files on FastAPI's bounded worker threadpool.
 
     The archive can contain thousands of files during an alert burst. Keeping
@@ -5583,7 +6318,7 @@ def get_landing_pad_recent(limit: int = 20, include_archive: bool = False) -> di
     """
     safe_limit = max(1, min(int(limit), 200))
     live_rows = list(RECENT_INGESTION_EVENTS)[:safe_limit]
-    if live_rows:
+    if live_rows and not include_archive:
         return {
             "processed_dir": str(LANDING_PAD_PROCESSED_DIR),
             "failed_dir": str(LANDING_PAD_FAILED_DIR),
@@ -5593,6 +6328,19 @@ def get_landing_pad_recent(limit: int = 20, include_archive: bool = False) -> di
             "rows": live_rows,
             "count": len(live_rows),
         }
+
+    input_snapshot_rows = _landing_pad_recent_input_snapshot(safe_limit)
+    if input_snapshot_rows and not include_archive:
+        return {
+            "processed_dir": str(LANDING_PAD_PROCESSED_DIR),
+            "failed_dir": str(LANDING_PAD_FAILED_DIR),
+            "partition_scheme": "YYYY/MM/DD",
+            "listing_lookback_days": 0,
+            "source": "landing-pad-input-snapshot",
+            "rows": input_snapshot_rows,
+            "count": len(input_snapshot_rows),
+        }
+
     if not include_archive:
         return {
             "processed_dir": str(LANDING_PAD_PROCESSED_DIR),
@@ -5603,14 +6351,34 @@ def get_landing_pad_recent(limit: int = 20, include_archive: bool = False) -> di
             "rows": [],
             "count": 0,
         }
+    session_factory = getattr(app.state, "session_factory", None)
+    if not settings.database_enabled or session_factory is None:
+        raise HTTPException(status_code=503, detail="MySQL object metadata is required for archive queries")
+    async with session_factory() as session:
+        stored = await ObjectStorageRepository(session).list(limit=safe_limit)
+    metadata_rows = [
+        {
+            "object_id": str(row.id), "file": Path(row.object_key).name, "object_uri": row.object_uri,
+            "source": row.source, "application": row.application, "environment": row.environment,
+            "received_at": row.ingested_at.isoformat() if row.ingested_at else None,
+            "modified_at": row.created_at.isoformat() if row.created_at else None,
+            "status": row.processing_status, "size_bytes": row.size_bytes,
+            "checksum_sha256": row.checksum_sha256, "retention_policy": row.retention_policy,
+            "security_classification": row.security_classification,
+            **(row.metadata_payload if isinstance(row.metadata_payload, dict) else {}),
+        }
+        for row in stored
+    ]
+    return {"source": "mysql-object-metadata", "rows": [*live_rows, *metadata_rows][:safe_limit], "count": min(safe_limit, len(live_rows) + len(metadata_rows))}
     LANDING_PAD_PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
     LANDING_PAD_FAILED_DIR.mkdir(parents=True, exist_ok=True)
 
     recent_lookback_days = min(LANDING_PAD_LISTING_LOOKBACK_DAYS, 3)
     scan_cap = max(safe_limit * 3, 80)
 
+    archive_scan_limit = min(scan_cap, max(safe_limit, 240))
     files = heapq.nlargest(
-        safe_limit,
+        archive_scan_limit,
         [
             *_collect_partitioned_json_files(
                 LANDING_PAD_PROCESSED_DIR,
@@ -5629,10 +6397,10 @@ def get_landing_pad_recent(limit: int = 20, include_archive: bool = False) -> di
     rows: list[dict[str, Any]] = []
     for path in files:
         try:
-            filename_timestamp = datetime.strptime(path.name[:22], "%Y%m%dT%H%M%S%fZ").replace(tzinfo=timezone.utc)
+            filename_timestamp = datetime.strptime(path.name[:22], "%Y%m%dT%H%M%S%fZ").replace(tzinfo=UTC)
             modified_at = filename_timestamp.isoformat()
         except ValueError:
-            modified_at = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat()
+            modified_at = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC).isoformat()
         entry: dict[str, Any] = {
             "file": path.name,
             "path": str(path),
@@ -5678,11 +6446,67 @@ def get_landing_pad_recent(limit: int = 20, include_archive: bool = False) -> di
             entry["parse_error"] = "invalid_json"
         rows.append(entry)
 
+    combined_rows = [*live_rows, *rows, *input_snapshot_rows]
+    deduplicated_rows: list[dict[str, Any]] = []
+    seen_rows: set[str] = set()
+    for row in sorted(
+        combined_rows,
+        key=lambda item: str(item.get("modified_at") or item.get("received_at") or ""),
+        reverse=True,
+    ):
+        identity = str(
+            row.get("path")
+            or row.get("file")
+            or f"{row.get('source')}:{row.get('name')}:{row.get('received_at') or row.get('modified_at')}"
+        )
+        if identity in seen_rows:
+            continue
+        seen_rows.add(identity)
+        deduplicated_rows.append(row)
+    def _source_bucket(row: dict[str, Any]) -> str:
+        labels = row.get("labels") if isinstance(row.get("labels"), dict) else {}
+        source_text = " ".join(
+            str(value or "").strip().lower()
+            for value in (
+                row.get("source"),
+                row.get("origin_system"),
+                row.get("ingestion_channel"),
+                labels.get("origin_system"),
+                labels.get("ingestion_channel"),
+            )
+        )
+        if any(token in source_text for token in ("email", "mail", "smtp")):
+            return "email"
+        if any(token in source_text for token in ("jira", "ticket", "servicenow", "itsm")):
+            return "ticket"
+        if any(token in source_text for token in ("log", "opensearch", "elasticsearch", "loki")):
+            return "log"
+        if any(token in source_text for token in ("telemetry", "otel", "opentelemetry", "trace")):
+            return "telemetry"
+        return "prometheus"
+
+    # High-volume Prometheus traffic must not crowd lower-volume or inactive
+    # sources out of the UI response. Reserve the latest row from every source
+    # represented in the bounded archive scan, then fill remaining slots by time.
+    latest_by_source: dict[str, dict[str, Any]] = {}
+    for row in deduplicated_rows:
+        latest_by_source.setdefault(_source_bucket(row), row)
+    reserved_ids = {id(row) for row in latest_by_source.values()}
+    selected_rows = [*latest_by_source.values()]
+    selected_rows.extend(row for row in deduplicated_rows if id(row) not in reserved_ids)
+    deduplicated_rows = sorted(
+        selected_rows[:safe_limit],
+        key=lambda item: str(item.get("modified_at") or item.get("received_at") or ""),
+        reverse=True,
+    )
+    rows = deduplicated_rows
+
     return {
         "processed_dir": str(LANDING_PAD_PROCESSED_DIR),
         "failed_dir": str(LANDING_PAD_FAILED_DIR),
         "partition_scheme": "YYYY/MM/DD",
         "listing_lookback_days": recent_lookback_days,
+        "source": "merged-live-and-archive",
         "rows": rows,
         "count": len(rows),
     }
@@ -5748,15 +6572,47 @@ async def process_landing_pad_input(payload: dict[str, Any] = Body(default={})) 
 @app.get("/landing-pad/archive")
 async def get_landing_pad_archive(limit: int = 50) -> dict[str, Any]:
     safe_limit = max(1, min(int(limit), 200))
-    rows = _landing_pad_file_rows(LANDING_PAD_ARCHIVE_DIR, safe_limit)
+    session_factory = getattr(app.state, "session_factory", None)
+    if not settings.database_enabled or session_factory is None:
+        raise HTTPException(status_code=503, detail="MySQL object metadata is required for archive queries")
+    async with session_factory() as session:
+        stored = await ObjectStorageRepository(session).list(limit=safe_limit)
+    rows = [{"object_id": str(row.id), "object_key": row.object_key, "object_uri": row.object_uri, "object_type": row.object_type, "application": row.application, "environment": row.environment, "source": row.source, "status": row.processing_status, "created_at": row.created_at.isoformat(), "size_bytes": row.size_bytes, "checksum_sha256": row.checksum_sha256, "retention_policy": row.retention_policy, "security_classification": row.security_classification} for row in stored]
     return {
-        "archive_dir": str(LANDING_PAD_ARCHIVE_DIR),
-        "archive_enabled": LANDING_PAD_ARCHIVE_ENABLED,
+        "source": "mysql-object-metadata",
+        "archive_enabled": settings.object_storage_enabled,
         "archive_after_days": LANDING_PAD_ARCHIVE_AFTER_DAYS,
         "archive_interval_seconds": LANDING_PAD_ARCHIVE_INTERVAL_SECONDS,
         "rows": rows,
         "count": len(rows),
     }
+
+
+@app.get("/landing-pad/objects/{object_id}/download")
+async def download_landing_pad_object(object_id: UUID) -> StreamingResponse:
+    if not settings.object_storage_enabled:
+        raise HTTPException(status_code=503, detail="Object storage is not enabled")
+    session_factory = getattr(app.state, "session_factory", None)
+    if not settings.database_enabled or session_factory is None:
+        raise HTTPException(status_code=503, detail="MySQL object metadata is required")
+    async with session_factory() as session:
+        row = await ObjectStorageRepository(session).get(object_id)
+    if row is None or row.processing_status != "stored":
+        raise HTTPException(status_code=404, detail="Stored object not found")
+    storage = build_object_storage(settings)
+    return StreamingResponse(storage.stream(row.object_key), media_type="application/octet-stream", headers={"Content-Disposition": f'attachment; filename="{Path(row.object_key).name}"', "X-Content-SHA256": row.checksum_sha256})
+
+
+@app.get("/landing-pad/objects/{object_id}/access")
+async def get_landing_pad_object_access(object_id: UUID) -> dict[str, Any]:
+    if not settings.object_storage_enabled:
+        raise HTTPException(status_code=503, detail="Object storage is not enabled")
+    async with app.state.session_factory() as session:
+        row = await ObjectStorageRepository(session).get(object_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Stored object not found")
+    url = await build_object_storage(settings).signed_url(row.object_key, settings.object_storage_signed_url_seconds)
+    return {"object_id": str(row.id), "expires_in": settings.object_storage_signed_url_seconds, "signed_url": url or None, "controlled_download": f"/landing-pad/objects/{row.id}/download"}
 
 
 @app.post("/landing-pad/archive/run")
@@ -5785,13 +6641,13 @@ async def get_agent_work_items(limit: int = 100) -> dict[str, Any]:
 
 
 @app.get("/incidents/closed")
-async def get_closed_incidents(limit: int = 100) -> dict[str, Any]:
+async def get_closed_incidents(tenant_id: str, limit: int = 100) -> dict[str, Any]:
     safe_limit = max(1, min(int(limit), 500))
     session_factory = getattr(app.state, "session_factory", None)
     if settings.database_enabled and session_factory is not None:
         async with session_factory() as session:
             repo = IncidentRepository(session)
-            rows = await repo.list_closed_incidents(limit=safe_limit)
+            rows = await repo.list_closed_incidents(limit=safe_limit, tenant_id=tenant_id)
         return {"rows": rows, "count": len(rows)}
 
     rows = list(CLOSED_INCIDENTS)[:safe_limit]
@@ -5800,12 +6656,15 @@ async def get_closed_incidents(limit: int = 100) -> dict[str, Any]:
 
 @app.get("/incidents/metadata")
 async def get_incident_metadata(
+    tenant_id: str,
     limit: int = 100,
+    include_enrichment: bool = True,
     risk_tier: str | None = None,
     execution_mode: str | None = None,
     transport_provider: str | None = None,
     status: str | None = None,
     service: str | None = None,
+    incident_id: str | None = None,
 ) -> dict[str, Any]:
     safe_limit = max(1, min(int(limit), 1000))
     session_factory = getattr(app.state, "session_factory", None)
@@ -5814,11 +6673,14 @@ async def get_incident_metadata(
             repo = IncidentRepository(session)
             rows = await repo.list_incident_projections(
                 limit=safe_limit,
+                include_enrichment=include_enrichment,
                 risk_tier=risk_tier,
                 execution_mode=execution_mode,
                 transport_provider=transport_provider,
                 status=status,
                 service=service,
+                incident_id=incident_id,
+                tenant_id=tenant_id,
             )
         return {"rows": rows, "count": len(rows)}
 
@@ -5839,21 +6701,109 @@ async def get_incident_metadata(
         ]
     if status:
         rows = [row for row in rows if str(row.get("status") or "").strip().lower() == str(status).strip().lower()]
+    if incident_id:
+        rows = [
+            row
+            for row in rows
+            if str(row.get("incident_id") or row.get("id") or "").strip().lower()
+            == str(incident_id).strip().lower()
+        ]
     if service:
         rows = [row for row in rows if str(row.get("service") or "").strip() == str(service).strip()]
     rows = rows[:safe_limit]
     return {"rows": rows, "count": len(rows)}
 
 
+@app.get("/incidents/groups")
+async def get_incident_groups(
+    tenant_id: str,
+    limit: int = 25,
+    cursor: str | None = None,
+    risk_tier: str | None = None,
+    execution_mode: str | None = None,
+    status: str | None = None,
+    service: str | None = None,
+) -> dict[str, Any]:
+    session_factory = getattr(app.state, "session_factory", None)
+    if not settings.database_enabled or session_factory is None:
+        raise HTTPException(status_code=503, detail="Incident group read model is unavailable")
+    async with session_factory() as session:
+        repo = IncidentRepository(session)
+        try:
+            return await repo.list_incident_groups(
+                tenant_id=tenant_id,
+                limit=limit,
+                cursor=cursor,
+                risk_tier=risk_tier,
+                execution_mode=execution_mode,
+                status=status,
+                service=service,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/incidents/{incident_id}")
+async def get_incident_by_id(incident_id: str, tenant_id: str) -> dict[str, Any]:
+    session_factory = getattr(app.state, "session_factory", None)
+    if not settings.database_enabled or session_factory is None:
+        raise HTTPException(status_code=503, detail="Incident read model is unavailable")
+    async with session_factory() as session:
+        repo = IncidentRepository(session)
+        rows = await repo.list_incident_projections(
+            limit=1,
+            tenant_id=tenant_id,
+            include_enrichment=True,
+            incident_id=incident_id,
+        )
+        if rows:
+            return rows[0]
+        legacy = await repo.get_incident(incident_id, tenant_id=tenant_id)
+        if legacy is None:
+            raise HTTPException(status_code=404, detail="Incident not found")
+        return legacy
+
+
+@app.get("/incidents/inbox/feed")
+async def get_unified_incident_inbox(
+    tenant_id: str,
+    limit: int = 25,
+    cursor: str | None = None,
+    project_id: str | None = None,
+    risk_tier: str | None = None,
+    execution_mode: str | None = None,
+    transport_provider: str | None = None,
+    status: str | None = None,
+    service: str | None = None,
+    inbox_view: str = "all",
+    record_type: str = "all",
+    severity: str | None = None,
+) -> dict[str, Any]:
+    session_factory = getattr(app.state, "session_factory", None)
+    if not settings.database_enabled or session_factory is None:
+        raise HTTPException(status_code=503, detail="Unified incident inbox is unavailable")
+    async with session_factory() as session:
+        repo = IncidentRepository(session)
+        try:
+            return await repo.list_unified_inbox(
+                tenant_id=tenant_id, limit=limit, cursor=cursor, project_id=project_id,
+                risk_tier=risk_tier, execution_mode=execution_mode,
+                transport_provider=transport_provider, status=status, service=service,
+                inbox_view=inbox_view, record_type=record_type, severity=severity,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
 @app.get("/incidents/{incident_id}/stage-completeness")
-async def get_incident_stage_completeness(incident_id: str) -> dict[str, Any]:
+async def get_incident_stage_completeness(incident_id: str, tenant_id: str) -> dict[str, Any]:
     session_factory = getattr(app.state, "session_factory", None)
     if not settings.database_enabled or session_factory is None:
         raise HTTPException(status_code=503, detail="Database is not enabled for incident stage completeness")
 
     async with session_factory() as session:
         repo = IncidentRepository(session)
-        result = await repo.get_incident_stage_completeness(incident_id)
+        result = await repo.get_incident_stage_completeness(incident_id, tenant_id=tenant_id)
 
     if not result:
         raise HTTPException(status_code=404, detail="No incident stage completeness found for incident")
@@ -5950,7 +6900,7 @@ async def post_onboarding_complete(payload: OnboardingCompletePayload = Body(...
             "target_platforms": [selected_tool],
             "discovery_inputs": {
                 "endpoint_url": endpoint_url,
-                "deployment_mode": str(connectivity.deployment_mode or "on_prem").strip(),
+                "deployment_mode": str(connectivity.deployment_mode or "cloud_neutral").strip(),
                 "environment": str(connectivity.project.environment or "prod").strip(),
                 "region": str(connectivity.project.region or "").strip(),
                 "selected_monitoring_tool": selected_tool,
@@ -6095,7 +7045,7 @@ async def update_onboarding_rules_pipeline(workflow_id: str, payload: dict[str, 
                 "pipeline": str(connectivity_payload.get("pipeline") or latest.get("provider_name") or "onboarding_pipeline"),
                 "summary": payload.get("summary") if isinstance(payload.get("summary"), dict) else connectivity_payload.get("summary", {}),
                 "result": merged_result,
-                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "updated_at": datetime.now(UTC).isoformat(),
             }
         )
 
@@ -6110,7 +7060,7 @@ async def update_onboarding_rules_pipeline(workflow_id: str, payload: dict[str, 
             test_message=str(payload.get("test_message") or latest.get("test_message") or "Workflow updated by admin"),
             project_payload=project_payload,
             connectivity_payload=connectivity_payload,
-            last_tested_at=datetime.now(timezone.utc),
+            last_tested_at=datetime.now(UTC),
         )
         await session.commit()
 
@@ -6148,42 +7098,9 @@ async def delete_onboarding_rules_pipeline(workflow_id: str) -> dict[str, Any]:
     return {"workflow_id": workflow_id, "deleted": deleted_total}
 
 
-@app.post("/sample/payment-latency/workflow")
-async def sample_payment_latency_workflow(
-    fast_mode: bool = False,
-    x_trace_id: str | None = Header(default=None),
-) -> dict[str, Any]:
-    return await run_local_payment_workflow(trace_id=x_trace_id, run_comparison=not fast_mode, auto_approve=False)
-
-
-@app.post("/sample/{flow_id}/workflow")
-async def sample_flow_workflow(
-    flow_id: str,
-    fast_mode: bool = False,
-    x_trace_id: str | None = Header(default=None),
-) -> dict[str, Any]:
-    return await run_local_payment_workflow(
-        trace_id=x_trace_id,
-        flow_id=flow_id,
-        run_comparison=not fast_mode,
-        auto_approve=False,
+app.include_router(
+    build_workflow_router(
+        run_workflow=run_local_payment_workflow,
+        continue_workflow=continue_pending_workflow,
     )
-
-
-@app.post("/sample/{flow_id}/workflow/continue")
-async def continue_flow_workflow(
-    flow_id: str,
-    payload: dict[str, Any] = ALERT_BODY,
-    x_trace_id: str | None = Header(default=None),
-) -> dict[str, Any]:
-    return await continue_pending_workflow(
-        flow_id=flow_id,
-        incident_id=str(payload.get("incident_id") or ""),
-        recommendation_id=str(payload.get("recommendation_id") or ""),
-        decision_token=str(payload.get("decision") or ""),
-        approver=str(payload.get("approver") or "").strip() or None,
-        channel=str(payload.get("channel") or "").strip() or None,
-        comment=str(payload.get("comment") or "").strip() or None,
-        modified_action=str(payload.get("modified_action") or "").strip() or None,
-        trace_id=x_trace_id,
-    )
+)

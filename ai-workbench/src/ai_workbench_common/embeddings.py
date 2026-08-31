@@ -107,12 +107,7 @@ class AzureOpenAIEmbeddingModel(Embeddings):
         headers = {"api-key": self._api_key, "Content-Type": "application/json"}
         try:
             parsed = _request_with_retries(
-                request=lambda: httpx.post(
-                    self._embeddings_endpoint(),
-                    headers=headers,
-                    json=payload,
-                    timeout=self._timeout_seconds,
-                ),
+                request=lambda: self._post_embedding_request(headers=headers, payload=payload),
                 max_retries=self._max_retries,
                 backoff_seconds=self._retry_backoff_seconds,
             )
@@ -136,6 +131,10 @@ class AzureOpenAIEmbeddingModel(Embeddings):
                 raise ValueError("azure openai embeddings item missing values")
             vectors.append([float(v) for v in values])
         return vectors
+
+    def _post_embedding_request(self, *, headers: dict[str, str], payload: dict[str, object]) -> httpx.Response:
+        with httpx.Client(timeout=self._timeout_seconds) as client:
+            return client.post(self._embeddings_endpoint(), headers=headers, json=payload)
 
 
 class OpenAIEmbeddingModel(Embeddings):
@@ -265,12 +264,13 @@ def get_embedding_model(settings: Settings) -> Embeddings:
     provider = str(getattr(settings, "rag_embedding_provider", "auto") or "auto").strip().lower()
     local = HashingEmbeddingModel()
     openai = OpenAIEmbeddingModel(settings, fallback=local)
+    azure_fallback: Embeddings = openai if bool(getattr(settings, "openai_api_key", None)) else local
     if provider == "azure-openai":
-        return AzureOpenAIEmbeddingModel(settings, fallback=openai)
+        return AzureOpenAIEmbeddingModel(settings, fallback=azure_fallback)
     if provider == "openai":
         return openai
     if provider == "auto" and bool(getattr(settings, "azure_openai_embeddings_enabled", False)):
-        return AzureOpenAIEmbeddingModel(settings, fallback=openai)
+        return AzureOpenAIEmbeddingModel(settings, fallback=azure_fallback)
     if provider == "auto" and bool(getattr(settings, "openai_api_key", None)):
         return openai
     return HashingEmbeddingModel()

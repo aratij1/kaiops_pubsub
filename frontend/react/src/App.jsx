@@ -1,13 +1,46 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+﻿import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import { useVirtualizer } from "@tanstack/react-virtual";
+import { Archive, BookOpen, Bot, Boxes, ChartNoAxesCombined, CircleCheckBig, ClipboardCheck, Cloud, Database, Gauge, PlugZap, RadioTower, ScrollText, Server, Settings, ShieldCheck, Siren, Workflow } from "lucide-react";
+import { alertRowsQueryOptions, landingPadRowsQueryOptions } from "./services/alerts";
+import { useOperationalEvents } from "./services/operationalEvents";
+import { beginOidcLogin, clearStoredSession, completeOidcLogin, restoreStoredSession, storeSessionTokens } from "./services/oidcClient";
+import { RouteRuntimeProvider } from "./app/routeRuntime";
+import { projectIdentityFromAlert } from "./domain/projectIdentity";
+import { isExpectedAnalysisVersion } from "./domain/analysisVersion";
+import { analysisFailureMessage, analysisRequestOutcome } from "./domain/analysisRequestStatus";
+import { durableIncidentPath, effectiveExecutionStatus, effectiveIncidentStatus, executionProcessPresentation, incidentStatusLabel } from "./domain/incidentStatus";
+import { resolveResolutionControl } from "./domain/resolutionControl";
+import { incidentDraftHasSubstantiveContent, simpleIncidentReport } from "./domain/incidentReport";
+import { approvalFlowFromPayload, approvalFlowId, approvalIncidentId, approvalRecommendationFromPayload, approvalRecommendationId, approvalTraceId } from "./domain/approvalContext";
+import { buildOnboardingSources } from "./domain/onboardingSources";
+import { buildAlertDocumentDraft as buildRcaEvidenceDocumentDraft } from "./domain/alertDocumentDraft";
+import { canonicalIncidentEvidence } from "./domain/incidentEvidence";
+import { canonicalApprovalEligibility } from "./domain/approvalEligibility";
+import { buildIncidentGroupQuery } from "./features/incidents/incidentGroupQuery";
+import { isEvidenceDraftConflict, useEvidenceDraftBundle } from "./features/incidents/useEvidenceDraftBundle";
+import RcaPanel from "./routes/incidents/RcaPanel";
+import ResolutionPanel from "./routes/incidents/ResolutionPanel";
+import VerifyWorkspace from "./routes/incidents/VerifyWorkspace";
+import "./routes/incidents/ExecutionWorkspace.css";
+import "./routes/incidents/AnalysisModeSelector.css";
+import "./styles/product-ui.css";
+import "./styles/product-foundation.css";
+import "./styles/legacy-operations.css";
+import CopilotRoute from "./routes/copilot/CopilotRoute";
+import { breadcrumbForPath, groupedNavigationForRole, navigationItemForPath, TAB_SHORTCUT_BY_CODE, VALID_LEGACY_TABS } from "./app/navigation";
+import { allowedLegacyTabsForRole, canAccessDestination } from "./app/permissions";
+import { KAI_BRAND } from "./config/brand";
+import KaiCommandPalette from "./app/KaiCommandPalette";
+import { KaiOperationsShell } from "./components/shell/KaiOperationsShell";
+const LOCAL_JENKINS_ENDPOINT = "http://jenkins:8080", LOCAL_JENKINS_JOB = "kaiops-auto-remediation", LOCAL_JENKINS_CREDENTIAL_REF = "vault://kaiops/local/jenkins#api-token";
 import {
   ALERT_DOC_KIND_OPTIONS,
-  APPROVAL_NAV_PRIMARY_ROLES,
   DOCUMENT_PROVIDER_ROLES,
   MONITORING_TOOL_OPTIONS,
   ONBOARDING_SOURCE_DOC_BUCKETS,
   ONBOARDING_SOURCE_DOC_EXTENSIONS,
   ONBOARDING_SOURCE_DOC_SAMPLE_FILES,
-  ROLE_ALLOWED_TABS,
 } from "./onboardingConfig";
 import {
   classifyOnboardingDocumentType,
@@ -21,6403 +54,431 @@ import {
   simplifyMonitoringUrl,
   summarizeUploadedDocument,
 } from "./onboardingUtils";
-
-const DEFAULT_ALERT = {
-  source: "monitoring-adapter",
-  name: "PaymentLatencySpike",
-  service: "payments",
-  severity: "high",
-  description: "Payment latency crossed 2.5s threshold for 5m",
-};
-
-const REAL_USE_CASE_SCOPE = "real-usecases";
-const TEST_USE_CASE_SCOPE = "test-usecases";
-const CORE_MONITOR_PROJECTS = ["KaiOps", "Telemetry"];
-const FIXED_MONITOR_SCOPES = [...CORE_MONITOR_PROJECTS, REAL_USE_CASE_SCOPE, TEST_USE_CASE_SCOPE];
-
-const SERVICE_TOPIC_FLOW = [
-  { service: "monitoring-adapter", consumes: "-", publishes: "raw-alerts", agent: "alert" },
-  { service: "alert-intelligence", consumes: "raw-alerts", publishes: "enriched-alerts", agent: "Alert Intelligence Agent" },
-  { service: "orchestrator", consumes: "enriched-alerts", publishes: "orchestration-events", agent: "Orchestrator Agent" },
-  { service: "context-agent", consumes: "orchestration-events", publishes: "context-events", agent: "Context Intelligence Agent" },
-  { service: "resolution-agent", consumes: "context-events", publishes: "resolution-events", agent: "Resolution Intelligence Agent" },
-  { service: "approval-service", consumes: "resolution-events", publishes: "approval-events", agent: "Human Approval Layer" },
-  { service: "remediation-engine", consumes: "approval-events", publishes: "remediation-events", agent: "Remediation Automation Engine" },
-  { service: "closure-service", consumes: "remediation-events", publishes: "closure-events", agent: "Closure & Validation" },
-];
-
-const RECOMMENDED_WORKER_PROFILE = {
-  "monitoring-adapter": { containers: 1, workers: 2, role: "landing-pad intake" },
-  "alert-intelligence": { containers: 1, workers: 2, role: "dedupe and correlation workers" },
-  orchestrator: { containers: 1, workers: 2, role: "master routing workers" },
-  "context-agent": { containers: 1, workers: 3, role: "RAG and evidence workers" },
-  "resolution-agent": { containers: 1, workers: 3, role: "RCA and recommendation workers" },
-  "approval-service": { containers: 1, workers: 1, role: "decision gate" },
-  "remediation-engine": { containers: 1, workers: 2, role: "execution policy workers" },
-  "closure-service": { containers: 1, workers: 2, role: "post-check workers" },
-};
-
-const SCALE_CAPACITY_GUIDE = [
-  {
-    rate: "100/hr",
-    perSecond: "0.03/sec",
-    masters: "1 master",
-    workers: "1 worker per service",
-    vm: "1 VM: 2 vCPU / 8 GB RAM",
-    config: "MESSAGE_BUS_WORKER_COUNT=1",
-    state: "Local Compose state is acceptable for dev/smoke.",
-  },
-  {
-    rate: "500/hr",
-    perSecond: "0.14/sec",
-    masters: "1 master",
-    workers: "1 alert-intel, 2 context, 2 resolution, 1 remediation",
-    vm: "1 VM: 4 vCPU / 16 GB RAM",
-    config: "Use docker-compose.scale.yml; CONTEXT_AGENT_WORKERS=2, RESOLUTION_AGENT_WORKERS=2",
-    state: "Move Redis/MySQL to managed or dedicated VM if dashboards and approvals are active.",
-  },
-  {
-    rate: "1,000/hr",
-    perSecond: "0.28/sec",
-    masters: "2 orchestrators",
-    workers: "2 alert-intel, 3 context, 3 resolution, 2 closure, 1-2 remediation",
-    vm: "2 VMs: 4 vCPU / 16 GB each, or 1 VM: 8 vCPU / 32 GB",
-    config: "Enable Kafka/RabbitMQ; ORCHESTRATOR_WORKERS=2, ALERT_INTELLIGENCE_WORKERS=2",
-    state: "Use shared DB, shared cache, shared message bus, shared vector index.",
-  },
-  {
-    rate: "10,000/hr",
-    perSecond: "2.78/sec",
-    masters: "3+ orchestrators",
-    workers: "4+ alert-intel, 6-10 context, 6-10 resolution, 3+ remediation",
-    vm: "3-6 VMs: 8 vCPU / 32 GB each, or AKS/VMSS node pool",
-    config: "Externalize DB/Redis/bus/vector store; tune RAG_EMBEDDING_BATCH_SIZE and provider limits",
-    state: "Production HA required: load balancer, managed DB, Kafka/Event Hubs, vector DB, object storage.",
-  },
-];
-
-const AGENT_DISPLAY_ALIASES = {
-  "orchestrator agent": "Master Agent",
-  orchestrator: "Master Agent",
-  "closure & validation": "Validator Agent",
-  "closure-service": "Validator Agent",
-};
-
-const AGENT_ROUTE_ALIASES = {
-  "master agent": "orchestrator agent",
-  "master agent (orchestrator agent)": "orchestrator agent",
-  "validator agent": "closure & validation",
-  "validator agent (closure & validation)": "closure & validation",
-};
-
-const PREFERENCE_STORAGE_KEY = "kaiops.ui.preferences.v1";
-const UI_THEME_VALUES = new Set(["auto", "light", "dark"]);
-const TAB_SHORTCUT_MAP = {
-  Digit1: "home",
-  Digit2: "approval",
-  Digit3: "executive",
-  Digit4: "admin",
-  Digit5: "trace",
-  Digit6: "safety",
-  Digit7: "rag",
-  Digit9: "closed",
-  Digit0: "summary",
-};
-const VALID_TABS = new Set(Object.values(TAB_SHORTCUT_MAP));
-function extractObservedRoutingMetrics(workflow) {
-  if (!workflow || typeof workflow !== "object") {
-    return {};
-  }
-  const rawEvents = [workflow.events, workflow.workflow_events, workflow.agent_events]
-    .find((items) => Array.isArray(items)) || [];
-  const events = rawEvents.filter((item) => item && typeof item === "object");
-  const traceRows = [workflow.event_trace, workflow.trace_events, workflow?.trace?.events]
-    .find((items) => Array.isArray(items)) || [];
-  const latestEvent = [...events].reverse().find((item) => item && typeof item === "object") || null;
-  const orchestratorEvent = [...events].reverse().find((item) => {
-    const agent = String(item?.agent || "").trim().toLowerCase();
-    return agent.includes("orchestrator") || agent.includes("master");
-  }) || latestEvent;
-  const latestTrace = [...traceRows]
-    .filter((row) => row && typeof row === "object")
-    .sort((a, b) => {
-      const aTime = parseUtcTimestamp(a.timestamp)?.getTime() || 0;
-      const bTime = parseUtcTimestamp(b.timestamp)?.getTime() || 0;
-      return bTime - aTime;
-    })[0] || null;
-
-  const recommendationMetadata =
-    typeof workflow?.recommendation?.metadata === "object" ? workflow.recommendation.metadata : {};
-  const metrics = typeof orchestratorEvent?.metrics === "object"
-    ? { ...orchestratorEvent.metrics }
-    : (typeof latestEvent?.metrics === "object" ? { ...latestEvent.metrics } : {});
-  const decision =
-    (typeof workflow?.decision === "object" && workflow.decision)
-    || (typeof workflow?.orchestration_decision === "object" && workflow.orchestration_decision)
-    || (typeof recommendationMetadata?.orchestration_decision === "object" && recommendationMetadata.orchestration_decision)
-    || (typeof orchestratorEvent?.decision === "object" && orchestratorEvent.decision)
-    || {};
-
-  const provider =
-    metrics.message_bus_provider
-    || decision.message_bus_provider
-    || latestTrace?.transport_provider
-    || latestEvent?.input?.transport_provider
-    || latestEvent?.transport_provider
-    || workflow?.transport_provider
-    || "";
-
-  return {
-    ...metrics,
-    workflow: metrics.workflow || decision.workflow || workflow?.scenario?.id || "",
-    next_action:
-      metrics.next_action
-      || decision.next_action
-      || workflow?.next_step
-      || workflow?.recommendation?.recommended_action
-      || "",
-    requires_approval:
-      metrics.requires_approval
-      ?? decision.requires_approval
-      ?? workflow?.approval?.required
-      ?? workflow?.recommendation?.requires_approval,
-    risk_tier: metrics.risk_tier || decision.risk_tier || latestTrace?.risk_tier || "",
-    execution_mode: metrics.execution_mode || decision.execution_mode || latestTrace?.execution_mode || "",
-    policy_version: metrics.policy_version || decision.policy_version || workflow?.recommendation?.policy_version || "",
-    message_bus_provider: provider,
-  };
-}
-
-function normalizeMatchTokens(value) {
-  return String(value || "")
-    .toLowerCase()
-    .split(/[^a-z0-9]+/)
-    .map((item) => item.trim())
-    .filter((item) => item.length >= 3);
-}
-
-function hasTokenOverlap(left, right) {
-  const leftTokens = normalizeMatchTokens(left);
-  const rightTokens = normalizeMatchTokens(right);
-  if (!leftTokens.length || !rightTokens.length) {
-    return false;
-  }
-  const rightSet = new Set(rightTokens);
-  return leftTokens.some((token) => rightSet.has(token));
-}
-
-const KAIOPS_CORE_SERVICE_SET = new Set([
-  "api-gateway",
-  "monitoring-adapter",
-  "alert-intelligence",
-  "orchestrator",
-  "context-agent",
-  "resolution-agent",
-  "approval-service",
-  "remediation-engine",
-  "closure-service",
-  "model-router",
-]);
-
-function normalizeMonitorToken(value) {
-  return String(value || "")
-    .trim()
-    .toLowerCase()
-    .replace(/[\s_]+/g, "-")
-    .replace(/-+/g, "-");
-}
-
-function isKaiopsCoreSelection(value) {
-  const token = normalizeMonitorToken(value);
-  return token === "kaiops-core" || token === "kaiops-core1" || token === "kaiops" || token === "core";
-}
-
-function isKaiopsCoreAlert(row) {
-  const labels = typeof row?.labels === "object" && row?.labels ? row.labels : {};
-  const metadata = typeof row?.metadata === "object" && row?.metadata ? row.metadata : {};
-  const service = String(row?.service || labels?.service || "").trim().toLowerCase();
-  const alertName = String(row?.name || labels?.alertname || "").trim().toLowerCase();
-  const ownerTeam = String(metadata?.owner_team || labels?.team || "").trim().toLowerCase();
-  const project = String(row?.project || row?.project_name || row?.application || labels?.project || labels?.project_name || "")
-    .trim()
-    .toLowerCase();
-
-  if (project.includes("telemetry") || project.includes("astronomy")) {
-    return false;
-  }
-  if (KAIOPS_CORE_SERVICE_SET.has(service)) {
-    return true;
-  }
-  if (alertName.includes("kaiops")) {
-    return true;
-  }
-  if (ownerTeam === "platform-ops" || ownerTeam === "kaiops") {
-    return true;
-  }
-  return project.includes("kaiops");
-}
-
-const PROMPT_FRAGMENT_PATTERNS = [
-  "identify the most likely root cause using only",
-  "assess customer, service, dependency, and business impact",
-  "generate an operator-safe remediation",
-];
-
-function isPromptFragment(value) {
-  const text = String(value || "").trim().toLowerCase();
-  return PROMPT_FRAGMENT_PATTERNS.some((fragment) => text.includes(fragment));
-}
-
-function cleanRecommendationText(value, fallback = "-") {
-  if (value == null) {
-    return fallback;
-  }
-  const text = String(value).trim();
-  if (!text) {
-    return fallback;
-  }
-  const payload = parseStructuredIntelligence(text);
-  if (payload) {
-    const keys = [
-      "root_cause",
-      "cause",
-      "impact_summary",
-      "service_impact",
-      "impact",
-      "customer_impact",
-      "dependency_impact",
-      "severity_rationale",
-      "recommended_action",
-      "action",
-      "summary",
-      "content",
-      "title",
-    ];
-    for (const key of keys) {
-      const candidate = String(payload[key] || "").trim();
-      if (candidate && !isPromptFragment(candidate)) {
-        return candidate;
-      }
-    }
-    if (payload.metadata?.fallback) {
-      return fallback;
-    }
-    return fallback;
-  }
-  return isPromptFragment(text) ? fallback : text;
-}
-
-function filterAlertsForMonitor(rows, applicationToMonitor) {
-  const target = String(applicationToMonitor || "").trim().toLowerCase();
-  const alertRows = Array.isArray(rows) ? rows : [];
-  if (!target) {
-    return alertRows;
-  }
-  if (target === REAL_USE_CASE_SCOPE) {
-    return alertRows.filter((row) => !isGeneratedOrTestAlert(row));
-  }
-  if (target === TEST_USE_CASE_SCOPE) {
-    return alertRows.filter((row) => isGeneratedOrTestAlert(row));
-  }
-  return alertRows.filter((row) => {
-    const labels = typeof row?.labels === "object" && row?.labels ? row.labels : {};
-    const explicitProject = String(
-      row?.project_name
-      || labels?.project_name
-      || row?.project
-      || labels?.project
-      || row?.application
-      || labels?.application
-      || ""
-    ).trim().toLowerCase();
-    if (target === "telemetry") {
-      return explicitProject === "telemetry" || explicitProject === "astronomy-shop";
-    }
-    if (isKaiopsCoreSelection(target) && (explicitProject === "telemetry" || explicitProject === "astronomy-shop")) {
-      return false;
-    }
-    if (isKaiopsCoreSelection(target)) {
-      return isKaiopsCoreAlert(row);
-    }
-    const metadata = typeof row?.metadata === "object" && row?.metadata ? row.metadata : {};
-    const candidates = [
-      row?.application,
-      row?.project,
-      row?.project_name,
-      row?.service,
-      row?.source,
-      row?.name,
-      metadata?.owner_team,
-      labels?.application,
-      labels?.project,
-      labels?.project_name,
-      labels?.deployment,
-      labels?.namespace,
-      labels?.service,
-      labels?.job,
-      labels?.instance,
-      labels?.team,
-      labels?.alertname,
-    ]
-      .map((value) => String(value || "").trim().toLowerCase())
-      .filter(Boolean);
-    return candidates.some(
-      (value) =>
-        value === target ||
-        value.includes(target) ||
-        target.includes(value) ||
-        hasTokenOverlap(value, target)
-    );
-  });
-}
-
-function filterRowsForMonitor(rows, applicationToMonitor) {
-  const target = String(applicationToMonitor || "").trim().toLowerCase();
-  const items = Array.isArray(rows) ? rows : [];
-  if (!target) {
-    return items;
-  }
-  if (target === REAL_USE_CASE_SCOPE) {
-    return items.filter((row) => !isGeneratedOrTestAlert(row));
-  }
-  if (target === TEST_USE_CASE_SCOPE) {
-    return items.filter((row) => isGeneratedOrTestAlert(row));
-  }
-  return items.filter((row) => {
-    if (isKaiopsCoreSelection(target)) {
-      const service = String(row?.service || "").trim().toLowerCase();
-      const owner = String(row?.owner || row?.owner_team || "").trim().toLowerCase();
-      return KAIOPS_CORE_SERVICE_SET.has(service) || owner === "platform-ops" || owner === "kaiops";
-    }
-    const labels = typeof row?.labels === "object" && row?.labels ? row.labels : {};
-    const candidates = [
-      row?.application,
-      row?.project,
-      row?.project_name,
-      row?.service,
-      row?.source,
-      row?.provider_name,
-      row?.owner,
-      row?.owner_team,
-      labels?.application,
-      labels?.project,
-      labels?.project_name,
-      labels?.deployment,
-      labels?.namespace,
-      labels?.service,
-      labels?.job,
-      labels?.instance,
-    ]
-      .map((value) => String(value || "").trim().toLowerCase())
-      .filter(Boolean);
-    return candidates.some(
-      (value) =>
-        value === target ||
-        value.includes(target) ||
-        target.includes(value) ||
-        hasTokenOverlap(value, target)
-    );
-  });
-}
-
-function isGeneratedOrTestAlert(row) {
-  const tokens = [
-    row?.name,
-    row?.alert_name,
-    row?.rule_name,
-    row?.rule,
-    row?.alert_rule,
-    row?.labels?.alertname,
-    row?.service,
-    row?.application,
-    row?.project_name,
-    row?.project,
-  ].map((value) => String(value || "").toLowerCase()).join(" ");
-  return /(^|[-_\s])(e2e|ui-e2e|admin-e2e|setup-doc-e2e|stress|smoke|onboarding-smoke-test)([-_\s]|$)/i.test(tokens)
-    || tokens.includes("stresspipelinealert")
-    || tokens.includes("onboarding-smoke-test");
-}
-
-function isEphemeralProjectName(value) {
-  const token = String(value || "").trim().toLowerCase();
-  if (!token) {
-    return false;
-  }
-  return /(^|[-_\s])(e2e|ui-e2e|admin-e2e|setup-doc-e2e|stress|smoke|onboarding-smoke-test)([-_\s]|$)/i.test(token);
-}
-
-function normalizeAlertChannel(row) {
-  const labels = typeof row?.labels === "object" && row?.labels ? row.labels : {};
-  const metadata = typeof row?.metadata === "object" && row?.metadata ? row.metadata : {};
-  const projectName = String(
-    row?.project_name
-    || row?.application
-    || labels?.project_name
-    || labels?.application
-    || ""
-  ).trim().toLowerCase();
-  const explicitOrigin = String(
-    labels?.origin_system
-    || labels?.source_system
-    || metadata?.origin_system
-    || row?.origin_system
-    || ""
-  ).trim().toLowerCase();
-  const explicitChannel = String(
-    labels?.ingestion_channel
-    || labels?.source_channel
-    || metadata?.ingestion_channel
-    || row?.ingestion_channel
-    || ""
-  ).trim().toLowerCase();
-  // OpenSearch is the transport for logs from both KaiOps and the
-  // OpenTelemetry demo. Preserve the owning project before classifying the
-  // transport as a generic log channel.
-  if (projectName === "telemetry" || projectName === "astronomy-shop") return "telemetry";
-  if (explicitOrigin.includes("telemetry") || explicitOrigin.includes("opentelemetry")) return "telemetry";
-  if (explicitOrigin.includes("email") || explicitChannel.includes("email")) return "email";
-  if (explicitOrigin.includes("jira") || explicitOrigin.includes("ticket") || explicitChannel.includes("ticket")) return "ticket";
-  if (explicitOrigin.includes("log") || explicitOrigin.includes("opensearch") || explicitChannel.includes("log")) return "log";
-  const source = [
-    row?.source,
-    row?.provider,
-    row?.provider_name,
-    row?.source_type,
-    row?.origin,
-    row?.channel_type,
-    row?.channel,
-    row?.ticket_provider,
-    row?.notification_channel,
-    row?.integration,
-    metadata?.source,
-    metadata?.channel,
-    labels?.source,
-    labels?.channel,
-    labels?.job,
-    labels?.alertname,
-  ]
-    .map((value) => String(value || "").trim().toLowerCase())
-    .filter(Boolean)
-    .join(" ");
-  if (
-    source.includes("telemetry")
-    || source.includes("opentelemetry")
-    || source.includes("astronomy")
-  ) {
-    return "telemetry";
-  }
-  if (
-    source.includes("prometheus")
-    || source.includes("alertmanager")
-    || source.includes("monitoring-adapter")
-  ) {
-    return "prometheus";
-  }
-  if (source.includes("email") || source.includes("smtp") || source.includes("mail") || source.includes("outlook")) {
-    return "email";
-  }
-  if (
-    source.includes("opensearch")
-    || source.includes("log-alert")
-    || source.includes("log monitoring")
-  ) {
-    return "log";
-  }
-  if (
-    source.includes("jira")
-    || source.includes("ticket")
-    || source.includes("itsm")
-    || source.includes("servicenow")
-    || source.includes("snow")
-    || source.includes("incident")
-    || source.includes("closed-incidents")
-  ) {
-    return "ticket";
-  }
-  if (
-    String(labels?.alertname || "").trim()
-    || String(row?.expr || row?.expression || row?.query || "").trim()
-  ) {
-    return "prometheus";
-  }
-  return "prometheus";
-}
-
-function sourceChannelLabel(value) {
-  const key = String(value || "").trim().toLowerCase();
-  if (key === "prometheus") return "Prometheus";
-  if (key === "email") return "Email";
-  if (key === "ticket") return "Ticket";
-  if (key === "telemetry") return "Telemetry / Prometheus";
-  if (key === "log") return "Logs / OpenSearch";
-  if (key === "other") return "Other";
-  return key || "Unknown";
-}
-
-function monitorScopeLabel(scope) {
-  const key = String(scope || "").trim().toLowerCase();
-  if (key === REAL_USE_CASE_SCOPE) {
-    return "Real Use Cases";
-  }
-  if (key === TEST_USE_CASE_SCOPE) {
-    return "Test Use Cases";
-  }
-  return scope || "Real Use Cases";
-}
-
-function alertTimeMs(row) {
-  return (
-    parseUtcTimestamp(row?.created_at || row?.starts_at || row?.closed_at || row?.updated_at)?.getTime()
-    || 0
-  );
-}
-
-function alertIdentityKeys(row) {
-  // Different sources populate different identity fields for the *same* real-world alert:
-  // a landing-pad file listing carries no fingerprint/incident_id at all (see
-  // _landing_pad_file_rows on the backend, which never surfaces labels), while the
-  // primary /alerts/all API row for that same alert does. Returning every candidate key
-  // (instead of picking just the single highest-priority one) lets the caller union two
-  // rows together if ANY key overlaps, rather than requiring both sides to agree on which
-  // identity field happened to be available.
-  const labels = typeof row?.labels === "object" && row?.labels ? row.labels : {};
-  const keys = [];
-
-  const fingerprint = String(
-    row?.fingerprint
-    || row?.alert_fingerprint
-    || labels?.alert_fingerprint
-    || labels?.fingerprint
-    || ""
-  ).trim();
-  if (fingerprint) {
-    keys.push(`fingerprint:${fingerprint.toLowerCase()}`);
-  }
-
-  const incidentId = String(row?.incident_id || "").trim();
-  if (incidentId) {
-    keys.push(`incident:${incidentId.toLowerCase()}`);
-  }
-
-  const correlation = String(row?.correlation_id || row?.trace_id || "").trim();
-  if (correlation) {
-    keys.push(`correlation:${correlation.toLowerCase()}`);
-  }
-
-  const name = String(row?.name || row?.alert_name || labels?.alertname || "").trim().toLowerCase();
-  const service = String(row?.service || labels?.service || labels?.job || "").trim().toLowerCase();
-  if (name && service) {
-    const severity = String(row?.severity || labels?.severity || "").trim().toLowerCase();
-    const timestampMs = alertTimeMs(row);
-    const bucket = timestampMs > 0 ? Math.floor(timestampMs / (5 * 60 * 1000)) : 0;
-    keys.push(`composite:${name}|${service}|${severity}|${bucket}`);
-  }
-
-  return keys;
-}
-
-function alertApplicationCandidate(row) {
-  const application = String(row?.application || "").trim();
-  const service = String(row?.service || "").trim();
-  // An application value that's just a copy of the service name is almost always a bad
-  // fallback (some mappers default "application" to "service" when the real project/app
-  // name is unknown), not a genuine project label -- don't let it win over a real one.
-  return application && application.toLowerCase() !== service.toLowerCase() ? application : "";
-}
-
-function alertRowScore(row) {
-  const status = String(row?.status || row?.state || "").trim().toLowerCase();
-  const openScore = isApprovalResolvedStatus(status) || row?._closed_incident ? 0 : 10;
-  const dataScore = [row?.trace_id, row?.correlation_id, row?.description, row?.annotations?.description]
-    .filter((item) => String(item || "").trim()).length;
-  return openScore + dataScore;
-}
-
-function resolveCanonicalAlertRow(row, candidates) {
-  if (!row || typeof row !== "object") {
-    return row;
-  }
-  const rowKeys = new Set(alertIdentityKeys(row));
-  if (!rowKeys.size) {
-    return row;
-  }
-  const matches = (Array.isArray(candidates) ? candidates : []).filter((candidate) => {
-    if (!candidate || typeof candidate !== "object") {
-      return false;
-    }
-    return alertIdentityKeys(candidate).some((key) => rowKeys.has(key));
-  });
-  if (!matches.length) {
-    return row;
-  }
-  return matches
-    .slice()
-    .sort((left, right) => {
-      const leftCanonical = ALERT_UUID_PATTERN.test(String(left?.alert_id || left?.id || "")) ? 1 : 0;
-      const rightCanonical = ALERT_UUID_PATTERN.test(String(right?.alert_id || right?.id || "")) ? 1 : 0;
-      if (leftCanonical !== rightCanonical) {
-        return rightCanonical - leftCanonical;
-      }
-      const leftLanding = left?._stream_kind === "landing_pad" ? 1 : 0;
-      const rightLanding = right?._stream_kind === "landing_pad" ? 1 : 0;
-      if (leftLanding !== rightLanding) {
-        return leftLanding - rightLanding;
-      }
-      return alertRowScore(right) - alertRowScore(left);
-    })[0];
-}
-
-function dedupeAndConsolidateAlertRows(rows, options = {}) {
-  const allowedChannels = new Set(
-    Array.isArray(options.channels)
-      ? options.channels
-      : ["prometheus", "telemetry", "email", "ticket", "log"]
-  );
-  const keyToGroup = new Map();
-  const groups = [];
-
-  (Array.isArray(rows) ? rows : []).forEach((row) => {
-    if (!row || typeof row !== "object") {
-      return;
-    }
-    const channel = normalizeAlertChannel(row);
-    if (!allowedChannels.has(channel)) {
-      return;
-    }
-
-    const candidateKeys = alertIdentityKeys(row);
-    // A row with zero candidate keys (no name/service and no id at all) can't be matched
-    // to anything -- give it a unique key so it still shows up as its own row instead of
-    // silently colliding with every other keyless row under a single shared bucket.
-    const lookupKeys = candidateKeys.length ? candidateKeys : [`row:${groups.length}:${Math.random()}`];
-    let group = null;
-    for (const key of lookupKeys) {
-      if (keyToGroup.has(key)) {
-        group = keyToGroup.get(key);
-        break;
-      }
-    }
-
-    if (!group) {
-      group = { row: { ...row, source_channel: channel, source_channels: [channel] }, channels: new Set([channel]) };
-      groups.push(group);
-    } else {
-      group.channels.add(channel);
-      const incomingScore = alertRowScore(row);
-      const existingScore = alertRowScore(group.row);
-      const incomingTime = alertTimeMs(row);
-      const existingTime = alertTimeMs(group.row);
-      const incomingIsLandingPad = row?._stream_kind === "landing_pad";
-      const existingIsLandingPad = group.row?._stream_kind === "landing_pad";
-      const shouldReplace = existingIsLandingPad && !incomingIsLandingPad
-        ? true
-        : !existingIsLandingPad && incomingIsLandingPad
-          ? false
-          : incomingScore > existingScore || (incomingScore === existingScore && incomingTime > existingTime);
-      const priorApplication = alertApplicationCandidate(group.row);
-      const incomingApplication = alertApplicationCandidate(row);
-      if (shouldReplace) {
-        group.row = { ...row, source_channel: channel };
-        if (!alertApplicationCandidate(group.row) && priorApplication) {
-          group.row.application = priorApplication;
-        }
-      } else if (!priorApplication && incomingApplication) {
-        group.row.application = incomingApplication;
-      }
-    }
-
-    // Register every candidate key from this row against the resolved group so a later
-    // row matching via a *different* one of these keys still merges into the same group.
-    lookupKeys.forEach((key) => keyToGroup.set(key, group));
-  });
-
-  return groups
-    .map((entry) => ({
-      ...entry.row,
-      source_channels: Array.from(entry.channels).sort(),
-    }))
-    .sort((a, b) => alertTimeMs(b) - alertTimeMs(a));
-}
-
-function mapClosedIncidentToAlertStreamRow(row) {
-  const payload = row?.projection_payload && typeof row.projection_payload === "object" ? row.projection_payload : {};
-  const eventPayload = payload?.event_payload && typeof payload.event_payload === "object" ? payload.event_payload : {};
-  const service = String(row?.service || eventPayload.service || "-").trim();
-  const incidentId = String(row?.incident_id || row?.flow_id || "").trim();
-  const alertId = String(row?.alert_id || incidentId || "").trim();
-  const status = String(row?.status || "closed").trim();
-  const closedAt = String(row?.closed_at || row?.updated_at || "").trim();
-  const alertName = String(
-    row?.alert_name
-    || row?.name
-    || eventPayload.alert_name
-    || eventPayload.alert_type
-    || (service && service !== "-" ? `${service} closed incident` : "Closed incident")
-  ).trim();
-  return {
-    ...row,
-    alert_id: alertId,
-    id: alertId || incidentId,
-    incident_id: incidentId,
-    name: alertName,
-    alert_name: alertName,
-    rule_name: row?.rule_name || row?.alert_type || eventPayload.alert_type || alertName,
-    application: row?.application || row?.project_name || row?.project || service,
-    service,
-    severity: row?.severity || "info",
-    status,
-    state: status,
-    created_at: closedAt || row?.created_at || row?.updated_at,
-    starts_at: row?.starts_at || closedAt,
-    closed_at: closedAt,
-    source: row?.source || "closed-incidents",
-    _stream_kind: "recent_closed",
-    _closed_incident: true,
-    annotations: {
-      ...(row?.annotations || {}),
-      description: eventPayload.action_taken || row?.summary || "Recently closed incident.",
-    },
-  };
-}
-
-function projectHintFromAlertRow(row) {
-  const labels = typeof row?.labels === "object" && row?.labels ? row.labels : {};
-  const candidates = [
-    row?.application,
-    row?.project_name,
-    row?.project,
-    labels?.application,
-    labels?.project_name,
-    labels?.project,
-  ]
-    .map((value) => String(value || "").trim())
-    .filter(Boolean);
-  return candidates[0] || "";
-}
-
-const ALERT_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-function mapLandingPadRowToAlertStreamRow(row, index = 0) {
-  const payload = row && typeof row === "object" ? row : {};
-  const labels = typeof payload.labels === "object" && payload.labels ? payload.labels : {};
-  const incidentId = String(payload.incident_id || payload.id || payload.alert_id || payload.file || `landing-${index + 1}`).trim();
-  const alertName = String(payload.name || payload.alert_name || payload.alertname || labels.alertname || "Landing Pad Alert").trim();
-  const channel = normalizeAlertChannel(payload);
-  return {
-    ...payload,
-    id: incidentId,
-    alert_id: String(payload.alert_id || incidentId).trim(),
-    incident_id: String(payload.incident_id || incidentId).trim(),
-    name: alertName,
-    alert_name: alertName,
-    application: String(payload.application || payload.project_name || payload.project || labels.application || labels.project || labels.project_name || "").trim(),
-    service: String(payload.service || labels.service || labels.job || "-").trim(),
-    severity: String(payload.severity || labels.severity || "warning").trim().toLowerCase(),
-    status: String(payload.status || payload.alert_status || "open").trim().toLowerCase(),
-    state: String(payload.state || payload.alert_status || payload.status || "open").trim().toLowerCase(),
-    created_at: payload.received_at || payload.created_at || payload.starts_at || payload.modified_at || payload.updated_at || "",
-    starts_at: payload.starts_at || payload.received_at || payload.created_at || "",
-    source: String(payload.source || payload.provider || payload.channel || "landing-pad").trim(),
-    source_channel: channel,
-    _stream_kind: "landing_pad",
-  };
-}
-
-function mergeAlertStreamRows(openRows, recentClosedRows) {
-  const merged = [];
-  const seen = new Set();
-  const add = (row) => {
-    if (!row || typeof row !== "object") {
-      return;
-    }
-    const key = String(row.alert_id || row.id || row.incident_id || "").trim();
-    if (key && seen.has(key)) {
-      return;
-    }
-    if (key) {
-      seen.add(key);
-    }
-    merged.push(row);
-  };
-  (Array.isArray(openRows) ? openRows : []).forEach(add);
-  (Array.isArray(recentClosedRows) ? recentClosedRows : []).map(mapClosedIncidentToAlertStreamRow).forEach(add);
-  return dedupeAndConsolidateAlertRows(
-    merged,
-    { channels: ["prometheus", "telemetry", "email", "ticket", "log"] }
-  );
-}
-
-function onboardingSourceDocCategoryLabel(category) {
-  const key = String(category || "other").trim();
-  if (key === "knowledge_pack") {
-    return "Service Knowledge";
-  }
-  return ONBOARDING_SOURCE_DOC_BUCKETS.find((bucket) => bucket.key === key)?.label || "Other Evidence";
-}
-
-function fallbackFetchTargets(path) {
-  const normalized = String(path || "").trim();
-  if (!normalized) {
-    return [];
-  }
-  const targets = [normalized];
-  const processedResultPrefix = "/monitoring-adapter/alerts/";
-  const processedResultSuffix = "/processed-result";
-  if (normalized.startsWith(processedResultPrefix) && normalized.endsWith(processedResultSuffix)) {
-    const alertId = normalized.slice(processedResultPrefix.length, normalized.length - processedResultSuffix.length);
-    if (alertId) {
-      targets.push(`/api-gateway/alerts/${alertId}/processed-result`);
-    }
-  }
-  return Array.from(new Set(targets));
-}
-
-async function fetchJson(path, options = {}) {
-  const maxAttemptsRaw = Number(options?.maxAttempts);
-  const maxAttempts = Number.isFinite(maxAttemptsRaw) && maxAttemptsRaw >= 1
-    ? Math.min(Math.max(Math.floor(maxAttemptsRaw), 1), 4)
-    : 3;
-  let lastError = null;
-  const { authenticated, onUnauthorized, maxAttempts: _maxAttempts, ...fetchOptions } = options || {};
-  const targets = fallbackFetchTargets(path);
-  const requestTarget = targets[0] || path;
-  const timeoutMsRaw = Number(fetchOptions.timeoutMs);
-  const timeoutMs = Number.isFinite(timeoutMsRaw) && timeoutMsRaw > 0 ? timeoutMsRaw : 15000;
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    for (const target of targets) {
-      const controller = new AbortController();
-      const timeoutHandle = setTimeout(() => controller.abort(new Error(`Request timeout after ${timeoutMs}ms`)), timeoutMs);
-      try {
-        const response = await fetch(target, {
-          ...fetchOptions,
-          signal: controller.signal,
-          headers: {
-            "Content-Type": "application/json",
-            ...(fetchOptions.headers || {}),
-          },
-        });
-        clearTimeout(timeoutHandle);
-
-        if (!response.ok) {
-          const text = await response.text();
-          if (response.status === 401 && authenticated && typeof onUnauthorized === "function") {
-            onUnauthorized(text, requestTarget);
-            throw new Error("Session expired. Please sign in again.");
-          }
-          const shouldRetry = response.status >= 500 && attempt < maxAttempts;
-          if (shouldRetry) {
-            await new Promise((resolve) => setTimeout(resolve, attempt * 500));
-            break;
-          }
-          throw new Error(`HTTP ${response.status}: ${text || "request failed"}`);
-        }
-
-        return response.json();
-      } catch (error) {
-        clearTimeout(timeoutHandle);
-        const message = String(error?.message || "");
-        if (message === "Session expired. Please sign in again.") {
-          throw error;
-        }
-        lastError = message === "Failed to fetch"
-          ? new Error(`Failed to reach ${requestTarget}. Open the UI through http://localhost:8501 with Docker/nginx running, or use the Vite proxy with api-gateway on http://localhost:8010.`)
-          : error;
-        if (target !== targets[targets.length - 1]) {
-          continue;
-        }
-        if (attempt < maxAttempts) {
-          await new Promise((resolve) => setTimeout(resolve, attempt * 500));
-        }
-      }
-    }
-  }
-
-  throw lastError || new Error("request failed");
-}
-
-function HealthBadge({ ok, label }) {
-  return (
-    <span className={`health ${ok ? "ok" : "error"}`}>
-      <span className="health-dot" />
-      {label}
-    </span>
-  );
-}
-
-function htmlEscape(value) {
-  return String(value)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/\"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
-
-function asDisplayValue(value) {
-  if (value === null || value === undefined || value === "") {
-    return "-";
-  }
-  if (typeof value === "object") {
-    try {
-      return JSON.stringify(value);
-    } catch (_error) {
-      return "[object]";
-    }
-  }
-  return String(value);
-}
-
-function parseUtcTimestamp(value) {
-  const raw = String(value || "").trim();
-  if (!raw) {
-    return null;
-  }
-  const normalized = /Z$|[+-]\d\d:\d\d$/.test(raw) ? raw : `${raw}Z`;
-  const parsed = new Date(normalized);
-  if (Number.isNaN(parsed.getTime())) {
-    return null;
-  }
-  return parsed;
-}
-
-function formatIstTimestamp(value) {
-  const parsed = parseUtcTimestamp(value);
-  if (!parsed) {
-    return "-";
-  }
-  return `${new Intl.DateTimeFormat("en-IN", {
-    timeZone: "Asia/Kolkata",
-    year: "numeric",
-    month: "short",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  }).format(parsed)} IST`;
-}
-
-function formatUtcTimestamp(value) {
-  return formatIstTimestamp(value);
-}
-
-function clampQualityScore(value, fallback = 0) {
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric)) {
-    return fallback;
-  }
-  return Math.min(Math.max(numeric, 0), 1);
-}
-
-function formatQualityPercent(value) {
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric)) {
-    return "-";
-  }
-  return `${Math.round(clampQualityScore(numeric) * 100)}%`;
-}
-
-function qualityToneFromScore(value, inverse = false) {
-  const score = clampQualityScore(value, inverse ? 1 : 0);
-  const effective = inverse ? 1 - score : score;
-  if (effective >= 0.82) {
-    return "success";
-  }
-  if (effective >= 0.62) {
-    return "warning";
-  }
-  return "error";
-}
-
-function normalizeEvaluationEnvelope(source = {}, fallback = {}) {
-  const raw = source && typeof source === "object" ? source : {};
-  const fallbackConfidence = clampQualityScore(fallback.confidence, 0);
-  const ragMatchScore = clampQualityScore(raw.rag_match_score ?? fallback.ragMatchScore, 0);
-  const citationCoverage = clampQualityScore(raw.citation_coverage ?? fallback.citationCoverage, 0);
-  const evidenceCoverage = clampQualityScore(raw.evidence_coverage ?? fallback.evidenceCoverage, 0);
-  const groundingScore = clampQualityScore(raw.grounding_score ?? ((ragMatchScore * 0.45) + (citationCoverage * 0.25) + (evidenceCoverage * 0.3)), 0);
-  const confidenceScore = clampQualityScore(raw.confidence_score ?? fallbackConfidence, fallbackConfidence);
-  const hallucinationRisk = clampQualityScore(raw.hallucination_risk ?? (1 - ((groundingScore * 0.55) + (confidenceScore * 0.25) + (citationCoverage * 0.2))), 0);
-  const hallucinationScore = clampQualityScore(raw.hallucination_score ?? (1 - hallucinationRisk), 0);
-  const overallScore = clampQualityScore(
-    raw.overall_score ?? ((confidenceScore * 0.3) + (groundingScore * 0.3) + (hallucinationScore * 0.2) + (citationCoverage * 0.1) + (evidenceCoverage * 0.1)),
-    0,
-  );
-  return {
-    contractVersion: raw.contract_version || "kaiops.evaluation.v1",
-    provider: raw.provider || "ui-derived-quality-gate",
-    confidenceScore,
-    groundingScore,
-    hallucinationRisk,
-    hallucinationScore,
-    citationCoverage,
-    evidenceCoverage,
-    ragMatchScore,
-    overallScore,
-    qualityLabel: raw.quality_label || (overallScore >= 0.82 ? "high" : overallScore >= 0.62 ? "medium" : "low"),
-    requiresReview: Boolean(raw.requires_review ?? (hallucinationRisk >= 0.45 || groundingScore < 0.55 || confidenceScore < 0.65)),
-    externalJudge: raw.external_judge && typeof raw.external_judge === "object" ? raw.external_judge : {},
-    signals: raw.signals && typeof raw.signals === "object" ? raw.signals : {},
-  };
-}
-
-function elapsedSeconds(start, end) {
-  const startDate = parseUtcTimestamp(start);
-  const endDate = parseUtcTimestamp(end);
-  if (!startDate || !endDate) {
-    return "-";
-  }
-  const delta = Math.max(0, endDate.getTime() - startDate.getTime());
-  return (delta / 1000).toFixed(3);
-}
-
-function normalizeTraceServiceName(event) {
-  const eventType = String(event?.event_type || "").trim().toLowerCase();
-  if (eventType.includes("closure")) {
-    return "closure-service";
-  }
-  if (eventType.includes("recommendation") || eventType.includes("resolution")) {
-    return "resolution-agent";
-  }
-  if (eventType.includes("approval")) {
-    return "approval-service";
-  }
-  if (eventType.includes("context")) {
-    return "context-agent";
-  }
-  if (eventType.includes("workflow") || eventType.includes("orchestration")) {
-    return "orchestrator";
-  }
-  if (eventType.includes("remediation")) {
-    return "remediation-engine";
-  }
-
-  const rawService = String(event?.service || "").trim();
-  if (!rawService) {
-    return "-";
-  }
-  if (!looksLikeUuid(rawService)) {
-    return rawService;
-  }
-  return "monitoring-adapter";
-}
-
-function routeForAgent(agentName) {
-  const rawNeedle = String(agentName || "").trim().toLowerCase();
-  const needle = AGENT_ROUTE_ALIASES[rawNeedle] || rawNeedle;
-  if (!needle) {
-    return null;
-  }
-  return (
-    SERVICE_TOPIC_FLOW.find((row) => String(row?.agent || "").trim().toLowerCase() === needle) || null
-  );
-}
-
-function displayAgentName(agentName) {
-  const token = String(agentName || "").trim();
-  if (!token) {
-    return "-";
-  }
-  const alias = AGENT_DISPLAY_ALIASES[token.toLowerCase()];
-  return alias ? `${alias} (${token})` : token;
-}
-
-function compactText(value, maxLength = 180) {
-  const text = String(value || "").trim();
-  if (!text) {
-    return "";
-  }
-  return text.length > maxLength ? `${text.slice(0, Math.max(24, maxLength - 1))}...` : text;
-}
-
-function hasMeaningfulValue(value) {
-  if (value === null || value === undefined) {
-    return false;
-  }
-  if (typeof value === "string") {
-    const normalized = value.trim();
-    return Boolean(normalized && normalized !== "-");
-  }
+import {
+  DEFAULT_ALERT, REAL_USE_CASE_SCOPE, TEST_USE_CASE_SCOPE, CORE_MONITOR_PROJECTS, FIXED_MONITOR_SCOPES,
+  SERVICE_TOPIC_FLOW, RECOMMENDED_WORKER_PROFILE, SCALE_CAPACITY_GUIDE, AGENT_DISPLAY_ALIASES, AGENT_ROUTE_ALIASES,
+  PREFERENCE_STORAGE_KEY, UI_THEME_VALUES, extractObservedRoutingMetrics, normalizeMatchTokens, hasTokenOverlap,
+  KAIOPS_CORE_SERVICE_SET, normalizeMonitorToken, isKaiopsCoreSelection, isKaiopsCoreAlert, PROMPT_FRAGMENT_PATTERNS,
+  isPromptFragment, isPlaceholderRecommendationText, cleanRecommendationText,
+  filterAlertsForMonitor,
+  filterRowsForMonitor,
+  inferMonitorScope,
+  isGeneratedOrTestAlert,
+  isEphemeralProjectName,
+  normalizeAlertChannel,
+  sourceChannelLabel,
+  ALERT_SOURCE_CHANNELS,
+  MAX_LATEST_ALERTS_PER_SOURCE,
+  MIN_VISIBLE_ALERTS_BY_SOURCE,
+  capLatestAlertsPerSource,
+  ensureMinimumAlertsBySource,
+  monitorScopeLabel,
+  alertTimeMs,
+  stableCrossSourceAlertSignature,
+  alertIdentityKeys,
+  alertApplicationCandidate,
+  alertRowScore,
+  resolveCanonicalAlertRow,
+  resolveCanonicalAlertForRow,
+  dedupeAndConsolidateAlertRows,
+  shouldRetainAlertSelection,
+  mapClosedIncidentToAlertStreamRow,
+  projectHintFromAlertRow,
+  ALERT_UUID_PATTERN,
+  mapLandingPadRowToAlertStreamRow,
+  mergeAlertStreamRows,
+  onboardingSourceDocCategoryLabel,
+  fallbackFetchTargets,
+  fetchJson,
+  HealthBadge,
+  htmlEscape,
+  asDisplayValue,
+  parseUtcTimestamp,
+  formatIstTimestamp,
+  formatUtcTimestamp,
+  clampQualityScore,
+  formatQualityPercent,
+  normalizeEvaluationEnvelope,
+  elapsedSeconds,
+  normalizeTraceServiceName,
+  routeForAgent,
+  displayAgentName,
+  compactText,
+  hasMeaningfulValue,
+  stringifyTimelineValue,
+  isFailureStatus,
+  normalizeApprovalStatus,
+  canonicalIncidentStatus,
+  isApprovalResolvedStatus,
+  isApprovalPendingStatus,
+  statusPillClass,
+  extractEventError,
+  extractEventInput,
+  extractEventOutput,
+  buildPreviewExecutionPlan,
+  deriveExecutionCommands,
+  remediationOutcomeFromAction,
+  shellArg,
+  buildKaiOpsRemediationScript,
+  firstTraceTimestamp,
+  firstEventTimestamp,
+  buildSyntheticFlowRows,
+  summarizeEventType,
+  timelinePhaseOrder,
+  buildAlertDocumentDrafts,
+  toFiniteNumber,
+  percentile,
+  normalizeUsageRow,
+  isPlaceholderUsageValue,
+  isMeaningfulUsageRow,
+  usageRowIdentity,
+  dedupeUsageRows,
+  HorizontalBarChart,
+  SuccessFailureDonut,
+  ONBOARDING_STEP_BACKGROUND,
+  explainOnboardingStepBackground,
+  findHistoricalTicketDiscoveryDocument,
+  HistoricalTicketDiscoveryPanel,
+  FlowTimelineGraph,
+  UnifiedIncidentTimeline,
+  parseStructuredIntelligence,
+  intelligenceListText,
+  groundedIntelligenceDisplay,
+  canonicalIncidentAnalysis,
+  downloadInvestigationArtifact,
+  ContextRetrievalGraph,
+  AgentEventsGraph,
+  TopicFlowGraph,
+  classifySelectedAlertPath,
+  parseTimelineJson,
+  classifyFlowStageFromRow,
+  timelineRowText,
+  timelineRowIndicatesFallback,
+  timelineRowIndicatesSuccess,
+  timelineRowHasError,
+  timelineRowStatus,
+  inferTimelineNextStep,
+  buildDynamicFlowSections,
+  ApplicationSankeyFlow,
+  ProcessingFlowMap,
+  MessageBusTopology,
+  ExecutionPlanGraph,
+  renderHtmlTable,
+  normalizeGeneratedRuleRows,
+  cleanRuleIntentLine,
+  slugForPrometheus,
+  yamlQuote,
+  inferPrometheusExpression,
+  inferRuleDuration,
+  inferRuleSeverity,
+  buildPrometheusRulePreview,
+  summarizeAlertRuleContext,
+} from "./appHelpers.jsx";
+import { buildWorkflowFlowStages } from "./domain/workflowStages";
+function readableImpactText(value, fallback) {
+  if (value == null || value === "") return fallback;
   if (Array.isArray(value)) {
-    return value.length > 0;
+    const items = value.map((item) => readableImpactText(item, "")).filter(Boolean);
+    return items.length ? Array.from(new Set(items)).join("; ") : fallback;
   }
   if (typeof value === "object") {
-    return Object.keys(value).length > 0;
+    const rows = Object.entries(value)
+      .map(([key, detail]) => {
+        const text = readableImpactText(detail, "");
+        return text ? `${key.replaceAll("_", " ")}: ${text}` : "";
+      })
+      .filter(Boolean);
+    return rows.length ? rows.join("; ") : fallback;
   }
-  return true;
-}
-
-function stringifyTimelineValue(value) {
-  if (!hasMeaningfulValue(value)) {
-    return "";
-  }
-  if (typeof value === "string") {
-    return value;
-  }
-  try {
-    return JSON.stringify(value, null, 2);
-  } catch (_error) {
-    return String(value);
-  }
-}
-
-function isFailureStatus(value) {
-  const token = String(value || "").trim().toLowerCase();
-  if (!token) {
-    return false;
-  }
-  return ["fail", "failed", "failure", "error", "exception", "rejected", "timeout", "denied"].some((flag) => token.includes(flag));
-}
-
-function normalizeApprovalStatus(value) {
-  return String(value || "").trim().toLowerCase();
-}
-
-function canonicalIncidentStatus(...values) {
-  const statuses = values
-    .flat()
-    .map((value) => String(value || "").trim().toLowerCase())
-    .filter(Boolean);
-  if (!statuses.length) {
-    return "unknown";
-  }
-
-  const terminalPriority = ["closed", "resolved", "failed", "cancelled", "canceled"];
-  const terminal = terminalPriority.find((candidate) => statuses.includes(candidate));
-  return terminal || statuses[0];
-}
-
-function isApprovalResolvedStatus(value) {
-  const token = normalizeApprovalStatus(value);
-  if (!token) {
-    return false;
-  }
-  return ["approved", "rejected", "closed", "resolved", "failed", "cancelled", "canceled"].includes(token);
-}
-
-function isApprovalPendingStatus(value) {
-  const token = normalizeApprovalStatus(value);
-  if (!token) {
-    return false;
-  }
-  return ["awaiting_approval", "pending", "queued", "awaiting user approval", "standby"].includes(token);
-}
-
-function statusPillClass(value) {
-  const token = normalizeApprovalStatus(value);
-  if (!token) {
-    return "status-open";
-  }
-  if (token.includes("approved")) {
-    return "status-approved";
-  }
-  if (token.includes("rejected")) {
-    return "status-rejected";
-  }
-  if (token.includes("closed") || token.includes("resolved")) {
-    return "status-closed";
-  }
-  if (token.includes("failed") || token.includes("error") || token.includes("blocked") || token.includes("denied")) {
-    return "status-failed";
-  }
-  const normalized = token.replace(/[^a-z0-9]+/g, "_");
-  return normalized ? `status-${normalized}` : "status-open";
-}
-
-function extractEventError(event) {
-  if (!event || typeof event !== "object") {
-    return "";
-  }
-  const status = String(event.status || "").trim();
-  const candidates = [
-    event.error,
-    event.errors,
-    event.exception,
-    event.failure,
-    event.failure_reason,
-    event.error_message,
-    event.detail,
-    event.message,
-  ];
-  const hit = candidates.find((item) => hasMeaningfulValue(item));
-  if (hit !== undefined) {
-    return stringifyTimelineValue(hit);
-  }
-  if (isFailureStatus(status)) {
-    const reason = hasMeaningfulValue(event.policy_reason) ? stringifyTimelineValue(event.policy_reason) : "";
-    return reason || `Status: ${status}`;
-  }
-  return "";
-}
-
-function extractEventInput(event) {
-  if (!event || typeof event !== "object") {
-    return null;
-  }
-  const payload = typeof event.payload === "object" && event.payload ? event.payload : null;
-  const candidates = [
-    event.input_value,
-    event.input,
-    event.input_payload,
-    event.request,
-    event.context,
-    event.source_payload,
-    payload?.input,
-    payload?.request,
-    payload?.context,
-  ];
-  const hit = candidates.find((item) => hasMeaningfulValue(item));
-  return hit === undefined ? null : hit;
-}
-
-function extractEventOutput(event) {
-  if (!event || typeof event !== "object") {
-    return null;
-  }
-  const payload = typeof event.payload === "object" && event.payload ? event.payload : null;
-  const candidates = [
-    event.output_value,
-    event.output,
-    event.result,
-    payload,
-    event.response,
-    event.recommendation,
-    event.decision,
-  ];
-  const hit = candidates.find((item) => hasMeaningfulValue(item));
-  if (!hasMeaningfulValue(hit)) {
-    return null;
-  }
-  const eventType = String(event.event_type || "").trim();
-  if (typeof hit === "string" && eventType && hit.trim() === eventType && hasMeaningfulValue(payload)) {
-    return payload;
-  }
-  return hit;
-}
-
-function buildPreviewExecutionPlan(workflow) {
-  const safeWorkflow = workflow && typeof workflow === "object" ? workflow : {};
-  const recommendation = typeof safeWorkflow.recommendation === "object" && safeWorkflow.recommendation ? safeWorkflow.recommendation : {};
-  const incident = typeof safeWorkflow.incident === "object" && safeWorkflow.incident ? safeWorkflow.incident : {};
-  const alert = typeof safeWorkflow.alert === "object" && safeWorkflow.alert ? safeWorkflow.alert : {};
-
-  const target = String(
-    recommendation?.metadata?.remediation_target
-    || recommendation?.target
-    || incident?.service
-    || alert?.service
-    || "unknown-target"
-  ).trim();
-  const environment = String(incident?.environment || alert?.environment || "prod").trim() || "prod";
-  const recommendationText = String(recommendation?.recommended_action || "rollback deployment").trim() || "rollback deployment";
-  const lowered = recommendationText.toLowerCase();
-
-  const actionType = lowered.includes("restart pod")
-    ? "restart_pod"
-    : lowered.includes("scale")
-      ? "scale_deployment"
-      : lowered.includes("restart service")
-        ? "restart_service"
-        : lowered.includes("cache")
-          ? "clear_cache"
-          : lowered.includes("failover") || lowered.includes("database")
-            ? "failover_database"
-            : lowered.includes("terraform")
-              ? "terraform_rollback"
-              : "rollback_deployment";
-
-  const preview = {
-    commands: [],
-    scripts: [],
-    queries: [],
-  };
-
-  if (actionType === "restart_pod") {
-    preview.commands = [
-      `kubectl rollout restart deployment/${target} -n ${environment}`,
-      `kubectl rollout status deployment/${target} -n ${environment} --timeout=180s`,
-    ];
-    preview.scripts = [`scripts/remediation/restart_pod.ps1 -Service ${target} -Namespace ${environment}`];
-    preview.queries = [`sum(rate(http_requests_total{service='${target}',status=~'5..'}[5m]))`];
-  } else if (actionType === "scale_deployment") {
-    preview.commands = [
-      `kubectl scale deployment/${target} --replicas=3 -n ${environment}`,
-      `kubectl rollout status deployment/${target} -n ${environment} --timeout=180s`,
-    ];
-    preview.scripts = [`scripts/remediation/scale_deployment.ps1 -Service ${target} -Namespace ${environment} -Replicas 3`];
-    preview.queries = [`avg_over_time(container_cpu_usage_seconds_total{pod=~'${target}.*'}[10m])`];
-  } else if (actionType === "restart_service") {
-    preview.commands = [`ansible-playbook playbooks/restart-service.yml -e service=${target} -e env=${environment}`];
-    preview.scripts = [`scripts/remediation/restart_service.ps1 -Service ${target} -Environment ${environment}`];
-    preview.queries = [`max_over_time(up{job='${target}'}[5m])`];
-  } else if (actionType === "clear_cache") {
-    preview.commands = [`redis-cli -h ${target}-redis -n 0 FLUSHDB`];
-    preview.scripts = [`scripts/remediation/clear_cache.ps1 -Service ${target}`];
-    preview.queries = [`sum(rate(cache_miss_total{service='${target}'}[5m]))`];
-  } else if (actionType === "failover_database") {
-    preview.commands = ["mysql -e \"CALL mysql.rds_failover();\""];
-    preview.scripts = ["scripts/remediation/failover_database.ps1"];
-    preview.queries = ["SHOW REPLICA STATUS;"];
-  } else if (actionType === "terraform_rollback") {
-    preview.commands = [
-      "terraform init",
-      `terraform apply -auto-approve -var service=${target} -var rollback=true`,
-    ];
-    preview.scripts = [`scripts/remediation/terraform_rollback.ps1 -Service ${target} -Environment ${environment}`];
-    preview.queries = [`sum(rate(terraform_apply_failures_total{service='${target}'}[15m]))`];
-  } else {
-    preview.commands = [
-      `kubectl rollout undo deployment/${target} -n ${environment}`,
-      `kubectl rollout status deployment/${target} -n ${environment} --timeout=180s`,
-    ];
-    preview.scripts = [`scripts/remediation/rollback_deployment.ps1 -Service ${target} -Namespace ${environment}`];
-    preview.queries = [`sum(rate(http_requests_total{service='${target}',status=~'5..'}[5m]))`];
-  }
-
-  return {
-    actionType,
-    recommendationText,
-    plan: preview,
-  };
-}
-
-function deriveExecutionCommands(workflow, traceRows) {
-  const safeWorkflow = workflow && typeof workflow === "object" ? workflow : {};
-  const safeTraceRows = Array.isArray(traceRows) ? traceRows : [];
-  const recommendation = typeof safeWorkflow.recommendation === "object" && safeWorkflow.recommendation ? safeWorkflow.recommendation : {};
-  const recommendationMetadata = typeof recommendation.metadata === "object" && recommendation.metadata ? recommendation.metadata : {};
-  const remediationAction = typeof safeWorkflow.remediation_action === "object" && safeWorkflow.remediation_action ? safeWorkflow.remediation_action : {};
-  const decision =
-    (typeof safeWorkflow.decision === "object" && safeWorkflow.decision)
-    || (typeof safeWorkflow.orchestration_decision === "object" && safeWorkflow.orchestration_decision)
-    || (typeof recommendationMetadata.orchestration_decision === "object" && recommendationMetadata.orchestration_decision)
-    || {};
-
-  const explicit =
-    (Array.isArray(recommendation.commands) && recommendation.commands)
-    || (Array.isArray(remediationAction.commands) && remediationAction.commands)
-    || (Array.isArray(decision.commands) && decision.commands)
-    || [];
-  const derived = [];
-  const seen = new Set();
-  const pushUnique = (value, prefix = "") => {
-    const token = String(value || "").trim();
-    if (!token) {
-      return;
-    }
-    const line = `${prefix}${token}`;
-    const key = line.toLowerCase();
-    if (seen.has(key)) {
-      return;
-    }
-    seen.add(key);
-    derived.push(line);
-  };
-
-  const pushPlan = (plan) => {
-    if (!plan || typeof plan !== "object") {
-      return;
-    }
-    (Array.isArray(plan.commands) ? plan.commands : []).forEach((item) => pushUnique(item, "cmd: "));
-    (Array.isArray(plan.scripts) ? plan.scripts : []).forEach((item) => pushUnique(item, "script: "));
-    (Array.isArray(plan.queries) ? plan.queries : []).forEach((item) => pushUnique(item, "query: "));
-  };
-
-  explicit.forEach((item) => pushUnique(item, "cmd: "));
-
-  const remediationParams = typeof remediationAction.parameters === "object" && remediationAction.parameters
-    ? remediationAction.parameters
-    : {};
-  pushPlan(remediationParams.execution_plan);
-  (Array.isArray(remediationParams.commands) ? remediationParams.commands : []).forEach((item) => pushUnique(item, "cmd: "));
-
-  safeTraceRows.forEach((row) => {
-    const payload = typeof row?.payload === "object" && row.payload ? row.payload : {};
-    pushPlan(payload?.execution_plan);
-
-    const payloadAction = typeof payload?.remediation_action === "object" && payload.remediation_action ? payload.remediation_action : {};
-    const payloadParams = typeof payloadAction.parameters === "object" && payloadAction.parameters ? payloadAction.parameters : {};
-    pushPlan(payloadParams.execution_plan);
-    (Array.isArray(payloadParams.commands) ? payloadParams.commands : []).forEach((item) => pushUnique(item, "cmd: "));
-
-    const commands = Array.isArray(payload?.commands) ? payload.commands : [];
-    commands.forEach((item) => pushUnique(item, "cmd: "));
-  });
-
-  if (!derived.length) {
-    const preview = buildPreviewExecutionPlan(safeWorkflow);
-    pushUnique("Pending live executor - no command has been executed yet", "cmd: ");
-    pushUnique(`# recommended_action: ${preview.recommendationText}`, "cmd: ");
-    (preview.plan.commands || []).forEach((item) => pushUnique(item, "cmd: "));
-    (preview.plan.scripts || []).forEach((item) => pushUnique(item, "script: "));
-    (preview.plan.queries || []).forEach((item) => pushUnique(item, "query: "));
-  }
-
-  return derived;
-}
-
-function remediationOutcomeFromAction(action) {
-  const safeAction = action && typeof action === "object" ? action : {};
-  const status = String(safeAction.status || "").trim().toLowerCase();
-  const error = String(safeAction.error || "").trim();
-  const output = String(safeAction.output || "").trim();
-  const parameters = safeAction.parameters && typeof safeAction.parameters === "object" ? safeAction.parameters : {};
-  const executionResult = parameters.execution_result && typeof parameters.execution_result === "object"
-    ? parameters.execution_result
-    : {};
-  const executorError = String(executionResult.stderr || executionResult.error || "").trim();
-  const executorOutput = String(executionResult.stdout || "").trim();
-  const reason = error || executorError || output || executorOutput || "";
-
-  if (!status && !reason) {
-    return null;
-  }
-
-  let title = "Remediation status";
-  if (status === "succeeded") {
-    title = "Remediation executed successfully";
-  } else if (status === "skipped") {
-    title = "Remediation was approved but not executed";
-  } else if (status === "failed") {
-    title = "Remediation execution failed";
-  }
-
-  let detail = reason || `Remediation engine returned status ${status || "unknown"}.`;
-  if (/no real .*executor is configured/i.test(detail) || /configure a connector executor/i.test(detail)) {
-    detail = `${detail} Add a real remediation connector with executor settings and secret_ref, or edit the plan to use the approved local triage script.`;
-  }
-
-  return {
-    status: status || "unknown",
-    title,
-    detail,
-    actionType: safeAction.action_type || "-",
-    target: safeAction.target || "-",
-  };
-}
-
-function shellArg(value) {
-  const token = String(value || "").trim();
-  if (!token) {
-    return "''";
-  }
-  if (/^[a-zA-Z0-9_./:@=-]+$/.test(token)) {
-    return token;
-  }
-  return `'${token.replace(/'/g, "'\\''")}'`;
-}
-
-function buildKaiOpsRemediationScript({
-  service,
-  environment,
-  apiGatewayUrl,
-  prometheusUrl,
-  mysqlHost,
-  mysqlDatabase,
-  mysqlUser,
-} = {}) {
-  return [
-    "bash scripts/remediation/kaiops_alert_health_triage.sh",
-    "--service", shellArg(service || "kaiops-service"),
-    "--environment", shellArg(environment || "prod"),
-    "--api-gateway-url", shellArg(apiGatewayUrl || "http://api-gateway:8000"),
-    "--prometheus-url", shellArg(prometheusUrl || "http://prometheus:9090"),
-    "--mysql-host", shellArg(mysqlHost || "mysql"),
-    "--mysql-database", shellArg(mysqlDatabase || "kaiops"),
-    "--mysql-user", shellArg(mysqlUser || "kaiops"),
-    "--dry-run", "true",
-  ].join(" ");
-}
-
-function firstTraceTimestamp(rows, predicate) {
-  const safeRows = Array.isArray(rows) ? rows : [];
-  const hit = safeRows.find((row) => {
-    if (!row || typeof row !== "object") {
-      return false;
-    }
-    return predicate(row);
-  });
-  return String(hit?.timestamp || "").trim();
-}
-
-function firstEventTimestamp(rows, predicate) {
-  const safeRows = Array.isArray(rows) ? rows : [];
-  const hit = safeRows.find((row) => {
-    if (!row || typeof row !== "object") {
-      return false;
-    }
-    return predicate(row);
-  });
-  return String(hit?.timestamp || "").trim();
-}
-
-function buildSyntheticFlowRows({ workflow, events, traceRows, ingestAt, incidentCreatedAt }) {
-  const safeWorkflow = workflow && typeof workflow === "object" ? workflow : {};
-  const safeEvents = Array.isArray(events) ? events : [];
-  const safeTraceRows = Array.isArray(traceRows) ? traceRows : [];
-
-  const alert = typeof safeWorkflow.alert === "object" && safeWorkflow.alert ? safeWorkflow.alert : {};
-  const incident = typeof safeWorkflow.incident === "object" && safeWorkflow.incident ? safeWorkflow.incident : {};
-  const context = typeof safeWorkflow.context === "object" && safeWorkflow.context ? safeWorkflow.context : {};
-  const contextMetadata = typeof context.metadata === "object" && context.metadata ? context.metadata : {};
-  const recommendation = typeof safeWorkflow.recommendation === "object" && safeWorkflow.recommendation ? safeWorkflow.recommendation : {};
-  const recommendationMetadata = typeof recommendation.metadata === "object" && recommendation.metadata ? recommendation.metadata : {};
-  const remediationAction =
-    typeof safeWorkflow.remediation_action === "object" && safeWorkflow.remediation_action
-      ? safeWorkflow.remediation_action
-      : {};
-  const decision =
-    (typeof safeWorkflow.decision === "object" && safeWorkflow.decision)
-    || (typeof safeWorkflow.orchestration_decision === "object" && safeWorkflow.orchestration_decision)
-    || (typeof recommendationMetadata.orchestration_decision === "object" && recommendationMetadata.orchestration_decision)
-    || {};
-
-  const contextTraceRow = safeTraceRows
-    .slice()
-    .reverse()
-    .find((row) => String(row?.event_type || "").toLowerCase().includes("context"));
-  const contextEventPayload = (contextTraceRow && typeof contextTraceRow.payload === "object" && contextTraceRow.payload)
-    ? contextTraceRow.payload
-    : {};
-  const contextEventMetadata = typeof contextEventPayload?.metadata === "object" && contextEventPayload.metadata
-    ? contextEventPayload.metadata
-    : {};
-  const contextAgentEvent = safeEvents
-    .slice()
-    .reverse()
-    .find((event) => String(event?.agent || "").toLowerCase().includes("context intelligence"));
-  const contextAgentDetails = typeof contextAgentEvent?.details === "object" && contextAgentEvent.details
-    ? contextAgentEvent.details
-    : {};
-  const contextAgentMetrics = typeof contextAgentDetails?.metrics === "object" && contextAgentDetails.metrics
-    ? contextAgentDetails.metrics
-    : {};
-
-  const ragMatches =
-    (Array.isArray(contextMetadata.rag_matches) && contextMetadata.rag_matches)
-    || (Array.isArray(recommendationMetadata.rag_matches) && recommendationMetadata.rag_matches)
-    || (Array.isArray(contextEventMetadata.rag_matches) && contextEventMetadata.rag_matches)
-    || (Array.isArray(contextAgentMetrics.rag_matches) && contextAgentMetrics.rag_matches)
-    || [];
-
-  const ragDocumentsRaw =
-    contextMetadata.rag_documents
-    ?? recommendationMetadata.rag_documents
-    ?? contextEventMetadata.rag_documents
-    ?? contextAgentMetrics.rag_documents
-    ?? contextEventPayload.rag_document_count
-    ?? null;
-  const ragTopSimilarityRaw =
-    contextMetadata.rag_top_similarity
-    ?? recommendationMetadata.rag_top_similarity
-    ?? contextEventMetadata.rag_top_similarity
-    ?? null;
-  const ragDocuments = ragDocumentsRaw === null || ragDocumentsRaw === undefined || ragDocumentsRaw === ""
-    ? null
-    : Number(ragDocumentsRaw);
-  const ragTopSimilarity = ragTopSimilarityRaw === null || ragTopSimilarityRaw === undefined || ragTopSimilarityRaw === ""
-    ? null
-    : Number(ragTopSimilarityRaw);
-  const runbookFound =
-    Boolean(context.runbook)
-    || Boolean(recommendationMetadata.runbook_found)
-    || Boolean(contextEventPayload.document_available)
-    || Boolean(contextEventMetadata.document_available)
-    || Boolean(contextAgentMetrics.runbook_found);
-  const ragDocumentDisplay = Number.isFinite(ragDocuments) ? ragDocuments : ragMatches.length;
-  const executionCommands = deriveExecutionCommands(safeWorkflow, safeTraceRows);
-  const traceEventTypes = safeTraceRows
-    .map((row) => String(row?.event_type || "").trim())
-    .filter(Boolean);
-
-  const findTraceEvents = (needles) => {
-    const tokens = Array.isArray(needles) ? needles : [];
-    const matches = traceEventTypes.filter((eventType) => {
-      const normalized = eventType.toLowerCase();
-      return tokens.some((needle) => normalized.includes(String(needle || "").toLowerCase()));
-    });
-    return Array.from(new Set(matches));
-  };
-  const findTraceRows = (needles) => {
-    const tokens = Array.isArray(needles) ? needles : [];
-    return safeTraceRows.filter((row) => {
-      const haystack = [
-        row?.event_type,
-        row?.event_stage,
-        row?.source_channel,
-        row?.transport_channel,
-        row?.service_name,
-      ].map((item) => String(item || "").toLowerCase()).join(" ");
-      return tokens.some((needle) => haystack.includes(String(needle || "").toLowerCase()));
-    });
-  };
-
-  const landingTimestamp =
-    String(ingestAt || "").trim()
-    || firstTraceTimestamp(safeTraceRows, (row) => {
-      const eventType = String(row?.event_type || "").toLowerCase();
-      const source = String(row?.source_channel || "").toLowerCase();
-      return eventType.includes("alert") || source.includes("raw-alert");
-    })
-    || String(incidentCreatedAt || "").trim();
-
-  const dedupeTimestamp =
-    firstEventTimestamp(safeEvents, (event) => String(event?.agent || "").toLowerCase().includes("alert intelligence"))
-    || firstTraceTimestamp(safeTraceRows, (row) => String(row?.event_type || "").toLowerCase().includes("workflow"))
-    || landingTimestamp;
-
-  const configTimestamp =
-    firstTraceTimestamp(safeTraceRows, (row) => {
-      const eventType = String(row?.event_type || "").toLowerCase();
-      const stage = String(row?.event_stage || "").toLowerCase();
-      return eventType.includes("config") || eventType.includes("connection") || stage.includes("config");
-    })
-    || dedupeTimestamp;
-
-  const contextTimestamp =
-    firstEventTimestamp(safeEvents, (event) => String(event?.agent || "").toLowerCase().includes("context intelligence"))
-    || firstTraceTimestamp(safeTraceRows, (row) => String(row?.event_type || "").toLowerCase().includes("context"))
-    || dedupeTimestamp;
-
-  const routingTimestamp =
-    firstTraceTimestamp(safeTraceRows, (row) => {
-      const eventType = String(row?.event_type || "").toLowerCase();
-      return eventType.includes("workflow.selected") || eventType.includes("recommendation.generated");
-    })
-    || firstEventTimestamp(safeEvents, (event) => String(event?.agent || "").toLowerCase().includes("orchestrator"))
-    || contextTimestamp;
-
-  const recommendationTimestamp =
-    firstTraceTimestamp(safeTraceRows, (row) => {
-      const eventType = String(row?.event_type || "").toLowerCase();
-      return eventType.includes("recommendation") || eventType.includes("resolution");
-    })
-    || firstEventTimestamp(safeEvents, (event) => String(event?.agent || "").toLowerCase().includes("resolution"))
-    || routingTimestamp;
-
-  const approvalTimestamp =
-    firstTraceTimestamp(safeTraceRows, (row) => String(row?.event_type || "").toLowerCase().includes("approval"))
-    || firstEventTimestamp(safeEvents, (event) => String(event?.agent || "").toLowerCase().includes("approval"))
-    || recommendationTimestamp;
-
-  const remediationTimestamp =
-    String(remediationAction.completed_at || remediationAction.started_at || "").trim()
-    || firstEventTimestamp(safeEvents, (event) => String(event?.agent || "").toLowerCase().includes("remediation"))
-    || firstTraceTimestamp(safeTraceRows, (row) => String(row?.event_type || "").toLowerCase().includes("remediation"))
-    || approvalTimestamp;
-
-  const closureTimestamp =
-    firstTraceTimestamp(safeTraceRows, (row) => {
-      const eventType = String(row?.event_type || "").toLowerCase();
-      return eventType.includes("closure") || eventType.includes("validation");
-    })
-    || String(safeWorkflow?.closure_report?.completed_at || safeWorkflow?.closure_report?.created_at || "").trim()
-    || "";
-
-  const rows = [];
-  const traceId = alert.trace_id || incident.trace_id || context.trace_id || recommendation.trace_id || remediationAction.trace_id || "";
-  const pushBusRow = ({ flowOrder, stage, consumes, publishes, timestamp, detail, payload = {}, backendEvents = [] }) => {
-    const observedBusRow = safeTraceRows
-      .slice()
-      .reverse()
-      .find((row) => {
-        const channel = String(row?.transport_channel || row?.source_channel || "").trim().toLowerCase();
-        return channel === String(publishes || "").trim().toLowerCase();
-      });
-    const observedProvider = String(observedBusRow?.transport_provider || "").trim();
-    const provider = observedProvider && observedProvider.toLowerCase() !== "unknown"
-      ? observedProvider
-      : (decision.message_bus_provider || "rabbitmq");
-    rows.push({
-      flowOrder,
-      stage,
-      agent: "Message Bus",
-      service: provider,
-      consumes,
-      publishes,
-      timestamp,
-      elapsed: elapsedSeconds(ingestAt || incidentCreatedAt, timestamp),
-      detail,
-      tables: "message_topics, incident_events",
-      inputValueText: stringifyTimelineValue({
-        provider,
-        trace_id: traceId,
-        ...payload,
-      }),
-      outputValueText: stringifyTimelineValue({
-        delivered_to: publishes,
-        trace_id: traceId,
-      }),
-      errorValueText: "",
-      backendEvents,
-    });
-  };
-
-  if (landingTimestamp || hasMeaningfulValue(alert)) {
-    rows.push({
-      flowOrder: 10,
-      stage: "Alert Landed In Landing Pad",
-      agent: "Monitoring Adapter",
-      service: "monitoring-adapter",
-      consumes: "provider webhook",
-      publishes: "raw-alerts",
-      timestamp: landingTimestamp,
-      elapsed: elapsedSeconds(ingestAt || incidentCreatedAt, landingTimestamp),
-      detail: "Alert ingested from monitoring provider and staged for downstream workflow processing.",
-      tables: "incident_events",
-      inputValueText: stringifyTimelineValue({
-        source: alert.source,
-        name: alert.name,
-        service: alert.service,
-        severity: alert.severity,
-      }),
-      outputValueText: stringifyTimelineValue({
-        correlation_id: alert.correlation_id,
-        trace_id: traceId,
-      }),
-      errorValueText: "",
-      backendEvents: findTraceEvents(["alert", "incident.opened", "incident.created"]),
-    });
-    pushBusRow({
-      flowOrder: 20,
-      stage: "Raw Alert Topic Handoff",
-      consumes: "provider webhook",
-      publishes: "raw-alerts",
-      timestamp: landingTimestamp,
-      detail: "Landing pad publishes the normalized alert envelope onto the raw-alerts topic for alert intelligence workers.",
-      payload: {
-        source_service: "monitoring-adapter",
-        target_service: "alert-intelligence",
-        topic: "raw-alerts",
-      },
-      backendEvents: findTraceEvents(["alert", "raw-alerts"]),
-    });
-  }
-
-  if (hasMeaningfulValue(alert.deduplicated_count) || dedupeTimestamp) {
-    rows.push({
-      flowOrder: 30,
-      stage: "Deduplication And Incident Correlation",
-      agent: "Alert Intelligence Agent",
-      service: "alert-intelligence",
-      consumes: "raw-alerts",
-      publishes: "enriched-alerts",
-      timestamp: dedupeTimestamp,
-      elapsed: elapsedSeconds(ingestAt || incidentCreatedAt, dedupeTimestamp),
-      detail: "Deduplication, severity classification, and incident correlation completed.",
-      tables: "alerts, incidents, incident_events",
-      inputValueText: stringifyTimelineValue({
-        deduplicated_count: alert.deduplicated_count,
-        correlation_id: alert.correlation_id,
-        incident_id: incident.id,
-      }),
-      outputValueText: stringifyTimelineValue({
-        incident_title: incident.title,
-        severity: incident.severity,
-        status: incident.status,
-        trace_id: traceId,
-      }),
-      errorValueText: "",
-      backendEvents: findTraceEvents(["workflow.selected", "context.collected"]),
-    });
-    pushBusRow({
-      flowOrder: 40,
-      stage: "Enriched Alert Topic Handoff",
-      consumes: "raw-alerts",
-      publishes: "enriched-alerts",
-      timestamp: dedupeTimestamp,
-      detail: "Alert intelligence publishes the correlated incident signal for orchestration routing.",
-      payload: {
-        source_service: "alert-intelligence",
-        target_service: "orchestrator",
-        incident_id: incident.id,
-        topic: "enriched-alerts",
-      },
-      backendEvents: findTraceEvents(["workflow.selected", "enriched-alerts"]),
-    });
-  }
-
-  if (hasMeaningfulValue(decision) || routingTimestamp) {
-    rows.push({
-      flowOrder: 50,
-      stage: "Orchestrator Workflow Selection",
-      agent: "Orchestrator Agent",
-      service: "orchestrator",
-      consumes: "enriched-alerts",
-      publishes: "workflow request",
-      timestamp: routingTimestamp,
-      elapsed: elapsedSeconds(ingestAt || incidentCreatedAt, routingTimestamp),
-      detail: "Orchestrator selects the incident workflow, worker route, approval requirement, and execution policy.",
-      tables: "incident_events, incident_projections, pending_workflows",
-      inputValueText: stringifyTimelineValue({
-        alert: alert.name,
-        service: alert.service || incident.service,
-        severity: alert.severity || incident.severity,
-        incident_id: incident.id,
-      }),
-      outputValueText: stringifyTimelineValue({
-        workflow: decision.workflow,
-        next_action: decision.next_action,
-        requires_approval: decision.requires_approval,
-        risk_tier: decision.risk_tier,
-        trace_id: traceId,
-      }),
-      errorValueText: "",
-      backendEvents: findTraceEvents(["workflow.selected"]),
-    });
-  }
-
-  rows.push({
-    flowOrder: 60,
-    stage: "Configuration And Connector Lookup",
-    agent: "Config Service",
-    service: "config",
-    consumes: "workflow request",
-    publishes: "connector profile",
-    timestamp: configTimestamp,
-    elapsed: elapsedSeconds(ingestAt || incidentCreatedAt, configTimestamp),
-    detail: "Service, environment, monitoring, message bus, RAG, and remediation connector settings resolved before agent execution.",
-    tables: "kaiops-connections.json, service_profiles, connector registry",
-    inputValueText: stringifyTimelineValue({
-      service: alert.service || incident.service,
-      environment: alert.environment || incident.environment,
-      requested_profiles: ["monitoring", "message_bus", "rag", "remediation"],
-    }),
-    outputValueText: stringifyTimelineValue({
-      monitoring_provider: decision.monitoring_provider || decision.provider || "prometheus",
-      message_bus_provider: decision.message_bus_provider || "rabbitmq",
-      workflow: decision.workflow || "guided-remediation",
-      execution_mode: decision.execution_mode || "-",
-      trace_id: traceId,
-    }),
-    errorValueText: "",
-    backendEvents: findTraceEvents(["config", "connection", "workflow.selected"]),
-  });
-  pushBusRow({
-    flowOrder: 70,
-    stage: "Orchestration Event Topic Handoff",
-    consumes: "workflow request + connector profile",
-    publishes: "orchestration-events",
-    timestamp: routingTimestamp,
-    detail: "Orchestrator publishes the runnable work item for context-agent workers with config, policy, and trace metadata attached.",
-    payload: {
-      source_service: "orchestrator",
-      target_service: "context-agent",
-      topic: "orchestration-events",
-      workflow: decision.workflow || "guided-remediation",
-    },
-    backendEvents: findTraceEvents(["workflow.selected", "orchestration-events"]),
-  });
-
-  if (ragDocuments > 0 || ragMatches.length || contextTimestamp) {
-    rows.push({
-      flowOrder: 80,
-      stage: "RAG Context Retrieval",
-      agent: "Context Intelligence Agent",
-      service: "context-agent",
-      consumes: "orchestration-events",
-      publishes: "context-events",
-      timestamp: contextTimestamp,
-      elapsed: elapsedSeconds(ingestAt || incidentCreatedAt, contextTimestamp),
-      detail: "Context built from RAG corpus, dependencies, recent changes, and observability connectors.",
-      tables: "incident_events, agent_work_items",
-      inputValueText: stringifyTimelineValue({
-        service: alert.service,
-        deployment: context.deployment,
-        related_incidents: Array.isArray(context.related_incidents) ? context.related_incidents.length : 0,
-      }),
-      outputValueText: stringifyTimelineValue({
-        rag_documents: ragDocumentDisplay,
-        rag_matches: ragMatches,
-        runbook_found: runbookFound,
-        trace_id: traceId,
-      }),
-      errorValueText: "",
-      backendEvents: findTraceEvents(["context.collected"]),
-    });
-  }
-
-  if (contextTimestamp || runbookFound || ragMatches.length) {
-    rows.push({
-      flowOrder: 90,
-      stage: "Context Merge And Evidence Assembly",
-      agent: "Context Intelligence Agent",
-      service: "context-agent",
-      consumes: "ranked rag matches + connector evidence",
-      publishes: "context-events",
-      timestamp: contextTimestamp,
-      elapsed: elapsedSeconds(ingestAt || incidentCreatedAt, contextTimestamp),
-      detail: "RAG matches, dependency evidence, recent incidents, deployment metadata, and observability signals merged into one context payload.",
-      tables: "incident_events, dependencies, changes, runbooks, agent_work_items",
-      inputValueText: stringifyTimelineValue({
-        documents_ranked: ragDocumentDisplay,
-        dependency_count: Array.isArray(context.dependencies) ? context.dependencies.length : "-",
-        related_incidents: Array.isArray(context.related_incidents) ? context.related_incidents.length : 0,
-        connector_events: findTraceRows(["connector", "context"]).length,
-      }),
-      outputValueText: stringifyTimelineValue({
-        runbook_found: runbookFound,
-        document_available: Boolean(contextEventPayload.document_available || runbookFound),
-        context_summary: context.summary || contextEventPayload.summary || "-",
-        trace_id: traceId,
-      }),
-      errorValueText: "",
-      backendEvents: findTraceEvents(["context.collected", "connector", "dependency"]),
-    });
-    pushBusRow({
-      flowOrder: 100,
-      stage: "Context Event Topic Handoff",
-      consumes: "orchestration-events",
-      publishes: "context-events",
-      timestamp: contextTimestamp,
-      detail: "Context-agent publishes the assembled incident context for resolution-agent workers.",
-      payload: {
-        source_service: "context-agent",
-        target_service: "resolution-agent",
-        topic: "context-events",
-        documents_ranked: ragDocumentDisplay,
-      },
-      backendEvents: findTraceEvents(["context.collected", "context-events"]),
-    });
-  }
-
-  if (ragMatches.length || (typeof ragTopSimilarity === "number" && ragTopSimilarity > 0)) {
-    rows.push({
-      flowOrder: 85,
-      stage: "Embedding And Semantic Search",
-      agent: "VectorDB Connector",
-      service: "context-agent",
-      consumes: "context query",
-      publishes: "ranked rag matches",
-      timestamp: contextTimestamp,
-      elapsed: elapsedSeconds(ingestAt || incidentCreatedAt, contextTimestamp),
-      detail: "Vector similarity and metadata ranking used to retrieve the most relevant runbook, incident, and deployment documents.",
-      tables: "rag corpus",
-      inputValueText: stringifyTimelineValue({
-        query: `${alert.service || ""} ${alert.name || ""} ${alert.description || ""}`.trim(),
-        rag_document_count: ragDocuments,
-      }),
-      outputValueText: stringifyTimelineValue({
-        rag_top_similarity: ragTopSimilarity ?? "-",
-        top_matches: ragMatches.slice(0, 5),
-        trace_id: traceId,
-      }),
-      errorValueText: "",
-      backendEvents: findTraceEvents(["context.collected", "recommendation.generated"]),
-    });
-  }
-
-  if (hasMeaningfulValue(recommendation) || recommendationTimestamp) {
-    rows.push({
-      flowOrder: 110,
-      stage: "Resolution Recommendation Generated",
-      agent: "Resolution Intelligence Agent",
-      service: "resolution-agent",
-      consumes: "context-events",
-      publishes: "resolution-events",
-      timestamp: recommendationTimestamp,
-      elapsed: elapsedSeconds(ingestAt || incidentCreatedAt, recommendationTimestamp),
-      detail: "RCA, impact, recommended action, confidence, and operator-safe execution plan generated from the assembled context.",
-      tables: "incident_events, recommendations, evaluation_records",
-      inputValueText: stringifyTimelineValue({
-        incident_id: incident.id || recommendation.incident_id,
-        service: incident.service || alert.service,
-        context_trace_id: context.trace_id || traceId,
-      }),
-      outputValueText: stringifyTimelineValue({
-        recommendation_id: recommendation.id,
-        root_cause: recommendation.root_cause,
-        confidence: recommendation.confidence,
-        grounding_score: recommendationMetadata.grounding_score,
-        hallucination_score: recommendationMetadata.hallucination_score,
-        trace_id: traceId,
-      }),
-      errorValueText: "",
-      backendEvents: findTraceEvents(["recommendation.generated", "resolution"]),
-    });
-    pushBusRow({
-      flowOrder: 120,
-      stage: "Resolution Event Topic Handoff",
-      consumes: "context-events",
-      publishes: "resolution-events",
-      timestamp: recommendationTimestamp,
-      detail: "Resolution-agent publishes RCA, impact, confidence, and the editable remediation plan for approval routing.",
-      payload: {
-        source_service: "resolution-agent",
-        target_service: "approval-service",
-        topic: "resolution-events",
-        recommendation_id: recommendation.id,
-      },
-      backendEvents: findTraceEvents(["recommendation.generated", "resolution-events"]),
-    });
-  }
-
-  if (approvalTimestamp || hasMeaningfulValue(recommendation.id)) {
-    rows.push({
-      flowOrder: 130,
-      stage: "Human Approval Gate",
-      agent: "Approval Service",
-      service: "approval-service",
-      consumes: "resolution-events",
-      publishes: "approval-events",
-      timestamp: approvalTimestamp,
-      elapsed: elapsedSeconds(ingestAt || incidentCreatedAt, approvalTimestamp),
-      detail: "Recommendation and editable remediation plan presented for human approval before execution.",
-      tables: "approvals, pending_workflows, incident_events",
-      inputValueText: stringifyTimelineValue({
-        recommendation_id: recommendation.id,
-        risk_tier: decision.risk_tier,
-        requires_approval: decision.requires_approval ?? true,
-        approver_role: decision.approver_role || "L2/L3/Admin",
-      }),
-      outputValueText: stringifyTimelineValue({
-        approval_status: remediationAction.approval_id ? "approved" : "pending",
-        approval_id: remediationAction.approval_id,
-        editable_plan: true,
-        trace_id: traceId,
-      }),
-      errorValueText: "",
-      backendEvents: findTraceEvents(["approval.requested", "approval.recorded"]),
-    });
-    pushBusRow({
-      flowOrder: 140,
-      stage: "Approval Event Topic Handoff",
-      consumes: "resolution-events",
-      publishes: "approval-events",
-      timestamp: approvalTimestamp,
-      detail: "Approval-service publishes the human decision and edited execution plan for remediation-engine workers.",
-      payload: {
-        source_service: "approval-service",
-        target_service: "remediation-engine",
-        topic: "approval-events",
-        approval_id: remediationAction.approval_id,
-      },
-      backendEvents: findTraceEvents(["approval.recorded", "approval-events"]),
-    });
-  }
-
-  if (executionCommands.length || hasMeaningfulValue(remediationAction.output) || remediationTimestamp) {
-    const remediationParameters =
-      typeof remediationAction.parameters === "object" && remediationAction.parameters
-        ? remediationAction.parameters
-        : {};
-    const executionPlan =
-      typeof remediationParameters.execution_plan === "object" && remediationParameters.execution_plan
-        ? remediationParameters.execution_plan
-        : {};
-    const executionResult =
-      typeof remediationParameters.execution_result === "object" && remediationParameters.execution_result
-        ? remediationParameters.execution_result
-        : {};
-    const remediationExecuted = hasMeaningfulValue(remediationAction.status) || hasMeaningfulValue(remediationAction.output);
-    const executedLive = executionResult.executed === true || String(remediationAction.status || "").toLowerCase() === "succeeded";
-    const skippedExecution = String(remediationAction.status || "").toLowerCase() === "skipped" || executionResult.executed === false;
-    rows.push({
-      flowOrder: 150,
-      stage: "Remediation Command Execution",
-      agent: "Remediation Automation Engine",
-      service: "remediation-engine",
-      consumes: "approval-events",
-      publishes: "remediation-events",
-      timestamp: remediationTimestamp,
-      elapsed: elapsedSeconds(ingestAt || incidentCreatedAt, remediationTimestamp),
-      detail: executedLive
-        ? "Approved remediation was executed by the configured backend executor and the execution result was captured."
-        : skippedExecution
-          ? "Approved remediation was not executed because no live executor/connector is configured; the approved command plan is preserved for operator action."
-          : "Remediation command/script/query plan is waiting for approval or executor dispatch.",
-      tables: "actions, audit_logs, incident_events",
-      inputValueText: stringifyTimelineValue({
-        mode: executedLive ? "live_executed" : skippedExecution ? "not_executed" : "pending_dispatch",
-        action_type: remediationAction.action_type,
-        target: remediationAction.target,
-        executor: executionResult.executor,
-        commands: Array.isArray(executionPlan.commands) ? executionPlan.commands : executionCommands,
-        scripts: Array.isArray(executionPlan.scripts) ? executionPlan.scripts : [],
-        queries: Array.isArray(executionPlan.queries) ? executionPlan.queries : [],
-      }),
-      outputValueText: stringifyTimelineValue({
-        status: remediationAction.status || (remediationExecuted ? "-" : "pending"),
-        executed: executionResult.executed,
-        reason: executionResult.reason,
-        output: remediationAction.output,
-        error: remediationAction.error,
-        trace_id: traceId,
-      }),
-      errorValueText: stringifyTimelineValue(remediationAction.error),
-      backendEvents: findTraceEvents(["remediation.executed", "closure.completed"]),
-    });
-    pushBusRow({
-      flowOrder: 160,
-      stage: "Remediation Event Topic Handoff",
-      consumes: "approval-events",
-      publishes: "remediation-events",
-      timestamp: remediationTimestamp,
-      detail: "Remediation-engine publishes execution status, output, and connector result for closure validation.",
-      payload: {
-        source_service: "remediation-engine",
-        target_service: "closure-service",
-        topic: "remediation-events",
-        action_id: remediationAction.id,
-        status: remediationAction.status,
-      },
-      backendEvents: findTraceEvents(["remediation.executed", "remediation-events"]),
-    });
-  }
-
-  if (closureTimestamp) {
-    rows.push({
-      flowOrder: 170,
-      stage: "Closure Validation And Incident Update",
-      agent: "Closure & Validation",
-      service: "closure-service",
-      consumes: "remediation-events",
-      publishes: "closure-events",
-      timestamp: closureTimestamp,
-      elapsed: elapsedSeconds(ingestAt || incidentCreatedAt, closureTimestamp),
-      detail: "Post-remediation validation updates incident status, evidence, audit trail, and cockpit projection.",
-      tables: "incident_events, incident_projections, actions, audit_logs",
-      inputValueText: stringifyTimelineValue({
-        remediation_status: remediationAction.status,
-        action_id: remediationAction.id,
-      }),
-      outputValueText: stringifyTimelineValue({
-        health_restored: safeWorkflow?.closure_report?.health_restored,
-        incident_status: incident.status,
-        trace_id: traceId,
-      }),
-      errorValueText: "",
-      backendEvents: findTraceEvents(["closure.completed", "validation"]),
-    });
-  }
-
-  return rows;
-}
-
-function summarizeEventType(value) {
-  const token = String(value || "").trim();
-  if (!token) {
-    return "Workflow Event";
-  }
-  return token
-    .split(".")
-    .filter(Boolean)
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-    .join(" -> ");
-}
-
-function timelinePhaseOrder(row) {
-  const explicitOrder = Number(row?.flowOrder);
-  if (Number.isFinite(explicitOrder) && explicitOrder > 0) {
-    return explicitOrder;
-  }
-  const stage = String(row?.stage || "").toLowerCase();
-  const eventHints = Array.isArray(row?.backendEvents)
-    ? row.backendEvents.map((item) => String(item || "").toLowerCase())
-    : [];
-  const haystack = `${stage} ${eventHints.join(" ")}`;
-
-  if (haystack.includes("landing pad") || haystack.includes("alert received") || haystack.includes("alert landed") || haystack.includes("incident.alert")) {
-    return 10;
-  }
-  if (haystack.includes("raw alert topic")) {
-    return 20;
-  }
-  if (haystack.includes("dedup") || haystack.includes("correlation") || haystack.includes("enrich")) {
-    return 30;
-  }
-  if (haystack.includes("enriched alert topic")) {
-    return 40;
-  }
-  if (haystack.includes("routing") || haystack.includes("orchestrator") || haystack.includes("workflow.selected")) {
-    return 50;
-  }
-  if (haystack.includes("config") || haystack.includes("connector lookup") || haystack.includes("connection")) {
-    return 60;
-  }
-  if (haystack.includes("orchestration event topic")) {
-    return 70;
-  }
-  if (haystack.includes("rag context") || haystack.includes("context retrieval") || haystack.includes("context intelligence") || haystack.includes("incident.context.collected")) {
-    return 80;
-  }
-  if (haystack.includes("embedding") || haystack.includes("semantic") || haystack.includes("vector")) {
-    return 85;
-  }
-  if (haystack.includes("context merge") || haystack.includes("evidence assembly")) {
-    return 90;
-  }
-  if (haystack.includes("context event topic")) {
-    return 100;
-  }
-  if (haystack.includes("recommendation") || haystack.includes("resolution")) {
-    return 110;
-  }
-  if (haystack.includes("policy")) {
-    return 115;
-  }
-  if (haystack.includes("resolution event topic")) {
-    return 120;
-  }
-  if (haystack.includes("approval")) {
-    return 130;
-  }
-  if (haystack.includes("approval event topic")) {
-    return 140;
-  }
-  if (haystack.includes("remediation") || haystack.includes("command") || haystack.includes("execute")) {
-    return 150;
-  }
-  if (haystack.includes("remediation event topic")) {
-    return 160;
-  }
-  if (haystack.includes("closure") || haystack.includes("validation")) {
-    return 170;
-  }
-  return 99;
-}
-
-function buildAlertDocumentDrafts(alertRow, workflowPayload) {
-  const alertName = String(alertRow?.name || alertRow?.alert_name || "Alert").trim();
-  const service = String(alertRow?.service || "unknown-service").trim();
-  const severity = String(alertRow?.severity || "high").trim().toLowerCase();
-  const alertId = String(alertRow?.alert_id || alertRow?.id || "").trim();
-  const workflow = workflowPayload?.workflow || workflowPayload || {};
-  const recommendation = typeof workflow?.recommendation === "object" && workflow.recommendation ? workflow.recommendation : {};
-  const incident = typeof workflow?.incident === "object" && workflow.incident ? workflow.incident : {};
-  const rootCause = cleanRecommendationText(recommendation?.root_cause, "");
-  const impact = cleanRecommendationText(recommendation?.impact, "");
-  const suggestedAction = cleanRecommendationText(recommendation?.recommended_action, "");
-  const commonHeader = `Alert ${alertName} observed on ${service} with severity ${severity.toUpperCase()}.`;
-  const fallbackRootCause = "Investigate recent deploys, dependency health, and resource saturation.";
-  const commonRoot = rootCause || fallbackRootCause;
-  const remediationPreview = buildPreviewExecutionPlan(workflow);
-  const remediationCommands = Array.isArray(remediationPreview?.plan?.commands) ? remediationPreview.plan.commands : [];
-  const remediationScripts = Array.isArray(remediationPreview?.plan?.scripts) ? remediationPreview.plan.scripts : [];
-  const remediationQueries = Array.isArray(remediationPreview?.plan?.queries) ? remediationPreview.plan.queries : [];
-  const remediationPlanText = [
-    remediationCommands.length ? `Commands:\n${remediationCommands.map((item) => `- ${item}`).join("\n")}` : "",
-    remediationScripts.length ? `Scripts:\n${remediationScripts.map((item) => `- ${item}`).join("\n")}` : "",
-    remediationQueries.length ? `Queries:\n${remediationQueries.map((item) => `- ${item}`).join("\n")}` : "",
-  ].filter(Boolean).join("\n\n");
-
-  return {
-    incident: {
-      kind: "incident",
-      title: `${alertName} Incident Summary`.slice(0, 160),
-      summary: [
-        `${alertName} detected for ${service}.`,
-        impact ? `Impact: ${impact}.` : "",
-      ].filter(Boolean).join(" "),
-      content: [
-        commonHeader,
-        `Probable root cause: ${commonRoot}`,
-        incident?.id ? `Incident reference: ${String(incident.id)}.` : "",
-        "Escalation path: L1 -> L2 -> L3 with timeline checkpoints at 5m, 15m, and 30m.",
-      ].filter(Boolean).join("\n\n"),
-      services: service,
-      severity,
-      alert_type: alertName,
-      alert_id: alertId,
-      root_cause: rootCause,
-      impact,
-      recommended_action: suggestedAction,
-    },
-    runbook: {
-      kind: "runbook",
-      title: `${alertName} Runbook`.slice(0, 160),
-      summary: [
-        `${alertName} detected for ${service}.`,
-        suggestedAction ? `Recommended action: ${suggestedAction}.` : "",
-      ].filter(Boolean).join(" "),
-      content: [
-        commonHeader,
-        `Probable root cause: ${commonRoot}`,
-        suggestedAction ? `Immediate action: ${suggestedAction}.` : "Immediate action: inspect logs, metrics, and dependency health.",
-        "Verification: confirm error rate and latency return to baseline before closure.",
-      ].filter(Boolean).join("\n\n"),
-      services: service,
-      severity,
-      alert_type: alertName,
-      alert_id: alertId,
-      root_cause: rootCause,
-      impact,
-      recommended_action: suggestedAction,
-    },
-    deployment: {
-      kind: "deployment",
-      title: `${alertName} Deployment Guidance`.slice(0, 160),
-      summary: `Deployment guardrails and rollback checks for ${service}.`,
-      content: [
-        commonHeader,
-        "Pre-deploy checks: SLO burn rate, dependency readiness, and database migration safety.",
-        "Post-deploy checks: p95 latency, error budget consumption, and alert noise monitoring for 30m.",
-        "Rollback criteria: sustained critical alerts for 10m or failed synthetic checks.",
-      ].join("\n\n"),
-      services: service,
-      severity,
-      alert_type: alertName,
-      alert_id: alertId,
-      root_cause: rootCause,
-      impact,
-      recommended_action: suggestedAction,
-    },
-    change: {
-      kind: "change",
-      title: `${alertName} Change Record`.slice(0, 160),
-      summary: `Change notes and approvals for ${service} remediation actions.`,
-      content: [
-        commonHeader,
-        "Change scope: configuration, deployment, and policy updates tied to this alert pattern.",
-        "Approval checklist: peer review, CAB approval (if required), and blast-radius assessment.",
-        "Backout plan: revert config, redeploy previous version, and validate health endpoints.",
-      ].join("\n\n"),
-      services: service,
-      severity,
-      alert_type: alertName,
-      alert_id: alertId,
-      root_cause: rootCause,
-      impact,
-      recommended_action: suggestedAction,
-    },
-    dependency: {
-      kind: "dependency",
-      title: `${alertName} Dependency Map`.slice(0, 160),
-      summary: `Dependency and upstream/downstream checks for ${service}.`,
-      content: [
-        commonHeader,
-        "Dependencies to inspect: datastore latency, queue backlog, external API error rates, and network saturation.",
-        "Signals to capture: timeout spikes, retry storms, and circuit breaker open rate.",
-        "Mitigation path: isolate degraded dependency, apply traffic shaping, and monitor stabilization.",
-      ].join("\n\n"),
-      services: service,
-      severity,
-      alert_type: alertName,
-      alert_id: alertId,
-      root_cause: rootCause,
-      impact,
-      recommended_action: suggestedAction,
-    },
-    remediation: {
-      kind: "remediation",
-      title: `${alertName} Remediation Command Plan`.slice(0, 160),
-      summary: `Auto-generated remediation commands/scripts/queries for ${service}.`,
-      content: [
-        commonHeader,
-        `Recommended remediation action: ${remediationPreview.recommendationText || suggestedAction || "Rollback deployment"}.`,
-        `Probable root cause: ${commonRoot}`,
-        remediationPlanText || "No remediation command plan was generated.",
-      ].filter(Boolean).join("\n\n"),
-      services: service,
-      severity,
-      alert_type: alertName,
-      alert_id: alertId,
-      root_cause: rootCause,
-      impact,
-      recommended_action: remediationPreview.recommendationText || suggestedAction,
-      execution_plan: remediationPlanText,
-      commands: remediationCommands,
-      scripts: remediationScripts,
-      queries: remediationQueries,
-    },
-  };
-}
-
-function toFiniteNumber(value) {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : 0;
-}
-
-function percentile(values, fraction) {
-  const nums = (Array.isArray(values) ? values : [])
-    .map((value) => Number(value))
-    .filter((value) => Number.isFinite(value))
-    .sort((a, b) => a - b);
-  if (!nums.length) {
-    return 0;
-  }
-  const index = Math.min(nums.length - 1, Math.max(0, Math.ceil(fraction * nums.length) - 1));
-  return nums[index];
-}
-
-function normalizeUsageRow(row) {
-  const entry = row && typeof row === "object" ? row : {};
-  const usage = entry?.usage && typeof entry.usage === "object" ? entry.usage : {};
-  const responseParams = entry?.response?.parameters && typeof entry.response.parameters === "object"
-    ? entry.response.parameters
-    : {};
-  const inputTokens = toFiniteNumber(entry.input_tokens ?? usage.input_tokens ?? entry.prompt_tokens ?? usage.prompt_tokens);
-  const outputTokens = toFiniteNumber(entry.output_tokens ?? usage.output_tokens ?? entry.completion_tokens ?? usage.completion_tokens);
-  const totalTokens = toFiniteNumber(entry.total_tokens ?? usage.total_tokens ?? (inputTokens + outputTokens));
-  const totalCostUsd = toFiniteNumber(
-    entry.total_cost_usd
-      ?? usage.total_cost_usd
-      ?? entry.cost_usd
-      ?? usage.cost_usd
-      ?? entry.total_cost
-      ?? usage.total_cost
-  );
-  const note = [entry.error, usage.error, entry.reason, usage.reason]
-    .map((item) => String(item || "").trim())
-    .find((item) => item && item !== "-") || "";
-  const estimated = Boolean(entry.estimated ?? usage.estimated);
-  const fallback = Boolean(entry.fallback ?? usage.fallback)
-    || ["fallback", "heuristic-fallback", "provider-error"].includes(String(entry.provider || usage.provider || entry.model || usage.model || "").trim().toLowerCase());
-  return {
-    task: entry.task || entry.agent || entry.service || entry.action || entry.event_type || "-",
-    provider: entry.provider || entry.vendor || entry.model_provider || usage.provider || responseParams.provider || "-",
-    model: entry.model || entry.model_name || entry.deployment || usage.model || responseParams.model || "-",
-    input_tokens: inputTokens,
-    output_tokens: outputTokens,
-    total_tokens: totalTokens,
-    total_cost_usd: totalCostUsd,
-    note,
-    estimated,
-    fallback,
-  };
-}
-
-function isPlaceholderUsageValue(value) {
-  const token = String(value || "").trim().toLowerCase();
-  return !token || token === "-" || token === "unknown" || token === "n/a" || token === "na" || token === "none" || token === "null";
-}
-
-function isMeaningfulUsageRow(row) {
-  const hasUsage = toFiniteNumber(row?.input_tokens) > 0 || toFiniteNumber(row?.output_tokens) > 0 || toFiniteNumber(row?.total_tokens) > 0 || toFiniteNumber(row?.total_cost_usd) > 0;
-  const hasProvider = !isPlaceholderUsageValue(row?.provider);
-  const hasModel = !isPlaceholderUsageValue(row?.model);
-  const hasErrorNote = Boolean(String(row?.note || "").trim());
-  return hasUsage || hasProvider || hasModel || hasErrorNote;
-}
-
-function usageRowIdentity(row) {
-  return [
-    String(row?.task || "").trim().toLowerCase(),
-    String(row?.provider || "").trim().toLowerCase(),
-    String(row?.model || "").trim().toLowerCase(),
-    String(row?.note || "").trim().toLowerCase(),
-    Number(row?.input_tokens || 0),
-    Number(row?.output_tokens || 0),
-    Number(row?.total_tokens || 0),
-  ].join("|");
-}
-
-function dedupeUsageRows(rows) {
-  const seen = new Set();
-  const out = [];
-  rows.forEach((row) => {
-    const key = usageRowIdentity(row);
-    if (seen.has(key)) {
-      return;
-    }
-    seen.add(key);
-    out.push(row);
-  });
-  return out;
-}
-
-function HorizontalBarChart({ title, subtitle, items }) {
-  const safeItems = Array.isArray(items) ? items : [];
-  const maxValue = safeItems.reduce((best, item) => Math.max(best, toFiniteNumber(item?.value)), 0);
-  return (
-    <article className="panel executive-chart-card">
-      <div className="panel-head">
-        <h3>{title}</h3>
-      </div>
-      {subtitle ? <p className="subtitle">{subtitle}</p> : null}
-      <div className="executive-bars">
-        {safeItems.map((item, index) => {
-          const value = toFiniteNumber(item?.value);
-          const widthPct = maxValue > 0 ? (value / maxValue) * 100 : 0;
-          const normalizedWidth = maxValue > 0 && value > 0 ? Math.max(4, widthPct) : 0;
-          const tone = String(item?.tone || "ops");
-          return (
-            <div className="executive-bar-row" key={`bar-${index}`}>
-              <span>{item?.label || "-"}</span>
-              <strong>{item?.displayValue ?? String(value)}</strong>
-              <div className="executive-bar-track">
-                <div className={`executive-bar-fill tone-${tone}`} style={{ width: `${normalizedWidth}%` }} />
-              </div>
-            </div>
-          );
-        })}
-        {!safeItems.length ? <p className="subtitle">No chart data available.</p> : null}
-      </div>
-    </article>
-  );
-}
-
-function SuccessFailureDonut({ success, failure }) {
-  const safeSuccess = Math.max(0, toFiniteNumber(success));
-  const safeFailure = Math.max(0, toFiniteNumber(failure));
-  const total = safeSuccess + safeFailure;
-  const successPct = total > 0 ? (safeSuccess / total) * 100 : 0;
-  return (
-    <article className="panel executive-chart-card">
-      <div className="panel-head">
-        <h3>Success vs Failure</h3>
-      </div>
-      <div className="executive-donut-wrap">
-        <div
-          className="executive-donut"
-          style={{
-            background: `conic-gradient(var(--ok) 0 ${successPct}%, var(--danger) ${successPct}% 100%)`,
-          }}
-        >
-          <div className="executive-donut-core">
-            <strong>{total}</strong>
-            <span>Requests</span>
-          </div>
-        </div>
-        <div className="executive-donut-legend">
-          <div><span className="legend-dot legend-ok" />Success: {safeSuccess}</div>
-          <div><span className="legend-dot legend-danger" />Failure: {safeFailure}</div>
-        </div>
-      </div>
-    </article>
-  );
-}
-
-const ONBOARDING_STEP_BACKGROUND = {
-  setup_monitoring: {
-    1: "Saved to the OnboardingStateRecord table (keyed by project_name) via POST /onboarding/complete on monitoring-adapter.",
-    2: "No backend call - determines which branch of the same request monitoring-adapter executes next (rule onboarding vs landing pad ingestion).",
-    3: "Your plain-English lines are sent to the new-rule-onboarding pipeline, which asks the model-router (LLM) to translate them into concrete Prometheus rule specs (metric, threshold, duration).",
-    4: "Generated rules are rendered into Prometheus rule YAML under backend/rag/changes/prometheus_rules, and Prometheus is asked to reload; a simulation check validates the rule behaves as expected.",
-    5: "The discovery layer searches incident-only RAG records for similar historical tickets, extracts their resolution context, then creates and saves a new runbook via POST /rag/documents. Existing runbooks are not used as the primary source.",
-  },
-  existing_monitoring: {
-    1: "Saved to the OnboardingStateRecord table (keyed by project_name) via POST /onboarding/complete on monitoring-adapter.",
-    2: "No backend call - determines which branch of the same request monitoring-adapter executes next (rule onboarding vs landing pad ingestion).",
-    3: "Saves the ingestion endpoint/connection profile you provide. This is the URL your monitoring tool's webhook (e.g. Alertmanager) should POST alerts to.",
-    4: "Incoming alerts hit monitoring-adapter's /alerts/alertmanager endpoint, are written to the landing pad, published to the raw-alerts topic, and consumed by alert-intelligence -> orchestrator -> the rest of the incident pipeline.",
-    5: "Optional. If rule onboarding was also enabled, documents are generated the same way as the Setup Monitoring path and appear under the Alert Knowledge tab.",
-  },
-};
-
-function explainOnboardingStepBackground(stepNumber, isSetupMonitoring) {
-  const table = ONBOARDING_STEP_BACKGROUND[isSetupMonitoring ? "setup_monitoring" : "existing_monitoring"];
-  return table[stepNumber] || "No background detail available for this step.";
-}
-
-function findHistoricalTicketDiscoveryDocument(documents, applicationId, applicationName) {
-  const normalizedId = String(applicationId || "").trim();
-  const normalizedName = String(applicationName || "").trim().toLowerCase();
-  return (Array.isArray(documents) ? documents : []).find((doc) => {
-    const metadata = doc?.metadata && typeof doc.metadata === "object" ? doc.metadata : {};
-    const services = Array.isArray(doc?.services) ? doc.services : [doc?.service];
-    return String(doc?.kind || "").trim().toLowerCase() === "runbook"
-      && String(metadata?.context_strategy || "").trim() === "similar-historical-tickets-first"
-      && (
-        (normalizedId && String(metadata?.application_id || "").trim() === normalizedId)
-        || (normalizedName && services.some((service) => String(service || "").trim().toLowerCase() === normalizedName))
-      );
-  }) || null;
-}
-
-function HistoricalTicketDiscoveryPanel({ applicationId, applicationName, documents, loading = false }) {
-  const discoveryDoc = findHistoricalTicketDiscoveryDocument(documents, applicationId, applicationName);
-  const metadata = discoveryDoc?.metadata && typeof discoveryDoc.metadata === "object" ? discoveryDoc.metadata : {};
-  const ticketPaths = Array.isArray(metadata.historical_ticket_paths)
-    ? metadata.historical_ticket_paths.filter(Boolean)
-    : [];
-  const ticketCount = Number(metadata.historical_ticket_count ?? ticketPaths.length ?? 0);
-  const discoveryComplete = Boolean(discoveryDoc);
-  return (
-    <section className="ticket-discovery-layer">
-      <div className="panel-head">
-        <div>
-          <h3>Discovery Layer: Historical Ticket Context</h3>
-          <p className="subtitle">Runbooks are grounded in similar resolved incidents before new guidance is generated.</p>
-        </div>
-        <span className={`workflow-pill ${discoveryComplete ? "workflow-pill-active" : "workflow-pill-idle"}`}>
-          {loading ? "discovering" : discoveryComplete ? "complete" : "waiting"}
-        </span>
-      </div>
-      <div className="ticket-discovery-flow" aria-label="Historical ticket discovery workflow">
-        <div className="ticket-discovery-step"><strong>1. Alert Rules</strong><span>Service and generated rule patterns form the search query.</span></div>
-        <span className="ticket-discovery-arrow" aria-hidden="true">→</span>
-        <div className="ticket-discovery-step"><strong>2. Similar Tickets</strong><span>{discoveryComplete ? `${ticketCount} incident match${ticketCount === 1 ? "" : "es"} found` : "Incident-only search pending"}</span></div>
-        <span className="ticket-discovery-arrow" aria-hidden="true">→</span>
-        <div className="ticket-discovery-step"><strong>3. Context Extraction</strong><span>Root cause and resolution evidence are extracted from matched tickets.</span></div>
-        <span className="ticket-discovery-arrow" aria-hidden="true">→</span>
-        <div className="ticket-discovery-step"><strong>4. Runbook</strong><span>{discoveryDoc?.title || "Generated after discovery completes"}</span></div>
-      </div>
-      {discoveryComplete ? (
-        <div className="ticket-discovery-evidence">
-          <strong>Evidence sources</strong>
-          {ticketPaths.length ? (
-            <ul>{ticketPaths.map((path, index) => <li key={`historical-ticket-${index}`} title={String(path)}>{String(path)}</li>)}</ul>
-          ) : (
-            <p>Fallback guidance used because no sufficiently similar historical ticket was found.</p>
-          )}
-        </div>
-      ) : (
-        <p className="subtitle">This panel updates dynamically when the rule-generation agent publishes the application runbook.</p>
-      )}
-    </section>
-  );
-}
-
-function FlowTimelineGraph({ rows }) {
-  const timelineRows = Array.isArray(rows) ? rows : [];
-  if (!timelineRows.length) {
-    return <p className="subtitle">No timeline data found for selected alert.</p>;
-  }
-
-  const parseMaybeJson = (value) => {
-    const text = String(value || "").trim();
-    if (!text) {
-      return null;
-    }
-    try {
-      const parsed = JSON.parse(text);
-      return parsed && typeof parsed === "object" ? parsed : null;
-    } catch (_error) {
-      return null;
-    }
-  };
-
-  const classifyStage = (row) => {
-    const stage = String(row?.stage || "").toLowerCase();
-    if (stage.includes("landing pad") || stage.includes("alert received") || stage.includes("alert landed")) {
-      return { kind: "ingestion", short: "ING", label: "Landing Pad" };
-    }
-    if (stage.includes("topic handoff") || stage.includes("message bus")) {
-      return { kind: "bus", short: "BUS", label: "Message Bus" };
-    }
-    if (stage.includes("dedup") || stage.includes("correlation") || stage.includes("enrich")) {
-      return { kind: "dedupe", short: "DED", label: "Dedup" };
-    }
-    if (stage.includes("config") || stage.includes("connector lookup")) {
-      return { kind: "config", short: "CFG", label: "Config" };
-    }
-    if (stage.includes("routing") || stage.includes("orchestrator") || stage.includes("workflow")) {
-      return { kind: "orchestration", short: "ORC", label: "Orchestrator" };
-    }
-    if (stage.includes("discovery agent") || stage.includes("code and log context")) {
-      return { kind: "discovery", short: "DSC", label: "Discovery" };
-    }
-    if (stage.includes("rag context") || stage.includes("context retrieval") || stage.includes("context intelligence")) {
-      return { kind: "rag", short: "RAG", label: "RAG" };
-    }
-    if (stage.includes("embedding") || stage.includes("semantic") || stage.includes("vector")) {
-      return { kind: "semantic", short: "SEM", label: "Semantic" };
-    }
-    if (stage.includes("context merge") || stage.includes("evidence assembly")) {
-      return { kind: "context", short: "CTX", label: "Context" };
-    }
-    if (stage.includes("resolution") || stage.includes("recommendation")) {
-      return { kind: "resolution", short: "RCA", label: "Resolution" };
-    }
-    if (stage.includes("approval")) {
-      return { kind: "approval", short: "APR", label: "Approval" };
-    }
-    if (stage.includes("policy")) {
-      return { kind: "policy", short: "POL", label: "Policy" };
-    }
-    if (stage.includes("remediation") || stage.includes("command") || stage.includes("execute")) {
-      return { kind: "execution", short: "CMD", label: "Execution" };
-    }
-    if (stage.includes("closure") || stage.includes("validation")) {
-      return { kind: "closure", short: "CLS", label: "Closure" };
-    }
-    return { kind: "generic", short: "EVT", label: "Event" };
-  };
-
-  const getRowBackendEvents = (row) => {
-    const input = parseMaybeJson(row?.inputValueText);
-    const output = parseMaybeJson(row?.outputValueText);
-    const rawEvents = Array.from(
-      new Set(
-        [
-          ...(Array.isArray(row?.backendEvents) ? row.backendEvents : []),
-          String(input?.event_type || "").trim(),
-          String(output?.event_type || "").trim(),
-        ].filter(Boolean)
-      )
+  const raw = String(value).trim();
+  const parsed = parseStructuredIntelligence(raw);
+  if (parsed) {
+    return readableImpactText(
+      parsed.impact_summary || parsed.observed_impact || parsed.service_impact
+        || parsed.customer_impact || parsed.business_impact || parsed.severity_rationale,
+      fallback,
     );
+  }
+  // Never expose malformed model JSON as operator-facing prose. The detailed
+  // technical view retains the source payload for diagnostics.
+  if (/^[\[{]/.test(raw) || /[}\]]$/.test(raw)) return fallback;
+  return cleanRecommendationText(raw, fallback);
+}
+const NAVIGATION_ICONS = {
+  dashboard: Database,
+  alerts: RadioTower,
+  incidents: Siren,
+  approvals: CircleCheckBig,
+  copilot: Bot,
+  agentFlow: Workflow,
+  knowledge: BookOpen,
+  safety: ShieldCheck,
+  audit: ScrollText,
+  closed: Archive,
+  applications: Boxes,
+  operationsCockpit: ChartNoAxesCombined,
+  platformOverview: Workflow,
+  cloudConnections: Cloud,
+  cloudResources: Server,
+  serviceOnboarding: ClipboardCheck,
+  services: Gauge,
+  integrations: PlugZap,
+  admin: Settings,
+  settings: Settings,
+  executive: ChartNoAxesCombined,
+};
+const INGESTION_SAVED_VIEWS = [
+  { id: "critical-active", label: "Critical active", section: "active", channel: "all", filters: { timeRange: "24h", severity: "critical", application: "selected", environment: "all" } },
+  { id: "failed-ingestion", label: "Failed ingestion", section: "failed", channel: "failed", filters: { timeRange: "24h", severity: "all", application: "selected", environment: "all" } },
+  { id: "my-applications", label: "My applications", section: "active", channel: "all", filters: { timeRange: "24h", severity: "all", application: "selected", environment: "all" } },
+];
+function redactOperationalSecrets(value) {
+  return String(value || "")
+    .replace(/((?:password|passwd|token|secret|api[_-]?key)\s*[=:]\s*)([^\s'";]+)/gi, "$1[REDACTED]")
+    .replace(/(authorization:\s*bearer\s+)[^\s'";]+/gi, "$1[REDACTED]");
+}
+function isTestApplicationRecord(row) {
+  const metadata = row?.metadata && typeof row.metadata === "object" ? row.metadata : {};
+  const labels = row?.labels && typeof row.labels === "object" ? row.labels : {};
+  const environment = String(row?.environment || metadata?.environment || labels?.environment || "").toLowerCase();
+  const projectType = String(row?.project_type || metadata?.project_type || labels?.project_type || "").toLowerCase();
+  const name = String(row?.name || row?.application || row?.project_name || row?.project || "").toLowerCase();
+  return isGeneratedOrTestAlert(row)
+    || ["test", "testing", "qa", "demo", "sandbox"].includes(environment)
+    || ["test", "demo", "sample"].includes(projectType)
+    || /(^|[-_\s])(test|demo|sample|sandbox)([-_\s]|$)/.test(name);
+}
 
-    const orderHints = [
-      "incident.alert",
-      "incident.workflow.selected",
-      "incident.context.collected",
-      "incident.recommendation.generated",
-      "incident.approval.requested",
-      "incident.approval.recorded",
-      "incident.remediation.executed",
-      "incident.closure.completed",
-    ];
-
-    const eventWeight = (eventName) => {
-      const normalized = String(eventName || "").toLowerCase();
-      const index = orderHints.findIndex((hint) => normalized.includes(hint));
-      return index === -1 ? orderHints.length : index;
-    };
-
-    return rawEvents
-      .slice()
-      .sort((left, right) => {
-        const leftWeight = eventWeight(left);
-        const rightWeight = eventWeight(right);
-        if (leftWeight !== rightWeight) {
-          return leftWeight - rightWeight;
-        }
-        return String(left).localeCompare(String(right));
-      });
-  };
-
-  const explainBackground = (row, stageMeta) => {
-    const input = parseMaybeJson(row?.inputValueText);
-    const output = parseMaybeJson(row?.outputValueText);
-    const topicIn = String(row?.consumes || "-");
-    const topicOut = String(row?.publishes || "-");
-    const dbTables = String(row?.tables || "-");
-    const mergedBackendEvents = getRowBackendEvents(row);
-    const eventStage = String(output?.event_stage || input?.event_stage || row?.detail || "-").trim() || "-";
-    const eventStatus = String(output?.status || input?.status || "-").trim() || "-";
-    const traceId = String(output?.trace_id || input?.trace_id || "-").trim() || "-";
-
-    return [
-      `stage_kind: ${stageMeta.kind}`,
-      `backend_events: ${mergedBackendEvents.length ? mergedBackendEvents.join(" | ") : "none"}`,
-      `source_topic: ${topicIn}`,
-      `target_topic: ${topicOut}`,
-      `tables_touched: ${dbTables}`,
-      `event_stage: ${eventStage}`,
-      `event_status: ${eventStatus}`,
-      `trace_id: ${traceId}`,
-    ].join("\n");
-  };
-
-  const copyPlanStep = async (value) => {
-    const text = String(value || "").trim();
-    if (!text || typeof navigator === "undefined" || !navigator.clipboard?.writeText) {
+function uniqueMonitorApplications(names) {
+  const canonicalCore = new Map(CORE_MONITOR_PROJECTS.map((name) => [normalizeMonitorToken(name), name]));
+  const unique = new Map();
+  names.forEach((value) => {
+    const name = String(value || "").trim();
+    const key = normalizeMonitorToken(name);
+    if (!key || [normalizeMonitorToken(REAL_USE_CASE_SCOPE), normalizeMonitorToken(TEST_USE_CASE_SCOPE)].includes(key)) {
       return;
     }
-    try {
-      await navigator.clipboard.writeText(text);
-    } catch (_error) {
-      // Best-effort copy for operator convenience.
-    }
-  };
-
-  const extractExecutionPlan = (row) => {
-    const input = parseMaybeJson(row?.inputValueText);
-    const output = parseMaybeJson(row?.outputValueText);
-    const commands = [];
-    const scripts = [];
-    const queries = [];
-    const seenObjects = new WeakSet();
-
-    const pushUnique = (target, value) => {
-      const token = String(value || "").trim();
-      if (!token) {
-        return;
-      }
-      if (!target.some((item) => item.toLowerCase() === token.toLowerCase())) {
-        target.push(token);
-      }
-    };
-
-    const classifyLine = (raw) => {
-      const token = String(raw || "").trim();
-      if (!token) {
-        return;
-      }
-      const lowered = token.toLowerCase();
-      if (lowered.startsWith("cmd:")) {
-        pushUnique(commands, token.slice(4).trim());
-        return;
-      }
-      if (lowered.startsWith("script:")) {
-        pushUnique(scripts, token.slice(7).trim());
-        return;
-      }
-      if (lowered.startsWith("query:")) {
-        pushUnique(queries, token.slice(6).trim());
-        return;
-      }
-      pushUnique(commands, token);
-    };
-
-    const collectFromPlanText = (value) => {
-      const text = String(value || "").trim();
-      if (!text) {
-        return;
-      }
-      let currentSection = "command";
-      text.split(/\r?\n/).forEach((line) => {
-        const token = String(line || "").trim();
-        if (!token) {
-          return;
-        }
-        if (/^commands?\s*:/i.test(token)) {
-          currentSection = "command";
-          const inline = token.replace(/^commands?\s*:/i, "").trim();
-          if (inline) {
-            classifyLine(`cmd: ${inline}`);
-          }
-          return;
-        }
-        if (/^scripts?\s*:/i.test(token)) {
-          currentSection = "script";
-          const inline = token.replace(/^scripts?\s*:/i, "").trim();
-          if (inline) {
-            classifyLine(`script: ${inline}`);
-          }
-          return;
-        }
-        if (/^(queries?|sql)\s*:/i.test(token)) {
-          currentSection = "query";
-          const inline = token.replace(/^(queries?|sql)\s*:/i, "").trim();
-          if (inline) {
-            classifyLine(`query: ${inline}`);
-          }
-          return;
-        }
-
-        const normalized = token.replace(/^[-*]\s*/, "").trim();
-        if (!normalized) {
-          return;
-        }
-        if (/^(cmd|command|script|query)\s*:/i.test(normalized)) {
-          classifyLine(normalized);
-          return;
-        }
-        if (currentSection === "script") {
-          pushUnique(scripts, normalized);
-          return;
-        }
-        if (currentSection === "query") {
-          pushUnique(queries, normalized);
-          return;
-        }
-        pushUnique(commands, normalized);
-      });
-    };
-
-    const collectFromValue = (value) => {
-      if (!hasMeaningfulValue(value)) {
-        return;
-      }
-      if (Array.isArray(value)) {
-        value.forEach(collectFromValue);
-        return;
-      }
-      if (typeof value === "string") {
-        collectFromPlanText(value);
-        return;
-      }
-      if (typeof value !== "object" || value === null) {
-        return;
-      }
-      if (seenObjects.has(value)) {
-        return;
-      }
-      seenObjects.add(value);
-
-      (Array.isArray(value.commands) ? value.commands : []).forEach(classifyLine);
-      (Array.isArray(value.scripts) ? value.scripts : []).forEach((item) => pushUnique(scripts, item));
-      (Array.isArray(value.queries) ? value.queries : []).forEach((item) => pushUnique(queries, item));
-
-      if (hasMeaningfulValue(value.execution_plan)) {
-        collectFromValue(value.execution_plan);
-      }
-
-      [
-        value.parameters,
-        value.remediation_action,
-        value.source_payload,
-        value.recommendation,
-        value.decision,
-        value.payload,
-        value.input,
-        value.output,
-        value.result,
-      ].forEach((item) => {
-        if (item && typeof item === "object") {
-          collectFromValue(item);
-        }
-      });
-    };
-
-    collectFromValue(input);
-    collectFromValue(output);
-
-    return {
-      commands: commands.filter(Boolean),
-      scripts: scripts.filter(Boolean),
-      queries: queries.filter(Boolean),
-    };
-  };
-
-  const observedPhases = Array.from(new Map(timelineRows.map((row) => {
-    const meta = classifyStage(row);
-    return [meta.kind, meta];
-  })).values());
-  const errorCount = timelineRows.filter((row) => timelineRowHasError(row)).length;
-  const compactRows = timelineRows.map((row, index) => {
-    const stageMeta = classifyStage(row);
-    return {
-      key: `compact-${index}`,
-      phase: stageMeta.label,
-      stage: row.stage || "-",
-      agent: row.agent || "-",
-      elapsed: row.elapsed !== "-" ? `${row.elapsed}s` : "-",
-      status: timelineRowStatus(row) === "failed" ? "error" : timelineRowStatus(row) === "fallback" ? "fallback" : "ok",
-      detail: compactText(row.detail, 120) || "-",
-    };
+    const canonical = canonicalCore.get(key) || name;
+    if (!unique.has(key) || canonicalCore.has(key)) unique.set(key, canonical);
   });
-  const totalElapsedSeconds = timelineRows.reduce((sum, row) => {
-    const value = Number(row?.elapsed);
-    return Number.isFinite(value) ? sum + Math.max(0, value) : sum;
-  }, 0);
-  const totalElapsedDisplay = timelineRows.length ? `${totalElapsedSeconds.toFixed(3)}s` : "-";
+  return Array.from(unique.values());
+}
+
+// Memoized so an unrelated App() state change (modal open, admin toggle, the
+// 4s live-stream staleness watchdog tick, ...) doesn't re-run the row-mapping
+// for the whole visible alert list on every render — only when these props
+// actually change.
+// Estimate only -- rowVirtualizer.measureElement (attached to each <tr> ref
+// below) measures the actual rendered height and self-corrects, so this
+// doesn't need to be exact.
+const ALERT_ROW_ESTIMATED_HEIGHT_PX = 44;
+
+const AlertStreamTable = memo(function AlertStreamTable({ rows, loading, selectedAlertId, onSelectAlert, scopeLabel }) {
+  const scrollRef = useRef(null);
+  const rowVirtualizer = useVirtualizer({
+    count: rows.length,
+    getScrollElement: () => scrollRef.current,
+    estimateSize: () => ALERT_ROW_ESTIMATED_HEIGHT_PX,
+    overscan: 10,
+  });
+  const virtualRows = rowVirtualizer.getVirtualItems();
+  const paddingTop = virtualRows.length > 0 ? virtualRows[0].start : 0;
+  const paddingBottom = virtualRows.length > 0 ? rowVirtualizer.getTotalSize() - virtualRows[virtualRows.length - 1].end : 0;
 
   return (
-    <div className="timeline-graph">
-      <div className="timeline-summary-strip">
-        <div className="timeline-summary-metric">
-          <strong>{timelineRows.length}</strong>
-          <span>Total Stages</span>
-        </div>
-        <div className="timeline-summary-metric">
-          <strong>{observedPhases.length}</strong>
-          <span>Observed Phases</span>
-        </div>
-        <div className="timeline-summary-metric">
-          <strong>{Math.max(0, timelineRows.length - errorCount)}</strong>
-          <span>Successful Stages</span>
-        </div>
-        <div className="timeline-phase-strip">
-          {observedPhases.map((phase) => {
+    <div
+      className="table-wrap table-wrap-scroll-x alert-stream-wrap"
+      tabIndex={0}
+      role="region"
+      aria-label="Alert stream table"
+      ref={scrollRef}
+    >
+      <table className="alert-stream-table">
+        <thead>
+          <tr>
+            <th>Alert ID</th>
+            <th>Time (UTC)</th>
+            <th className="alert-name-col">Name</th>
+            <th>Rule</th>
+            <th>Application</th>
+            <th>Service</th>
+            <th>Source</th>
+            <th>Severity</th>
+            <th>Tier</th>
+            <th>Status</th>
+            <th>Action</th>
+          </tr>
+        </thead>
+        <tbody>
+          {paddingTop > 0 ? (
+            <tr aria-hidden="true" style={{ height: paddingTop }}>
+              <td colSpan={11} style={{ padding: 0, border: 0 }} />
+            </tr>
+          ) : null}
+          {virtualRows.map((virtualRow) => {
+            const row = rows[virtualRow.index];
+            const index = virtualRow.index;
+            const rowId = String(row.alert_id || row.id || row.incident_id || index);
+            const fullAlertId = String(row.alert_id || row.id || row.incident_id || "-");
+            const compactAlertId = fullAlertId.length > 16 ? `${fullAlertId.slice(0, 8)}...${fullAlertId.slice(-6)}` : fullAlertId;
+            const severity = String(row.severity || "-").toUpperCase();
+            const supportTier = String(row.labels?.support_tier || "-");
+            const status = String(row.status || row.state || "open");
+            const application = row.application || row.project_name || row.project || row.service || "-";
+            const sourceChannels = Array.isArray(row?.source_channels) && row.source_channels.length
+              ? row.source_channels
+              : [normalizeAlertChannel(row)];
+            const alertRuleName = String(
+              row.rule_name
+              || row.rule
+              || row.alert_rule
+              || row.labels?.alertname
+              || row.name
+              || row.alert_name
+              || "-"
+            ).trim();
+            const alertName = row.name || row.alert_name || "-";
             return (
-              <span
-                key={`phase-${phase.kind}`}
-                className={`timeline-phase-pill phase-${phase.kind} is-active`}
-                title={`${phase.label} observed from runtime events`}
+              <tr
+                key={rowId}
+                data-index={index}
+                ref={rowVirtualizer.measureElement}
+                className={`alert-row ${selectedAlertId === rowId ? "row-selected" : ""}`}
+                onClick={() => onSelectAlert(row)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    onSelectAlert(row);
+                  }
+                }}
+                tabIndex={0}
+                role="button"
+                aria-label={`Open alert ${rowId}`}
               >
-                {phase.label}
-              </span>
+                <td title={fullAlertId}>{compactAlertId}</td>
+                <td>{formatUtcTimestamp(row.created_at || row.starts_at || row.closed_at)}</td>
+                <td className="alert-name-col" title={alertName}>{alertName}</td>
+                <td title={String(row.expression || row.expr || row.query || row.description || row.annotations?.description || "").trim()}>{alertRuleName}</td>
+                <td>{application}</td>
+                <td>{row.service || "-"}</td>
+                <td>
+                  <div className="alert-source-chips">
+                    {sourceChannels.map((sourceChannel) => {
+                      const sourceKey = String(sourceChannel || "").toLowerCase();
+                      return (
+                        <span key={`${rowId}-${sourceKey}`} className={`source-badge source-${sourceKey}`}>
+                          {sourceChannelLabel(sourceKey)}
+                        </span>
+                      );
+                    })}
+                  </div>
+                </td>
+                <td><span className={`pill severity-${severity.toLowerCase()}`}>{severity}</span></td>
+                <td><span className={`pill tier-${supportTier.toLowerCase().replace("/", "-")}`}>{supportTier}</span></td>
+                <td><span className={`pill status-${status.toLowerCase()}`}>{status}</span></td>
+                <td>
+                  <button
+                    type="button"
+                    className="button-secondary"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      onSelectAlert(row);
+                    }}
+                  >
+                    Inspect
+                  </button>
+                </td>
+              </tr>
             );
           })}
-        </div>
-      </div>
-      {timelineRows.map((row, index) => (
-        (() => {
-          const stageMeta = classifyStage(row);
-          const backendEvents = getRowBackendEvents(row);
-          const executionPlan = extractExecutionPlan(row);
-          const nextRow = timelineRows[index + 1] || null;
-          const fallbackStatus = timelineRowStatus(row, nextRow);
-          const nextStep = inferTimelineNextStep(row, nextRow);
-          const hasExecutionPlan = stageMeta.kind === "execution"
-            && (executionPlan.commands.length || executionPlan.scripts.length || executionPlan.queries.length);
-          return (
-        <article
-          className={`timeline-node stage-${stageMeta.kind} ${(fallbackStatus === "failed" || hasMeaningfulValue(row?.errorValueText)) ? "timeline-has-error" : ""}`}
-          key={`timeline-node-${index}`}
-          style={{ animationDelay: `${Math.min(index * 70, 560)}ms` }}
-        >
-          <div className="timeline-rail">
-            <span className="timeline-dot" />
-            {index < timelineRows.length - 1 ? <span className="timeline-line" /> : null}
-          </div>
-          <div className="timeline-body">
-            <div className="timeline-headline">
-              <strong>
-                <span className={`timeline-stage-badge stage-${stageMeta.kind}`}>{stageMeta.short}</span>
-                {" "}
-                {row.stage || "-"}
-              </strong>
-              <span>{formatUtcTimestamp(row.timestamp)}</span>
-            </div>
-            <div className="timeline-meta">
-              <span>{row.agent || "-"}</span>
-              <span>{row.service || "-"}</span>
-              <span>{row.elapsed !== "-" ? `${row.elapsed}s` : "-"}</span>
-              {fallbackStatus === "fallback" ? <span>fallback path</span> : null}
-            </div>
-            <p>{row.detail || "-"}</p>
-            {nextStep && nextStep !== "-" ? (
-              <div className="timeline-tags">
-                <span className="timeline-tag">next: {nextStep}</span>
-              </div>
-            ) : null}
-            {row.inputValueText ? (
-              <details>
-                <summary>Input Value</summary>
-                <pre className="result">{row.inputValueText}</pre>
-              </details>
-            ) : null}
-            {row.outputValueText ? (
-              <details>
-                <summary>Output Value</summary>
-                <pre className="result">{row.outputValueText}</pre>
-              </details>
-            ) : null}
-            {hasExecutionPlan ? (
-              <details open>
-                <summary>Resolution Plan (Commands, Scripts, Queries)</summary>
-                <div className="timeline-plan-grid">
-                  <div className="timeline-plan-section">
-                    <h4>Commands</h4>
-                    {executionPlan.commands.length ? executionPlan.commands.map((step, stepIndex) => (
-                      <div className="timeline-plan-row" key={`cmd-${index}-${stepIndex}`}>
-                        <pre className="result">{step}</pre>
-                        <button type="button" className="timeline-copy-btn" onClick={() => copyPlanStep(step)}>Copy</button>
-                      </div>
-                    )) : <p className="subtitle">No command steps.</p>}
-                  </div>
-                  <div className="timeline-plan-section">
-                    <h4>Scripts</h4>
-                    {executionPlan.scripts.length ? executionPlan.scripts.map((step, stepIndex) => (
-                      <div className="timeline-plan-row" key={`script-${index}-${stepIndex}`}>
-                        <pre className="result">{step}</pre>
-                        <button type="button" className="timeline-copy-btn" onClick={() => copyPlanStep(step)}>Copy</button>
-                      </div>
-                    )) : <p className="subtitle">No script steps.</p>}
-                  </div>
-                  <div className="timeline-plan-section">
-                    <h4>Queries</h4>
-                    {executionPlan.queries.length ? executionPlan.queries.map((step, stepIndex) => (
-                      <div className="timeline-plan-row" key={`query-${index}-${stepIndex}`}>
-                        <pre className="result">{step}</pre>
-                        <button type="button" className="timeline-copy-btn" onClick={() => copyPlanStep(step)}>Copy</button>
-                      </div>
-                    )) : <p className="subtitle">No validation queries.</p>}
-                  </div>
-                </div>
-              </details>
-            ) : null}
-            {row.errorValueText ? (
-              <details open>
-                <summary>Error</summary>
-                <pre className="result">{row.errorValueText}</pre>
-              </details>
-            ) : null}
-            <details>
-              <summary>How This Worked In Background</summary>
-              <pre className="result">{explainBackground(row, stageMeta)}</pre>
-            </details>
-            <div className="timeline-tags">
-              <span className="timeline-tag">in: {row.consumes || "-"}</span>
-              <span className="timeline-tag">out: {row.publishes || "-"}</span>
-              <span className="timeline-tag">db: {row.tables || "-"}</span>
-            </div>
-            <div className="timeline-backend-events">
-              <span className="timeline-backend-label">backend:</span>
-              {backendEvents.length ? backendEvents.map((eventName, eventIndex) => (
-                <span className="timeline-backend-chip" key={`backend-${index}-${eventIndex}`}>
-                  {eventName}
-                </span>
-              )) : <span className="timeline-backend-chip is-empty">none</span>}
-            </div>
-          </div>
-        </article>
-          );
-        })()
-      ))}
-      <article className="panel" style={{ marginTop: 10 }}>
-        <div className="panel-head">
-          <h3>Stage Summary Table</h3>
-          <p>Compact timeline view with phase, ownership, and status.</p>
-        </div>
-        <div className="table-wrap table-wrap-scroll-x">
-          <table>
-            <thead>
-              <tr>
-                <th>Phase</th>
-                <th>Stage</th>
-                <th>Agent</th>
-                <th>Elapsed</th>
-                <th>Status</th>
-                <th>Detail</th>
-              </tr>
-            </thead>
-            <tbody>
-              {compactRows.map((row) => (
-                <tr key={row.key}>
-                  <td>{row.phase}</td>
-                  <td>{row.stage}</td>
-                  <td>{row.agent}</td>
-                  <td>{row.elapsed}</td>
-                  <td><span className={`pill ${row.status === "error" ? "status-failed" : "status-approved"}`}>{row.status}</span></td>
-                  <td>{row.detail}</td>
-                </tr>
-              ))}
-              <tr>
-                <td colSpan={3}><strong>Total Alert Time</strong></td>
-                <td><strong>{totalElapsedDisplay}</strong></td>
-                <td>-</td>
-                <td>Cumulative elapsed time across all listed stages.</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-      </article>
-    </div>
-  );
-}
-
-function UnifiedIncidentTimeline({ workflow, rows, documents = [] }) {
-  const [expandedPhaseId, setExpandedPhaseId] = useState("");
-  const safeWorkflow = workflow && typeof workflow === "object" ? workflow : {};
-  const safeRows = Array.isArray(rows) ? rows : [];
-  const lanes = [
-    { id: "detect", icon: "↗", label: "Detect", hint: "Signal received", match: ["landing", "ingest", "alert", "monitor"] },
-    { id: "discover", icon: "⌕", label: "Discover", hint: "Evidence collected", match: ["discover", "ticket", "log", "trace", "code", "context"] },
-    { id: "diagnose", icon: "◇", label: "Diagnose", hint: "Cause assessed", match: ["resolution", "root cause", "rca", "impact", "model"] },
-    { id: "decide", icon: "✓", label: "Decide", hint: "Risk reviewed", match: ["approval", "decision", "policy", "risk"] },
-    { id: "act", icon: "⚡", label: "Act", hint: "Fix executed", match: ["remedi", "execute", "command", "action"] },
-    { id: "validate", icon: "◎", label: "Validate", hint: "Recovery confirmed", match: ["validat", "closure", "closed", "health restored"] },
-  ];
-  const assigned = new Set();
-  // Lane text is built from curated, human-readable fields only -- NOT the raw
-  // inputValueText/outputValueText JSON blobs, which almost always carry a trace_id
-  // (matches "discover"'s "trace" token) or similar incidental substrings and would
-  // otherwise pull unrelated events (e.g. ingestion/topic-handoff rows) into the wrong lane.
-  const laneText = (row) => [row?.status, row?.stage, row?.detail, row?.agent, row?.service, row?.consumes, row?.publishes]
-    .map((item) => String(item || "").toLowerCase())
-    .join(" ");
-  const laneRows = lanes.map((lane) => {
-    // A row is claimed by at most one lane: the first (in detect -> validate order) whose
-    // keywords match. Previously every lane re-tested every row independently, so a single
-    // event could match more than one lane's keywords and appear duplicated across phases.
-    const matched = safeRows.filter((row, index) => {
-      if (assigned.has(index)) {
-        return false;
-      }
-      const text = laneText(row);
-      const hit = lane.match.some((token) => text.includes(token));
-      if (hit) assigned.add(index);
-      return hit;
-    });
-    return { ...lane, rows: matched };
-  });
-  safeRows.forEach((row, index) => {
-    if (!assigned.has(index)) {
-      const target = laneRows[Math.min(laneRows.length - 1, Math.floor((index / Math.max(1, safeRows.length)) * laneRows.length))];
-      target.rows.push(row);
-    }
-  });
-  const recommendation = safeWorkflow?.recommendation || {};
-  const contextMetadata = recommendation?.metadata || safeWorkflow?.context?.metadata || {};
-  const retrievedSources = Array.from(new Set([
-    ...(Array.isArray(contextMetadata?.sources) ? contextMetadata.sources : []),
-    ...(Array.isArray(documents) ? documents.map((doc) => doc?.source || doc?.kind || doc?.path) : []),
-    ...safeRows.flatMap((row) => {
-      const text = timelineRowText(row).toLowerCase();
-      return [
-        text.includes("ticket") || text.includes("jira") ? "Jira / tickets" : "",
-        text.includes("log") || text.includes("opensearch") ? "Logs" : "",
-        text.includes("trace") || text.includes("jaeger") ? "Traces" : "",
-        text.includes("code") || text.includes("repository") ? "Source code" : "",
-        text.includes("prometheus") || text.includes("metric") ? "Metrics" : "",
-      ].filter(Boolean);
-    }),
-  ].map((value) => String(value || "").trim()).filter(Boolean)));
-  const expandedLane = laneRows.find((lane) => lane.id === expandedPhaseId && lane.rows.length) || null;
-
-  return (
-    <section className="unified-incident-timeline" aria-label="Unified incident timeline">
-      <header className="unified-timeline-header">
-        <div>
-          <span className="discovery-eyebrow">Live incident journey</span>
-          <h3>Signal to Recovery</h3>
-          <p>One ordered view joining ingestion, discovery, context retrieval, reasoning, approval, remediation, and validation.</p>
-        </div>
-        <div className="unified-timeline-stats">
-          <span><strong>{safeRows.length}</strong> events</span>
-          <span><strong>{retrievedSources.length}</strong> sources</span>
-          <span><strong>{laneRows.filter((lane) => lane.rows.length).length}</strong>/6 phases observed</span>
-        </div>
-      </header>
-      <div className="unified-source-strip">
-        <strong>Evidence</strong>
-        {retrievedSources.length
-          ? retrievedSources.map((source) => <span key={source}>{compactText(source, 42)}</span>)
-          : <span>Waiting for source evidence</span>}
-      </div>
-      <div className="timeline-phase-map">
-        {laneRows.map((lane, laneIndex) => {
-          const failed = lane.rows.some((row) => timelineRowHasError(row));
-          const fallback = lane.rows.some((row) => timelineRowStatus(row) === "fallback");
-          const status = failed ? "failed" : fallback ? "fallback" : lane.rows.length ? "complete" : "waiting";
-          const latest = lane.rows[lane.rows.length - 1] || {};
-          return (
-            <article className={`timeline-phase-card is-${status}`} key={lane.id}>
-              <div className="timeline-phase-top">
-                <span className="timeline-phase-icon" aria-hidden="true">{lane.icon}</span>
-                <span className="timeline-phase-number">{String(laneIndex + 1).padStart(2, "0")}</span>
-                <i className="timeline-phase-status">{status}</i>
-              </div>
-              <h4>{lane.label}</h4>
-              <p>{lane.hint}</p>
-              <div className="timeline-phase-summary">
-                <strong>{lane.rows.length}</strong>
-                <span>{lane.rows.length === 1 ? "event" : "events"}</span>
-              </div>
-              {lane.rows.length ? (
-                <div className="timeline-phase-latest">
-                  <strong>{compactText(latest.stage || latest.agent || latest.service || `${lane.label} event`, 60)}</strong>
-                  <p>{compactText(latest.detail || latest.outputValueText || latest.inputValueText, 140) || "No additional detail was recorded for this event."}</p>
-                  <small>
-                    {latest.agent || latest.service || "KaiOps"} · {formatIstTimestamp(latest.timestamp || latest.created_at)}
-                    {latest.status || timelineRowStatus(latest) ? ` · ${latest.status || timelineRowStatus(latest)}` : ""}
-                  </small>
-                </div>
-              ) : (
-                <small className="timeline-phase-latest timeline-phase-latest-empty">Not reached yet</small>
-              )}
-              {lane.rows.length ? (
-                <button
-                  type="button"
-                  className={`timeline-phase-toggle ${expandedPhaseId === lane.id ? "is-active" : ""}`}
-                  aria-expanded={expandedPhaseId === lane.id}
-                  aria-controls="timeline-event-panel"
-                  onClick={() => setExpandedPhaseId((current) => current === lane.id ? "" : lane.id)}
-                >
-                  {expandedPhaseId === lane.id ? "Hide events" : "View events"}
-                </button>
-              ) : null}
-            </article>
-          );
-        })}
-      </div>
-      {expandedLane ? (
-        <section className="timeline-event-panel" id="timeline-event-panel" aria-live="polite">
-          <header>
-            <div>
-              <span className="timeline-phase-icon" aria-hidden="true">{expandedLane.icon}</span>
-              <div>
-                <strong>{expandedLane.label} events</strong>
-                <small>{expandedLane.rows.length} recorded workflow event(s)</small>
-              </div>
-            </div>
-            <button type="button" className="button-secondary" onClick={() => setExpandedPhaseId("")}>Close</button>
-          </header>
-          <div className="timeline-event-list">
-            {expandedLane.rows.slice(0, 20).map((row, rowIndex) => (
-              <article key={`${expandedLane.id}-expanded-${rowIndex}`}>
-                <span className="timeline-event-index">{String(rowIndex + 1).padStart(2, "0")}</span>
-                <div>
-                  <header>
-                    <strong>{row.stage || row.agent || row.service || `Event ${rowIndex + 1}`}</strong>
-                    <span>{row.status || timelineRowStatus(row)}</span>
-                  </header>
-                  <p>{compactText(row.detail || row.outputValueText || row.inputValueText, 360) || "Stage completed."}</p>
-                  <small>
-                    {row.agent || row.service || "KaiOps"} · {formatIstTimestamp(row.timestamp || row.created_at)}
-                    {row.executionTimeMs || row.execution_time_ms ? ` · ${row.executionTimeMs || row.execution_time_ms} ms` : ""}
-                  </small>
-                </div>
-              </article>
-            ))}
-          </div>
-        </section>
-      ) : null}
-    </section>
-  );
-}
-
-function DiscoveryFlowView({ workflow, timelineRows = [], selectedAlert = null, compact = false }) {
-  const safeWorkflow = workflow && typeof workflow === "object" ? workflow : {};
-  const recommendation = safeWorkflow?.recommendation && typeof safeWorkflow.recommendation === "object"
-    ? safeWorkflow.recommendation
-    : {};
-  const recommendationMetadata = recommendation?.metadata && typeof recommendation.metadata === "object"
-    ? recommendation.metadata
-    : {};
-  const metadataCandidates = [
-    safeWorkflow?.context?.metadata,
-    safeWorkflow?.recommendation?.metadata,
-  ].filter((row) => row && typeof row === "object");
-  const tracePayloads = (Array.isArray(safeWorkflow.event_trace) ? safeWorkflow.event_trace : [])
-    .map((row) => row?.payload)
-    .filter((row) => row && typeof row === "object");
-  const eventContracts = [
-    ...(Array.isArray(safeWorkflow.events) ? safeWorkflow.events : []),
-    ...tracePayloads,
-  ]
-    .map((row) => row?.event_contract?.payload?.discovery || row?.payload?.discovery || row?.discovery)
-    .filter((row) => row && typeof row === "object");
-  const mcp = metadataCandidates.map((row) => row.discovery_report).find((row) => row && typeof row === "object") || {};
-  const contractDiscovery = eventContracts[0] || {};
-  const report =
-    (mcp.report && typeof mcp.report === "object" && mcp.report)
-    || contractDiscovery
-    || {};
-  const evidence =
-    (Array.isArray(mcp.evidence) && mcp.evidence)
-    || (Array.isArray(contractDiscovery.evidence) && contractDiscovery.evidence)
-    || [];
-  let stages =
-    (Array.isArray(mcp.retrieval_stages) && mcp.retrieval_stages)
-    || (Array.isArray(contractDiscovery.retrieval_stages) && contractDiscovery.retrieval_stages)
-    || [];
-  if (!stages.length) {
-    stages = (Array.isArray(timelineRows) ? timelineRows : [])
-      .filter((row) => String(row?.stage || "").toLowerCase().includes("discovery"))
-      .map((row) => ({
-        stage: row.stage,
-        status: row.errorValueText ? "failed" : "completed",
-        error: row.errorValueText || "",
-      }));
-  }
-  if (!stages.length && evidence.length) {
-    const sources = [...new Set(evidence.map((row) => row?.source).filter(Boolean))];
-    stages = [
-      { stage: "query_planned", status: "completed" },
-      ...sources.map((source) => ({ stage: `${source}_search`, status: "completed", result_count: evidence.filter((row) => row?.source === source).length })),
-      { stage: "evidence_correlated", status: "completed", result_count: evidence.length },
-    ];
-  }
-  const hypotheses = Array.isArray(report.hypotheses) ? report.hypotheses : [];
-  const modelInteraction =
-    (mcp.model_interaction && typeof mcp.model_interaction === "object" && mcp.model_interaction)
-    || (contractDiscovery.model_interaction && typeof contractDiscovery.model_interaction === "object" && contractDiscovery.model_interaction)
-    || {};
-  const sourceCounts = evidence.reduce((counts, row) => {
-    const source = String(row?.source || "other").toLowerCase();
-    counts[source] = (counts[source] || 0) + 1;
-    return counts;
-  }, {});
-  const rootCause = cleanRecommendationText(
-    recommendation?.root_cause,
-    report.summary || safeWorkflow?.alert?.description || selectedAlert?.description || "-"
-  );
-  const impact = cleanRecommendationText(
-    recommendation?.impact,
-    `${selectedAlert?.service || safeWorkflow?.alert?.service || "Selected service"} may have degraded availability, latency, or downstream workflow impact until mitigation is validated.`
-  );
-  const recommendedAction = cleanRecommendationText(recommendation?.recommended_action, "-");
-  const supportingReasonCandidates = [
-    ...(Array.isArray(recommendationMetadata?.reasoning_steps) ? recommendationMetadata.reasoning_steps : []),
-    ...(Array.isArray(recommendationMetadata?.reason_codes) ? recommendationMetadata.reason_codes : []),
-    ...(Array.isArray(recommendationMetadata?.causal_factors) ? recommendationMetadata.causal_factors : []),
-    ...hypotheses.flatMap((row) => Array.isArray(row?.supporting_evidence) ? row.supporting_evidence : []),
-    ...(Array.isArray(timelineRows) ? timelineRows : [])
-      .filter((row) => row?.errorValueText)
-      .map((row) => `${row.stage || "stage"}: ${row.errorValueText}`),
-  ]
-    .map((row) => compactText(row, 220))
-    .map((row) => String(row || "").trim())
-    .filter(Boolean);
-  const detailedReasons = Array.from(new Set(supportingReasonCandidates)).slice(0, 12);
-  const protocol = mcp.protocol || "mcp-jsonrpc-2.0";
-  const hasDiscovery = stages.length > 0 || evidence.length > 0 || Boolean(report.summary);
-  const sourceOrder = ["log", "ticket", "code", "mysql", "metric", "trace", "opensearch"];
-  const visibleSources = Array.from(new Set([...sourceOrder, ...Object.keys(sourceCounts)]))
-    .filter((source) => sourceCounts[source]);
-  const stageDetail = (stage) => {
-    const name = String(stage?.stage || "").toLowerCase();
-    if (name.includes("query_planned")) return "Build service, alert, environment, trace, scenario, application, and ticket search terms.";
-    if (name.includes("log_search") || name.includes("logs_search")) return "Search runtime and landing-pad logs and preserve matching lines with source URIs.";
-    if (name.includes("ticket_search") || name.includes("tickets_search")) return "Search Jira CSV, email, historical incidents, and landing-pad ticket content.";
-    if (name.includes("code_search")) return "Search the affected service source first, then the full project repository.";
-    if (name.includes("mysql_search")) return "Search KaiOps incident projections and related operational records.";
-    if (name.includes("telemetry_search")) return "Correlate Prometheus metrics, Jaeger traces, and OpenSearch logs by service and trace ID.";
-    if (name.includes("onboarding_context_merge")) return "Merge application ownership, environment, namespace, monitoring, and onboarding metadata into context.";
-    if (name.includes("evidence_correlated")) return "Deduplicate and rank facts while retaining evidence IDs and provenance.";
-    if (name.includes("llm_analysis")) return "Send only retrieved evidence to the model and require cited JSON RCA.";
-    if (name.includes("discovery_completed")) return "Publish grounded discovery context to downstream RCA and impact analysis.";
-    return "Execute the recorded discovery stage and preserve its input, status, and output.";
-  };
-
-  return (
-    <section className={`discovery-workspace ${compact ? "is-compact" : ""}`}>
-      {compact ? (
-        <header className="discovery-compact-head">
-          <h4>Discovery Agent Trace</h4>
-          <div className="discovery-kpis">
-            <span><strong>{stages.length}</strong> stages</span>
-            <span><strong>{evidence.length}</strong> evidence</span>
-            <span><strong>{hypotheses.length}</strong> hypotheses</span>
-            <span><strong>{protocol.includes("mcp") ? "MCP" : protocol}</strong> protocol</span>
-          </div>
-        </header>
-      ) : (
-        <header className="discovery-hero">
-          <div>
-            <span className="discovery-eyebrow">Evidence-grounded investigation</span>
-            <h3>Discovery Agent</h3>
-            <p>Dynamic retrieval from logs, tickets, and code followed by cited RCA reasoning.</p>
-          </div>
-          <div className="discovery-kpis">
-            <span><strong>{stages.length}</strong> stages</span>
-            <span><strong>{evidence.length}</strong> evidence</span>
-            <span><strong>{hypotheses.length}</strong> hypotheses</span>
-            <span><strong>{protocol.includes("mcp") ? "MCP" : protocol}</strong> protocol</span>
-          </div>
-        </header>
-      )}
-
-      {hasDiscovery ? (
-        <>
-          <div className="discovery-flow" aria-label="Dynamic discovery agent flow">
-            {stages.map((stage, index) => {
-              const state = String(stage.status || "completed").toLowerCase();
-              return (
-                <div className="discovery-flow-segment" key={`discovery-stage-${index}-${stage.stage || ""}`}>
-                  <article className={`discovery-stage is-${state}`}>
-                    <span className="discovery-stage-index">{index + 1}</span>
-                    <div>
-                      <strong>{String(stage.stage || `stage ${index + 1}`).replaceAll("_", " ")}</strong>
-                      <small>{state}{Number.isFinite(Number(stage.result_count)) ? ` · ${stage.result_count} result(s)` : ""}</small>
-                      <p className="discovery-stage-detail">{stageDetail(stage)}</p>
-                      {Number(stage.result_count) === 0 ? <small className="discovery-no-match">No matching evidence was returned by this source.</small> : null}
-                      {Array.isArray(stage.terms) && stage.terms.length ? <small>Query: {stage.terms.join(", ")}</small> : null}
-                      {stage.model ? <small>Model: {stage.model}</small> : null}
-                      {stage.error ? <p>{stage.error}</p> : null}
-                    </div>
-                  </article>
-                  {index < stages.length - 1 ? <span className="discovery-connector" aria-hidden="true">↓</span> : null}
-                </div>
-              );
-            })}
-          </div>
-
-          <div className="discovery-grid">
-            <article className="discovery-panel">
-              <div className="panel-head">
-                <h4>RCA synthesis</h4>
-                <p>{report.model ? `Model: ${report.model}` : "Model details not reported"}</p>
-              </div>
-              <p className="discovery-summary">{report.summary || "Retrieval completed; no synthesis summary was returned."}</p>
-              {hypotheses.length ? hypotheses.map((row, index) => (
-                <div className="discovery-hypothesis" key={`discovery-hypothesis-${index}`}>
-                  <strong>{row.cause || `Hypothesis ${index + 1}`}</strong>
-                  <span>{Math.round(Number(row.confidence || 0) * 100)}% confidence</span>
-                  <small>Evidence: {(row.supporting_evidence || []).join(", ") || "not cited"}</small>
-                </div>
-              )) : (
-                <p className="subtitle">{report.insufficient_evidence ? "Insufficient evidence for a defensible root-cause hypothesis." : "No hypothesis was returned."}</p>
-              )}
-            </article>
-
-            <article className="discovery-panel">
-              <div className="panel-head">
-                <h4>What Was Retrieved From Each Source</h4>
-                <p>Every fact retains its source, search match, URI, location, and content hash.</p>
-              </div>
-              <div className="discovery-source-grid">
-                {visibleSources.map((source) => (
-                  <div key={`source-${source}`}>
-                    <strong>{sourceCounts[source] || 0}</strong>
-                    <span>{source}</span>
-                  </div>
-                ))}
-              </div>
-              <div className="discovery-evidence-list">
-                {evidence.map((row, index) => (
-                  <details key={`evidence-${row.evidence_id || index}`}>
-                    <summary><strong>{row.evidence_id || `EVIDENCE-${index + 1}`}</strong> · {row.source || "source"}</summary>
-                    <small>{row.uri || row.path || "No source URI"}</small>
-                    <pre className="result">{row.snippet || "No evidence snippet returned."}</pre>
-                    {Array.isArray(row.matched_terms) && row.matched_terms.length ? <small>Matched: {row.matched_terms.join(", ")}</small> : null}
-                    {row.sha256 ? <small>Content hash: {row.sha256}</small> : null}
-                  </details>
-                ))}
-                {!evidence.length ? <p className="subtitle">No cited evidence was returned for this run.</p> : null}
-              </div>
-            </article>
-
-            <article className="discovery-panel discovery-model-panel">
-              <div className="panel-head">
-                <h4>Prompt And Response Received</h4>
-                <p>{modelInteraction.model ? `${modelInteraction.provider || "provider"} · ${modelInteraction.model}` : "Available for newly processed alerts"}</p>
-              </div>
-              {modelInteraction.prompt ? (
-                <>
-                  <div className="discovery-message-label">Prompt</div>
-                  <pre className="result discovery-message">{modelInteraction.prompt}</pre>
-                  <details>
-                    <summary>Request payload sent with the prompt</summary>
-                    <pre className="result discovery-message">{JSON.stringify(modelInteraction.request_payload || {}, null, 2)}</pre>
-                  </details>
-                  <div className="discovery-message-label">Response received</div>
-                  <pre className="result discovery-message">{typeof modelInteraction.response_received === "string"
-                    ? modelInteraction.response_received
-                    : JSON.stringify(modelInteraction.response_received ?? modelInteraction.parsed_response ?? {}, null, 2)}</pre>
-                  {modelInteraction.usage && Object.keys(modelInteraction.usage).length ? (
-                    <small>Usage: {JSON.stringify(modelInteraction.usage)}</small>
-                  ) : null}
-                </>
-              ) : (
-                <p className="subtitle">This alert predates prompt auditing. Reprocess it to capture the exact prompt, evidence payload, model, and response.</p>
-              )}
-            </article>
-
-            <article className="discovery-panel discovery-outcome-panel">
-              <div className="panel-head">
-                <h4>Detailed RCA and Impact</h4>
-                <p>Root cause, impact scope, and explicit reasoning signals merged from discovery and context metadata.</p>
-              </div>
-              <div className="table-wrap table-wrap-scroll-x">
-                <table>
-                  <tbody>
-                    <tr><th>Root Cause</th><td>{rootCause}</td></tr>
-                    <tr><th>Impact</th><td>{impact}</td></tr>
-                    <tr><th>Recommended Action</th><td>{recommendedAction}</td></tr>
-                  </tbody>
-                </table>
-              </div>
-              {detailedReasons.length ? (
-                <div>
-                  <h5 style={{ margin: "8px 0 6px" }}>Reason Breakdown</h5>
-                  <ul style={{ margin: 0, paddingLeft: 18 }}>
-                    {detailedReasons.map((reason, index) => (
-                      <li key={`discovery-reason-${index}`}>{reason}</li>
-                    ))}
-                  </ul>
-                </div>
-              ) : (
-                <p className="subtitle">No explicit reason trace was returned by this run.</p>
-              )}
-            </article>
-          </div>
-        </>
-      ) : (
-        <div className="discovery-empty">
-          <strong>No Discovery Agent trace exists for this alert.</strong>
-          <p>Process a fresh alert after the MCP deployment. This view will construct itself from the stages and evidence returned by that run.</p>
-        </div>
-      )}
-    </section>
-  );
-}
-
-function parseStructuredIntelligence(value) {
-  if (value && typeof value === "object" && !Array.isArray(value)) {
-    return value;
-  }
-  const text = String(value || "").trim();
-  if (!text) {
-    return null;
-  }
-  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  const candidates = [fenced?.[1], text];
-  const firstBrace = text.indexOf("{");
-  const lastBrace = text.lastIndexOf("}");
-  if (firstBrace >= 0 && lastBrace > firstBrace) {
-    candidates.push(text.slice(firstBrace, lastBrace + 1));
-  }
-  for (const candidate of candidates.filter(Boolean)) {
-    try {
-      const parsed = JSON.parse(candidate);
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        return parsed;
-      }
-    } catch (_error) {
-      // Continue through compatible legacy model-response shapes.
-    }
-  }
-  return null;
-}
-
-function intelligenceListText(value) {
-  if (Array.isArray(value)) {
-    return value
-      .map((item) => {
-        if (item && typeof item === "object") {
-          return item.snippet || item.summary || item.evidence_id || item.id || Object.values(item).filter(Boolean).join(": ");
-        }
-        return String(item || "").trim();
-      })
-      .filter(Boolean)
-      .join("; ");
-  }
-  if (value && typeof value === "object") {
-    return Object.entries(value)
-      .map(([key, item]) => `${key.replaceAll("_", " ")}: ${intelligenceListText(item)}`)
-      .join("; ");
-  }
-  return String(value || "").trim();
-}
-
-function groundedIntelligenceDisplay(label, value, structuredOverride) {
-  // structuredOverride is recommendation.metadata.grounding — the RCA
-  // model's full structured response (evidence_used/alternative_causes/
-  // missing_evidence/grounding_notes/confidence_score), preserved
-  // server-side instead of being discarded. root_cause itself is always
-  // plain text (never JSON), so it isn't in this object — headline still
-  // falls back to `value` below.
-  const hasOverride =
-    structuredOverride &&
-    typeof structuredOverride === "object" &&
-    Object.values(structuredOverride).some((entry) => entry !== null && entry !== undefined && entry !== "");
-  const parsed = hasOverride ? { ...(parseStructuredIntelligence(value) || {}), ...structuredOverride } : parseStructuredIntelligence(value);
-  if (!parsed) {
-    return { headline: cleanRecommendationText(value, `No ${label.toLowerCase()} was produced.`), details: [] };
-  }
-  const isRca = label === "RCA";
-  const isImpact = label === "Impact";
-  const headline = String(
-    isRca
-      ? parsed.root_cause || parsed.cause || parsed.summary || value
-      : isImpact
-        ? parsed.impact_summary || parsed.service_impact || parsed.customer_impact || parsed.severity_rationale || parsed.summary
-        : parsed.recommended_action || parsed.action || parsed.summary
-  ).trim() || `No ${label.toLowerCase()} was produced.`;
-  const detailCandidates = isRca
-    ? [
-        ["Evidence used", parsed.evidence_used],
-        ["Alternative causes", parsed.alternative_causes],
-        ["Missing evidence", parsed.missing_evidence],
-        ["Grounding notes", parsed.grounding_notes],
-      ]
-    : isImpact
-      ? [
-          ["Impacted services", parsed.impacted_services],
-          ["Customer impact", parsed.customer_impact],
-          ["Dependency impact", parsed.dependency_impact],
-          ["Blast radius", parsed.blast_radius],
-          ["Evidence used", parsed.evidence_used],
-          ["Missing evidence", parsed.missing_evidence],
-          ["Assumptions", parsed.assumptions],
-        ]
-      : [
-          ["Why", parsed.why_this_action],
-          ["Validation", parsed.validation_queries],
-          ["Rollback", parsed.rollback_plan],
-          ["Missing evidence", parsed.missing_evidence],
-        ];
-  const details = detailCandidates
-    .map(([detailLabel, detailValue]) => ({ label: detailLabel, value: intelligenceListText(detailValue) }))
-    .filter((item) => item.value);
-  const confidence = Number(parsed.confidence_score);
-  if (Number.isFinite(confidence) && confidence >= 0) {
-    details.push({ label: "Confidence", value: `${Math.round(confidence * 100)}%` });
-  }
-  return { headline, details };
-}
-
-function canonicalIncidentAnalysis(workflow, alertRow = null) {
-  const safeWorkflow = workflow && typeof workflow === "object" ? workflow : {};
-  const recommendation = safeWorkflow.recommendation && typeof safeWorkflow.recommendation === "object"
-    ? safeWorkflow.recommendation
-    : {};
-  const metadata = recommendation.metadata && typeof recommendation.metadata === "object"
-    ? recommendation.metadata
-    : {};
-  const contextMetadata = safeWorkflow?.context?.metadata && typeof safeWorkflow.context.metadata === "object"
-    ? safeWorkflow.context.metadata
-    : {};
-  const discovery = contextMetadata.discovery_report && typeof contextMetadata.discovery_report === "object"
-    ? contextMetadata.discovery_report
-    : {};
-  const report = discovery.report && typeof discovery.report === "object" ? discovery.report : {};
-  const hypotheses = Array.isArray(report.hypotheses) ? report.hypotheses : [];
-  const rca = metadata.rca_analysis && typeof metadata.rca_analysis === "object" ? metadata.rca_analysis : {};
-  const impact = metadata.impact_analysis && typeof metadata.impact_analysis === "object" ? metadata.impact_analysis : {};
-  const remediation = metadata.remediation_analysis && typeof metadata.remediation_analysis === "object"
-    ? metadata.remediation_analysis
-    : {};
-  const confirmedRootCause = cleanRecommendationText(rca.root_cause || recommendation.root_cause, "");
-  const hypothesis = hypotheses.find((item) => item && item.cause);
-  const rootCause = confirmedRootCause
-    || (hypothesis ? `Hypothesis (not confirmed): ${cleanRecommendationText(hypothesis.cause, "")}` : "")
-    || "RCA pending: available evidence is insufficient for a grounded conclusion.";
-  const explicitImpact = cleanRecommendationText(
-    impact.impact_summary
-      || impact.customer_impact
-      || impact.service_impact
-      || recommendation.impact,
-    "",
-  );
-  const action = cleanRecommendationText(remediation.recommended_action || recommendation.recommended_action, "");
-  const externalKnowledgeUsed = Boolean(
-    rca.external_knowledge_used
-      || report.external_knowledge_used
-      || metadata.external_knowledge_used
-  );
-  const externalKnowledgeEligible = Boolean(
-    report.external_knowledge_eligible
-      || metadata.external_knowledge_eligible
-  );
-  const externalKnowledgeError = cleanRecommendationText(
-    report.external_knowledge_error || metadata.external_knowledge_error,
-    "",
-  );
-  return {
-    rootCause,
-    impact: explicitImpact || "Impact not established from current evidence.",
-    action: action || "Recommended action pending grounded RCA.",
-    rca,
-    impactAnalysis: impact,
-    remediation,
-    status: confirmedRootCause ? "resolved-analysis" : hypothesis ? "hypothesis" : "insufficient-evidence",
-    confidence: Number(recommendation.confidence ?? rca.confidence_score ?? hypothesis?.confidence ?? 0),
-    externalKnowledgeUsed,
-    externalKnowledgeEligible,
-    externalKnowledgeError,
-    externalKnowledgeStatus: externalKnowledgeUsed
-      ? "used"
-      : externalKnowledgeError
-        ? `failed: ${externalKnowledgeError}`
-        : externalKnowledgeEligible
-          ? "eligible; no configured external evidence returned"
-          : "not required",
-    externalToolsUsed: Array.isArray(metadata.external_tools_used)
-      ? metadata.external_tools_used
-      : Array.isArray(report.external_tools_used)
-        ? report.external_tools_used
-        : [],
-    service: alertRow?.service || safeWorkflow?.alert?.service || recommendation?.metadata?.service || "unknown",
-  };
-}
-
-function downloadInvestigationArtifact(filename, payload) {
-  const safeName = String(filename || "kaiops-investigation.json")
-    .replace(/[^a-z0-9._-]+/gi, "-")
-    .replace(/-+/g, "-")
-    .toLowerCase();
-  const content = typeof payload === "string" ? payload : JSON.stringify(payload, null, 2);
-  const blob = new Blob([content], {
-    type: typeof payload === "string" ? "text/plain;charset=utf-8" : "application/json;charset=utf-8",
-  });
-  const objectUrl = URL.createObjectURL(blob);
-  const anchor = document.createElement("a");
-  anchor.href = objectUrl;
-  anchor.download = safeName;
-  document.body.appendChild(anchor);
-  anchor.click();
-  anchor.remove();
-  URL.revokeObjectURL(objectUrl);
-}
-
-function IntelligenceConnectionView({ workflow, documents = [], onDownloadDocument }) {
-  const safeWorkflow = workflow && typeof workflow === "object" ? workflow : {};
-  const context = safeWorkflow.context && typeof safeWorkflow.context === "object" ? safeWorkflow.context : {};
-  const metadata = context.metadata && typeof context.metadata === "object" ? context.metadata : {};
-  const discovery = metadata.discovery_report && typeof metadata.discovery_report === "object" ? metadata.discovery_report : {};
-  const report = discovery.report && typeof discovery.report === "object" ? discovery.report : {};
-  const evidence = Array.isArray(discovery.evidence) ? discovery.evidence : [];
-  const recommendation = safeWorkflow.recommendation && typeof safeWorkflow.recommendation === "object"
-    ? safeWorkflow.recommendation
-    : {};
-  const canonicalAnalysis = canonicalIncidentAnalysis(safeWorkflow);
-  const ragMatches = Array.isArray(metadata.rag_matches) ? metadata.rag_matches : [];
-  const sourceCounts = evidence.reduce((result, item) => {
-    const source = String(item?.source || "other").toLowerCase();
-    result[source] = (result[source] || 0) + 1;
-    return result;
-  }, {});
-  const contextItems = [
-    context.deployment ? { label: "Deployment", value: context.deployment, source: "Jenkins / alert / RAG deployment" } : null,
-    Array.isArray(context.dependency_services) && context.dependency_services.length
-      ? { label: "Dependencies", value: context.dependency_services.join(", "), source: "CMDB + dependency documents" }
-      : null,
-    Array.isArray(context.related_incidents) && context.related_incidents.length
-      ? { label: "Related incidents", value: `${context.related_incidents.length} historical incident(s)`, source: "RAG incident search" }
-      : null,
-    Array.isArray(context.recent_changes) && context.recent_changes.length
-      ? { label: "Recent changes", value: `${context.recent_changes.length} change record(s)`, source: "ServiceNow + GitHub + RAG changes" }
-      : null,
-    context.runbook ? { label: "Runbook", value: compactText(context.runbook, 180), source: "RAG runbook retrieval" } : null,
-    ragMatches.length ? { label: "Ranked documents", value: `${ragMatches.length} semantic/metadata match(es)`, source: "Vector and metadata search" } : null,
-    evidence.length ? { label: "Discovery evidence", value: `${evidence.length} grounded fact(s)`, source: "Discovery MCP" } : null,
-  ].filter(Boolean);
-  const hypotheses = Array.isArray(report.hypotheses) ? report.hypotheses : [];
-  const recommendationMetadata = recommendation.metadata && typeof recommendation.metadata === "object"
-    ? recommendation.metadata
-    : {};
-  const rcaAnalysis = recommendationMetadata.rca_analysis && typeof recommendationMetadata.rca_analysis === "object"
-    ? recommendationMetadata.rca_analysis
-    : {};
-  const impactAnalysis = recommendationMetadata.impact_analysis && typeof recommendationMetadata.impact_analysis === "object"
-    ? recommendationMetadata.impact_analysis
-    : {};
-  const remediationAnalysis = recommendationMetadata.remediation_analysis && typeof recommendationMetadata.remediation_analysis === "object"
-    ? recommendationMetadata.remediation_analysis
-    : {};
-  const detectedErrors = Array.isArray(report.detected_errors)
-    ? report.detected_errors
-    : Array.isArray(discovery.detected_errors)
-      ? discovery.detected_errors
-      : Array.isArray(recommendationMetadata.detected_errors)
-        ? recommendationMetadata.detected_errors
-        : [];
-  const supportingIds = Array.from(new Set([
-    ...(Array.isArray(report.citations) ? report.citations : []),
-    ...hypotheses.flatMap((item) => Array.isArray(item?.supporting_evidence) ? item.supporting_evidence : []),
-    // evidence_used entries are sometimes descriptive objects ({source,
-    // details}), not evidence-ID strings — the RCA prompt schema allows
-    // both. Only string entries belong in the citation-ID list; spreading
-    // objects in here made them hit .join() below and render as the
-    // literal text "[object Object]".
-    ...(Array.isArray(rcaAnalysis.evidence_used) ? rcaAnalysis.evidence_used.filter((item) => typeof item === "string") : []),
-    ...(Array.isArray(impactAnalysis.evidence_used) ? impactAnalysis.evidence_used.filter((item) => typeof item === "string") : []),
-    ...detectedErrors.map((item) => item?.evidence_id),
-  ].filter(Boolean)));
-  const queryTerms = Array.isArray(discovery.query_terms)
-    ? discovery.query_terms
-    : Array.isArray(metadata.query_terms)
-      ? metadata.query_terms
-      : [];
-  const recentChanges = Array.isArray(context.recent_changes) ? context.recent_changes : [];
-  const dependencies = Array.isArray(context.dependency_services) ? context.dependency_services : [];
-  const relatedIncidents = Array.isArray(context.related_incidents) ? context.related_incidents : [];
-  const reasoningConfidence = Number(
-    recommendation.confidence
-    ?? rcaAnalysis.confidence_score
-    ?? report.confidence_score
-    ?? 0
-  );
-  const storyStages = [
-    {
-      id: "signal",
-      number: "01",
-      eyebrow: "Question formed",
-      title: "Alert becomes a search plan",
-      summary: "Service, alert name, environment, symptoms, and scenario are converted into focused retrieval terms.",
-      metric: queryTerms.length || "Auto",
-      metricLabel: queryTerms.length === 1 ? "query term" : "query terms",
-      tags: queryTerms.slice(0, 5),
-      tone: "blue",
-    },
-    {
-      id: "discover",
-      number: "02",
-      eyebrow: "Read-only discovery",
-      title: "Tools return source facts",
-      summary: "Logs, tickets, traces, metrics, and code are searched. Every useful fact keeps its source and immutable evidence ID.",
-      metric: evidence.length,
-      metricLabel: evidence.length === 1 ? "grounded fact" : "grounded facts",
-      tags: Object.entries(sourceCounts).map(([source, count]) => `${source} ${count}`).slice(0, 5),
-      tone: "violet",
-    },
-    {
-      id: "context",
-      number: "03",
-      eyebrow: "Context retrieval",
-      title: "Facts are connected to operations",
-      summary: "Semantic and metadata search rank documents, then merge dependencies, recent changes, related incidents, and runbook guidance.",
-      metric: ragMatches.length || documents.length,
-      metricLabel: "ranked documents",
-      tags: [
-        dependencies.length ? `${dependencies.length} dependencies` : "",
-        recentChanges.length ? `${recentChanges.length} changes` : "",
-        relatedIncidents.length ? `${relatedIncidents.length} incidents` : "",
-        context.runbook ? "runbook found" : "",
-      ].filter(Boolean),
-      tone: "green",
-    },
-    {
-      id: "reason",
-      number: "04",
-      eyebrow: "Grounded reasoning",
-      title: "RCA and impact are derived",
-      summary: "The reasoning agent compares hypotheses against collected context, retains alternatives and missing evidence, and cites supporting facts.",
-      metric: Number.isFinite(reasoningConfidence) && reasoningConfidence > 0 ? `${Math.round(reasoningConfidence * 100)}%` : supportingIds.length,
-      metricLabel: Number.isFinite(reasoningConfidence) && reasoningConfidence > 0 ? "confidence" : "citations",
-      tags: supportingIds.slice(0, 4),
-      tone: "orange",
-    },
-    {
-      id: "act",
-      number: "05",
-      eyebrow: "Decision ready",
-      title: "Evidence becomes an action",
-      summary: "RCA, impact, and safety constraints produce an operator-readable recommendation for approval, execution, and validation.",
-      metric: recommendation.recommended_action ? "Ready" : "Pending",
-      metricLabel: "recommended action",
-      tags: ["approval gate", "guarded execution", "recovery validation"],
-      tone: "red",
-    },
-  ];
-  const outputs = [
-    {
-      label: "RCA",
-      value: Object.keys(rcaAnalysis).length
-        ? rcaAnalysis
-        : recommendation.root_cause || (hypotheses[0] && {
-            root_cause: hypotheses[0].cause,
-            evidence_used: hypotheses[0].supporting_evidence,
-            alternative_causes: hypotheses.slice(1).map((item) => item.cause),
-            confidence_score: hypotheses[0].confidence,
-            grounding_notes: report.summary,
-          }) || canonicalAnalysis.rootCause,
-    },
-    {
-      label: "Impact",
-      value: Object.keys(impactAnalysis).length
-        ? impactAnalysis
-        : recommendation.impact || report.impact || canonicalAnalysis.impact,
-    },
-    {
-      label: "Recommended action",
-      value: Object.keys(remediationAnalysis).length
-        ? remediationAnalysis
-        : recommendation.recommended_action || (Array.isArray(report.recommended_next_checks)
-          ? {
-              recommended_action: report.recommended_next_checks[0],
-              validation_queries: report.recommended_next_checks.slice(1),
-              missing_evidence: report.insufficient_evidence ? ["Resolution Agent output is not available yet."] : [],
-            }
-          : canonicalAnalysis.action),
-    },
-  ].map((item) => ({
-    ...item,
-    display: groundedIntelligenceDisplay(item.label, item.value, item.label === "RCA" ? recommendation.metadata?.grounding : null),
-  }));
-  const investigationPackage = {
-    generated_at: new Date().toISOString(),
-    alert: safeWorkflow.alert || {},
-    incident: safeWorkflow.incident || {},
-    query_plan: { query_terms: queryTerms, retrieval_stages: discovery.retrieval_stages || [] },
-    discovery_evidence: evidence,
-    assembled_context: context,
-    ranked_documents: ragMatches,
-    linked_documents: documents,
-    hypotheses,
-    detected_errors: detectedErrors,
-    citations: supportingIds,
-    recommendation,
-  };
-  const stageArtifact = (stageId) => {
-    if (stageId === "signal") return investigationPackage.query_plan;
-    if (stageId === "discover") return { source_counts: sourceCounts, evidence };
-    if (stageId === "context") return { context, ranked_documents: ragMatches, linked_documents: documents };
-    if (stageId === "reason") {
-      return {
-        report,
-        hypotheses,
-        citations: supportingIds,
-        rca_analysis: rcaAnalysis,
-        impact_analysis: impactAnalysis,
-        root_cause: recommendation.root_cause,
-        impact: recommendation.impact,
-      };
-    }
-    return {
-      recommended_action: recommendation.recommended_action,
-      remediation_analysis: remediationAnalysis,
-      preventive_action: recommendation.preventive_action,
-      validation: recommendation.validation || report.recommended_next_checks || [],
-      approval: safeWorkflow.approval || {},
-    };
-  };
-
-  return (
-    <section className="intelligence-connection">
-      <header>
-        <div>
-          <span className="discovery-eyebrow">Connected data lineage</span>
-          <h3>Discovery Evidence → Context Assembly → RCA & Impact</h3>
-          <p>This is the handoff between the two agents. Only retrieved evidence and assembled context should support downstream conclusions.</p>
-        </div>
-        <div className="intelligence-header-actions">
-          <span className={`workflow-pill ${evidence.length || contextItems.length ? "workflow-pill-active" : "workflow-pill-idle"}`}>
-            {evidence.length || contextItems.length ? "connected" : "no context"}
-          </span>
-          <button type="button" className="button-primary" onClick={() => downloadInvestigationArtifact("kaiops-complete-investigation.json", investigationPackage)}>
-            Download complete investigation
-          </button>
-        </div>
-      </header>
-      <div className="investigation-story">
-        <div className="investigation-story-intro">
-          <span>How KaiOps reached this conclusion</span>
-          <strong>Every conclusion moves through an observable, evidence-backed handoff.</strong>
-        </div>
-        <div className="investigation-story-track">
-          {storyStages.map((stage, index) => (
-            <div className="investigation-story-segment" key={stage.id}>
-              <article className={`investigation-story-card tone-${stage.tone}`}>
-                <header>
-                  <span className="investigation-story-number">{stage.number}</span>
-                  <div>
-                    <small>{stage.eyebrow}</small>
-                    <h4>{stage.title}</h4>
-                  </div>
-                </header>
-                <p>{stage.summary}</p>
-                <div className="investigation-story-metric">
-                  <strong>{stage.metric}</strong>
-                  <span>{stage.metricLabel}</span>
-                </div>
-                <div className="investigation-story-tags">
-                  {stage.tags.length
-                    ? stage.tags.map((tag) => <span key={`${stage.id}-${tag}`}>{compactText(tag, 30)}</span>)
-                    : <span>Awaiting persisted data</span>}
-                </div>
-                <button
-                  type="button"
-                  className="investigation-download-button"
-                  onClick={() => downloadInvestigationArtifact(`kaiops-${stage.number}-${stage.id}.json`, stageArtifact(stage.id))}
-                >
-                  Download {stage.id === "discover" ? "evidence & logs" : stage.id === "context" ? "context & documents" : stage.id === "reason" ? "RCA & impact" : stage.id === "act" ? "action plan" : "search plan"}
-                </button>
-              </article>
-              {index < storyStages.length - 1 ? (
-                <div className="investigation-story-handoff" aria-hidden="true">
-                  <i>→</i>
-                  <small>{index === 0 ? "query" : index === 1 ? "evidence" : index === 2 ? "context" : "decision"}</small>
-                </div>
-              ) : null}
-            </div>
-          ))}
-        </div>
-      </div>
-      <div className="intelligence-lineage-heading">
-        <span className="discovery-eyebrow">Live lineage from this alert</span>
-        <h4>Inspect exactly what entered each stage</h4>
-        <p>Source facts are shown on the left, assembled operational context in the middle, and the derived conclusions on the right.</p>
-      </div>
-      <div className="intelligence-connection-flow">
-        <article className="intelligence-column intelligence-discovery-column">
-          <span className="intelligence-column-step">1</span>
-          <h4>Issues and facts discovered</h4>
-          <p className="subtitle">Raw facts with immutable evidence IDs and source provenance.</p>
-          <div className="intelligence-source-list">
-            {Object.entries(sourceCounts).map(([source, count]) => (
-              <div key={`lineage-source-${source}`}><strong>{count}</strong><span>{source}</span></div>
-            ))}
-            {!Object.keys(sourceCounts).length ? <small>No MCP evidence stored for this alert.</small> : null}
-          </div>
-          {evidence.slice(0, 6).map((item, index) => (
-            <div className="intelligence-fact" key={`lineage-evidence-${item.evidence_id || index}`}>
-              <strong>{item.evidence_id || `FACT-${index + 1}`}</strong>
-              <span>{item.source || "source"} · {compactText(item.snippet, 150)}</span>
-              <button
-                type="button"
-                className="intelligence-inline-download"
-                onClick={() => downloadInvestigationArtifact(`kaiops-${item.source || "evidence"}-${item.evidence_id || index + 1}.json`, item)}
-              >
-                Download {String(item.source || "evidence").toLowerCase()}
-              </button>
-            </div>
-          ))}
-        </article>
-        <span className="intelligence-handoff" aria-hidden="true">→</span>
-        <article className="intelligence-column intelligence-context-column">
-          <span className="intelligence-column-step">2</span>
-          <h4>Context Intelligence assembled</h4>
-          <p className="subtitle">Operational context merged with Discovery evidence before reasoning.</p>
-          {contextItems.map((item) => (
-            <div className="intelligence-context-item" key={`context-item-${item.label}`}>
-              <strong>{item.label}</strong>
-              <span>{item.value}</span>
-              <small>Retrieved from: {item.source}</small>
-            </div>
-          ))}
-          {!contextItems.length ? <p className="subtitle">No structured context payload is attached to this alert.</p> : null}
-        </article>
-        <span className="intelligence-handoff" aria-hidden="true">→</span>
-        <article className="intelligence-column intelligence-output-column">
-          <span className="intelligence-column-step">3</span>
-          <h4>Grounded intelligence produced</h4>
-          <p className="subtitle">RCA, impact, and action generated from the context shown to the left.</p>
-          {detectedErrors.length ? (
-            <div className="intelligence-output-item">
-              <strong>Detected application errors ({detectedErrors.length})</strong>
-              {detectedErrors.map((error, index) => (
-                <div className="intelligence-fact" key={`detected-error-${error?.evidence_id || index}`}>
-                  <strong>{error?.service || error?.container || `Application error ${index + 1}`}</strong>
-                  <span>{compactText(error?.message, 320)}</span>
-                  <small>
-                    {[error?.timestamp, ...(Array.isArray(error?.signals) ? error.signals : []), error?.evidence_id]
-                      .filter(Boolean)
-                      .join(" · ")}
-                  </small>
-                </div>
-              ))}
-              <button
-                type="button"
-                className="intelligence-inline-download"
-                onClick={() => downloadInvestigationArtifact("kaiops-detected-application-errors.json", detectedErrors)}
-              >
-                Download detected errors
-              </button>
-            </div>
+          {paddingBottom > 0 ? (
+            <tr aria-hidden="true" style={{ height: paddingBottom }}>
+              <td colSpan={11} style={{ padding: 0, border: 0 }} />
+            </tr>
           ) : null}
-          {outputs.map((item) => (
-            <div className="intelligence-output-item" key={`output-${item.label}`}>
-              <strong>{item.label}</strong>
-              <span>{item.display.headline}</span>
-              {item.display.details.length ? (
-                <dl className="intelligence-output-details">
-                  {item.display.details.map((detail) => (
-                    <div key={`${item.label}-${detail.label}`}>
-                      <dt>{detail.label}</dt>
-                      <dd>{detail.value}</dd>
-                    </div>
-                  ))}
-                </dl>
-              ) : null}
-              <button
-                type="button"
-                className="intelligence-inline-download"
-                onClick={() => downloadInvestigationArtifact(`kaiops-${item.label}.json`, {
-                  type: item.label,
-                  value: item.value,
-                  display: item.display,
-                  citations: supportingIds,
-                })}
-              >
-                Download {item.label}
-              </button>
-            </div>
-          ))}
-          <div className="intelligence-citations">
-            <strong>Supporting evidence IDs</strong>
-            <span>{supportingIds.join(", ") || "No explicit citations returned"}</span>
-          </div>
-          <div className="intelligence-document-downloads">
-            <strong>{documents.length} linked document(s)</strong>
-            {documents.length ? (
-              <button
-                type="button"
-                className="button-primary"
-                onClick={() => downloadInvestigationArtifact("kaiops-linked-document-package.json", {
-                  documents,
-                  ranked_matches: ragMatches,
-                  assembled_context: context,
-                })}
-              >
-                Download all documents + context
-              </button>
-            ) : null}
-            {documents.slice(0, 6).map((doc, index) => (
-              <button
-                type="button"
-                className="button-secondary"
-                key={`intelligence-download-${doc?.path || doc?.document_id || doc?.title || index}`}
-                disabled={!doc?.path && !doc?.content && !doc?.summary && !doc?.recommended_action}
-                onClick={() => onDownloadDocument && onDownloadDocument(doc)}
-              >
-                Download {compactText(doc?.title || doc?.path || `Document ${index + 1}`, 34)}
-              </button>
-            ))}
-            {!documents.length ? <small>No alert-linked document is available yet.</small> : null}
-          </div>
-        </article>
-      </div>
-    </section>
-  );
-}
-
-function ContextRetrievalGraph({ workflow, timelineRows, documents, evaluation, documentContract, onLoadDocumentContent, onDownloadDocument, compact = false }) {
-  const [documentPreviewState, setDocumentPreviewState] = useState({ key: "", loading: false, content: null, error: "" });
-  const safeWorkflow = workflow && typeof workflow === "object" ? workflow : {};
-  const safeTimelineRows = Array.isArray(timelineRows) ? timelineRows : [];
-  const safeDocuments = Array.isArray(documents) ? documents : [];
-  const recommendation = safeWorkflow.recommendation && typeof safeWorkflow.recommendation === "object" ? safeWorkflow.recommendation : {};
-  const recommendationMetadata = recommendation.metadata && typeof recommendation.metadata === "object" ? recommendation.metadata : {};
-  const context = safeWorkflow.context && typeof safeWorkflow.context === "object" ? safeWorkflow.context : {};
-  const contextMetadata = context.metadata && typeof context.metadata === "object" ? context.metadata : {};
-  const contextTraceRow = safeTimelineRows
-    .slice()
-    .reverse()
-    .find((row) => {
-      const text = `${row?.stage || ""} ${row?.service || ""} ${row?.agent || ""} ${row?.outputValueText || ""}`.toLowerCase();
-      return text.includes("context") || text.includes("rag") || text.includes("semantic") || text.includes("vector");
-    });
-  const parseMaybeJson = (value) => {
-    const text = String(value || "").trim();
-    if (!text) {
-      return null;
-    }
-    try {
-      const parsed = JSON.parse(text);
-      return parsed && typeof parsed === "object" ? parsed : null;
-    } catch (_error) {
-      return null;
-    }
-  };
-  const contextTraceOutput = parseMaybeJson(contextTraceRow?.outputValueText) || {};
-  const traceMetadata = contextTraceOutput.metadata && typeof contextTraceOutput.metadata === "object" ? contextTraceOutput.metadata : {};
-  const discoveryEvidence =
-    (contextMetadata.discovery_evidence && typeof contextMetadata.discovery_evidence === "object" && contextMetadata.discovery_evidence)
-    || (recommendationMetadata.discovery_evidence && typeof recommendationMetadata.discovery_evidence === "object" && recommendationMetadata.discovery_evidence)
-    || (traceMetadata.discovery_evidence && typeof traceMetadata.discovery_evidence === "object" && traceMetadata.discovery_evidence)
-    || {};
-  const discoveryMcp =
-    (contextMetadata.discovery_report && typeof contextMetadata.discovery_report === "object" && contextMetadata.discovery_report)
-    || (recommendationMetadata.discovery_report && typeof recommendationMetadata.discovery_report === "object" && recommendationMetadata.discovery_report)
-    || (traceMetadata.discovery_report && typeof traceMetadata.discovery_report === "object" && traceMetadata.discovery_report)
-    || {};
-  const discoveryReport = discoveryMcp.report && typeof discoveryMcp.report === "object" ? discoveryMcp.report : {};
-  const mcpEvidence = Array.isArray(discoveryMcp.evidence) ? discoveryMcp.evidence : [];
-  const retrievalStages = Array.isArray(discoveryMcp.retrieval_stages) ? discoveryMcp.retrieval_stages : [];
-  const hypotheses = Array.isArray(discoveryReport.hypotheses) ? discoveryReport.hypotheses : [];
-  const codeMatches = Array.isArray(discoveryEvidence.code_matches) ? discoveryEvidence.code_matches : [];
-  const logMatches = Array.isArray(discoveryEvidence.log_matches) ? discoveryEvidence.log_matches : [];
-  const ragMatches =
-    (Array.isArray(contextMetadata.rag_matches) && contextMetadata.rag_matches)
-    || (Array.isArray(recommendationMetadata.rag_matches) && recommendationMetadata.rag_matches)
-    || (Array.isArray(traceMetadata.rag_matches) && traceMetadata.rag_matches)
-    || [];
-  const ragIndex =
-    (contextMetadata.rag_index && typeof contextMetadata.rag_index === "object" && contextMetadata.rag_index)
-    || (recommendationMetadata.rag_index && typeof recommendationMetadata.rag_index === "object" && recommendationMetadata.rag_index)
-    || (traceMetadata.rag_index && typeof traceMetadata.rag_index === "object" && traceMetadata.rag_index)
-    || {};
-  const firstDoc = safeDocuments[0] || {};
-  const embeddingModel =
-    (ragIndex.embedding_model && typeof ragIndex.embedding_model === "object" && ragIndex.embedding_model)
-    || (firstDoc.embedding_model && typeof firstDoc.embedding_model === "object" && firstDoc.embedding_model)
-    || {};
-  const vectorStore =
-    (ragIndex.vector_store && typeof ragIndex.vector_store === "object" && ragIndex.vector_store)
-    || (firstDoc.vector_store && typeof firstDoc.vector_store === "object" && firstDoc.vector_store)
-    || {};
-  const alert = safeWorkflow.alert && typeof safeWorkflow.alert === "object" ? safeWorkflow.alert : {};
-  const queryText = compactText(
-    [
-      alert.service || safeWorkflow.service,
-      alert.name || safeWorkflow.alert_name,
-      alert.description || safeWorkflow.description,
-      recommendation.title,
-    ].filter(Boolean).join(" "),
-    180
-  ) || "Selected alert service, name, severity, and description";
-  const topSimilarity = Number(
-    contextMetadata.rag_top_match_confidence
-    ?? recommendationMetadata.rag_top_match_confidence
-    ?? traceMetadata.rag_top_match_confidence
-    ?? contextMetadata.rag_top_similarity
-    ?? recommendationMetadata.rag_top_similarity
-    ?? traceMetadata.rag_top_similarity
-    ?? 0
-  );
-  const topSemanticScore = Number(
-    contextMetadata.rag_top_semantic_score
-    ?? recommendationMetadata.rag_top_semantic_score
-    ?? traceMetadata.rag_top_semantic_score
-    ?? 0
-  );
-  const topMetadataScore = Number(
-    contextMetadata.rag_top_metadata_match_score
-    ?? recommendationMetadata.rag_top_metadata_match_score
-    ?? traceMetadata.rag_top_metadata_match_score
-    ?? 0
-  );
-  const linkedSummary = documentContract?.document_link_summary && typeof documentContract.document_link_summary === "object"
-    ? documentContract.document_link_summary
-    : {};
-  const reportedDocCount = Number(ragIndex.document_count ?? ragIndex.total_documents ?? linkedSummary.count ?? safeDocuments.length ?? ragMatches.length ?? 0);
-  const docCount = Number.isFinite(reportedDocCount) && reportedDocCount > 0 ? reportedDocCount : 0;
-  const reportedIndexedCount = Number(ragIndex.embedded_document_count ?? ragIndex.metadata_embedding_count ?? 0);
-  const indexedCount = Number.isFinite(reportedIndexedCount) && reportedIndexedCount > 0 ? reportedIndexedCount : 0;
-  const touchedDocuments = (safeDocuments.length ? safeDocuments : ragMatches).slice(0, 8);
-  const bestMatch = touchedDocuments[0] || {};
-  const hasIndexInfo = hasMeaningfulValue(ragIndex) || hasMeaningfulValue(embeddingModel) || hasMeaningfulValue(vectorStore);
-  const embeddingProvider = embeddingModel.provider || (hasIndexInfo ? "configured by backend" : "not reported");
-  const embeddingName = embeddingModel.model || (hasIndexInfo ? "not reported" : "not reported");
-  const vectorProvider = vectorStore.provider || (hasIndexInfo ? "configured by backend" : "not reported");
-  const contextQuality = evaluation && typeof evaluation === "object" ? evaluation : {};
-  const flowSteps = [
-    {
-      id: "receive",
-      label: "Query Received",
-      meta: "Context agent consumes orchestration-events",
-      detail: queryText,
-      status: safeWorkflow.incident || alert.name ? "observed" : "inferred",
-    },
-    {
-      id: "normalize",
-      label: "Signal Normalized",
-      meta: "service + severity + labels + incident id",
-      detail: compactText(`${alert.service || "-"} | ${alert.severity || recommendation.severity || "-"} | ${safeWorkflow?.incident?.id || safeWorkflow.incident_id || "-"}`, 160),
-      status: alert.service || safeWorkflow.incident_id ? "observed" : "inferred",
-    },
-    {
-      id: "index",
-      label: "Index Checked",
-      meta: `${docCount || touchedDocuments.length || 0} document(s), ${indexedCount || "metadata"} indexed`,
-      detail: `Embedding: ${embeddingName} | Store: ${vectorProvider}`,
-      status: docCount || touchedDocuments.length || hasIndexInfo ? "observed" : "warning",
-    },
-    {
-      id: "search",
-      label: "Search Ranked",
-      meta: `${ragMatches.length || touchedDocuments.length || 0} match(es)`,
-      detail: `Confidence ${Number.isFinite(topSimilarity) && topSimilarity > 0 ? `${Math.round(topSimilarity * 100)}%` : "not reported"} | semantic ${Number.isFinite(topSemanticScore) && topSemanticScore > 0 ? `${Math.round(topSemanticScore * 100)}%` : "-"} | metadata ${Number.isFinite(topMetadataScore) && topMetadataScore > 0 ? `${Math.round(topMetadataScore * 100)}%` : "-"}`,
-      status: ragMatches.length || touchedDocuments.length ? "observed" : "warning",
-    },
-    {
-      id: "touch",
-      label: "Documents Touched",
-      meta: bestMatch.title || bestMatch.path || "no linked document title",
-      detail: compactText(bestMatch.match_reason || bestMatch.summary || bestMatch.content || bestMatch.path || "Linked alert documents are used as context evidence.", 180),
-      status: touchedDocuments.length ? "observed" : "warning",
-    },
-    {
-      id: "assemble",
-      label: "Context Prepared",
-      meta: "context-events published",
-      detail: `Grounding ${Math.round((contextQuality.groundingScore || 0) * 100)}% | Confidence ${Math.round((contextQuality.confidenceScore || recommendation.confidence || 0) * 100)}%`,
-      status: contextTraceRow || safeWorkflow.context || recommendation ? "observed" : "inferred",
-    },
-  ];
-  const documentKey = (doc, index = 0) => String(doc?.path || doc?.document_id || doc?.title || `doc-${index}`).trim();
-  const documentMetadata = (doc) => ({
-    document_id: doc?.document_id || doc?.id || "-",
-    title: doc?.title || "-",
-    kind: doc?.kind || doc?.document_kind || "-",
-    path: doc?.path || "-",
-    services: doc?.services || doc?.service || "-",
-    owner: doc?.owner || "-",
-    version: doc?.version || "-",
-    freshness_score: doc?.freshness_score ?? "-",
-    embedding_status: doc?.embedding_status || "-",
-    vector_store: doc?._vector_store || doc?.vector_store?.provider || "-",
-    match_reason: doc?.match_reason || "-",
-    match_confidence: doc?.match_confidence ?? doc?._similarity ?? doc?.score ?? "-",
-    semantic_score: doc?.semantic_score ?? doc?._semantic_score ?? "-",
-    metadata_match_score: doc?.metadata_match_score ?? doc?._metadata_match_score ?? "-",
-    source_ref: doc?.source_ref || "-",
-  });
-  const documentContextExcerpt = (doc) => compactText(
-    doc?.context_excerpt
-    || doc?.matched_text
-    || doc?.snippet
-    || doc?.match_reason
-    || doc?.summary
-    || doc?.recommended_action
-    || doc?.content
-    || doc?.path,
-    320
-  ) || "No context excerpt was reported for this document.";
-  const viewDocument = async (doc, index) => {
-    const key = documentKey(doc, index);
-    if (!key) {
-      return;
-    }
-    if (documentPreviewState.key === key && documentPreviewState.content && !documentPreviewState.error) {
-      setDocumentPreviewState({ key: "", loading: false, content: null, error: "" });
-      return;
-    }
-    setDocumentPreviewState({ key, loading: true, content: null, error: "" });
-    try {
-      const loaded = typeof onLoadDocumentContent === "function"
-        ? await onLoadDocumentContent(doc)
-        : doc;
-      setDocumentPreviewState({
-        key,
-        loading: false,
-        content: loaded && typeof loaded === "object" ? loaded : doc,
-        error: "",
-      });
-    } catch (error) {
-      setDocumentPreviewState({
-        key,
-        loading: false,
-        content: doc,
-        error: String(error?.message || "Unable to load document content."),
-      });
-    }
-  };
-  const renderDocumentPreview = (doc, index) => {
-    const key = documentKey(doc, index);
-    if (documentPreviewState.key !== key) {
-      return null;
-    }
-    const full = documentPreviewState.content && typeof documentPreviewState.content === "object"
-      ? documentPreviewState.content
-      : doc;
-    const metadata = documentMetadata({ ...doc, ...full });
-    const body = String(
-      full?.content
-      || full?.text
-      || full?.summary
-      || full?.recommended_action
-      || doc?.content
-      || doc?.summary
-      || ""
-    ).trim();
-    return (
-      <div className="context-doc-preview">
-        {documentPreviewState.loading ? <p className="subtitle">Loading document content...</p> : null}
-        {documentPreviewState.error ? <p className="error">{documentPreviewState.error}</p> : null}
-        <details open>
-          <summary>Document Metadata</summary>
-          <pre className="result">{JSON.stringify(metadata, null, 2)}</pre>
-        </details>
-        <details open>
-          <summary>Document View</summary>
-          <pre className="result">{body || "No document body was returned. Metadata is shown above."}</pre>
-        </details>
-      </div>
-    );
-  };
-  const indexRows = [
-    ["Embedding Provider", embeddingProvider],
-    ["Embedding Model", embeddingName],
-    ["Fallback Model", embeddingModel.fallback_model || "-"],
-    ["Fallback Active", embeddingModel.fallback_active ? "yes" : "no"],
-    ["Vector Store", vectorProvider],
-    ["Enterprise Index", ragIndex.enterprise_index_enabled ? "enabled" : "not enabled"],
-    ["Vector Index", (vectorStore.index || vectorStore.index_name || vectorStore.configured) ? String(vectorStore.index || vectorStore.index_name || "configured") : "-"],
-    ["Documents Seen", String(docCount || touchedDocuments.length || "-")],
-  ];
-
-  return (
-    <div className={`context-flow-panel ${compact ? "is-compact" : ""}`}>
-      <div className="context-flow-header">
-        <div>
-          <h3>Context Retrieval Flow</h3>
-          <p>Query intake, document indexing, semantic search, document touchpoints, and context assembly for the selected alert.</p>
-        </div>
-        <div className="context-flow-scoreboard">
-          <span><strong>{ragMatches.length || safeDocuments.length}</strong> matches</span>
-          <span><strong>{Number.isFinite(topSimilarity) && topSimilarity > 0 ? `${Math.round(topSimilarity * 100)}%` : "-"}</strong> confidence</span>
-          <span><strong>{Math.round((contextQuality.groundingScore || 0) * 100) || "-"}</strong> grounding</span>
-        </div>
-      </div>
-      <div className="context-flow-track">
-        {flowSteps.map((step, index) => (
-          <div className="context-flow-segment" key={step.id}>
-            <article className={`context-flow-node status-${step.status}`}>
-              <span className="context-flow-step">{index + 1}</span>
-              <strong>{step.label}</strong>
-              <small>{step.meta}</small>
-              <p>{step.detail}</p>
-            </article>
-            {index < flowSteps.length - 1 ? <span className="context-flow-arrow" aria-hidden="true">-&gt;</span> : null}
-          </div>
-        ))}
-      </div>
-      <div className="context-flow-grid">
-        <article className="context-flow-detail">
-          <div className="panel-head">
-            <h4>MCP Discovery And LLM Analysis</h4>
-            <p>Read-only log, ticket, and code tools followed by evidence-grounded model reasoning.</p>
-          </div>
-          <div className="context-flow-scoreboard">
-            <span><strong>{mcpEvidence.length}</strong> cited evidence</span>
-            <span><strong>{retrievalStages.length}</strong> stages</span>
-            <span><strong>{hypotheses.length}</strong> hypotheses</span>
-          </div>
-          {retrievalStages.length ? (
-            <div className="context-doc-list">
-              {retrievalStages.map((stage, index) => (
-                <div className="context-doc-row" key={`mcp-stage-${index}-${stage.stage || ""}`}>
-                  <strong>{String(stage.stage || "stage").replaceAll("_", " ")}</strong>
-                  <span>{stage.status || "unknown"}{Number.isFinite(Number(stage.result_count)) ? ` · ${stage.result_count} result(s)` : ""}</span>
-                  {stage.error ? <small>{stage.error}</small> : null}
-                </div>
-              ))}
-            </div>
-          ) : <p className="subtitle">No MCP retrieval trace was returned for this alert.</p>}
-          {discoveryReport.summary ? <p>{discoveryReport.summary}</p> : null}
-          {hypotheses.map((hypothesis, index) => (
-            <div className="context-doc-row" key={`mcp-hypothesis-${index}`}>
-              <strong>{hypothesis.cause || `Hypothesis ${index + 1}`}</strong>
-              <span>Confidence {Math.round(Number(hypothesis.confidence || 0) * 100)}%</span>
-              <small>Citations: {(hypothesis.supporting_evidence || []).join(", ") || "none"}</small>
-            </div>
-          ))}
-          {mcpEvidence.length ? (
-            <details>
-              <summary>Retrieved Evidence And Provenance</summary>
-              <pre className="result">{JSON.stringify(mcpEvidence, null, 2)}</pre>
-            </details>
+          {!rows.length && !loading ? (
+            <tr>
+              <td colSpan={11}>No alerts match current filters for {scopeLabel}.</td>
+            </tr>
           ) : null}
-        </article>
-        <article className="context-flow-detail">
-          <div className="panel-head">
-            <h4>Discovery Agent: Code And Log Evidence</h4>
-            <p>Read-only evidence retrieved using service, alert, scenario, ticket, and component terms.</p>
-          </div>
-          <div className="context-flow-scoreboard">
-            <span><strong>{codeMatches.length}</strong> code matches</span>
-            <span><strong>{logMatches.length}</strong> log matches</span>
-            <span><strong>{Array.isArray(discoveryEvidence.query_terms) ? discoveryEvidence.query_terms.length : 0}</strong> query terms</span>
-          </div>
-          {codeMatches.length || logMatches.length ? (
-            <div className="context-doc-list">
-              {[...logMatches, ...codeMatches].slice(0, 20).map((match, index) => (
-                <div className="context-doc-row" key={`discovery-evidence-${index}-${match.path || ""}-${match.line || ""}`}>
-                  <strong>{String(match.kind || "evidence").toUpperCase()} · {match.path || "unknown path"}{match.line ? `:${match.line}` : ""}</strong>
-                  <span>Matched: {Array.isArray(match.matched_terms) ? match.matched_terms.join(", ") : "-"}</span>
-                  <pre className="result">{match.snippet || "No snippet returned."}</pre>
-                </div>
-              ))}
-            </div>
-          ) : (
-            <p className="subtitle">
-              No code/log evidence was returned for this run. Configure CODE_DISCOVERY_ROOTS and LOG_DISCOVERY_ROOTS,
-              rebuild the context-agent, and process a new alert to populate this panel.
-            </p>
-          )}
-          <details>
-            <summary>Discovery Query And Roots</summary>
-            <pre className="result">{JSON.stringify({
-              query_terms: discoveryEvidence.query_terms || [],
-              code_roots: discoveryEvidence.code_roots || [],
-              log_roots: discoveryEvidence.log_roots || [],
-            }, null, 2)}</pre>
-          </details>
-        </article>
-        <article className="context-flow-detail">
-          <div className="panel-head">
-            <h4>Documents And Metadata Touched</h4>
-            <p>{safeDocuments.length ? "Backend linked documents for this alert." : ragMatches.length ? "RAG match metadata is shown because no backend linked-document rows were returned." : "No document match metadata was returned for this alert."}</p>
-          </div>
-          {touchedDocuments.length ? (
-            <div className="context-doc-list">
-              {touchedDocuments.map((doc, index) => (
-                <div className="context-doc-row" key={`${doc.document_id || doc.path || doc.title || index}`}>
-                  <strong>{doc.title || doc.path || `Document ${index + 1}`}</strong>
-                  <span>{doc.kind || doc.document_kind || "document"} | confidence {Math.round(Number(doc.match_confidence || doc._similarity || doc.score || 0) * 100) || "-"}%</span>
-                  <small>semantic {Math.round(Number(doc.semantic_score || doc._semantic_score || 0) * 100) || "-"}% | metadata {Math.round(Number(doc.metadata_match_score || doc._metadata_match_score || 0) * 100) || "-"}%</small>
-                  <div className="context-doc-highlight">
-                    <strong>Context collected from this document</strong>
-                    <p>{documentContextExcerpt(doc)}</p>
-                  </div>
-                  <details>
-                    <summary>Metadata</summary>
-                    <pre className="result">{JSON.stringify(documentMetadata(doc), null, 2)}</pre>
-                  </details>
-                  <div className="context-doc-actions">
-                    <button type="button" className="button-secondary" onClick={() => viewDocument(doc, index)}>
-                      {documentPreviewState.key === documentKey(doc, index) ? "Hide" : "View"} Document
-                    </button>
-                    <button
-                      type="button"
-                      className="button-secondary"
-                      disabled={!doc.path && !doc.content && !doc.summary && !doc.recommended_action}
-                      title="Download this document and its collected context"
-                      onClick={() => onDownloadDocument && onDownloadDocument(doc)}
-                    >
-                      Download
-                    </button>
-                  </div>
-                  {renderDocumentPreview(doc, index)}
-                </div>
-              ))}
-            </div>
-          ) : (
-            <p className="subtitle">No linked documents are reported for this alert yet.</p>
-          )}
-        </article>
-        <article className="context-flow-detail">
-          <h4>Index And Embedding</h4>
-          <div className="table-wrap table-wrap-scroll-x">
-            <table>
-              <tbody>
-                {indexRows.map(([label, value]) => (
-                  <tr key={`context-index-${label}`}><th>{label}</th><td>{value}</td></tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-          {!hasIndexInfo ? (
-            <p className="subtitle">The selected payload did not include full RAG index metadata. The context agent may still have used fallback matching or historical metadata.</p>
-          ) : null}
-        </article>
-      </div>
+        </tbody>
+      </table>
     </div>
   );
-}
+});
 
-function AgentEventsGraph({ rows }) {
-  const eventRows = Array.isArray(rows) ? rows : [];
-  if (!eventRows.length) {
-    return <p className="subtitle">No events found for selected alert.</p>;
-  }
-
-  const flowNodes = [
-    { id: "alert-intelligence", label: "Alert Intelligence Agent", short: "A1" },
-    { id: "orchestrator", label: "Master Agent", short: "M" },
-    { id: "discovery-agent", label: "Discovery Agent", short: "D" },
-    { id: "context-agent", label: "Context Intelligence Agent", short: "C" },
-    { id: "resolution-agent", label: "Resolution Intelligence Agent", short: "R" },
-    { id: "approval-service", label: "Human Approval Layer", short: "H" },
-    { id: "remediation-engine", label: "Remediation Automation Engine", short: "X" },
-    { id: "closure-service", label: "Validator Agent", short: "V" },
-  ];
-
-  const detectAgentId = (row) => {
-    const haystack = [
-      row?.agent,
-      row?.action,
-      row?.eventType,
-      row?.detail,
-      row?.backgroundDetailText,
-      row?.inputValueText,
-      row?.outputValueText,
-    ]
-      .map((item) => String(item || "").toLowerCase())
-      .join(" | ");
-    if (
-      haystack.includes("alert intelligence")
-      || haystack.includes("alert-intelligence")
-      || haystack.includes("incident.alert")
-      || haystack.includes("raw-alert")
-      || haystack.includes("enriched-alert")
-    ) {
-      return "alert-intelligence";
-    }
-    if (haystack.includes("master agent") || haystack.includes("orchestrator")) {
-      return "orchestrator";
-    }
-    if (haystack.includes("discovery agent") || haystack.includes("local-evidence") || haystack.includes("code_matches") || haystack.includes("log_matches")) {
-      return "discovery-agent";
-    }
-    if (haystack.includes("context intelligence") || haystack.includes("context-agent")) {
-      return "context-agent";
-    }
-    if (haystack.includes("resolution intelligence") || haystack.includes("resolution-agent") || haystack.includes("recommendation")) {
-      return "resolution-agent";
-    }
-    if (haystack.includes("approval") || haystack.includes("human approval")) {
-      return "approval-service";
-    }
-    if (haystack.includes("remediation")) {
-      return "remediation-engine";
-    }
-    if (haystack.includes("validator") || haystack.includes("closure")) {
-      return "closure-service";
-    }
-    return "";
-  };
-
-  const groupedRows = new Map(flowNodes.map((node) => [node.id, []]));
-  eventRows.forEach((row) => {
-    const id = detectAgentId(row);
-    if (!id || !groupedRows.has(id)) {
-      return;
-    }
-    groupedRows.get(id).push(row);
-  });
-
-  // Some runs persist sparse early-stage metadata; synthesize one Alert Intelligence row for visibility.
-  if (!(groupedRows.get("alert-intelligence") || []).length && eventRows.length) {
-    const seed = eventRows
-      .slice()
-      .sort((a, b) => toFiniteNumber(a?.sequence) - toFiniteNumber(b?.sequence))[0];
-    groupedRows.set("alert-intelligence", [
-      {
-        ...seed,
-        action: "Alert landed, deduped, and enriched for orchestration.",
-        decision: seed?.decision || "severity + correlation applied",
-        output: seed?.output || "enriched-alert emitted",
-        communicates_to: seed?.communicates_to || "orchestration-events",
-      },
-    ]);
-  }
-
-  const visibleFlowNodes = flowNodes.filter((node) => (groupedRows.get(node.id) || []).length > 0);
-  if (!visibleFlowNodes.length) {
-    return <p className="subtitle">No mapped agent events found for this alert yet.</p>;
-  }
-
+/**
+ * Temporary Phase 1 compatibility boundary. URL routing owns the requested
+ * top-level tab while the existing application retains its in-memory session
+ * and operational state. See docs/TECHNICAL_DEBT.md (TD-FE-001).
+ *
+ * @param {{ initialTab?: string, currentPath?: string, currentSearch?: string, onActiveTabChange?: (tabId: string) => void, onNavigatePath?: (path: string) => void, routeOutlet?: import("react").ReactNode }} props
+ */
+function KaiMSBrand({ compact = false, inverse = false, onActivate = null }) {
+  const content = <>
+    <span className="kaims-brand-mark" aria-hidden="true">
+      <svg viewBox="0 0 48 48" role="img">
+        <path className="kaims-mark-ms" d="M7 35V13l8 12 8-12v22M40 15c-3-3-11-3-14 1-4 7 16 6 14 14-1 6-11 7-16 2" />
+        <path className="kaims-mark-signal" d="M6 39h8l3-4 4 6 4-4h17" />
+      </svg>
+    </span>
+    <span className="kaims-brand-copy">
+      <strong><span className="kaims-brand-prefix">Kai</span><span className="kaims-brand-managed">MS</span></strong>
+      {!compact ? <small>{KAI_BRAND.category}</small> : null}
+    </span>
+  </>;
   return (
-    <div className="agent-dag-flow">
-      <div className="agent-dag-track">
-        {visibleFlowNodes.map((node, index) => {
-          const rowsForNode = (groupedRows.get(node.id) || [])
-            .slice()
-            .sort((a, b) => toFiniteNumber(a?.sequence) - toFiniteNumber(b?.sequence));
-          const latest = rowsForNode[rowsForNode.length - 1] || null;
-          const hasError = hasMeaningfulValue(latest?.errorValueText);
-          const statusLabel = hasError ? "error" : "observed";
-
-          return (
-            <div key={`agent-dag-${node.id}`} className="agent-dag-segment">
-              <article className={`agent-dag-node status-${statusLabel}`}>
-                <div className="agent-dag-head">
-                  <span className="agent-dag-badge">{node.short}</span>
-                  <strong>{node.label}</strong>
-                  <span className={`agent-dag-status status-${statusLabel}`}>{statusLabel}</span>
-                </div>
-                <p>{latest?.action || "No agent event captured yet."}</p>
-                <div className="agent-event-kv">
-                  <span>Decision: {compactText(latest?.decision, 140) || "-"}</span>
-                  <span>Output: {compactText(latest?.output, 140) || "-"}</span>
-                  <span>Next: {latest?.communicates_to || "-"}</span>
-                  <span>Events: {rowsForNode.length}</span>
-                </div>
-                {latest?.backgroundDetailText ? (
-                  <details>
-                    <summary>Background Details</summary>
-                    <pre className="result">{latest.backgroundDetailText}</pre>
-                  </details>
-                ) : null}
-                {rowsForNode.length ? (
-                  <details>
-                    <summary>Agent Event Timeline ({rowsForNode.length})</summary>
-                    <div className="agent-event-rows">
-                      {rowsForNode.map((row, rowIndex) => (
-                        <div key={`agent-node-${node.id}-row-${rowIndex}`} className="agent-event-row timeline">
-                          <strong>{row.sequence || rowIndex + 1}.</strong>
-                          <span>{compactText(row.action, 120) || "-"}</span>
-                          <span>{compactText(row.decision, 120) || "-"}</span>
-                          <span>{formatUtcTimestamp(row.timestamp)}</span>
-                          <span>{row.eventType || "-"}</span>
-                        </div>
-                      ))}
-                    </div>
-                  </details>
-                ) : null}
-              </article>
-              {index < flowNodes.length - 1 ? <div className="agent-dag-arrow" aria-hidden="true">→</div> : null}
-            </div>
-          );
-        })}
-      </div>
-    </div>
+    onActivate
+      ? <button type="button" className={`kaims-brand kaims-brand-home ${compact ? "is-compact" : ""} ${inverse ? "is-inverse" : ""}`} aria-label="Go to KaiMS home" onClick={onActivate}>{content}</button>
+      : <div className={`kaims-brand ${compact ? "is-compact" : ""} ${inverse ? "is-inverse" : ""}`} aria-label={`${KAI_BRAND.productName} ${KAI_BRAND.category}`}>{content}</div>
   );
 }
 
-function TopicFlowGraph({ routing, timelineRows }) {
-  const safeRouting = routing && typeof routing === "object" ? routing : {};
-  const safeRows = Array.isArray(timelineRows) ? timelineRows : [];
-  const published = Array.from(new Set(
-    safeRows
-      .map((row) => String(row?.publishes || "").trim())
-      .filter((item) => item && item !== "-" && item.toLowerCase() !== "unknown")
-  ));
-  const consumed = Array.from(new Set(
-    safeRows
-      .map((row) => String(row?.consumes || "").trim())
-      .filter((item) => item && item !== "-" && item.toLowerCase() !== "unknown")
-  ));
-  const provider = String(safeRouting?.message_bus_provider || "rabbitmq").trim().toUpperCase();
-  const actualRows = SERVICE_TOPIC_FLOW.map((row) => {
-    const hasTopicActivity = published.includes(row.publishes) || consumed.includes(row.consumes);
-    return {
-      service: row.service,
-      consumed: hasTopicActivity ? row.consumes : "-",
-      published: hasTopicActivity ? row.publishes : "-",
-      provider,
-      status: hasTopicActivity ? "Observed" : "Configured",
-    };
-  });
-  const configuredRows = SERVICE_TOPIC_FLOW.map((row) => ({
-    service: row.service,
-    consumes: row.consumes === "-" ? "-" : `${row.consumes} (enabled transports)`,
-    publishes: row.publishes,
-  }));
-
-  return (
-    <MessageBusTopology
-      actual={{ rows: actualRows, published, consumed }}
-      configuredRows={configuredRows}
-      routing={safeRouting}
-      primaryTopic={published[0] || "raw-alerts"}
-      compact
-    />
-  );
+function visibleManagedApplication(row) {
+  const rawName = String(typeof row === "string" ? row : row?.name || row?.application || "").trim();
+  const name = rawName.toLowerCase();
+  if (["kaims", "kaiops", "kaims-core", "kaiops-core"].includes(name)) return typeof row === "string" ? "KaiMS" : { ...row, name: "KaiMS" };
+  if (name === "telemetry") return typeof row === "string" ? "Telemetry" : { ...row, name: "Telemetry" };
+  // Alert-derived strings are not authoritative application registrations and
+  // can contain hundreds of transient service/project identities. Registered
+  // application objects are authoritative and belong in the workspace picker.
+  if (typeof row === "string" || !rawName) return null;
+  // ParaBank is an intentionally onboarded public banking application, not a
+  // generated UX fixture, despite "Demo" being part of its product name.
+  if (name.includes("parabank")) return { ...row, name: rawName };
+  return isTestApplicationRecord(row) ? null : { ...row, name: rawName };
 }
 
-function classifySelectedAlertPath(workflow, timelineRows, selectedAlert) {
-  const safeWorkflow = workflow && typeof workflow === "object" ? workflow : {};
-  const safeRows = Array.isArray(timelineRows) ? timelineRows : [];
-  const safeAlert = selectedAlert && typeof selectedAlert === "object" ? selectedAlert : {};
-  const recommendation = safeWorkflow?.recommendation && typeof safeWorkflow.recommendation === "object" ? safeWorkflow.recommendation : {};
-  const recommendationMetadata = recommendation?.metadata && typeof recommendation.metadata === "object" ? recommendation.metadata : {};
-  const decision =
-    (safeWorkflow?.decision && typeof safeWorkflow.decision === "object" && safeWorkflow.decision)
-    || (safeWorkflow?.orchestration_decision && typeof safeWorkflow.orchestration_decision === "object" && safeWorkflow.orchestration_decision)
-    || (recommendationMetadata?.orchestration_decision && typeof recommendationMetadata.orchestration_decision === "object" && recommendationMetadata.orchestration_decision)
-    || {};
-  const approval = safeWorkflow?.approval && typeof safeWorkflow.approval === "object" ? safeWorkflow.approval : {};
-  const remediation = safeWorkflow?.remediation_action && typeof safeWorkflow.remediation_action === "object" ? safeWorkflow.remediation_action : {};
-  const closure = safeWorkflow?.closure_report && typeof safeWorkflow.closure_report === "object" ? safeWorkflow.closure_report : {};
-  const rowText = safeRows
-    .map((row) => `${row?.stage || ""} ${row?.agent || ""} ${row?.service || ""} ${row?.consumes || ""} ${row?.publishes || ""} ${row?.detail || ""} ${row?.inputValueText || ""} ${row?.outputValueText || ""}`)
-    .join(" ")
-    .toLowerCase();
-  const incidentStatus = String(safeWorkflow?.incident?.status || safeAlert.status || safeAlert.state || "").trim().toLowerCase();
-  const explicitApproval = safeWorkflow?.approval?.required ?? decision?.requires_approval ?? recommendation?.requires_approval;
-  const approvalRequired = explicitApproval === true || ["awaiting_approval", "pending_approval"].some((token) => incidentStatus.includes(token));
-  const hasApproval = approvalRequired || hasMeaningfulValue(approval.status || approval.id || approval.approval_id) || rowText.includes("approval");
-  const hasRemediation = hasMeaningfulValue(remediation.status || remediation.id || remediation.action_type) || rowText.includes("remediation");
-  const hasClosure = Boolean(closure.health_restored || closure.closed_at) || ["closed", "resolved", "complete", "completed", "validated"].some((token) => incidentStatus.includes(token)) || rowText.includes("closure-events") || rowText.includes("closure service");
-  const hasResolution = hasMeaningfulValue(recommendation.id || recommendation.root_cause || recommendation.recommended_action) || rowText.includes("resolution") || rowText.includes("model router");
-  const hasContext = hasMeaningfulValue(safeWorkflow?.context) || rowText.includes("context") || rowText.includes("rag");
-  const hasOrchestration = hasContext || hasResolution || hasApproval || hasRemediation || hasClosure || rowText.includes("orchestrator") || rowText.includes("orchestration");
-  const hasAlertIntelligence = hasOrchestration || rowText.includes("alert intelligence") || rowText.includes("enriched-alerts");
-  const label = hasClosure
-    ? "Closed path"
-    : hasRemediation
-      ? "Remediation path"
-      : hasApproval
-        ? "Approval path"
-        : hasResolution
-          ? "Resolution path"
-          : hasContext
-            ? "Context path"
-            : hasAlertIntelligence
-              ? "Intelligence path"
-              : "Intake path";
-  return {
-    label,
-    approvalRequired,
-    hasAlertIntelligence,
-    hasOrchestration,
-    hasContext,
-    hasResolution,
-    hasApproval,
-    hasRemediation,
-    hasClosure,
-  };
-}
-
-function parseTimelineJson(value) {
-  const text = String(value || "").trim();
-  if (!text) {
-    return null;
-  }
-  try {
-    const parsed = JSON.parse(text);
-    return parsed && typeof parsed === "object" ? parsed : null;
-  } catch (_error) {
-    return null;
-  }
-}
-
-function classifyFlowStageFromRow(row) {
-  const stage = String(row?.stage || "").toLowerCase();
-  if (stage.includes("landing pad") || stage.includes("alert received") || stage.includes("alert landed")) {
-    return { kind: "ingestion", short: "ING", label: "Landing Pad" };
-  }
-  if (stage.includes("topic handoff") || stage.includes("message bus")) {
-    return { kind: "bus", short: "BUS", label: "Message Bus" };
-  }
-  if (stage.includes("dedup") || stage.includes("correlation") || stage.includes("enrich")) {
-    return { kind: "dedupe", short: "DED", label: "Dedup" };
-  }
-  if (stage.includes("config") || stage.includes("connector lookup")) {
-    return { kind: "config", short: "CFG", label: "Config" };
-  }
-  if (stage.includes("routing") || stage.includes("orchestrator") || stage.includes("workflow")) {
-    return { kind: "orchestration", short: "ORC", label: "Orchestrator" };
-  }
-  if (stage.includes("discovery agent") || stage.includes("code and log context")) {
-    return { kind: "discovery", short: "DSC", label: "Discovery" };
-  }
-  if (stage.includes("rag context") || stage.includes("context retrieval") || stage.includes("context intelligence")) {
-    return { kind: "rag", short: "RAG", label: "RAG" };
-  }
-  if (stage.includes("embedding") || stage.includes("semantic") || stage.includes("vector")) {
-    return { kind: "semantic", short: "SEM", label: "Semantic" };
-  }
-  if (stage.includes("context merge") || stage.includes("evidence assembly")) {
-    return { kind: "context", short: "CTX", label: "Context" };
-  }
-  if (stage.includes("resolution") || stage.includes("recommendation")) {
-    return { kind: "resolution", short: "RCA", label: "Resolution" };
-  }
-  if (stage.includes("approval")) {
-    return { kind: "approval", short: "APR", label: "Approval" };
-  }
-  if (stage.includes("policy")) {
-    return { kind: "policy", short: "POL", label: "Policy" };
-  }
-  if (stage.includes("remediation") || stage.includes("command") || stage.includes("execute")) {
-    return { kind: "execution", short: "CMD", label: "Execution" };
-  }
-  if (stage.includes("closure") || stage.includes("validation")) {
-    return { kind: "closure", short: "CLS", label: "Closure" };
-  }
-  return { kind: "generic", short: "EVT", label: "Event" };
-}
-
-function timelineRowText(row) {
-  return [
-    row?.status,
-    row?.stage,
-    row?.detail,
-    row?.agent,
-    row?.service,
-    row?.consumes,
-    row?.publishes,
-    row?.errorValueText,
-    row?.inputValueText,
-    row?.outputValueText,
-  ].map((item) => String(item || "").toLowerCase()).join(" ");
-}
-
-function timelineRowIndicatesFallback(text) {
-  return [
-    "fallback",
-    "heuristic-fallback",
-    "skipped",
-    "not executed",
-    "no live executor",
-    "no real",
-    "policy-blocked",
-    "safety gate",
-    "live mutation blocked",
-    "requires_human_review",
-  ].some((token) => text.includes(token));
-}
-
-function timelineRowIndicatesSuccess(text) {
-  return [
-    "succeeded",
-    "success",
-    "completed",
-    "closed",
-    "observed",
-    "validated",
-    "recommendation_id",
-    "approval_id",
-  ].some((token) => text.includes(token));
-}
-
-function timelineRowHasError(row) {
-  if (!hasMeaningfulValue(row?.errorValueText)) {
-    return false;
-  }
-  const text = timelineRowText(row);
-  if (timelineRowIndicatesFallback(text) || timelineRowIndicatesSuccess(text)) {
-    return false;
-  }
-  return text.includes("error") || text.includes("failed") || text.includes("exception") || text.includes("timeout");
-}
-
-function timelineRowStatus(row, nextRow = null) {
-  const text = timelineRowText(row);
-  if (timelineRowIndicatesFallback(text)) {
-    return "fallback";
-  }
-  if (timelineRowHasError(row)) {
-    return "failed";
-  }
-  if (timelineRowIndicatesSuccess(text) || hasMeaningfulValue(row)) {
-    return "observed";
-  }
-  if (nextRow) {
-    return "continued";
-  }
-  return "waiting";
-}
-
-function inferTimelineNextStep(row, nextRow = null) {
-  const outputText = String(row?.outputValueText || "").trim();
-  const inputText = String(row?.inputValueText || "").trim();
-  const detailText = String(row?.detail || "").trim();
-  const transport = String(row?.publishes || "").trim();
-  const parsedOutput = parseTimelineJson(outputText) || {};
-  const parsedInput = parseTimelineJson(inputText) || {};
-  const explicit = [
-    parsedOutput?.next_action,
-    parsedOutput?.fallback_path,
-    parsedInput?.next_action,
-    parsedInput?.fallback_path,
-    row?.communicates_to,
-  ].find((value) => hasMeaningfulValue(value));
-  if (explicit) {
-    return String(explicit).trim();
-  }
-  if (nextRow?.stage) {
-    return `${transport || "next"} -> ${nextRow.stage}`;
-  }
-  if (transport && transport !== "-") {
-    return transport;
-  }
-  if (timelineRowIndicatesFallback(`${outputText} ${detailText}`.toLowerCase())) {
-    return "Guarded path preserved for operator review";
-  }
-  return "-";
-}
-
-function buildDynamicFlowSections(rows) {
-  const safeRows = Array.isArray(rows) ? rows.filter(Boolean) : [];
-  const sections = [];
-  safeRows.forEach((row, index) => {
-    const meta = classifyFlowStageFromRow(row);
-    const current = sections[sections.length - 1];
-    if (!current || current.kind !== meta.kind) {
-      sections.push({
-        key: `${meta.kind}-${sections.length}`,
-        kind: meta.kind,
-        label: meta.label,
-        short: meta.short,
-        rows: [row],
-        startIndex: index,
-      });
-      return;
-    }
-    current.rows.push(row);
-  });
-  return sections.map((section) => {
-    const lastRow = section.rows[section.rows.length - 1] || null;
-    const nextRow = safeRows[section.startIndex + section.rows.length] || null;
-    const status = section.rows.some((row) => timelineRowHasError(row))
-      ? "failed"
-      : section.rows.some((row) => timelineRowStatus(row) === "fallback")
-        ? "fallback"
-        : "observed";
-    return {
-      ...section,
-      lastRow,
-      nextRow,
-      status,
-      nextStep: inferTimelineNextStep(lastRow, nextRow),
-    };
-  });
-}
-
-function ApplicationSankeyFlow({ workflow, timelineRows, routing, alertRows, selectedAlert, selectedAlertId, onDrillTimeline }) {
-  const safeWorkflow = workflow && typeof workflow === "object" ? workflow : {};
-  const safeRows = Array.isArray(timelineRows) ? timelineRows : [];
-  const safeRouting = routing && typeof routing === "object" ? routing : {};
-  const safeAlert = selectedAlert && typeof selectedAlert === "object" ? selectedAlert : {};
-  const safeAlerts = Array.isArray(alertRows) ? alertRows : [];
-  const publishedTopics = new Set(
-    safeRows
-      .map((row) => String(row?.publishes || "").trim())
-      .filter((topic) => topic && topic !== "-" && topic.toLowerCase() !== "unknown")
-  );
-  const consumedTopics = new Set(
-    safeRows
-      .map((row) => String(row?.consumes || "").trim())
-      .filter((topic) => topic && topic !== "-" && topic.toLowerCase() !== "unknown")
-  );
-  const observedTopics = new Set([...publishedTopics, ...consumedTopics]);
-  const path = classifySelectedAlertPath(safeWorkflow, safeRows, safeAlert);
-  const dynamicSections = buildDynamicFlowSections(safeRows);
-  const topicRows = SERVICE_TOPIC_FLOW.map((row, index) => {
-    const topic = String(row.publishes || "").trim();
-    const consumed = String(row.consumes || "").trim();
-    const observed = observedTopics.has(topic) || observedTopics.has(consumed);
-    return {
-      ...row,
-      index: index + 1,
-      observed,
-      status: observed ? "observed" : "configured",
-    };
-  }).filter((row) => row.observed || row.service === "monitoring-adapter" || row.service === "alert-intelligence" || (path.hasOrchestration && row.service === "orchestrator"));
-  const workerRows = SERVICE_TOPIC_FLOW.slice(1).map((row) => {
-    const text = safeRows
-      .map((item) => `${item?.agent || ""} ${item?.service || ""} ${item?.stage || ""} ${item?.detail || ""}`)
-      .join(" ")
-      .toLowerCase();
-    const service = String(row.service || "").toLowerCase();
-    const agent = String(row.agent || "").toLowerCase();
-    const observed = text.includes(service) || text.includes(agent) || observedTopics.has(row.consumes) || observedTopics.has(row.publishes);
-    const profile = RECOMMENDED_WORKER_PROFILE[row.service] || { containers: 1, workers: 1, role: "worker" };
-    return { ...row, observed, profile, slots: Number(profile.containers || 1) * Number(profile.workers || 1) };
-  }).filter((row) => {
-    if (row.observed) return true;
-    if (row.service === "alert-intelligence") return true;
-    if (row.service === "orchestrator") return path.hasOrchestration;
-    if (row.service === "context-agent") return path.hasContext;
-    if (row.service === "resolution-agent") return path.hasResolution;
-    if (row.service === "approval-service") return path.hasApproval;
-    if (row.service === "remediation-engine") return path.hasRemediation;
-    if (row.service === "closure-service") return path.hasClosure;
-    return false;
-  });
-  const landedAlertCount = Math.max(
-    safeAlerts.length,
-    safeWorkflow?.alert ? 1 : 0,
-    safeRows.some((row) => String(row?.stage || "").toLowerCase().includes("landing")) ? 1 : 0,
-  );
-  const provider = String(safeRouting.message_bus_provider || "rabbitmq").trim();
-  const workflowName = String(safeRouting.workflow || safeWorkflow?.decision?.workflow || "guided-remediation").trim();
-  const executionMode = String(safeRouting.execution_mode || safeWorkflow?.decision?.execution_mode || "parallel-workers").trim();
-  const incidentId = String(safeWorkflow?.incident?.id || safeWorkflow?.incident_id || "-").trim();
-  const approvalRequired = Boolean(
-    safeWorkflow?.approval?.required
-    ?? safeWorkflow?.decision?.requires_approval
-    ?? safeWorkflow?.recommendation?.requires_approval
-  );
-  const remediationStatus = String(safeWorkflow?.remediation_action?.status || "pending").trim();
-  const alertName = String(
-    safeAlert.name
-    || safeAlert.alert_name
-    || safeWorkflow?.alert?.name
-    || safeWorkflow?.alert?.alertname
-    || selectedAlertId
-    || "selected alert"
-  ).trim();
-  const landedFile = String(
-    safeAlert.file_name
-    || safeAlert.filename
-    || safeAlert.source_file
-    || safeAlert.file_path
-    || safeAlert.path
-    || safeWorkflow?.alert?.source_file
-    || safeWorkflow?.alert?.file_name
-    || ""
-  ).trim();
-  const landingSource = String(safeAlert.source || safeAlert.provider || safeWorkflow?.alert?.source || "landing pad").trim();
-  const landingTime = formatIstTimestamp(
-    safeAlert.created_at
-    || safeAlert.starts_at
-    || safeAlert.received_at
-    || safeWorkflow?.alert?.starts_at
-    || safeRows[0]?.timestamp
-    || ""
-  );
-  const alertService = String(safeAlert.service || safeWorkflow?.alert?.service || "-").trim();
-  const alertSeverity = String(safeAlert.severity || safeWorkflow?.alert?.severity || "-").trim();
-  const activeWorkerCount = workerRows.filter((row) => row.observed).length;
-  const observedTopicCount = topicRows.filter((row) => row.observed).length;
-  const masterProfile = RECOMMENDED_WORKER_PROFILE.orchestrator;
-  const masterSlots = Number(masterProfile.containers || 1) * Number(masterProfile.workers || 1);
-  const workerSlots = workerRows.reduce((sum, row) => sum + Number(row.slots || 0), 0);
-  const sankeyStats = [
-    ["Alerts Landed", landedAlertCount || "-"],
-    ["Topics Observed", `${observedTopicCount}/${topicRows.length}`],
-    ["Master Nodes", `${masterProfile.containers} x orchestrator`],
-    ["Worker Slots", workerSlots],
-    ["Path", path.label],
-  ];
-  const staticStageRows = [
-    { id: "landed", title: landedFile ? "File Landed" : "Alert Landed", detail: landedFile || alertName, meta: `${landingSource} | ${landingTime || "time not reported"}`, tone: "blue", status: landedAlertCount ? "observed" : "ready" },
-    { id: "normalized", title: "Landing Pad Normalized", detail: `${alertService} | ${alertSeverity}`, meta: "labels + severity + trace id", tone: "blue", status: safeRows.length ? "observed" : "ready" },
-    { id: "topics", title: "Topics Created", detail: `${observedTopicCount}/${topicRows.length} observed`, meta: provider, tone: "purple", status: observedTopicCount ? "observed" : "configured" },
-    ...(path.hasOrchestration ? [{ id: "master", title: "Master Nodes Route Work", detail: `${masterProfile.containers} orchestrator container(s), ${masterSlots} consumer slot(s)`, meta: `${workflowName} | ${executionMode}`, tone: "green", status: observedTopics.has("orchestration-events") ? "observed" : "ready" }] : []),
-    ...(workerRows.length ? [{ id: "workers", title: "Parallel Workers Process", detail: `${activeWorkerCount}/${workerRows.length} worker services observed`, meta: `${workerSlots} recommended worker slots`, tone: "teal", status: activeWorkerCount ? "observed" : "ready" }] : []),
-    { id: "outputs", title: "Cockpit Updated", detail: incidentId, meta: path.hasRemediation ? `remediation ${remediationStatus}` : path.hasApproval ? `approval ${approvalRequired ? "required" : "observed"}` : path.label, tone: "orange", status: incidentId !== "-" ? "observed" : "ready" },
-  ];
-  const staticStageColumns = [
-    {
-      id: "source",
-      title: landedFile ? "Landed File" : "Landed Alert",
-      subtitle: landingSource,
-      nodes: [
-        { title: alertName, meta: landedFile || selectedAlertId || "selected row", status: landedAlertCount ? "observed" : "ready" },
-        { title: "Service / Severity", meta: `${alertService} / ${alertSeverity}`, status: "ready" },
-      ],
-    },
-    {
-      id: "landing",
-      title: "Landing Pad",
-      subtitle: "/alerts/alertmanager",
-      nodes: [
-        { title: "Normalize Alert", meta: "labels + severity + trace", status: safeRows.length ? "observed" : "ready" },
-        { title: "Persist Intake", meta: "alerts, incidents, incident_events", status: safeRows.length ? "observed" : "ready" },
-      ],
-    },
-    {
-      id: "topics",
-      title: "Topic Creation",
-      subtitle: provider,
-      nodes: topicRows.map((row) => ({
-        title: row.publishes,
-        meta: row.consumes === "-" ? "seed topic" : `after ${row.consumes}`,
-        status: row.status,
-      })),
-    },
-    ...(path.hasOrchestration ? [{
-      id: "master",
-      title: "Master Node",
-      subtitle: executionMode,
-      nodes: [
-        { title: "orchestrator masters", meta: `${masterProfile.containers} container(s) x ${masterProfile.workers} worker(s) = ${masterSlots} route slot(s)`, status: observedTopics.has("orchestration-events") ? "observed" : "ready" },
-        { title: "workflow policy", meta: `${workflowName}; ${approvalRequired ? "approval required" : "approval optional"}`, status: approvalRequired ? "observed" : "ready" },
-      ],
-    }] : []),
-    ...(workerRows.length ? [{
-      id: "workers",
-      title: "Parallel Workers",
-      subtitle: "independent consumers",
-      nodes: workerRows.map((row) => ({
-        title: row.service,
-        meta: `${row.profile.containers} container(s) x ${row.profile.workers} worker(s) = ${row.slots} slot(s); ${row.consumes} -> ${row.publishes}`,
-        status: row.observed ? "observed" : "ready",
-      })),
-    }] : []),
-    {
-      id: "outputs",
-      title: "Cockpit Outputs",
-      subtitle: "operator workspace",
-      nodes: [
-        { title: "Incident", meta: incidentId, status: incidentId !== "-" ? "observed" : "ready" },
-        ...(path.hasContext ? [{ title: "Documents + RAG", meta: "context, matches, citations", status: safeRows.some((row) => String(row?.stage || "").toLowerCase().includes("rag")) ? "observed" : "ready" }] : []),
-        ...(path.hasApproval ? [{ title: "Approval", meta: approvalRequired ? "decision gate" : "observed decision", status: approvalRequired ? "observed" : "ready" }] : []),
-        ...(path.hasRemediation ? [{ title: "Remediation", meta: remediationStatus || "pending", status: remediationStatus !== "pending" ? "observed" : "ready" }] : []),
-        ...(path.hasClosure ? [{ title: "Closure", meta: safeWorkflow?.incident?.status || "validated", status: "observed" }] : []),
-      ],
-    },
-  ];
-
-  const stageRows = dynamicSections.length
-    ? dynamicSections.map((section) => ({
-        id: section.key,
-        title: section.label,
-        detail: section.lastRow?.stage || section.label,
-        meta: `${section.lastRow?.agent || "-"} | ${section.lastRow?.consumes || "-"} -> ${section.lastRow?.publishes || "-"}`,
-        tone: section.status === "failed" ? "orange" : section.status === "fallback" ? "purple" : "blue",
-        status: section.status === "failed" ? "ready" : "observed",
-        nextStep: section.nextStep,
-      }))
-    : staticStageRows;
-  const stageColumns = dynamicSections.length
-    ? dynamicSections.map((section) => ({
-        id: section.key,
-        title: section.label,
-        subtitle: section.nextStep && section.nextStep !== "-"
-          ? `next: ${section.nextStep}`
-          : (section.lastRow?.publishes || section.lastRow?.service || "observed"),
-        nodes: section.rows.map((row, index) => ({
-          title: row.stage || `${section.label} ${index + 1}`,
-          meta: `${row.agent || "-"} | ${row.consumes || "-"} -> ${row.publishes || "-"}`,
-          status: timelineRowStatus(row, safeRows[safeRows.indexOf(row) + 1]) === "failed" ? "ready" : "observed",
-        })),
-      }))
-    : staticStageColumns;
-
-  return (
-    <div className="application-sankey">
-      <div className="context-flow-header">
-        <div>
-          <h3>Application Alert Flow</h3>
-          <p>Actual landed alert/file first, then the downstream processing path. Use drilldown to inspect each stage in Flow Timeline.</p>
-          <p>Best single-VM profile: one service container per stage with broker-backed worker consumers; add more VMs behind a load balancer for horizontal replicas.</p>
-        </div>
-        <div className="context-flow-scoreboard">
-          {sankeyStats.map(([label, value]) => (
-            <span key={`sankey-stat-${label}`}>
-              {label}
-              <strong>{value}</strong>
-            </span>
-          ))}
-        </div>
-      </div>
-
-      <div className="app-flow-landed-card">
-        <div>
-          <span>{landedFile ? "Actual File Landed" : "Actual Alert Landed"}</span>
-          <strong>{landedFile || alertName}</strong>
-          <small>{alertName} | {alertService} | {alertSeverity}</small>
-        </div>
-        <button type="button" className="button-secondary" onClick={onDrillTimeline}>
-          View Flow Timeline Detail
-        </button>
-      </div>
-
-      <div className="app-sankey-stage-flow" aria-label="Actual alert processing flow">
-        {stageRows.map((stage, index) => (
-          <div className="app-sankey-stage-wrap" key={stage.id}>
-            <article className={`app-sankey-stage tone-${stage.tone} status-${stage.status}`} style={{ animationDelay: `${index * 70}ms` }}>
-              <span>{index + 1}</span>
-              <div>
-                <strong>{stage.title}</strong>
-                <p>{stage.detail}</p>
-                <small>{stage.meta}</small>
-                {stage.nextStep && stage.nextStep !== "-" ? <small>next: {stage.nextStep}</small> : null}
-              </div>
-              <button type="button" className="timeline-copy-btn" onClick={onDrillTimeline}>Timeline</button>
-            </article>
-            {index < stageRows.length - 1 ? <i className={`app-sankey-stage-link tone-${stage.tone}`} aria-hidden="true" /> : null}
-          </div>
-        ))}
-      </div>
-
-      <div className="app-sankey-columns">
-        {stageColumns.map((column) => (
-          <section className={`app-sankey-column column-${column.id}`} key={column.id}>
-            <div className="app-sankey-column-head">
-              <strong>{column.title}</strong>
-              <span>{column.subtitle}</span>
-            </div>
-            <div className="app-sankey-node-list">
-              {column.nodes.map((node, index) => (
-                <article className={`app-sankey-node status-${node.status}`} key={`${column.id}-${node.title}-${index}`}>
-                  <strong>{node.title}</strong>
-                  <span>{node.meta}</span>
-                </article>
-              ))}
-            </div>
-          </section>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function ProcessingFlowMap({ workflow, timelineRows, routing, selectedAlert, selectedAlertId, onDrillTimeline }) {
-  const safeWorkflow = workflow && typeof workflow === "object" ? workflow : {};
-  const safeRows = Array.isArray(timelineRows) ? timelineRows : [];
-  const safeRouting = routing && typeof routing === "object" ? routing : {};
-  const safeAlert = selectedAlert && typeof selectedAlert === "object" ? selectedAlert : {};
-  const path = classifySelectedAlertPath(safeWorkflow, safeRows, safeAlert);
-  const dynamicSections = buildDynamicFlowSections(safeRows);
-  const rowByOrder = (order) => safeRows.find((row) => Number(row?.flowOrder) === order) || {};
-  const firstRowMatching = (tokens) => {
-    const needles = Array.isArray(tokens) ? tokens : [];
-    return safeRows.find((row) => {
-      const haystack = `${row?.stage || ""} ${row?.service || ""} ${row?.agent || ""} ${row?.consumes || ""} ${row?.publishes || ""}`.toLowerCase();
-      return needles.some((token) => haystack.includes(String(token || "").toLowerCase()));
-    }) || {};
-  };
-  const alertName = String(
-    safeAlert.name
-    || safeAlert.alert_name
-    || safeWorkflow?.alert?.name
-    || safeWorkflow?.alert?.alertname
-    || selectedAlertId
-    || "selected alert"
-  ).trim();
-  const service = String(safeAlert.service || safeWorkflow?.alert?.service || safeWorkflow?.incident?.service || "-").trim();
-  const severity = String(safeAlert.severity || safeWorkflow?.alert?.severity || safeWorkflow?.incident?.severity || "-").trim();
-  const incidentId = String(safeWorkflow?.incident?.id || safeWorkflow?.incident_id || "-").trim();
-  const workflowName = String(safeRouting.workflow || safeWorkflow?.decision?.workflow || "guided-remediation").trim();
-  const busProvider = String(safeRouting.message_bus_provider || safeWorkflow?.decision?.message_bus_provider || "rabbitmq").trim();
-  const executionMode = String(safeRouting.execution_mode || safeWorkflow?.decision?.execution_mode || "parallel-workers").trim();
-  const traceId = String(
-    safeWorkflow?.alert?.trace_id
-    || safeWorkflow?.incident?.trace_id
-    || safeWorkflow?.context?.trace_id
-    || safeWorkflow?.recommendation?.trace_id
-    || ""
-  ).trim();
-  const recommendation = safeWorkflow?.recommendation && typeof safeWorkflow.recommendation === "object" ? safeWorkflow.recommendation : {};
-  const contextPayload = safeWorkflow?.context && typeof safeWorkflow.context === "object" ? safeWorkflow.context : {};
-  const contextMetadata = contextPayload?.metadata && typeof contextPayload.metadata === "object" ? contextPayload.metadata : {};
-  const recommendationMetadata = recommendation?.metadata && typeof recommendation.metadata === "object" ? recommendation.metadata : {};
-  const remediation = safeWorkflow?.remediation_action && typeof safeWorkflow.remediation_action === "object" ? safeWorkflow.remediation_action : {};
-  const documentsRow = firstRowMatching(["rag context", "semantic", "context merge"]);
-  const remediationPlan = remediation?.parameters?.execution_plan && typeof remediation.parameters.execution_plan === "object"
-    ? remediation.parameters.execution_plan
-    : {};
-  const parseFlowJson = (value) => {
-    const text = String(value || "").trim();
-    if (!text) {
-      return {};
-    }
-    try {
-      const parsed = JSON.parse(text);
-      return parsed && typeof parsed === "object" ? parsed : {};
-    } catch (_error) {
-      return {};
-    }
-  };
-  const contextRetrievalRow = rowByOrder(80);
-  const semanticSearchRow = rowByOrder(85);
-  const contextMergeRow = rowByOrder(90);
-  const resolutionRow = rowByOrder(110);
-  const contextRetrievalOutput = parseFlowJson(contextRetrievalRow.outputValueText);
-  const semanticSearchOutput = parseFlowJson(semanticSearchRow.outputValueText);
-  const contextMergeOutput = parseFlowJson(contextMergeRow.outputValueText);
-  const resolutionOutput = parseFlowJson(resolutionRow.outputValueText);
-  const contextRetrievalInput = parseFlowJson(contextRetrievalRow.inputValueText);
-  const resolutionInput = parseFlowJson(resolutionRow.inputValueText);
-  const ragMatches = Array.isArray(contextRetrievalOutput.rag_matches)
-    ? contextRetrievalOutput.rag_matches
-    : Array.isArray(semanticSearchOutput.top_matches)
-      ? semanticSearchOutput.top_matches
-      : [];
-  const topRagMatches = ragMatches.slice(0, 5);
-  const ragIndex =
-    (contextMetadata.rag_index && typeof contextMetadata.rag_index === "object" && contextMetadata.rag_index)
-    || (recommendationMetadata.rag_index && typeof recommendationMetadata.rag_index === "object" && recommendationMetadata.rag_index)
-    || {};
-  const embeddingModel =
-    (ragIndex.embedding_model && typeof ragIndex.embedding_model === "object" && ragIndex.embedding_model)
-    || {};
-  const vectorStore =
-    (ragIndex.vector_store && typeof ragIndex.vector_store === "object" && ragIndex.vector_store)
-    || {};
-  const embeddingProvider = String(embeddingModel.provider || contextMetadata.embedding_provider || "not reported").trim();
-  const embeddingName = String(embeddingModel.model || contextMetadata.embedding_model || "not reported").trim();
-  const embeddingFallback = String(embeddingModel.fallback_active ? embeddingModel.fallback_model || "active" : embeddingModel.fallback_model || "-").trim();
-  const vectorProvider = String(vectorStore.provider || contextMetadata.vector_store || "not reported").trim();
-  const vectorIndexName = String(vectorStore.index || vectorStore.index_name || ragIndex.index_name || ragIndex.name || "-").trim();
-  const indexedDocuments = ragIndex.document_count ?? ragIndex.total_documents ?? ragIndex.embedded_document_count ?? contextRetrievalOutput.rag_documents ?? "-";
-  const modelUsage = Array.isArray(recommendationMetadata.model_usage)
-    ? recommendationMetadata.model_usage
-    : Array.isArray(recommendation.model_usage)
-      ? recommendation.model_usage
-      : [];
-  const primaryModelCall = modelUsage[0] || {};
-  const modelRouterProvider = String(primaryModelCall.provider || primaryModelCall.model_provider || recommendationMetadata.model_provider || "model-router").trim();
-  const modelRouterModel = String(primaryModelCall.model || primaryModelCall.model_name || recommendationMetadata.model_name || "not reported").trim();
-  const modelRouterTask = String(primaryModelCall.task || primaryModelCall.model_task || recommendationMetadata.model_task || "rca").trim();
-  const modelRouterCalls = modelUsage.length;
-  const modelRouterTokens = modelUsage.reduce((sum, row) => sum + Number(row.total_tokens || row.input_tokens || 0), 0);
-  const modelRouterFailed = modelUsage.some((row) => {
-    const safeRow = row && typeof row === "object" ? row : {};
-    return hasMeaningfulValue(safeRow.error) || String(safeRow.status || "").trim().toLowerCase() === "failed";
-  });
-  const modelRouterFallback = modelUsage.some((row) => {
-    const safeRow = row && typeof row === "object" ? row : {};
-    const provider = String(safeRow.provider || safeRow.model_provider || "").trim().toLowerCase();
-    const model = String(safeRow.model || safeRow.model_name || "").trim().toLowerCase();
-    return provider.includes("fallback") || model.includes("fallback");
-  });
-  const modelRouterStatus = modelRouterFailed
-    ? "failed"
-    : modelRouterFallback
-      ? "fallback"
-      : modelRouterCalls > 0
-        ? "observed"
-        : "waiting";
-  const contextDetailRows = [
-    ["Query", contextRetrievalInput.service || contextRetrievalInput.query || service],
-    ["Deployment", contextRetrievalInput.deployment || "-"],
-    ["Related Incidents", contextRetrievalInput.related_incidents ?? "-"],
-    ["RAG Documents", contextRetrievalOutput.rag_documents ?? "-"],
-    ["Index Name", vectorIndexName],
-    ["Vector Store", vectorProvider],
-    ["Embedding Model", `${embeddingProvider} / ${embeddingName}`],
-    ["Embedding Fallback", embeddingFallback || "-"],
-    ["Runbook Found", String(contextRetrievalOutput.runbook_found ?? contextMergeOutput.runbook_found ?? "-")],
-    ["Top Match Confidence", semanticSearchOutput.rag_top_match_confidence ?? semanticSearchOutput.rag_top_similarity ?? "-"],
-    ["Top Semantic Score", semanticSearchOutput.rag_top_semantic_score ?? "-"],
-    ["Top Metadata Score", semanticSearchOutput.rag_top_metadata_match_score ?? "-"],
-    ["Context Summary", contextMergeOutput.context_summary || "-"],
-  ];
-  const resolutionDetailRows = [
-    ["Incident", resolutionInput.incident_id || incidentId],
-    ["Recommendation ID", resolutionOutput.recommendation_id || recommendation.id || "-"],
-    ["Root Cause", cleanRecommendationText(resolutionOutput.root_cause || recommendation.root_cause, "-")],
-    ["Impact", cleanRecommendationText(recommendation.impact, "-")],
-    ["Recommended Action", cleanRecommendationText(recommendation.recommended_action, "-")],
-    ["Model Router", `${modelRouterProvider} / ${modelRouterModel}`],
-    ["Model Task", modelRouterTask],
-    ["LLM Calls", modelRouterCalls || "-"],
-    ["Tokens", modelRouterTokens || "-"],
-    ["Confidence", resolutionOutput.confidence ?? recommendation.confidence ?? "-"],
-    ["Grounding Score", resolutionOutput.grounding_score ?? recommendation?.metadata?.grounding_score ?? "-"],
-    ["Hallucination Score", resolutionOutput.hallucination_score ?? recommendation?.metadata?.hallucination_score ?? "-"],
-  ];
-  const incidentStatusText = String(safeWorkflow?.incident?.status || safeAlert.status || safeAlert.state || "").trim().toLowerCase();
-  const isClosed = ["closed", "resolved", "validated", "complete", "completed"].some((token) => incidentStatusText.includes(token));
-  const allTimelineText = safeRows
-    .map((row) => `${row?.stage || ""} ${row?.detail || ""} ${row?.errorValueText || ""} ${row?.inputValueText || ""} ${row?.outputValueText || ""}`)
-    .join(" ")
-    .toLowerCase();
-  const fallbackDetected = ["fallback", "skipped", "not executed", "no live executor", "no real", "blocked", "policy"].some((token) => allTimelineText.includes(token));
-  const rowIndicatesFallback = (text) => [
-    "fallback",
-    "heuristic-fallback",
-    "skipped",
-    "not executed",
-    "no live executor",
-    "no real",
-    "policy-blocked",
-    "safety gate",
-    "live mutation blocked",
-  ].some((token) => text.includes(token));
-  const rowIndicatesSuccess = (text) => [
-    "succeeded",
-    "success",
-    "completed",
-    "closed",
-    "observed",
-    "validated",
-    "confidence",
-    "recommendation_id",
-  ].some((token) => text.includes(token));
-  const rowHasFailure = (row) => {
-    const text = `${row?.status || ""} ${row?.detail || ""} ${row?.errorValueText || ""} ${row?.inputValueText || ""} ${row?.outputValueText || ""}`.toLowerCase();
-    if (!hasMeaningfulValue(row?.errorValueText)) {
-      return false;
-    }
-    if (rowIndicatesFallback(text) || rowIndicatesSuccess(text)) {
-      return false;
-    }
-    return text.includes("error") || text.includes("failed") || text.includes("exception");
-  };
-  const failedCount = safeRows.filter(rowHasFailure).length;
-
-  const nodeStatus = (row, order, fallbackHint = "") => {
-    // Only trust the dedicated error/fallback signal for this stage, not the
-    // stringified input/output JSON blobs — those often contain unrelated
-    // fields (e.g. the incident's overall lifecycle status) whose text can
-    // coincidentally include words like "failed", which previously caused
-    // unrelated stages to be mislabeled as failed.
-    const errorText = String(row?.errorValueText || "").toLowerCase();
-    const hintText = String(fallbackHint || "").toLowerCase();
-    const statusText = `${errorText} ${hintText}`;
-    if (statusText.includes("error") || statusText.includes("failed") || statusText.includes("exception")) {
-      return "failed";
-    }
-    if (
-      statusText.includes("fallback")
-      || statusText.includes("skipped")
-      || statusText.includes("not executed")
-      || statusText.includes("no live executor")
-      || statusText.includes("no real")
-      || statusText.includes("policy-blocked")
-      || statusText.includes("safety gate")
-      || statusText.includes("live mutation blocked")
-    ) {
-      return "fallback";
-    }
-    if (rowIndicatesSuccess(statusText)) {
-      return "observed";
-    }
-    if (statusText.includes("error") || statusText.includes("failed") || statusText.includes("exception")) {
-      return "failed";
-    }
-    if (isClosed && Number(order || 0) >= 170) {
-      return "closed";
-    }
-    if (hasMeaningfulValue(row) || safeRows.some((item) => Number(item?.flowOrder) === order)) {
-      return "observed";
-    }
-    return "waiting";
-  };
-
-  const makeNode = ({ key, title, meta, detail, type = "service", row = {}, order, fallbackHint = "", statusOverride = "", nextStep = "" }) => {
-    const observed = hasMeaningfulValue(row) || safeRows.some((item) => Number(item?.flowOrder) === order);
-    const status = statusOverride || nodeStatus(row, order, fallbackHint);
-    return { key, title, meta, detail, type, row, order, observed, status, nextStep };
-  };
-
-  const mainNodes = [
-    makeNode({ key: "source", title: "Alerts ingested by third party", meta: "Prometheus / Grafana / external tools", detail: alertName, order: 5, type: "source", row: safeAlert }),
-    makeNode({ key: "landing", title: "Alerts landed in Landing Pad", meta: "/input or /alerts/alertmanager", detail: `${service} | ${severity}`, order: 10, row: rowByOrder(10) }),
-    makeNode({ key: "normalize", title: "Alert normalized to canonical format", meta: "labels + annotations + trace id", detail: traceId || "trace generated by intake", order: 10, row: rowByOrder(10) }),
-    makeNode({ key: "raw-bus", title: "Raw alert message published", meta: `${busProvider}: raw-alerts`, detail: "Monitoring Adapter -> Alert Intelligence", order: 20, type: "bus", row: rowByOrder(20) }),
-    makeNode({
-      key: "alert-ai",
-      title: "Alert intelligence: classify, dedupe, correlate",
-      meta: "policy + labels + fingerprint + service",
-      detail: `severity=${severity}; incident=${incidentId}`,
-      order: 30,
-      row: {
-        ...rowByOrder(30),
-        inputValueText: stringifyTimelineValue({
-          alert: alertName,
-          service,
-          environment: safeAlert.environment || safeWorkflow?.alert?.environment || "-",
-          fingerprint: safeAlert.fingerprint || safeAlert.labels?.alert_fingerprint || "-",
-        }),
-        outputValueText: stringifyTimelineValue({
-          severity_classification: severity,
-          deduplicated_count: safeAlert.deduplicated_count ?? safeWorkflow?.alert?.deduplicated_count ?? "-",
-          correlation_id: safeAlert.correlation_id || safeWorkflow?.alert?.correlation_id || "-",
-          incident_id: incidentId,
-        }),
-      },
-    }),
-  ];
-
-  const orchestrationNodes = path.hasOrchestration ? [
-    makeNode({ key: "enriched-bus", title: "Enriched alert message published", meta: `${busProvider}: enriched-alerts`, detail: "Alert Intelligence -> Orchestrator", order: 40, type: "bus", row: rowByOrder(40) }),
-    makeNode({ key: "orchestrator", title: "Orchestrator workflow selected", meta: workflowName, detail: `execution=${executionMode}`, order: 50, row: rowByOrder(50) }),
-    makeNode({ key: "config", title: "Config and connector lookup", meta: "connections + playbooks + action catalog", detail: "workflow, bus provider, risk, executor profile", order: 60, type: "config", row: rowByOrder(60) }),
-    makeNode({ key: "orch-bus", title: "Execution work item published", meta: `${busProvider}: orchestration-events`, detail: "Orchestrator -> Context Agent", order: 70, type: "bus", row: rowByOrder(70) }),
-  ] : [];
-
-  const workerLanes = [
-    ...(path.hasContext ? [{
-      key: "context",
-      title: "Context",
-      nodes: [
-        makeNode({ key: "ctx-agent", title: "Context Agent consumes orchestration-events", meta: "query + signal + service", detail: service, order: 80, row: rowByOrder(80) }),
-        makeNode({ key: "index", title: "Checks index and documents", meta: `${vectorProvider} / ${vectorIndexName}`, detail: `${indexedDocuments} document(s), embedding ${embeddingProvider}/${embeddingName}`, order: 85, type: "store", row: documentsRow }),
-        makeNode({ key: "ranked", title: "Search ranked", meta: "semantic + metadata ranking", detail: `top similarity ${semanticSearchOutput.rag_top_similarity ?? "not reported"}`, order: 85, type: "store", row: rowByOrder(85) }),
-        makeNode({ key: "context-merge", title: "Context merged and evidence assembled", meta: "docs + deps + connector evidence", detail: "context-events payload prepared", order: 90, row: rowByOrder(90) }),
-        makeNode({ key: "context-bus", title: "Context message published", meta: `${busProvider}: context-events`, detail: "Context Agent -> Resolution Agent", order: 100, type: "bus", row: rowByOrder(100) }),
-      ],
-    }] : []),
-    ...(path.hasResolution ? [{
-      key: "resolution",
-      title: "Resolution",
-      nodes: [
-        makeNode({
-          key: "model-router",
-          title: "Model Router LLM call",
-          meta: `${modelRouterProvider} / ${modelRouterModel}`,
-          detail: `${modelRouterTask} | ${modelRouterCalls || 0} call(s) | ${modelRouterTokens || 0} token(s)`,
-          order: 109,
-          type: "config",
-          row: modelUsage.length
-            ? {
-                inputValueText: stringifyTimelineValue({ task: modelRouterTask, provider: modelRouterProvider, model: modelRouterModel }),
-                outputValueText: stringifyTimelineValue({
-                  calls: modelRouterCalls,
-                  tokens: modelRouterTokens,
-                  status: modelRouterStatus,
-                  errors: modelUsage.map((row) => row?.error).filter(Boolean),
-                }),
-                errorValueText: modelRouterFailed ? stringifyTimelineValue(modelUsage.map((row) => row?.error).filter(Boolean)) : "",
-              }
-            : {},
-          fallbackHint: modelRouterFallback ? "fallback" : "",
-          statusOverride: modelRouterStatus,
-        }),
-        makeNode({ key: "resolution-agent", title: "Resolution Agent consumes context-events", meta: "RCA + impact + action", detail: cleanRecommendationText(recommendation.root_cause, "root cause analysis"), order: 110, row: rowByOrder(110) }),
-        makeNode({ key: "impact", title: "Impact analysis", meta: "customer + dependency impact", detail: cleanRecommendationText(recommendation.impact, "-"), order: 110, row: rowByOrder(110) }),
-        makeNode({ key: "action", title: "Recommendation action", meta: "safe next step", detail: cleanRecommendationText(recommendation.recommended_action, "-"), order: 110, row: rowByOrder(110) }),
-        makeNode({ key: "confidence", title: "Confidence and grounding", meta: "quality guardrails", detail: `confidence ${recommendation.confidence ?? "-"}`, order: 110, row: rowByOrder(110) }),
-        ...(path.hasApproval || path.hasRemediation ? [makeNode({ key: "resolution-bus", title: "Resolution message published", meta: `${busProvider}: resolution-events`, detail: "Resolution Agent -> Approval Service", order: 120, type: "bus", row: rowByOrder(120) })] : []),
-      ],
-    }] : []),
-    ...(path.hasApproval || path.hasRemediation ? [{
-      key: "remediation",
-      title: "Approval + Remediation",
-      nodes: [
-        ...(path.hasApproval ? [
-          makeNode({ key: "approval", title: "Human approval gate", meta: "L2/L3/Admin can edit plan", detail: remediation.approval_id || "pending decision", order: 130, row: rowByOrder(130) }),
-          makeNode({ key: "approval-bus", title: "Approval message published", meta: `${busProvider}: approval-events`, detail: "Approval Service -> Remediation Engine", order: 140, type: "bus", row: rowByOrder(140) }),
-        ] : []),
-        ...(path.hasRemediation ? [makeNode({ key: "execute", title: "Remediation Engine validates and executes", meta: "policy + executor + secret_ref", detail: remediation.status || "pending", order: 150, row: rowByOrder(150), fallbackHint: remediation?.error || remediation?.output || "" })] : []),
-        ...(fallbackDetected ? [
-          makeNode({
-            key: "fallback",
-            title: "Fallback or safety gate applied",
-            meta: "plan preserved, live mutation blocked",
-            detail: remediation.error || remediation.output || "No live executor/connector was available, so the approved plan remains available for operator action.",
-            order: 151,
-            type: "config",
-            row: rowByOrder(150),
-            fallbackHint: "fallback",
-          }),
-        ] : []),
-        ...(path.hasRemediation ? [
-          makeNode({ key: "script", title: "Execution plan script", meta: "editable before approval", detail: Array.isArray(remediationPlan.scripts) && remediationPlan.scripts.length ? remediationPlan.scripts[0] : "no script reported", order: 150, type: "config", row: rowByOrder(150) }),
-          makeNode({ key: "rem-bus", title: "Remediation message published", meta: `${busProvider}: remediation-events`, detail: "Remediation Engine -> Closure Service", order: 160, type: "bus", row: rowByOrder(160) }),
-        ] : []),
-      ],
-    }] : []),
-    ...(path.hasClosure ? [{
-      key: "closure",
-      title: "Closure",
-      nodes: [
-        makeNode({ key: "closure-service", title: "Closure Service validates outcome", meta: "post-checks + incident projection", detail: safeWorkflow?.incident?.status || "-", order: 170, row: rowByOrder(170) }),
-        makeNode({ key: "closure-bus", title: "Closure message published", meta: `${busProvider}: closure-events`, detail: "Dashboard, reports, notifications", order: 180, type: "bus", row: firstRowMatching(["closure-events"]) }),
-      ],
-    }] : []),
-  ];
-
-  const statusLabel = (status) => {
-    if (status === "failed") return "Failed";
-    if (status === "fallback") return "Review required";
-    if (status === "closed") return "Closed";
-    if (status === "observed") return "Observed";
-    return "Waiting";
-  };
-  const renderNode = (node) => (
-    <article className={`processing-flow-node node-${node.type} status-${node.status}`} key={node.key}>
-      <div className="processing-node-head">
-        <strong>{node.title}</strong>
-        <em>{statusLabel(node.status)}</em>
-      </div>
-      <span>{node.meta}</span>
-      <p>{compactText(node.detail, 150) || "-"}</p>
-      <small>
-        {node.status === "fallback"
-          ? "fallback, blocked execution, or safety gate path used"
-          : node.status === "failed"
-            ? "error detected in selected alert flow"
-            : node.status === "closed"
-              ? "incident closure path completed"
-              : node.status === "observed"
-                ? "observed from selected alert flow"
-                : "configured path, not observed yet"}
-      </small>
-        {node.nextStep && node.nextStep !== "-" ? <small>next step: {node.nextStep}</small> : null}
-      {node.row?.inputValueText || node.row?.outputValueText ? (
-        <details>
-          <summary>Details</summary>
-          {node.row?.inputValueText ? <pre className="result">{node.row.inputValueText}</pre> : null}
-          {node.row?.outputValueText ? <pre className="result">{node.row.outputValueText}</pre> : null}
-        </details>
-      ) : null}
-    </article>
-  );
-
-  return (
-    <div className="processing-flow-map">
-      <div className="context-flow-header">
-        <div>
-          <h3>Complete Processing Flow</h3>
-          <p>Architecture-style view for the selected alert. Use Flow Timeline for full event payload details.</p>
-        </div>
-        <button type="button" className="button-secondary" onClick={onDrillTimeline}>Open Detailed Timeline</button>
-      </div>
-      <div className="processing-flow-status-strip">
-        <span><strong>{safeRows.length}</strong> timeline rows</span>
-        <span><strong>{failedCount}</strong> failures</span>
-        <span><strong>{fallbackDetected ? "yes" : "no"}</strong> fallback</span>
-        <span><strong>{isClosed ? "closed" : incidentStatusText || "open"}</strong> incident</span>
-        <span><strong>{path.label}</strong> selected path</span>
-      </div>
-      {fallbackDetected || failedCount ? (
-        <div className={`processing-flow-banner ${failedCount ? "is-failed" : "is-fallback"}`}>
-          <strong>{failedCount ? "Flow needs attention" : "Fallback path detected"}</strong>
-          <span>
-            {failedCount
-              ? "One or more stages reported errors. Open the detailed timeline to inspect exact payloads."
-              : "A safety gate, fallback, or skipped execution was detected. The plan is preserved and closure should reflect the guarded outcome."}
-          </span>
-        </div>
-      ) : null}
-      {dynamicSections.length ? (
-      <div className="processing-flow-lanes">
-        {dynamicSections.map((section) => {
-          const nodes = section.rows.map((row, index) => {
-            const rowIndex = safeRows.indexOf(row);
-            const nextRow = rowIndex >= 0 ? safeRows[rowIndex + 1] : null;
-            return makeNode({
-              key: `${section.key}-${index}`,
-              title: row.stage || section.label,
-              meta: `${row.agent || "-"} | ${row.consumes || "-"} -> ${row.publishes || "-"}`,
-              detail: row.detail || "Observed stage from incident timeline.",
-              type: row.publishes && row.publishes !== "-" ? "bus" : "service",
-              row,
-              order: row.flowOrder || row.sequence || index + 1,
-              fallbackHint: inferTimelineNextStep(row, nextRow),
-              statusOverride: timelineRowStatus(row, nextRow),
-              nextStep: inferTimelineNextStep(row, nextRow),
-            });
-          });
-          return (
-            <section className="processing-flow-lane" key={section.key}>
-              <h4>{section.label}</h4>
-              {section.nextStep && section.nextStep !== "-" ? <p className="subtitle">next: {section.nextStep}</p> : null}
-              {nodes.map((node, index) => (
-                <div className="processing-flow-step" key={node.key}>
-                  {renderNode(node)}
-                  {index < nodes.length - 1 ? <span className="processing-flow-arrow" aria-hidden="true">v</span> : null}
-                </div>
-              ))}
-            </section>
-          );
-        })}
-      </div>
-      ) : (
-      <>
-      <div className="processing-flow-spine">
-        {mainNodes.map((node, index) => (
-          <div className="processing-flow-step" key={node.key}>
-            {renderNode(node)}
-            {index < mainNodes.length - 1 ? <span className="processing-flow-arrow" aria-hidden="true">v</span> : null}
-          </div>
-        ))}
-      </div>
-      {orchestrationNodes.length ? (
-        <div className="processing-flow-spine">
-          {orchestrationNodes.map((node, index) => (
-            <div className="processing-flow-step" key={node.key}>
-              {renderNode(node)}
-              {index < orchestrationNodes.length - 1 ? <span className="processing-flow-arrow" aria-hidden="true">v</span> : null}
-            </div>
-          ))}
-        </div>
-      ) : null}
-      {workerLanes.length ? (
-      <div className="processing-flow-lanes">
-        {workerLanes.map((lane) => (
-          <section className="processing-flow-lane" key={lane.key}>
-            <h4>{lane.title}</h4>
-            {lane.nodes.map((node, index) => (
-              <div className="processing-flow-step" key={node.key}>
-                {renderNode(node)}
-                {index < lane.nodes.length - 1 ? <span className="processing-flow-arrow" aria-hidden="true">v</span> : null}
-              </div>
-            ))}
-          </section>
-        ))}
-      </div>
-      ) : (
-        <div className="processing-flow-banner">
-          <strong>No downstream worker cycle required</strong>
-          <span>This selected alert currently only shows intake/intelligence stages. Context, resolution, approval, remediation, and closure will appear only if the workflow reaches those stages.</span>
-        </div>
-      )}
-      </>
-      )}
-      <div className="processing-flow-detail-grid">
-        <article className="processing-flow-detail-card">
-          <div className="panel-head">
-            <h4>Context Details</h4>
-            <p>Same evidence path as Context Flow, shown inline for this processing map.</p>
-          </div>
-          <div className="table-wrap table-wrap-scroll-x">
-            <table>
-              <tbody>
-                {contextDetailRows.map(([label, value]) => (
-                  <tr key={`processing-context-${label}`}><th>{label}</th><td>{String(value ?? "-")}</td></tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-          <h4>Documents / Matches Touched</h4>
-          {topRagMatches.length ? (
-            <div className="processing-flow-match-list">
-              {topRagMatches.map((match, index) => (
-                <div className="processing-flow-match" key={`processing-match-${index}`}>
-                  <strong>{match.title || match.document_id || match.path || `Match ${index + 1}`}</strong>
-                  <span>{match.kind || match.document_kind || "document"} | confidence {Math.round(Number(match.match_confidence || match._similarity || match.score || 0) * 100) || "-"}%</span>
-                  <small>{compactText(match.match_reason || match.summary || match.path || JSON.stringify(match), 180)}</small>
-                </div>
-              ))}
-            </div>
-          ) : (
-            <p className="subtitle">No RAG match list was reported for this selected alert.</p>
-          )}
-        </article>
-        <article className="processing-flow-detail-card">
-          <div className="panel-head">
-          <h4>Resolution Details</h4>
-          <p>RCA, impact, recommendation, and quality scores from the Resolution Agent.</p>
-          </div>
-          <div className="table-wrap table-wrap-scroll-x">
-            <table>
-              <tbody>
-                {resolutionDetailRows.map(([label, value]) => (
-                  <tr key={`processing-resolution-${label}`}><th>{label}</th><td>{String(value ?? "-")}</td></tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-          <h4>LLM Calls Through Model Router</h4>
-          {modelUsage.length ? (
-            <div className="processing-flow-match-list">
-              {modelUsage.slice(0, 6).map((usage, index) => (
-                <div className="processing-flow-match" key={`processing-llm-${index}`}>
-                  <strong>{usage.provider || usage.model_provider || "model-router"}</strong>
-                  <span>{usage.model || usage.model_name || "-"} | task {usage.task || usage.model_task || "-"}</span>
-                  <small>
-                    input {usage.input_tokens ?? "-"} | output {usage.output_tokens ?? "-"} | total {usage.total_tokens ?? "-"} | cost {usage.total_cost_usd ?? "-"}
-                  </small>
-                </div>
-              ))}
-            </div>
-          ) : (
-            <p className="subtitle">No persisted model-router usage rows were reported for this selected alert.</p>
-          )}
-          <h4>Execution Plan Preview</h4>
-          <div className="processing-flow-match-list">
-            <div className="processing-flow-match">
-              <strong>Commands</strong>
-              <span>{Array.isArray(remediationPlan.commands) ? remediationPlan.commands.length : 0} item(s)</span>
-              <small>{Array.isArray(remediationPlan.commands) && remediationPlan.commands.length ? remediationPlan.commands.join(" | ") : "No command list reported."}</small>
-            </div>
-            <div className="processing-flow-match">
-              <strong>Scripts</strong>
-              <span>{Array.isArray(remediationPlan.scripts) ? remediationPlan.scripts.length : 0} item(s)</span>
-              <small>{Array.isArray(remediationPlan.scripts) && remediationPlan.scripts.length ? remediationPlan.scripts.join(" | ") : "No script reported."}</small>
-            </div>
-            <div className="processing-flow-match">
-              <strong>Queries</strong>
-              <span>{Array.isArray(remediationPlan.queries) ? remediationPlan.queries.length : 0} item(s)</span>
-              <small>{Array.isArray(remediationPlan.queries) && remediationPlan.queries.length ? remediationPlan.queries.join(" | ") : "No validation query reported."}</small>
-            </div>
-          </div>
-        </article>
-      </div>
-    </div>
-  );
-}
-
-function MessageBusTopology({ actual, configuredRows, routing, primaryTopic, compact = false }) {
-  const safeActual = actual && typeof actual === "object" ? actual : {};
-  const safeRouting = routing && typeof routing === "object" ? routing : {};
-  const published = Array.isArray(safeActual.published) ? safeActual.published : [];
-  const consumed = Array.isArray(safeActual.consumed) ? safeActual.consumed : [];
-  const observedTopics = new Set([...published, ...consumed].map((topic) => String(topic || "").trim()).filter(Boolean));
-  const rows = Array.isArray(configuredRows) ? configuredRows : [];
-  const provider = String(safeRouting?.message_bus_provider || safeActual?.rows?.[0]?.provider || "Azure Service Bus").trim();
-  const workflow = String(safeRouting?.workflow || "alert-workflow").trim();
-  const executionMode = String(safeRouting?.execution_mode || "parallel-workers").trim();
-  const sourceTopic = String(primaryTopic || rows.find((row) => row?.publishes)?.publishes || "kaiops-orchestration-events").trim();
-  const workerNodes = [
-    { title: "Alert Intelligence", service: "alert-intelligence", topic: "enriched-alerts", lane: "worker" },
-    { title: "Context Worker", service: "context-agent", topic: "context-events", lane: "worker" },
-    { title: "Resolution Worker", service: "resolution-agent", topic: "resolution-events", lane: "worker" },
-    { title: "Approval Worker", service: "approval-service", topic: "approval-events", lane: "gate" },
-    { title: "Remediation Worker", service: "remediation-engine", topic: "remediation-events", lane: "worker" },
-    { title: "Closure Worker", service: "closure-service", topic: "closure-events", lane: "worker" },
-  ];
-
-  const isObserved = (topic) => observedTopics.has(String(topic || "").replace(" (enabled transports)", ""));
-
-  return (
-    <div className={`message-bus-topology ${compact ? "compact" : ""}`} aria-label="Message bus topology">
-      <div className="bus-summary-strip">
-        <div>
-          <span>Provider</span>
-          <strong>{provider}</strong>
-        </div>
-        <div>
-          <span>Workflow</span>
-          <strong>{workflow}</strong>
-        </div>
-        <div>
-          <span>Execution</span>
-          <strong>{executionMode}</strong>
-        </div>
-        <div>
-          <span>Primary Topic</span>
-          <strong>{sourceTopic}</strong>
-        </div>
-      </div>
-
-      <div className="bus-path-stage-grid">
-        <section className="bus-stage bus-stage-ingest">
-          <div className="bus-stage-head">
-            <span className="bus-node-icon">LP</span>
-            <div>
-              <strong>Landing Pad</strong>
-              <span>Alert intake and normalization</span>
-            </div>
-          </div>
-          <div className="bus-endpoint-box">
-            <span>HTTP ingestion</span>
-            <code>/alerts/alertmanager</code>
-          </div>
-          <div className="bus-topic-pill active">raw-alerts</div>
-        </section>
-
-        <section className="bus-stage bus-stage-topic">
-          <div className="bus-stage-head">
-            <span className="bus-node-icon">TC</span>
-            <div>
-              <strong>Topic Creation</strong>
-              <span>Provisioned routing channels</span>
-            </div>
-          </div>
-          <div className="bus-topic-sequence" aria-label="Sequential topic creation flow">
-            {rows.map((row, index) => {
-              const topic = String(row?.publishes || "").trim();
-              const consumes = String(row?.consumes || "").replace(" (enabled transports)", "").trim();
-              const state = isObserved(topic) ? "created" : "configured";
-              return (
-                <div className="bus-topic-sequence-step" key={`${topic || "topic"}-${index}`}>
-                  <div className={`bus-topic-create-row ${state}`}>
-                    <span>{index + 1}</span>
-                    <div>
-                      <strong>{topic || "-"}</strong>
-                      <small>{consumes && consumes !== "-" ? `after ${consumes}` : "landing pad seed topic"}</small>
-                    </div>
-                    <em>{state}</em>
-                  </div>
-                  {index < rows.length - 1 ? (
-                    <div className="bus-topic-sequence-arrow" aria-hidden="true">
-                      <i />
-                      <span>next</span>
-                    </div>
-                  ) : null}
-                </div>
-              );
-            })}
-          </div>
-        </section>
-
-        <section className="bus-stage bus-stage-master">
-          <div className="bus-stage-head">
-            <span className="bus-node-icon">MN</span>
-            <div>
-              <strong>Master Node</strong>
-              <span>Orchestrator coordinates workers</span>
-            </div>
-          </div>
-          <div className="bus-master-node">
-            <strong>orchestrator</strong>
-            <span>Consumes enriched-alerts</span>
-            <span>Publishes orchestration-events</span>
-          </div>
-        </section>
-      </div>
-
-      <div className="bus-flow-arrow-row" aria-hidden="true">
-        <span>Landing Pad</span>
-        <i />
-        <span>Topics</span>
-        <i />
-        <span>Master Node</span>
-        <i />
-        <span>Parallel Workers</span>
-      </div>
-
-      <section className="bus-parallel-section">
-        <div className="bus-stage-head">
-          <span className="bus-node-icon">PW</span>
-          <div>
-            <strong>Parallel Processing Workers</strong>
-            <span>Independent consumers process topic events concurrently</span>
-          </div>
-        </div>
-        <div className="bus-worker-grid">
-          {workerNodes.map((worker) => (
-            <div className={`bus-worker-node ${worker.lane}`} key={worker.service}>
-              <span>{worker.service}</span>
-              <strong>{worker.title}</strong>
-              <em className={isObserved(worker.topic) ? "observed" : "pending"}>
-                {isObserved(worker.topic) ? "observed" : "ready"}
-              </em>
-              <code>{worker.topic}</code>
-            </div>
-          ))}
-        </div>
-      </section>
-
-      <div className="bus-observed-rail">
-        <strong>Observed Topics</strong>
-        <div>
-          {[...observedTopics].map((topic) => (
-            <span key={`observed-topic-${topic}`}>{topic}</span>
-          ))}
-          {!observedTopics.size ? <span>No live topic activity yet</span> : null}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function ExecutionPlanGraph({ plan }) {
-  const safePlan = plan && typeof plan === "object" ? plan : {};
-  const commands = Array.isArray(safePlan.commands) ? safePlan.commands : [];
-  const grouped = { commands: [], scripts: [], queries: [] };
-  commands.forEach((item) => {
-    const token = String(item || "").trim();
-    if (!token) {
-      return;
-    }
-    if (/^script\s*:/i.test(token)) {
-      grouped.scripts.push(token.replace(/^script\s*:/i, "").trim());
-      return;
-    }
-    if (/^query\s*:/i.test(token)) {
-      grouped.queries.push(token.replace(/^query\s*:/i, "").trim());
-      return;
-    }
-    grouped.commands.push(token.replace(/^cmd\s*:/i, "").trim());
-  });
-
-  return (
-    <div className="execution-graph">
-      <article className="execution-card">
-        <h4>Plan Core</h4>
-        <div className="execution-grid">
-          <span>Workflow</span><strong>{safePlan.workflow || "-"}</strong>
-          <span>Action</span><strong>{safePlan.action || "-"}</strong>
-          <span>Rationale</span><strong>{safePlan.rationale || "-"}</strong>
-          <span>Mode</span><strong>{safePlan.executionMode || "-"}</strong>
-          <span>Risk</span><strong>{safePlan.riskTier || "-"}</strong>
-          <span>Provider</span><strong>{String(safePlan.provider || "-").toUpperCase()}</strong>
-          <span>Approval</span><strong>{String(safePlan.requiresApproval)}</strong>
-          <span>Incident Status</span><strong>{safePlan.incidentStatus || "-"}</strong>
-          <span>Approval Status</span><strong>{safePlan.approvalStatus || "-"}</strong>
-        </div>
-      </article>
-      <article className="execution-card">
-        <h4>Remediation Plan</h4>
-        <div className="execution-command-list">
-          {grouped.commands.length ? grouped.commands.map((command, index) => (
-            <div className="execution-command" key={`cmd-${index}`} style={{ animationDelay: `${Math.min(index * 80, 640)}ms` }}>
-              <span>{index + 1}</span>
-              <code>{String(command || "-")}</code>
-            </div>
-          )) : <p className="subtitle">No command sequence found.</p>}
-          {grouped.scripts.length ? (
-            <>
-              <h4>Scripts</h4>
-              {grouped.scripts.map((script, index) => (
-                <div className="execution-command" key={`script-${index}`}>
-                  <span>S{index + 1}</span>
-                  <code>{script}</code>
-                </div>
-              ))}
-            </>
-          ) : null}
-          {grouped.queries.length ? (
-            <>
-              <h4>Validation Queries</h4>
-              {grouped.queries.map((query, index) => (
-                <div className="execution-command" key={`query-${index}`}>
-                  <span>Q{index + 1}</span>
-                  <code>{query}</code>
-                </div>
-              ))}
-            </>
-          ) : null}
-        </div>
-      </article>
-    </div>
-  );
-}
-
-function renderHtmlTable(headers, rows) {
-  const safeHeaders = Array.isArray(headers) ? headers : [];
-  const safeRows = Array.isArray(rows) ? rows : [];
-  const head = safeHeaders.map((header) => `<th>${htmlEscape(header)}</th>`).join("");
-  const body = safeRows.length
-    ? safeRows
-        .map((row) => {
-          const cells = Array.isArray(row) ? row : [];
-          return `<tr>${cells.map((cell) => `<td>${htmlEscape(asDisplayValue(cell))}</td>`).join("")}</tr>`;
-        })
-        .join("")
-    : `<tr><td colspan="${Math.max(1, safeHeaders.length)}">No rows available.</td></tr>`;
-  return `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
-}
-
-function normalizeGeneratedRuleRows(source) {
-  const payload = source && typeof source === "object" ? source : {};
-  const candidates = [
-    payload.generated_rules,
-    payload.rules,
-    payload.rule_candidates,
-    payload.rule_set,
-    payload.output?.rules,
-    payload.result?.rules,
-    payload.data?.rules,
-  ];
-  const first = candidates.find((item) => Array.isArray(item) && item.length) || [];
-  return first.map((item, index) => {
-    const row = item && typeof item === "object" ? item : {};
-    return {
-      id: String(row.id || row.rule_id || row.name || `rule-${index + 1}`),
-      name: String(row.name || row.rule_name || row.alertname || `rule-${index + 1}`),
-      platform: String(row.platform || row.target_platform || row.provider || "prometheus"),
-      contractMode: String(row.contract_mode || row.adapter_mode || "-"),
-      contractStatus: String(row.contract_status || row.adapter_status || "-"),
-      severity: String(row.severity || row.level || "-").toLowerCase(),
-      expression: String(row.expression || row.expr || row.query || row.condition || "-").trim(),
-      status: String(row.status || row.state || "generated"),
-    };
-  });
-}
-
-function cleanRuleIntentLine(line) {
-  return String(line || "")
-    .replace(/^[^\n:]{1,180}\.(?:md|markdown|txt|log|json|ya?ml|csv)\s*:\s*/i, "")
-    .trim();
-}
-
-function slugForPrometheus(value) {
-  return String(value || "kaiops")
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9_:-]+/g, "-")
-    .replace(/^-+|-+$/g, "") || "kaiops";
-}
-
-function yamlQuote(value) {
-  return JSON.stringify(String(value ?? ""));
-}
-
-function inferPrometheusExpression(requirement, serviceName) {
-  const text = String(requirement || "").toLowerCase();
-  const service = String(serviceName || "service").trim() || "service";
-  const numberMatch = text.match(/(?:above|over|greater than|exceeds?|>=?)\s+([0-9]+(?:\.[0-9]+)?)/i);
-  const threshold = numberMatch ? Number(numberMatch[1]) : null;
-  if (text.includes("unavailable") || text.includes("down") || text.includes("not reachable") || text.includes("not available")) {
-    return `up{service="${service}"} == 0`;
-  }
-  if (text.includes("latency") || text.includes("p95") || text.includes("p99")) {
-    const metric = text.includes("p99") ? "request_latency_ms_p99" : "request_latency_ms_p95";
-    return `quantile_over_time(0.95, ${metric}{service="${service}"}[5m]) > ${threshold || 500}`;
-  }
-  if (text.includes("error rate") || text.includes("5xx") || text.includes("errors")) {
-    return `avg_over_time(error_rate_percent{service="${service}"}[5m]) > ${threshold || 5}`;
-  }
-  if (text.includes("row") || text.includes("table")) {
-    return `sum_over_time(mysql_table_rows{service="${service}"}[5m]) > ${threshold || 20}`;
-  }
-  if (text.includes("cpu")) {
-    return `avg_over_time(cpu_usage_percent{service="${service}"}[5m]) > ${threshold || 85}`;
-  }
-  if (text.includes("memory")) {
-    return `avg_over_time(memory_usage_percent{service="${service}"}[5m]) > ${threshold || 85}`;
-  }
-  return `vector(1)`;
-}
-
-function inferRuleDuration(requirement) {
-  const match = String(requirement || "").match(/for\s+([0-9]+)\s*(minutes?|mins?|m|hours?|hrs?|h)\b/i);
-  if (!match) {
-    return "5m";
-  }
-  const value = match[1];
-  const unit = String(match[2] || "m").toLowerCase();
-  return unit.startsWith("h") ? `${value}h` : `${value}m`;
-}
-
-function inferRuleSeverity(requirement) {
-  const text = String(requirement || "").toLowerCase();
-  if (text.includes("critical")) return "critical";
-  if (text.includes("high")) return "high";
-  if (text.includes("low")) return "low";
-  if (text.includes("info")) return "info";
-  return "warning";
-}
-
-function buildPrometheusRulePreview({ projectName, serviceName, environment, requirements }) {
-  const project = slugForPrometheus(projectName || serviceName || "kaiops-project");
-  const service = String(serviceName || project).trim() || project;
-  const env = String(environment || "prod").trim() || "prod";
-  const lines = (Array.isArray(requirements) ? requirements : [])
-    .map((item) => String(item || "").trim())
-    .filter(Boolean);
-  const ruleLines = lines.length ? lines : [`Alert when ${service} is unavailable for 5 minutes.`];
-  const rendered = ruleLines.map((line, index) => {
-    const severity = inferRuleSeverity(line);
-    const name = `${project}-${slugForPrometheus(line).slice(0, 52) || `rule-${index + 1}`}-${severity}`;
-    const expr = inferPrometheusExpression(line, service);
-    const duration = inferRuleDuration(line);
-    return [
-      `    - alert: ${name}`,
-      `      expr: ${expr}`,
-      `      for: ${duration}`,
-      "      labels:",
-      `        severity: ${severity}`,
-      `        project: ${project}`,
-      `        service: ${service}`,
-      `        environment: ${env}`,
-      "      annotations:",
-      `        summary: ${yamlQuote(line)}`,
-      `        description: ${yamlQuote(`Generated from KaiOps guided setup for ${project}.`)}`,
-    ].join("\n");
-  });
-  return [
-    "groups:",
-    `  - name: ${project}-generated-rules`,
-    "    rules:",
-    ...rendered,
-  ].join("\n");
-}
-
-function summarizeAlertRuleContext(row, workflow = {}) {
-  const alertRow = row && typeof row === "object" ? row : {};
-  const alertLabels = typeof alertRow.labels === "object" && alertRow.labels ? alertRow.labels : {};
-  const alertAnnotations = typeof alertRow.annotations === "object" && alertRow.annotations ? alertRow.annotations : {};
-  const workflowPayload = workflow && typeof workflow === "object" ? workflow : {};
-  const recommendation = typeof workflowPayload.recommendation === "object" && workflowPayload.recommendation ? workflowPayload.recommendation : {};
-  const recommendationMetadata = typeof recommendation.metadata === "object" && recommendation.metadata ? recommendation.metadata : {};
-  const candidates = [
-    alertRow.rule_name,
-    alertRow.rule,
-    alertRow.alert_rule,
-    alertRow.rule_expression,
-    alertRow.rule_query,
-    alertLabels.rule_name,
-    alertLabels.alertname,
-    alertLabels.alert,
-    alertLabels.rule,
-    recommendationMetadata.rule_name,
-    recommendationMetadata.rule,
-  ]
-    .map((value) => String(value || "").trim())
-    .filter(Boolean);
-  const expressionCandidates = [
-    alertRow.expression,
-    alertRow.expr,
-    alertRow.query,
-    alertRow.rule_expression,
-    alertRow.rule_query,
-    recommendationMetadata.rule_expression,
-    recommendationMetadata.rule_query,
-    alertAnnotations.expression,
-    alertAnnotations.query,
-  ]
-    .map((value) => String(value || "").trim())
-    .filter(Boolean);
-
-  const ruleName = candidates[0] || String(alertRow.name || alertRow.alert_name || alertLabels.alertname || "Alert Rule").trim();
-  const expression = expressionCandidates[0] || "No explicit rule expression was surfaced in the incident payload.";
-  const service = String(alertRow.service || alertLabels.service || recommendationMetadata.service || "").trim();
-  const environment = String(alertRow.environment || alertLabels.environment || recommendationMetadata.environment || "").trim();
-  const note = [service ? `service=${service}` : "", environment ? `environment=${environment}` : ""].filter(Boolean).join(" | ");
-  const expandRuleValues = (value) => {
-    if (Array.isArray(value)) return value;
-    if (value && typeof value === "object") return Object.values(value);
-    const text = String(value || "").trim();
-    if (!text) return [];
-    try {
-      const parsed = JSON.parse(text);
-      if (Array.isArray(parsed)) return parsed;
-    } catch (_error) {
-      // Plain rule names can be comma or newline separated.
-    }
-    return text.split(/\r?\n|,\s*(?=[A-Za-z])/);
-  };
-  const rules = [
-    ...candidates,
-    ...expandRuleValues(alertRow.rules),
-    ...expandRuleValues(alertRow.matched_rules),
-    ...expandRuleValues(alertRow.correlated_rules),
-    ...expandRuleValues(alertLabels.rules),
-    ...expandRuleValues(alertLabels.matched_rules),
-    ...expandRuleValues(alertLabels.correlated_rules),
-    ...expandRuleValues(recommendationMetadata.rules),
-    ...expandRuleValues(recommendationMetadata.matched_rules),
-  ]
-    .map((value, index) => {
-      const item = value && typeof value === "object" ? value : {};
-      const name = String(item.name || item.rule_name || item.alert || value || "").trim();
-      const ruleExpression = String(item.expression || item.expr || item.query || (index === 0 ? expressionCandidates[0] : "") || "").trim();
-      return name ? { name, expression: ruleExpression } : null;
-    })
-    .filter(Boolean)
-    .filter((item, index, all) => all.findIndex((candidate) => candidate.name.toLowerCase() === item.name.toLowerCase()) === index);
-  if (!rules.length) {
-    rules.push({ name: ruleName, expression: expressionCandidates[0] || "" });
-  }
-
-  return {
-    ruleName: rules[0]?.name || ruleName,
-    expression,
-    rules,
-    summary: compactText(alertAnnotations.summary || alertRow.summary || alertRow.description, 220) || "No concise incident summary was supplied.",
-    note: note || "Derived from alert labels and workflow metadata.",
-    source: String(alertRow.source || alertRow.provider || alertLabels.job || "payload metadata").trim(),
-    severity: String(alertRow.severity || alertLabels.severity || recommendation?.severity || "warning").trim().toLowerCase(),
-  };
-}
-
-function buildWorkflowFlowStages(workflow, timelineRows = []) {
-  const safeWorkflow = workflow && typeof workflow === "object" ? workflow : {};
-  const safeRows = Array.isArray(timelineRows) ? timelineRows : [];
-  const findStage = (needle) => safeRows.find((row) => String(row?.stage || row?.agent || row?.detail || "").toLowerCase().includes(needle));
-  const hasParallelProcessing = safeRows.some((row) => {
-    const token = String(row?.agent || row?.service || row?.detail || "").toLowerCase();
-    return token.includes("alert intelligence") || token.includes("orchestrator") || token.includes("context") || token.includes("resolution");
-  });
-  return [
-    {
-      id: "landing-pad",
-      label: "Landing Pad",
-      detail: "Raw alerts are accepted, normalized, and added to the incident stream.",
-      status: findStage("landing") ? "done" : "active",
-    },
-    {
-      id: "parallel-processing",
-      label: "Parallel Processing",
-      detail: hasParallelProcessing
-        ? "Alert intelligence, orchestration, context, and resolution work the stream in parallel workers."
-        : "Backend workers fan out the alert stream through independent services for concurrent processing.",
-      status: hasParallelProcessing ? "done" : "active",
-    },
-    {
-      id: "approval",
-      label: "Approval Gate",
-      detail: String(safeWorkflow?.approval?.status || safeWorkflow?.decision?.status || "pending").trim(),
-      status: safeWorkflow?.approval?.status ? "done" : "active",
-    },
-    {
-      id: "remediation",
-      label: "Remediation Execution",
-      detail: `${Array.isArray(safeWorkflow?.remediation_action?.parameters?.execution_plan?.commands) ? safeWorkflow.remediation_action.parameters.execution_plan.commands.length : 0} commands captured for execution or review.`,
-      status: safeWorkflow?.remediation_action?.status ? "done" : "active",
-    },
-    {
-      id: "closure",
-      label: "Closure & Validation",
-      detail: String(safeWorkflow?.closure_report?.health_restored ? "Service restored and closure completed." : "Validation continues after remediation.").trim(),
-      status: safeWorkflow?.closure_report?.health_restored ? "done" : "active",
-    },
-  ];
-}
-
-export default function App() {
+export default function App({ initialTab = "home", currentPath = "/", currentSearch = "", onActiveTabChange, onNavigatePath, routeOutlet = null } = {}) {
+  const queryClient = useQueryClient();
+  const skipNextActiveTabNavigationRef = useRef(false);
+  const skipInitialPreferencesPersistRef = useRef(true);
   const defaultMonitorApplications = FIXED_MONITOR_SCOPES;
-  const [applicationToMonitor, setApplicationToMonitor] = useState("KaiOps");
+  const [applicationToMonitor, setApplicationToMonitor] = useState("KaiMS");
   const [monitorApplications, setMonitorApplications] = useState(defaultMonitorApplications);
-  const [activeTab, setActiveTab] = useState("home");
+  const [activeTab, setActiveTab] = useState(() => (VALID_LEGACY_TABS.has(initialTab) ? initialTab : "home"));
+  const [isCopilotOpen, setIsCopilotOpen] = useState(false);
   const [uiDensity, setUiDensity] = useState("comfortable");
   const [uiTheme, setUiTheme] = useState("auto");
   const [health, setHealth] = useState({ loading: false, ok: false, message: "Not checked" });
+  const [queueHealth, setQueueHealth] = useState({ loading: true, status: "checking", provider: "rabbitmq", healthy: false, queues: 0, messages: 0, ready: 0, unacknowledged: 0 });
   const [alerts, setAlerts] = useState({ loading: false, rows: [], error: "" });
   const [alertsLimit, setAlertsLimit] = useState(25);
   const [alertSeverityOverrides, setAlertSeverityOverrides] = useState({ loading: false, rows: [], error: "", savingKey: "" });
   const [alertSeverityDrafts, setAlertSeverityDrafts] = useState({});
+  const [alertSeverityReasons, setAlertSeverityReasons] = useState({});
   const [dashboardAlertQuery, setDashboardAlertQuery] = useState("");
+  const [globalOperationsView, setGlobalOperationsView] = useState("search");
+  const [globalOperationsQuery, setGlobalOperationsQuery] = useState("");
+  // Debounce the client-side alert filter so typing does not rescan every row.
+  const [dashboardAlertQueryDebounced, setDashboardAlertQueryDebounced] = useState("");
+  useEffect(() => {
+    const handle = setTimeout(() => setDashboardAlertQueryDebounced(dashboardAlertQuery), 250);
+    return () => clearTimeout(handle);
+  }, [dashboardAlertQuery]);
   const [dashboardAlertFocus, setDashboardAlertFocus] = useState("all");
-  const [incidentMetadata, setIncidentMetadata] = useState({ loading: false, rows: [], error: "" });
+  const [dashboardAlertSource, setDashboardAlertSource] = useState("all");
+  const [incidentMetadata, setIncidentMetadata] = useState({ loading: false, rows: [], error: "", page: {} });
   const [closedIncidents, setClosedIncidents] = useState({ loading: false, rows: [], error: "" });
   const [flows, setFlows] = useState({ loading: false, rows: [], error: "" });
   const [gatewaySummary, setGatewaySummary] = useState({ loading: false, data: {}, error: "" });
@@ -6426,6 +487,11 @@ export default function App() {
   const [landingPadRecent, setLandingPadRecent] = useState({ loading: false, rows: [], error: "" });
   const [ingestionStreamChannel, setIngestionStreamChannel] = useState("all");
   const [ingestionStreamQuery, setIngestionStreamQuery] = useState("");
+  const [ingestionStreamSection, setIngestionStreamSection] = useState("active");
+  const [ingestionStreamPaused, setIngestionStreamPaused] = useState(false);
+  const [ingestionStreamUpdatedAt, setIngestionStreamUpdatedAt] = useState("");
+  const [ingestionStreamView, setIngestionStreamView] = useState("");
+  const [ingestionStreamFilters, setIngestionStreamFilters] = useState({ timeRange: "all", severity: "all", application: "selected", environment: "all" });
   const [ragDocs, setRagDocs] = useState({ loading: false, rows: [], error: "" });
   const [guidanceQuery, setGuidanceQuery] = useState("");
   const [guidanceState, setGuidanceState] = useState({ loading: false, rows: [], error: "" });
@@ -6442,9 +508,20 @@ export default function App() {
     error: "",
   });
   const [selectedAlertId, setSelectedAlertId] = useState("");
+  const [selectedAlertSnapshot, setSelectedAlertSnapshot] = useState(null);
+  // A landing-pad row opened before its canonical DB alert exists yet: keep
+  // the raw row here so the cockpit stays on it while a background effect
+  // retries resolveCanonicalAlertForRow against alerts.rows as it refreshes.
+  const [pendingCanonicalAlert, setPendingCanonicalAlert] = useState(null);
+  const pendingCanonicalAlertRetryRef = useRef({ key: "", attempts: 0 });
+  const selectedAlertAnalysisPollRef = useRef({ alertId: "", attempts: 0 });
   const alertStreamRefreshInFlight = useRef(false);
+  const landingPadStreamRefreshInFlight = useRef(false);
   const [selectedApprovalIncidentId, setSelectedApprovalIncidentId] = useState("");
   const [selectedAlertData, setSelectedAlertData] = useState({ loading: false, payload: null, error: "", alertId: "" });
+  const [selectedAlertRegeneration, setSelectedAlertRegeneration] = useState({ loading: false, message: "", error: "" });
+  const [rcaAnalysisMode, setRcaAnalysisMode] = useState("smart");
+  const [aiFeedbackState, setAiFeedbackState] = useState({ loading: false, decision: "", message: "", error: "" });
   const [selectedAlertDocumentLinks, setSelectedAlertDocumentLinks] = useState({
     loading: false,
     alertId: "",
@@ -6459,7 +536,8 @@ export default function App() {
     error: "",
     incidentId: "",
   });
-  const [homeDetailTab, setHomeDetailTab] = useState("timeline");
+  const [homeDetailTab, setHomeDetailTab] = useState("overview");
+  const [rcaDetailView, setRcaDetailView] = useState("simple");
   const [diagnosticsDetailTab, setDiagnosticsDetailTab] = useState("pipeline");
   const [approvalForm, setApprovalForm] = useState({
     action: "approve",
@@ -6476,10 +554,24 @@ export default function App() {
     queries: "",
     connection_url: "",
     connection_type: "application",
+    executor_type: "",
+    job_name: "",
     namespace: "",
+    credential_ref: "",
+    credential_store: "hashicorp_vault",
     notes: "",
   });
+  const [evidenceDraftReview, setEvidenceDraftReview] = useState({ loading: false, draft: null, content: "", notes: "", error: "", message: "" });
+  const [incidentReportView, setIncidentReportView] = useState("simple");
+  const [executionOutcomeReview, setExecutionOutcomeReview] = useState({ outcome: "successful", notes: "", reusable: true, loading: false, error: "", message: "", reviewedAlertId: "" });
+  const [showExecutionCredential, setShowExecutionCredential] = useState(false);
   const [remediationExecutionState, setRemediationExecutionState] = useState({ loading: false, result: null, error: "" });
+  const [emergencyStopState, setEmergencyStopState] = useState({ reason: "", loading: false, error: "", message: "" });
+  const [executionPreflightState, setExecutionPreflightState] = useState({ signature: "", checkedAt: "", passed: false });
+  const [approvedExecutionSignature, setApprovedExecutionSignature] = useState("");
+  const [approvedExecutionApprovalId, setApprovedExecutionApprovalId] = useState("");
+  const [executionApprovalRequiresRenewal, setExecutionApprovalRequiresRenewal] = useState(false);
+  const [executionConfirmationText, setExecutionConfirmationText] = useState("");
   const [selectedFlow, setSelectedFlow] = useState("payment-latency");
   const [metadataFilters, setMetadataFilters] = useState({
     risk_tier: "all",
@@ -6492,7 +584,28 @@ export default function App() {
   const [form, setForm] = useState(DEFAULT_ALERT);
   const [adminWorkspace, setAdminWorkspace] = useState("users");
   const [adminAuthForm, setAdminAuthForm] = useState({ username: "admin", password: "", device: "react-ui" });
-  const [adminSession, setAdminSession] = useState({ loading: false, accessToken: "", refreshToken: "", user: null, error: "" });
+  const [loginPasswordVisible, setLoginPasswordVisible] = useState(false);
+  const [adminSession, setAdminSession] = useState({ loading: true, accessToken: "", refreshToken: "", user: null, error: "" });
+  const [authConfig, setAuthConfig] = useState({ loading: true, mode: "local", local_development_only: true, issuer: null, client_id: null, audience: null, pkce_required: false, error: "" });
+  const liveEvents = useOperationalEvents({
+    accessToken: String(adminSession?.accessToken || ""),
+    paused: ingestionStreamPaused,
+    onEvent: (event) => {
+      if (event.type === "alert.created" && activeTab === "home" && !selectedAlertId) {
+        void loadRecentAlerts({ background: true });
+      }
+      if (event.type === "alert.created" && activeTab === "stream" && !ingestionStreamPaused) {
+        // The server event is the freshness signal; never let the periodic
+        // polling throttle suppress this event-driven refresh.
+        void loadLandingPadRecent({ background: true, force: true });
+      }
+      if (["incident.status", "approval.state", "remediation.progress"].includes(event.type) && activeTab === "summary") {
+        void loadIncidentMetadata({ background: true });
+      }
+    },
+  });
+  const adminSessionRef = useRef(adminSession);
+  const adminRefreshPromiseRef = useRef(null);
   const [adminRoles, setAdminRoles] = useState([]);
   const [adminUsers, setAdminUsers] = useState({ loading: false, rows: [], error: "" });
   const [adminCreateUser, setAdminCreateUser] = useState({
@@ -6520,14 +633,31 @@ export default function App() {
   const [onboardingForm, setOnboardingForm] = useState({
     name: "kaiops-project",
     owner_team: "platform-ops",
+    description: "",
+    business_service: "",
+    owner_email: "",
+    criticality: "high",
+    cost_center: "",
+    repository_url: "",
     environment: "prod",
     region: "us-east-1",
-    deployment_mode: "on_prem",
+    deployment_mode: "cloud_neutral",
     monitoring_tool: "prometheus",
     monitoring_url: "http://prometheus:9090",
     prometheus_url: "http://prometheus:9090",
     new_relic_url: "",
     datadog_url: "",
+    logs_url: "",
+    traces_url: "",
+    telemetry_url: "",
+    ticketing_url: "",
+    email_url: "",
+    healthcheck_url: "",
+    network_zone: "",
+    connection_auth_type: "none",
+    connection_secret_store: "hashicorp_vault",
+    connection_secret_ref: "",
+    context_strategy: "auto",
     azure_subscription_id: "",
     azure_resource_group: "",
     azure_service_bus_namespace: "",
@@ -6642,10 +772,11 @@ export default function App() {
     error: "",
   });
   const [alertKnowledgeView, setAlertKnowledgeView] = useState("onboarding");
-  const [projectSetupStep, setProjectSetupStep] = useState("docs_rules");
+  const [projectSetupStep, setProjectSetupStep] = useState("setup");
   const [projectSetupShowAll, setProjectSetupShowAll] = useState(false);
   const [alertOnboardingState, setAlertOnboardingState] = useState({ loading: false, result: null, error: "" });
   const [docPromptAlert, setDocPromptAlert] = useState(null);
+  const [isBrowserOnline, setIsBrowserOnline] = useState(() => typeof navigator === "undefined" || navigator.onLine);
   const [docPromptKind, setDocPromptKind] = useState("runbook");
   const [docPromptMode, setDocPromptMode] = useState("create");
   const [docPromptExistingDoc, setDocPromptExistingDoc] = useState(null);
@@ -6654,13 +785,48 @@ export default function App() {
   const [alertRuleState, setAlertRuleState] = useState({ loading: false, result: null, error: "" });
   const alertDetailsRef = useRef(null);
   const docPromptRef = useRef(null);
+  const docPromptReturnFocusRef = useRef(null);
   const approvalQueueRef = useRef(null);
   const monitoringInspectRef = useRef(null);
   const alertKnowledgeRef = useRef(null);
   const approvalIncidentRequestRef = useRef({ incidentId: "", inFlight: false, lastFetchedAt: 0 });
+  const selectedAlertDetailsRetryRef = useRef({ alertId: "", lastAttemptAt: 0 });
   const healthRequestRef = useRef(0);
-  const recentAlertsRequestRef = useRef({ inFlight: false, requestId: "", startedAt: 0 });
-  const incidentMetadataRequestRef = useRef(false);
+  const recentAlertsRequestRef = useRef({
+    inFlight: false,
+    requestId: "",
+    startedAt: 0,
+    lastFetchedAt: 0,
+  });
+
+  useEffect(() => {
+    if (!docPromptAlert || !docPromptRef.current) return undefined;
+    const dialog = docPromptRef.current;
+    dialog.querySelector("button")?.focus();
+    const handleKeyDown = (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeDocumentPrompt();
+      }
+    };
+    dialog.addEventListener("keydown", handleKeyDown);
+    return () => dialog.removeEventListener("keydown", handleKeyDown);
+  }, [docPromptAlert]);
+
+  useEffect(() => {
+    const markOnline = () => setIsBrowserOnline(true);
+    const markOffline = () => setIsBrowserOnline(false);
+    window.addEventListener("online", markOnline);
+    window.addEventListener("offline", markOffline);
+    return () => {
+      window.removeEventListener("online", markOnline);
+      window.removeEventListener("offline", markOffline);
+    };
+  }, []);
+  const landingPadRecentRequestRef = useRef({ inFlight: false, lastFetchedAt: 0 });
+  const incidentMetadataRequestRef = useRef({ inFlight: false, lastFetchedAt: 0 });
+  const incidentMetadataFiltersRef = useRef(metadataFilters);
+  const queueHealthRequestRef = useRef({ inFlight: false, lastFetchedAt: 0 });
   const closedIncidentsRequestRef = useRef(false);
 
   const formValid = useMemo(() => {
@@ -6677,7 +843,6 @@ export default function App() {
         return;
       }
       setHealth({ loading: false, ok: data?.status === "ok", message: `${data?.service || "api-gateway"} is ${data?.status || "unknown"}` });
-      loadMonitorApplications().catch(() => {});
     } catch (error) {
       if (healthRequestRef.current !== requestId) {
         return;
@@ -6686,16 +851,56 @@ export default function App() {
     }
   }
 
+  async function checkQueueHealth(options = {}) {
+    const background = Boolean(options?.background);
+    const requestState = queueHealthRequestRef.current;
+    if (requestState.inFlight) return;
+    if (background && Date.now() - Number(requestState.lastFetchedAt || 0) < 55000) return;
+    queueHealthRequestRef.current = { ...requestState, inFlight: true };
+    if (!background) setQueueHealth((current) => ({ ...current, loading: true }));
+    try {
+      const data = await fetchJson("/api-gateway/operations/queue-health", { timeoutMs: 4000 });
+      queueHealthRequestRef.current.lastFetchedAt = Date.now();
+      setQueueHealth({ loading: false, ...data });
+    } catch (error) {
+      setQueueHealth((current) => ({ ...current, loading: false, status: "unreachable", healthy: false, error: error.message }));
+    } finally {
+      queueHealthRequestRef.current.inFlight = false;
+    }
+  }
+
+  useEffect(() => {
+    if (!String(adminSession.accessToken || "").trim()) return undefined;
+    if (!["home", "rag"].includes(activeTab)) return undefined;
+    const refreshQueueHealth = () => {
+      if (document.visibilityState === "visible") void checkQueueHealth({ background: true });
+    };
+    refreshQueueHealth();
+    const timer = window.setInterval(refreshQueueHealth, 60000);
+    return () => window.clearInterval(timer);
+  }, [adminSession.accessToken, activeTab]);
+
   function unwrap(payload) {
     return payload?.data || payload || {};
   }
 
   async function loadRecentAlerts(options = {}) {
     const background = Boolean(options && options.background);
+    if (
+      background
+      && Date.now() - Number(recentAlertsRequestRef.current.lastFetchedAt || 0) < 45000
+    ) {
+      return;
+    }
     if (recentAlertsRequestRef.current.inFlight) {
       const startedAt = Number(recentAlertsRequestRef.current.startedAt || 0);
       if (startedAt && Date.now() - startedAt > 15000) {
-        recentAlertsRequestRef.current = { inFlight: false, requestId: "", startedAt: 0 };
+        recentAlertsRequestRef.current = {
+          ...recentAlertsRequestRef.current,
+          inFlight: false,
+          requestId: "",
+          startedAt: 0,
+        };
       } else {
         return;
       }
@@ -6704,33 +909,43 @@ export default function App() {
       return;
     }
     const requestId = `${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-    recentAlertsRequestRef.current = { inFlight: true, requestId, startedAt: Date.now() };
+    // Fetch enough candidates before balancing. During log bursts the newest
+    // 200 rows can all be logs, hiding otherwise valid Email and Jira rows.
+    const sourceBalancedFetchLimit = Math.min(
+      200,
+      Math.max(
+        Number(alertsLimit) || 0,
+        MAX_LATEST_ALERTS_PER_SOURCE * ALERT_SOURCE_CHANNELS.length,
+        100,
+      ),
+    );
+    recentAlertsRequestRef.current = {
+      ...recentAlertsRequestRef.current,
+      inFlight: true,
+      requestId,
+      startedAt: Date.now(),
+    };
     setAlerts((prev) => ({ ...prev, loading: !background, error: "" }));
     try {
-      const [payload, landingPayload] = await Promise.all([
-        fetchJson(`/api-gateway/alerts/all?limit=${alertsLimit}`, {
-          timeoutMs: background ? 6000 : 7000,
-          maxAttempts: 1,
-        }),
-        fetchJson(`/api-gateway/landing-pad/recent?limit=${Math.min(Math.max(alertsLimit, 50), 200)}`, {
-          timeoutMs: background ? 6000 : 7000,
-          maxAttempts: 1,
-        }).catch(() => null),
-      ]);
-      const data = unwrap(payload);
-      const rows = data?.rows || [];
-      const landingRowsRaw = unwrap(landingPayload)?.rows;
-      const landingRows = (Array.isArray(landingRowsRaw) ? landingRowsRaw : [])
-        .filter((row) => String(row?.status || "").trim().toLowerCase() !== "failed")
-        .map((row, index) => mapLandingPadRowToAlertStreamRow(row, index));
-      const mergedRows = dedupeAndConsolidateAlertRows([
-        ...(Array.isArray(rows) ? rows : []),
-        ...landingRows,
-      ]);
+      const rows = await queryClient.fetchQuery({
+        ...alertRowsQueryOptions(sourceBalancedFetchLimit, String(adminSessionRef.current?.accessToken || "")),
+        staleTime: background ? 45000 : 0,
+      });
+      const balancedRows = capLatestAlertsPerSource(Array.isArray(rows) ? rows : []);
       if (recentAlertsRequestRef.current.requestId !== requestId) {
         return;
       }
-      setAlerts({ loading: false, rows: mergedRows, error: "" });
+      setAlerts((prev) => {
+        if (
+          background
+          && !prev.loading
+          && !prev.error
+          && JSON.stringify(prev.rows) === JSON.stringify(balancedRows)
+        ) {
+          return prev;
+        }
+        return { loading: false, rows: balancedRows, error: "" };
+      });
     } catch (error) {
       if (background) {
         if (recentAlertsRequestRef.current.requestId !== requestId) {
@@ -6744,12 +959,16 @@ export default function App() {
         return;
       }
       try {
-        const fallbackPayload = await fetchJson(`/api-gateway/landing-pad/recent?limit=${alertsLimit}`, {
-          timeoutMs: 7000,
-          maxAttempts: 1,
+        const fallbackRowsRaw = await queryClient.fetchQuery({
+          // Share the same landing-pad query key as the live stream. This lets
+          // TanStack coalesce fallback and stream loads instead of cancelling
+          // two equivalent requests with different limits.
+          ...landingPadRowsQueryOptions(100),
+          staleTime: 0,
         });
-        const fallbackRowsRaw = unwrap(fallbackPayload)?.rows;
-        const fallbackRows = (Array.isArray(fallbackRowsRaw) ? fallbackRowsRaw : []).map((row, index) => mapLandingPadRowToAlertStreamRow(row, index));
+        const fallbackRows = capLatestAlertsPerSource(
+          (Array.isArray(fallbackRowsRaw) ? fallbackRowsRaw : []).map((row, index) => mapLandingPadRowToAlertStreamRow(row, index))
+        );
         if (recentAlertsRequestRef.current.requestId !== requestId) {
           return;
         }
@@ -6772,7 +991,12 @@ export default function App() {
       }));
     } finally {
       if (recentAlertsRequestRef.current.requestId === requestId) {
-        recentAlertsRequestRef.current = { inFlight: false, requestId: "", startedAt: 0 };
+        recentAlertsRequestRef.current = {
+          inFlight: false,
+          requestId: "",
+          startedAt: 0,
+          lastFetchedAt: Date.now(),
+        };
       }
     }
   }
@@ -6780,9 +1004,9 @@ export default function App() {
   async function loadAlertSeverityOverrides() {
     setAlertSeverityOverrides((prev) => ({ ...prev, loading: true, error: "" }));
     try {
-      const payload = await fetchJson("/api-gateway/alerts/severity-overrides");
+      const payload = await fetchJson("/api-gateway/alerts/severity-overrides", authenticatedOptions());
       const data = unwrap(payload);
-      const rows = Array.isArray(data?.rows) ? data.rows : [];
+      const rows = (Array.isArray(data?.rows) ? data.rows : []).map(visibleManagedApplication).filter(Boolean);
       setAlertSeverityOverrides((prev) => ({ ...prev, loading: false, rows, error: "" }));
     } catch (error) {
       setAlertSeverityOverrides((prev) => ({ ...prev, loading: false, rows: [], error: error.message }));
@@ -6795,13 +1019,18 @@ export default function App() {
     const environment = String(row?.environment || "").trim();
     const key = severityOverrideKey(alertName, service, environment);
     const draftSeverity = String(alertSeverityDrafts[key] || row?.severity || "warning").trim().toLowerCase();
+    const reason = String(alertSeverityReasons[key] || "").trim();
     if (!alertName) {
       setAlertSeverityOverrides((prev) => ({ ...prev, error: "Alert name is required for severity override." }));
       return;
     }
+    if (reason.length < 10) {
+      setAlertSeverityOverrides((prev) => ({ ...prev, error: "Explain why this severity correction is needed (at least 10 characters)." }));
+      return;
+    }
     setAlertSeverityOverrides((prev) => ({ ...prev, savingKey: key, error: "" }));
     try {
-      await fetchJson("/api-gateway/alerts/severity-overrides", {
+      await fetchJson("/api-gateway/alerts/severity-overrides", authenticatedOptions({
         method: "PUT",
         body: JSON.stringify({
           name: alertName,
@@ -6812,8 +1041,25 @@ export default function App() {
           requested_role: String(currentRole || "").trim(),
           updated_at: new Date().toISOString(),
         }),
-      });
+      }));
+      await fetchJson("/api-gateway/triage/corrections", authenticatedOptions({
+        method: "POST",
+        body: JSON.stringify({
+          entity_type: "alert",
+          entity_id: String(row?.alert_id || row?.id || alertName).trim(),
+          correction_type: "severity",
+          original_payload: {
+            severity: String(row?.severity || "unknown").toLowerCase(),
+            name: alertName,
+            service,
+            environment,
+          },
+          corrected_payload: { severity: draftSeverity },
+          reason,
+        }),
+      }));
       await loadAlertSeverityOverrides();
+      setAlertSeverityReasons((current) => ({ ...current, [key]: "" }));
       setAlertSeverityOverrides((prev) => ({ ...prev, savingKey: "", error: "" }));
     } catch (error) {
       setAlertSeverityOverrides((prev) => ({ ...prev, savingKey: "", error: error.message }));
@@ -6831,7 +1077,7 @@ export default function App() {
     setAlertSeverityOverrides((prev) => ({ ...prev, savingKey: key, error: "" }));
     try {
       const params = new URLSearchParams({ name: alertName, service, environment });
-      await fetchJson(`/api-gateway/alerts/severity-overrides?${params.toString()}`, { method: "DELETE" });
+      await fetchJson(`/api-gateway/alerts/severity-overrides?${params.toString()}`, authenticatedOptions({ method: "DELETE" }));
       await loadAlertSeverityOverrides();
       setAlertSeverityOverrides((prev) => ({ ...prev, savingKey: "", error: "" }));
     } catch (error) {
@@ -6844,7 +1090,7 @@ export default function App() {
     try {
       const payload = await fetchJson("/api-gateway/applications", authenticatedOptions());
       const data = unwrap(payload);
-      const rows = Array.isArray(data?.rows) ? data.rows : [];
+      const rows = (Array.isArray(data?.rows) ? data.rows : []).map(visibleManagedApplication).filter(Boolean);
       setMonitoringApps({ loading: false, rows, error: "" });
       setSelectedMonitoringAppId((current) => {
         const normalizedCurrent = String(current || "").trim();
@@ -6931,8 +1177,9 @@ export default function App() {
     }
   }
 
-  async function loadAlertDetails(alertId, fallbackRow = null) {
+  async function loadAlertDetails(alertId, fallbackRow = null, options = {}) {
     const normalized = String(alertId || "").trim();
+    const background = Boolean(options?.background);
     if (!normalized) {
       return;
     }
@@ -6960,20 +1207,50 @@ export default function App() {
       });
       return;
     }
+    const immediatePayload = fallbackRow && typeof fallbackRow === "object"
+      ? {
+          data: {
+            alert: fallbackRow,
+            incident: fallbackRow.incident_id || fallbackRow.projection_payload
+              ? {
+                  id: fallbackRow.incident_id || fallbackRow.id || "",
+                  status: fallbackRow.status || fallbackRow.state || "",
+                  service: fallbackRow.service || "",
+                  environment: fallbackRow.environment || "",
+                }
+              : null,
+            context: { metadata: { processing_state: "loading" } },
+            timeline: [],
+          },
+        }
+      : null;
     setSelectedAlertData((prev) => ({
-      loading: true,
-      payload: String(prev.alertId || "") === normalized ? prev.payload : null,
+      loading: background ? prev.loading : true,
+      payload: String(prev.alertId || "") === normalized ? prev.payload : immediatePayload,
       error: "",
       alertId: normalized,
     }));
     try {
-      const payload = await fetchJson(`/monitoring-adapter/alerts/${normalized}/processed-result`, { timeoutMs: 25000 });
+      const payload = await queryClient.fetchQuery({
+        queryKey: ["alert-processed-result", normalized],
+        queryFn: () => fetchJson(`/api-gateway/alerts/${normalized}/processed-result`, authenticatedOptions({
+          timeoutMs: 12000,
+          maxAttempts: 1,
+        })),
+        // Background hydration must bypass the query cache. Incident stages
+        // can complete between polls, and returning a 15-second-old partial
+        // payload makes the cockpit appear permanently stuck.
+        // Processed results are mutable projections. Never treat a previous
+        // recommendation revision as fresh after correlation or regeneration.
+        staleTime: 0,
+      });
       setSelectedAlertData((prev) => {
         if (String(prev.alertId || "") !== normalized) {
           return prev;
         }
         return { loading: false, payload, error: "", alertId: normalized };
       });
+      return payload;
     } catch (error) {
       setSelectedAlertData((prev) => {
         if (String(prev.alertId || "") !== normalized) {
@@ -7019,7 +1296,10 @@ export default function App() {
       error: "",
     }));
     try {
-      const payload = await fetchJson(`/api-gateway/alerts/${encodeURIComponent(normalized)}/linked-documents?limit=${alertsLimit}`);
+      const payload = await fetchJson(
+        `/api-gateway/alerts/${encodeURIComponent(normalized)}/linked-documents?limit=${alertsLimit}`,
+        authenticatedOptions(),
+      );
       const data = unwrap(payload);
       const rows = Array.isArray(data?.linked_documents) ? data.linked_documents : [];
       setSelectedAlertDocumentLinks((current) => {
@@ -7052,15 +1332,24 @@ export default function App() {
     }
   }
 
-  async function loadIncidentStageCompleteness(incidentId) {
+  async function loadIncidentStageCompleteness(incidentId, options = {}) {
     const normalized = String(incidentId || "").trim();
+    const background = Boolean(options?.background);
     if (!normalized) {
       setSelectedStageCompleteness({ loading: false, data: null, error: "", incidentId: "" });
       return;
     }
-    setSelectedStageCompleteness({ loading: true, data: null, error: "", incidentId: normalized });
+    setSelectedStageCompleteness((prev) => ({
+      loading: background ? prev.loading : true,
+      data: background && String(prev.incidentId || "") === normalized ? prev.data : null,
+      error: "",
+      incidentId: normalized,
+    }));
     try {
-      const payload = await fetchJson(`/api-gateway/incidents/${normalized}/stage-completeness`);
+      const payload = await fetchJson(
+        `/api-gateway/incidents/${normalized}/stage-completeness`,
+        authenticatedOptions(),
+      );
       const stageData = payload?.data || payload;
       setSelectedStageCompleteness((prev) => {
         if (String(prev.incidentId || "") !== normalized) {
@@ -7078,32 +1367,160 @@ export default function App() {
     }
   }
 
-  function openAlertDetails(row) {
-    const canonicalRow = resolveCanonicalAlertRow(row, alerts.rows);
-    const alertId = canonicalRow?.alert_id || canonicalRow?.id || canonicalRow?.incident_id;
+  function openAlertDetails(row, initialTab = "overview") {
+    // Incident projections already carry the authoritative alert UUID. Do not
+    // replace it with a semantically similar landing-pad row whose id is a
+    // filename; processed RCA endpoints are keyed by the canonical UUID.
+    const resolution = resolveCanonicalAlertForRow(row, alerts.rows);
+    const pending = resolution.status === "pending";
+    // While pending (canonical DB alert not in alerts.rows yet -- landing-pad
+    // ingestion fires before the alert row is persisted/fetched), keep the
+    // row itself as the selection so it stays visible in the cockpit.
+    // loadAlertDetails already has a dedicated non-UUID branch that renders a
+    // local "landing_pad_only" snapshot without an API call, so this never
+    // sends a doomed processed-result lookup. The retry effect below promotes
+    // the selection to the real UUID once alerts.rows catches up.
+    const canonicalRow = pending ? row : resolution.row;
+    const alertId = String(canonicalRow?.alert_id || canonicalRow?.id || canonicalRow?.incident_id || "").trim();
     if (!alertId) {
       return;
     }
-    setSelectedAlertId(String(alertId));
+    setPendingCanonicalAlert(pending ? row : null);
+    setSelectedAlertSnapshot(canonicalRow);
+    setSelectedAlertId(alertId);
+    // This action owns the complete cockpit URL below. Prevent the legacy tab
+    // synchronization effect from racing it with a navigation to plain `/`,
+    // which would remove workspace=alert and leave the details view hidden.
+    skipNextActiveTabNavigationRef.current = true;
     setActiveTab("home");
-    setHomeDetailTab("timeline");
+    setHomeDetailTab(initialTab === "rca" ? "evidence" : initialTab);
     loadAlertDetails(alertId, canonicalRow);
-    loadSelectedAlertDocumentLinks(alertId, canonicalRow);
+    onNavigatePath?.(`/?workspace=alert&alert_id=${encodeURIComponent(alertId)}`);
   }
 
-  function openAlertDetailsFromIncident(row) {
+  function openAlertDetailsFromIncident(row, initialTab = "overview") {
     const incidentId = String(row?.incident_id || row?.id || "").trim();
     if (!incidentId) {
       return;
     }
     setApprovalState({ loading: false, result: null, error: "" });
-    const scopedAlerts = visibleAlerts;
-    const matchedAlert = scopedAlerts.find((alertRow) => {
+    const projection = row?.projection_payload && typeof row.projection_payload === "object"
+      ? row.projection_payload
+      : {};
+    const eventPayload = projection?.event_payload && typeof projection.event_payload === "object"
+      ? projection.event_payload
+      : {};
+    const sourceAlert = row?.source_alert && typeof row.source_alert === "object"
+      ? row.source_alert
+      : projection?.source_alert && typeof projection.source_alert === "object"
+        ? projection.source_alert
+        : eventPayload?.alert && typeof eventPayload.alert === "object"
+          ? eventPayload.alert
+          : {};
+    const projectedAlertId = String(
+      row?.alert_id
+      || projection?.alert_id
+      || eventPayload?.alert_id
+      || eventPayload?.source_alert_id
+      || sourceAlert?.alert_id
+      || sourceAlert?.id
+      || ""
+    ).trim();
+    // Incident navigation must not depend on the current alert filters. Search
+    // the complete backend collection so dashboard/approval drill-downs retain
+    // their canonical alert identity even when that alert is not visible in the
+    // active Signals view.
+    const matchedAlert = alerts.rows.find((alertRow) => {
       const alertId = String(alertRow?.alert_id || alertRow?.id || alertRow?.incident_id || "").trim();
       const sourceIncident = String(alertRow?.incident_id || "").trim();
-      return alertId === incidentId || sourceIncident === incidentId;
+      return alertId === projectedAlertId || alertId === incidentId || sourceIncident === incidentId;
     });
-    openAlertDetails(matchedAlert || row);
+    const canonicalAlertId = String(
+      matchedAlert?.alert_id
+      || matchedAlert?.id
+      || projectedAlertId
+      || ""
+    ).trim();
+    if (!canonicalAlertId || canonicalAlertId === incidentId) {
+      // Stay on the incident record instead of opening an alert endpoint with
+      // an incident UUID. A subsequent metadata refresh can supply the missing
+      // canonical relationship without corrupting the cockpit URL.
+      setActiveTab("summary");
+      onNavigatePath?.(`/incidents?incident_id=${encodeURIComponent(incidentId)}&stage=${encodeURIComponent(initialTab)}`);
+      return;
+    }
+    const canonicalRow = matchedAlert || { ...row, ...sourceAlert, alert_id: canonicalAlertId, incident_id: incidentId };
+    openAlertDetails(canonicalRow, initialTab);
+  }
+
+  useEffect(() => {
+    if (!adminSession.accessToken || activeTab !== "home") return;
+    const params = new URLSearchParams(currentSearch || "");
+    if (params.get("workspace") !== "alert") return;
+    const routeAlertId = String(params.get("alert_id") || "").trim();
+    if (!routeAlertId || routeAlertId === String(selectedAlertId || "")) return;
+
+    // Detail URLs are durable application state. Reconstruct the selection on
+    // refresh, browser history navigation, and shared links instead of relying
+    // on an in-memory summary-row click from the current session.
+    if (ALERT_UUID_PATTERN.test(routeAlertId)) {
+      const snapshotId = String(selectedAlertSnapshot?.alert_id || selectedAlertSnapshot?.id || selectedAlertSnapshot?.incident_id || "").trim();
+      const fallbackRow = snapshotId === routeAlertId
+        ? selectedAlertSnapshot
+        : alerts.rows.find((row) => String(row?.alert_id || row?.id || row?.incident_id || "").trim() === routeAlertId) || null;
+      setSelectedAlertId(routeAlertId);
+      setSelectedAlertSnapshot(fallbackRow);
+      setHomeDetailTab("overview");
+      void loadAlertDetails(routeAlertId, fallbackRow);
+      return;
+    }
+    // A landing-pad filename can end up in the URL from an earlier click that
+    // happened before the canonical DB alert existed (see openAlertDetails /
+    // resolveCanonicalAlertForRow). Route restoration must go through the same
+    // canonicalization -- otherwise every refresh/shared-link re-opens with an
+    // id that can never resolve, permanently stuck on a landing-pad-only
+    // snapshot even after the canonical alert is long since available. Find
+    // the original landing-pad row by filename so matching has its real
+    // fingerprint/name/service identity, not just the bare filename string.
+    const landingPadSourceRow = (Array.isArray(landingPadRecent.rows) ? landingPadRecent.rows : [])
+      .find((row) => String(row?.file || "") === routeAlertId)
+      || { id: routeAlertId, alert_id: routeAlertId, file: routeAlertId };
+    const resolution = resolveCanonicalAlertForRow(landingPadSourceRow, alerts.rows);
+    if (resolution.status === "resolved") {
+      const canonicalRow = resolution.row;
+      const alertId = String(canonicalRow?.alert_id || canonicalRow?.id || canonicalRow?.incident_id || "").trim();
+      if (alertId) {
+        setSelectedAlertId(alertId);
+        setSelectedAlertSnapshot(canonicalRow);
+        setHomeDetailTab("overview");
+        void loadAlertDetails(alertId, canonicalRow);
+        onNavigatePath?.(`/?workspace=alert&alert_id=${encodeURIComponent(alertId)}`);
+      }
+      return;
+    }
+    setSelectedAlertId(routeAlertId);
+    setSelectedAlertSnapshot(null);
+    setHomeDetailTab("overview");
+    void loadAlertDetails(routeAlertId);
+    if (resolution.status === "pending") {
+      setPendingCanonicalAlert(landingPadSourceRow);
+    }
+  }, [adminSession.accessToken, activeTab, currentSearch, selectedAlertId, selectedAlertSnapshot, alerts.rows, landingPadRecent.rows]);
+
+  function openGlobalOperationalItem(item) {
+    if (!item?.row) return;
+    if (["Alert", "Ticket"].includes(item.kind)) {
+      openAlertDetails(item.row);
+    } else if (["Incident", "Assigned incident", "Approval", "Failed action", "Approval reminder", "Resolved", "Reopened"].includes(item.kind)) {
+      openAlertDetailsFromIncident(item.row);
+    } else if (item.kind === "Application") {
+      setApplicationToMonitor(String(item.row?.name || item.row?.id || "all"));
+      setActiveTab("home");
+    } else if (item.kind === "Service") {
+      setDashboardAlertQuery(String(item.row.service || ""));
+      setActiveTab("home");
+    }
+    setGlobalOperationsQuery("");
   }
 
   useEffect(() => {
@@ -7114,7 +1531,8 @@ export default function App() {
       return;
     }
     window.requestAnimationFrame(() => {
-      alertDetailsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      alertDetailsRef.current?.scrollIntoView({ behavior: "auto", block: "start" });
+      alertDetailsRef.current?.focus({ preventScroll: true });
     });
   }, [activeTab, selectedAlertId]);
 
@@ -7140,14 +1558,50 @@ export default function App() {
   }, [activeTab, selectedAlertData.payload, selectedStageCompleteness.incidentId, selectedStageCompleteness.data, selectedStageCompleteness.loading, selectedStageCompleteness.error]);
 
   useEffect(() => {
+    const incidentId = String(selectedStageCompleteness.incidentId || "").trim();
+    const completion = selectedStageCompleteness.data?.stage_completion;
+    const completed = Number(completion?.completed || 0);
+    const total = Number(completion?.total || 0);
+    if (activeTab !== "home" || !incidentId || selectedStageCompleteness.loading || (total > 0 && completed >= total)) {
+      return undefined;
+    }
+    const timer = window.setTimeout(() => {
+      loadIncidentStageCompleteness(incidentId, { background: true });
+    }, 10000);
+    return () => window.clearTimeout(timer);
+  }, [activeTab, selectedStageCompleteness.incidentId, selectedStageCompleteness.data, selectedStageCompleteness.loading]);
+
+  useEffect(() => {
     const scopedRows = mergeAlertStreamRows(
       filterAlertsForMonitor(alerts.rows, applicationToMonitor),
       filterRowsForMonitor(closedIncidents.rows, applicationToMonitor),
     );
+    const snapshotAlertId = String(
+      selectedAlertSnapshot?.alert_id
+      || selectedAlertSnapshot?.id
+      || selectedAlertSnapshot?.incident_id
+      || ""
+    );
+    // An explicit incident drill-down owns its selection. Dashboard scope
+    // filters must not discard the clicked row while its full payload hydrates.
+    const hasSelectedSnapshot = Boolean(selectedAlertId && snapshotAlertId === String(selectedAlertId));
     if (activeTab !== "home") {
       return;
     }
     if (!scopedRows.length) {
+      // A landing-pad event is immediately actionable even before it has been
+      // persisted into the canonical alerts collection. Keep the clicked row
+      // available as the cockpit snapshot while asynchronous processing runs.
+      if (hasSelectedSnapshot) {
+        return;
+      }
+      if (
+        selectedAlertId
+        && String(selectedAlertData.alertId || "") === String(selectedAlertId)
+        && (selectedAlertData.loading || selectedAlertData.payload || selectedAlertData.error)
+      ) {
+        return;
+      }
       if (selectedAlertId) {
         setSelectedAlertId("");
       }
@@ -7160,48 +1614,176 @@ export default function App() {
       (row) => String(row?.alert_id || row?.id || row?.incident_id || "") === selectedAlertId
     );
     if (selectedExists) {
-      if (String(selectedAlertData.alertId || "") !== String(selectedAlertId || "")) {
+      const normalizedSelectedAlertId = String(selectedAlertId || "");
+      if (String(selectedAlertData.alertId || "") !== normalizedSelectedAlertId) {
         loadAlertDetails(selectedAlertId);
-      }
-      if (String(selectedAlertDocumentLinks.alertId || "") !== String(selectedAlertId || "")) {
-        loadSelectedAlertDocumentLinks(selectedAlertId);
+      } else if (!selectedAlertData.payload && !selectedAlertData.loading) {
+        const now = Date.now();
+        const retryState = selectedAlertDetailsRetryRef.current;
+        const sameAlert = String(retryState.alertId || "") === normalizedSelectedAlertId;
+        const elapsedMs = now - Number(retryState.lastAttemptAt || 0);
+        if (!sameAlert || elapsedMs > 15000) {
+          selectedAlertDetailsRetryRef.current = { alertId: normalizedSelectedAlertId, lastAttemptAt: now };
+          loadAlertDetails(selectedAlertId);
+        }
       }
       return;
     }
-    openAlertDetails(scopedRows[0]);
-  }, [activeTab, alerts.rows, closedIncidents.rows, applicationToMonitor, selectedAlertId, selectedAlertData.payload, selectedAlertData.error, selectedAlertData.alertId, selectedAlertDocumentLinks.alertId]);
+    if (hasSelectedSnapshot && (!selectedAlertData.error || selectedAlertData.loading)) {
+      return;
+    }
+    if (selectedAlertData.loading && String(selectedAlertData.alertId || "") === String(selectedAlertId || "")) {
+      return;
+    }
+    // See shouldRetainAlertSelection: list membership in scopedRows is not
+    // authoritative for whether the selected alert still exists (closure and
+    // monitor-scope filtering can both drop it from this summary list without
+    // it having stopped existing) -- only clear the selection when there is no
+    // already-loaded payload to fall back on.
+    if (shouldRetainAlertSelection({
+      selectedAlertId,
+      payload: selectedAlertData.payload,
+      error: selectedAlertData.error,
+      alertId: selectedAlertData.alertId,
+    })) {
+      return;
+    }
+    // The incident summary must not implicitly open the newest row. That row may
+    // still be moving through enrichment/RCA, which made the first cockpit
+    // appear incomplete before the operator selected an alert.
+    if (selectedAlertId) {
+      setSelectedAlertId("");
+      setSelectedAlertSnapshot(null);
+      setSelectedAlertData({ loading: false, payload: null, error: "", alertId: "" });
+    }
+  }, [activeTab, alerts.rows, closedIncidents.rows, applicationToMonitor, selectedAlertId, selectedAlertSnapshot, selectedAlertData.loading, selectedAlertData.payload, selectedAlertData.error, selectedAlertData.alertId]);
 
-  async function loadIncidentMetadata() {
-    if (incidentMetadataRequestRef.current) {
+  useEffect(() => {
+    // A landing-pad row was opened before its canonical DB alert existed in
+    // alerts.rows (see openAlertDetails / resolveCanonicalAlertForRow). Retry
+    // resolution on every alerts.rows refresh; once the canonical UUID-bearing
+    // alert appears, promote the selection to it and load the real processed
+    // result. Bounded so a landing-pad event that never gets persisted (e.g.
+    // discovery classified it as noise) doesn't retry forever.
+    if (activeTab !== "home" || !pendingCanonicalAlert) {
+      return undefined;
+    }
+    const resolution = resolveCanonicalAlertForRow(pendingCanonicalAlert, alerts.rows);
+    if (resolution.status === "resolved") {
+      const canonicalRow = resolution.row;
+      const alertId = String(canonicalRow?.alert_id || canonicalRow?.id || canonicalRow?.incident_id || "").trim();
+      if (alertId) {
+        setPendingCanonicalAlert(null);
+        setSelectedAlertSnapshot(canonicalRow);
+        setSelectedAlertId(alertId);
+        loadAlertDetails(alertId, canonicalRow);
+        onNavigatePath?.(`/?workspace=alert&alert_id=${encodeURIComponent(alertId)}`);
+      }
+      return undefined;
+    }
+    if (resolution.status === "unresolved") {
+      // The row itself carries no identity to ever match against -- retrying
+      // cannot help.
+      setPendingCanonicalAlert(null);
+      return undefined;
+    }
+    const previous = pendingCanonicalAlertRetryRef.current;
+    const pendingKey = String(
+      pendingCanonicalAlert?.file
+      || pendingCanonicalAlert?.id
+      || pendingCanonicalAlert?.alert_id
+      || ""
+    );
+    const attempts = previous.key === pendingKey ? Number(previous.attempts || 0) : 0;
+    // loadRecentAlerts throttles background refreshes to at most once per 45s
+    // (see recentAlertsRequestRef), so polling faster than that only re-checks
+    // the same alerts.rows snapshot. Match that cadence; ten attempts (~7.5
+    // minutes) covers slow discovery processing without retrying forever for
+    // an event that never gets persisted (e.g. classified as noise).
+    if (attempts >= 10) {
+      return undefined;
+    }
+    pendingCanonicalAlertRetryRef.current = { key: pendingKey, attempts: attempts + 1 };
+    const timer = window.setTimeout(() => {
+      void loadRecentAlerts({ background: true });
+    }, 45000);
+    return () => window.clearTimeout(timer);
+  }, [activeTab, pendingCanonicalAlert, alerts.rows]);
+
+  useEffect(() => {
+    const needsEvidence = homeDetailTab === "evidence" && rcaDetailView === "evidence";
+    if (!needsEvidence || !selectedAlertId) return;
+    if (String(selectedAlertDocumentLinks.alertId || "") === String(selectedAlertId)) return;
+    loadSelectedAlertDocumentLinks(selectedAlertId, selectedAlertRow);
+  }, [homeDetailTab, rcaDetailView, selectedAlertId, selectedAlertDocumentLinks.alertId]);
+
+  useEffect(() => {
+    const alertId = String(selectedAlertId || "").trim();
+    if (activeTab !== "home" || !ALERT_UUID_PATTERN.test(alertId)) {
+      selectedAlertAnalysisPollRef.current = { alertId: "", attempts: 0 };
+      return undefined;
+    }
+    if (alertAnalysisReady(selectedAlertData.payload)) {
+      selectedAlertAnalysisPollRef.current = { alertId, attempts: 0 };
+      return undefined;
+    }
+    const previous = selectedAlertAnalysisPollRef.current;
+    const attempts = previous.alertId === alertId ? Number(previous.attempts || 0) : 0;
+    // Model-backed RCA can legitimately take several minutes when the queue is
+    // draining. Keep the selected incident hydrated for up to ten minutes.
+    if (attempts >= 60) {
+      return undefined;
+    }
+    selectedAlertAnalysisPollRef.current = { alertId, attempts: attempts + 1 };
+    const timer = window.setTimeout(() => {
+      loadAlertDetails(alertId, null, { background: true });
+    }, 10000);
+    return () => window.clearTimeout(timer);
+  }, [activeTab, selectedAlertId, selectedAlertData.payload]);
+
+  async function loadIncidentMetadata(options = {}) {
+    const background = Boolean(options && options.background);
+    const ignoreFilters = Boolean(options && options.ignoreFilters);
+    const requestState = incidentMetadataRequestRef.current;
+    if (requestState.inFlight) {
+      incidentMetadataRequestRef.current = { ...requestState, pending: true };
       return;
     }
-    incidentMetadataRequestRef.current = true;
-    setIncidentMetadata((prev) => ({ ...prev, loading: true, error: "" }));
+    // Coalesce bursts of incident lifecycle notifications instead of flooding
+    // the gateway and repainting the Operations workspace for every event.
+    if (background && Date.now() - Number(requestState.lastFetchedAt || 0) < 15000) {
+      return;
+    }
+    incidentMetadataRequestRef.current = { ...requestState, inFlight: true };
+    setIncidentMetadata((prev) => {
+      const loading = background ? prev.loading : true;
+      return prev.loading === loading && !prev.error ? prev : { ...prev, loading, error: "" };
+    });
     try {
-      const params = new URLSearchParams({ limit: "120" });
-      if (metadataFilters.risk_tier !== "all") {
-        params.set("risk_tier", metadataFilters.risk_tier);
-      }
-      if (metadataFilters.execution_mode !== "all") {
-        params.set("execution_mode", metadataFilters.execution_mode);
-      }
-      if (metadataFilters.transport_provider !== "all") {
-        params.set("transport_provider", metadataFilters.transport_provider);
-      }
-      if (metadataFilters.status !== "all") {
-        params.set("status", metadataFilters.status);
-      }
-      if (String(metadataFilters.service || "").trim()) {
-        params.set("service", String(metadataFilters.service).trim());
-      }
-      const payload = await fetchJson(`/api-gateway/incidents/metadata?${params.toString()}`);
+      const currentFilters = ignoreFilters
+        ? { risk_tier: "all", execution_mode: "all", transport_provider: "all", status: "all", service: "" }
+        : incidentMetadataFiltersRef.current;
+      const payload = await fetchJson(
+        `/api-gateway/incidents/groups?${buildIncidentGroupQuery(options || {}, currentFilters)}`,
+        authenticatedOptions(),
+      );
       const data = unwrap(payload);
       const rows = data?.rows || [];
-      setIncidentMetadata({ loading: false, rows: Array.isArray(rows) ? rows : [], error: "" });
+      const nextRows = Array.isArray(rows) ? rows : [];
+      setIncidentMetadata({ loading: false, rows: nextRows, error: "", page: data || {} });
     } catch (error) {
-      setIncidentMetadata({ loading: false, rows: [], error: error.message });
+      setIncidentMetadata((prev) => ({
+        loading: false,
+        rows: Array.isArray(prev.rows) ? prev.rows : [],
+        error: Array.isArray(prev.rows) && prev.rows.length ? "" : error.message,
+        page: prev.page || {},
+      }));
     } finally {
-      incidentMetadataRequestRef.current = false;
+      const pending = Boolean(incidentMetadataRequestRef.current.pending);
+      incidentMetadataRequestRef.current = { inFlight: false, pending: false, lastFetchedAt: Date.now() };
+      if (pending) {
+        window.setTimeout(() => loadIncidentMetadata(), 0);
+      }
     }
   }
 
@@ -7212,7 +1794,10 @@ export default function App() {
     closedIncidentsRequestRef.current = true;
     setClosedIncidents((prev) => ({ ...prev, loading: true, error: "" }));
     try {
-      const payload = await fetchJson("/api-gateway/incidents/closed?limit=120", { timeoutMs: 12000 });
+      const payload = await fetchJson(
+        "/api-gateway/incidents/closed?limit=120",
+        authenticatedOptions({ timeoutMs: 12000 }),
+      );
       const data = unwrap(payload);
       const rows = Array.isArray(data?.rows) ? data.rows : [];
       if (rows.length) {
@@ -7221,9 +1806,9 @@ export default function App() {
       }
 
       const [closedPayload, resolvedPayload, failedPayload] = await Promise.all([
-        fetchJson("/api-gateway/incidents/metadata?limit=120&status=closed", { timeoutMs: 10000, maxAttempts: 2 }),
-        fetchJson("/api-gateway/incidents/metadata?limit=120&status=resolved", { timeoutMs: 10000, maxAttempts: 2 }),
-        fetchJson("/api-gateway/incidents/metadata?limit=120&status=failed", { timeoutMs: 10000, maxAttempts: 2 }),
+        fetchJson("/api-gateway/incidents/metadata?limit=120&status=closed", authenticatedOptions({ timeoutMs: 10000, maxAttempts: 2 })),
+        fetchJson("/api-gateway/incidents/metadata?limit=120&status=resolved", authenticatedOptions({ timeoutMs: 10000, maxAttempts: 2 })),
+        fetchJson("/api-gateway/incidents/metadata?limit=120&status=failed", authenticatedOptions({ timeoutMs: 10000, maxAttempts: 2 })),
       ]);
       const closedRows = Array.isArray(unwrap(closedPayload)?.rows) ? unwrap(closedPayload).rows : [];
       const resolvedRows = Array.isArray(unwrap(resolvedPayload)?.rows) ? unwrap(resolvedPayload).rows : [];
@@ -7269,6 +1854,57 @@ export default function App() {
     await Promise.all(tasks);
   }
 
+  async function pollIncidentTerminalStatus(incidentId, timeoutMs = 25 * 60 * 1000) {
+    const normalizedIncidentId = String(incidentId || "").trim();
+    if (!normalizedIncidentId) return;
+
+    const terminalStatuses = new Set([
+      "succeeded", "failed", "skipped", "completed", "closed", "resolved",
+      "policy_blocked", "dispatch_failed", "execution_failed", "validation_failed",
+      "rolled_back", "rollback_failed", "timed_out", "cancelled", "manual_intervention_required",
+    ]);
+    const startedAt = Date.now();
+    let attempt = 0;
+    while (Date.now() - startedAt < timeoutMs) {
+      const delayMs = attempt === 0 ? 800 : Math.min(10000, 2000 + Math.floor(attempt / 10) * 1000);
+      await new Promise((resolve) => window.setTimeout(resolve, delayMs));
+      attempt += 1;
+      try {
+        const actionPayload = await fetchJson(`/api-gateway/remediation/actions/by-incident/${encodeURIComponent(normalizedIncidentId)}/latest`, authenticatedOptions());
+        const action = unwrap(actionPayload);
+        const actionStatus = String(action?.status || "").trim().toLowerCase();
+        if (terminalStatuses.has(actionStatus)) {
+          setRemediationExecutionState({ loading: false, result: actionPayload, error: "" });
+          applyApprovalResolutionToUi(normalizedIncidentId, actionStatus === "succeeded" ? "validating" : "failed");
+          await refreshApprovalDrivenViews(normalizedIncidentId);
+          return;
+        }
+        // Preserve the latest durable phase (dispatching, accepted, running,
+        // verifying) so the UI reflects progress rather than a stale submit response.
+        setRemediationExecutionState({ loading: true, result: actionPayload, error: "" });
+        const payload = await fetchJson(
+          `/api-gateway/incidents/${encodeURIComponent(normalizedIncidentId)}/stage-completeness`,
+          authenticatedOptions(),
+        );
+        const data = unwrap(payload) || {};
+        const status = String(data.status || "").trim().toLowerCase();
+        if (["closed", "resolved", "failed"].includes(status)) {
+          applyApprovalResolutionToUi(normalizedIncidentId, status);
+          await refreshApprovalDrivenViews(normalizedIncidentId);
+          return;
+        }
+      } catch {
+        // A transient projection read must not stop later terminal refreshes.
+      }
+    }
+    await refreshApprovalDrivenViews(normalizedIncidentId);
+    setRemediationExecutionState((current) => ({
+      ...current,
+      loading: false,
+      error: "Execution status did not become terminal before the monitoring deadline. The durable workflow continues in the backend; refresh or inspect the executor run.",
+    }));
+  }
+
   function refreshApprovalDrivenViewsSoon(incidentId = "") {
     window.setTimeout(() => {
       refreshApprovalDrivenViews(incidentId);
@@ -7305,7 +1941,7 @@ export default function App() {
   async function loadGatewayRecent() {
     setGatewayRecent((prev) => ({ ...prev, loading: true, error: "" }));
     try {
-      const payload = await fetchJson("/api-gateway/observability/recent");
+      const payload = await fetchJson("/api-gateway/observability/recent?limit=120");
       const rows = payload?.events || [];
       setGatewayRecent({ loading: false, rows: Array.isArray(rows) ? rows : [], error: "" });
     } catch (error) {
@@ -7313,22 +1949,49 @@ export default function App() {
     }
   }
 
-  async function loadLandingPadRecent() {
-    setLandingPadRecent((prev) => ({ ...prev, loading: true, error: "" }));
+  async function loadLandingPadRecent(options = {}) {
+    const background = Boolean(options && options.background);
+    const force = Boolean(options && options.force);
+    if (landingPadRecentRequestRef.current.inFlight) {
+      return;
+    }
+    if (background && !force && Date.now() - landingPadRecentRequestRef.current.lastFetchedAt < 12000) {
+      return;
+    }
+    landingPadRecentRequestRef.current.inFlight = true;
+    // Keep existing cards mounted while the periodic poll runs. New rows are
+    // swapped in atomically when the background request completes.
+    setLandingPadRecent((prev) => {
+      const loading = background ? prev.loading : true;
+      return prev.loading === loading && !prev.error ? prev : { ...prev, loading, error: "" };
+    });
     try {
-      const payload = await fetchJson("/api-gateway/landing-pad/recent?limit=200");
-      const data = unwrap(payload);
-      const rows = data?.rows || [];
-      setLandingPadRecent({ loading: false, rows: Array.isArray(rows) ? rows : [], error: "" });
+      // Interactive refreshes only read the live landing-pad window. Historical
+      // source coverage is supplied by /alerts/all, so walking the mounted
+      // archive here adds tens of seconds without improving the visible stream.
+      const rows = await queryClient.fetchQuery({
+        ...landingPadRowsQueryOptions(100),
+        staleTime: force ? 0 : background ? 12000 : 0,
+      });
+      const balancedRows = capLatestAlertsPerSource(
+        (Array.isArray(rows) ? rows : []).map((row, index) => mapLandingPadRowToAlertStreamRow(row, index))
+      );
+      const rowsChanged = JSON.stringify(landingPadRecent.rows) !== JSON.stringify(balancedRows);
+      setLandingPadRecent((prev) => !rowsChanged && !prev.loading && !prev.error
+        ? prev
+        : { loading: false, rows: rowsChanged ? balancedRows : prev.rows, error: "" });
+      if (rowsChanged) setIngestionStreamUpdatedAt(new Date().toISOString());
     } catch (error) {
-      setLandingPadRecent({ loading: false, rows: [], error: error.message });
+      setLandingPadRecent((prev) => ({ ...prev, loading: false, error: error.message }));
+    } finally {
+      landingPadRecentRequestRef.current = { inFlight: false, lastFetchedAt: Date.now() };
     }
   }
 
   async function loadRagDocs() {
     setRagDocs((prev) => ({ ...prev, loading: true, error: "" }));
     try {
-      const payload = await fetchJson("/api-gateway/rag/documents");
+      const payload = await fetchJson("/api-gateway/rag/documents", authenticatedOptions());
       const rows = payload?.documents || payload?.data?.documents || [];
       setRagDocs({ loading: false, rows: Array.isArray(rows) ? rows : [], error: "" });
     } catch (error) {
@@ -7336,32 +1999,45 @@ export default function App() {
     }
   }
 
-  async function loadMonitorApplications() {
+  async function loadMonitorApplications({ preLogin = false } = {}) {
     try {
-      const payload = await fetchJson("/api-gateway/applications", authenticatedOptions());
+      // The login selector is rendered before a bearer token exists. Keep its
+      // inventory request public and independent from alert discovery so a
+      // protected/unavailable alert endpoint cannot collapse the selector to
+      // the two built-in workspaces.
+      const requestOptions = preLogin
+        ? { headers: { Accept: "application/json" }, maxAttempts: 1, staleTimeMs: 0 }
+        : authenticatedOptions();
+      const payload = await fetchJson("/api-gateway/applications", requestOptions);
+      const discoveredPayload = preLogin
+        ? null
+        : await fetchJson("/api-gateway/alerts/applications?limit=1000", authenticatedOptions()).catch(() => null);
       const data = unwrap(payload);
-      const applicationRows = Array.isArray(data?.rows) ? data.rows : [];
+      const discoveredData = unwrap(discoveredPayload);
+      const applicationRows = (Array.isArray(data?.rows) ? data.rows : []).map(visibleManagedApplication).filter(Boolean);
+      const discoveredRows = (Array.isArray(discoveredData?.rows) ? discoveredData.rows : []).map(visibleManagedApplication).filter(Boolean);
       setMonitoringApps({ loading: false, rows: applicationRows, error: "" });
-      const registered = applicationRows
-        .map((row) => String(row?.name || "").trim())
+      const registered = [
+        ...applicationRows.map((row) => String(row?.name || row?.application || "").trim()),
+        ...discoveredRows.map((row) => String(row?.name || row?.application || "").trim()),
+        ...alerts.rows.map(projectIdentityFromAlert).map(visibleManagedApplication).filter(Boolean),
+      ]
         .filter(Boolean);
-      const ordered = Array.from(new Set([
-        ...CORE_MONITOR_PROJECTS.filter((name) => registered.some((item) => item.toLowerCase() === name.toLowerCase())),
-        ...registered,
-        REAL_USE_CASE_SCOPE,
-        TEST_USE_CASE_SCOPE,
-      ]));
-      const options = ordered.length ? ordered : defaultMonitorApplications;
+      // `registered` already contains names taken from authoritative,
+      // visibility-checked application objects. Running those names through
+      // visibleManagedApplication again treats them as untrusted alert-derived
+      // strings and removes every non-built-in application.
+      const options = uniqueMonitorApplications([...defaultMonitorApplications, ...registered]);
       setMonitorApplications(options);
       setApplicationToMonitor((current) => (
         options.some((item) => item.toLowerCase() === String(current || "").toLowerCase())
           ? current
-          : options[0] || "KaiOps"
+          : options[0] || "KaiMS"
       ));
     } catch (_error) {
       setMonitorApplications(defaultMonitorApplications);
       setApplicationToMonitor((current) => (
-        defaultMonitorApplications.includes(current) ? current : "KaiOps"
+        defaultMonitorApplications.includes(current) ? current : "KaiMS"
       ));
     }
   }
@@ -7375,7 +2051,7 @@ export default function App() {
     setGuidanceState({ loading: true, rows: [], error: "" });
     try {
       const params = new URLSearchParams({ query, limit: "8" });
-      const payload = await fetchJson(`/api-gateway/rag/search?${params.toString()}`);
+      const payload = await fetchJson(`/api-gateway/rag/search?${params.toString()}`, authenticatedOptions());
       const rows = payload?.matches || payload?.data?.matches || [];
       setGuidanceState({ loading: false, rows: Array.isArray(rows) ? rows : [], error: "" });
     } catch (error) {
@@ -7425,9 +2101,291 @@ export default function App() {
     }
   }
 
+  function normalizeMetadataMap(value) {
+    if (!value || typeof value !== "object") {
+      return {};
+    }
+    return Object.fromEntries(
+      Object.entries(value)
+        .map(([key, raw]) => [String(key || "").trim(), String(raw ?? "").trim()])
+        .filter(([key, item]) => key && item)
+    );
+  }
+
+  function coerceText(value, fallback = "") {
+    const text = String(value ?? "").trim();
+    return text || fallback;
+  }
+
+  function alertAnalysisReady(payload) {
+    const data = unwrap(payload);
+    const workflow = data?.workflow && typeof data.workflow === "object" ? data.workflow : data;
+    const recommendation = workflow?.recommendation && typeof workflow.recommendation === "object"
+      ? workflow.recommendation
+      : data?.recommendation && typeof data.recommendation === "object"
+        ? data.recommendation
+        : {};
+    const metadata = recommendation?.metadata && typeof recommendation.metadata === "object"
+      ? recommendation.metadata
+      : {};
+    const rcaAnalysis = metadata?.rca_analysis && typeof metadata.rca_analysis === "object"
+      ? metadata.rca_analysis
+      : {};
+    const impactAnalysis = metadata?.impact_analysis && typeof metadata.impact_analysis === "object"
+      ? metadata.impact_analysis
+      : {};
+    const hasRcaText = Boolean(
+      coerceText(data?.rootCause)
+      || coerceText(recommendation?.root_cause)
+      || coerceText(rcaAnalysis?.root_cause)
+    );
+    const hasImpactText = Boolean(
+      coerceText(data?.impact)
+      || coerceText(recommendation?.impact)
+      || coerceText(impactAnalysis?.impact_summary)
+      || coerceText(impactAnalysis?.customer_impact)
+      || coerceText(impactAnalysis?.service_impact)
+    );
+    const hasEvidence = Array.isArray(rcaAnalysis?.evidence_used) && rcaAnalysis.evidence_used.length > 0;
+    const discovery = metadata?.discovery_report && typeof metadata.discovery_report === "object"
+      ? metadata.discovery_report
+      : workflow?.context?.metadata?.discovery_report && typeof workflow.context.metadata.discovery_report === "object"
+        ? workflow.context.metadata.discovery_report
+        : {};
+    const discoveryEvidence = Array.isArray(discovery?.evidence) ? discovery.evidence : [];
+    const isProvisional = workflow?.mode === "alert-only-fallback"
+      || metadata?.fallback === true
+      || metadata?.fallback_reason === "No linked incident projection exists for this alert yet.";
+    return !isProvisional
+      && hasRcaText
+      && hasImpactText
+      && (hasEvidence || discoveryEvidence.length > 0);
+  }
+
+  async function waitForAlertAnalysis(alertId, options = {}) {
+    const normalized = String(alertId || "").trim();
+    if (!normalized) {
+      return { ready: false, payload: null, attempts: 0 };
+    }
+    const attempts = Number(options.attempts || 40);
+    const intervalMs = Number(options.intervalMs || 3000);
+    const requestId = String(options.requestId || "").trim();
+    const incidentId = String(options.incidentId || "").trim();
+    const expectedRecommendationId = String(options.expectedRecommendationId || "").trim();
+    if (!requestId || !incidentId || !expectedRecommendationId) {
+      return { ready: false, payload: null, attempts: 0 };
+    }
+    let latestPayload = null;
+    let statusReady = false;
+    for (let index = 0; index < attempts; index += 1) {
+      try {
+        if (!statusReady) {
+          const status = await fetchJson(
+            `/api-gateway/analysis/requests/${encodeURIComponent(requestId)}/status?incident_id=${encodeURIComponent(incidentId)}`,
+            authenticatedOptions({ timeoutMs: 10000, maxAttempts: 1 }),
+          );
+          const outcome = analysisRequestOutcome(status, expectedRecommendationId);
+          if (outcome.terminalFailure) {
+            return { ready: false, terminal: true, status, error: analysisFailureMessage(status), payload: latestPayload, attempts: index + 1 };
+          }
+          statusReady = outcome.ready;
+        }
+        if (statusReady) {
+          // Hydrate the full cockpit once, after the indexed completion signal.
+          const payload = await fetchJson(`/api-gateway/alerts/${normalized}/processed-result`, authenticatedOptions({
+            timeoutMs: 120000,
+            maxAttempts: 1,
+          }));
+          latestPayload = payload;
+          const data = unwrap(payload) || {};
+          if (alertAnalysisReady(payload) && isExpectedAnalysisVersion(data, expectedRecommendationId)) {
+            return { ready: true, payload, attempts: index + 1 };
+          }
+        }
+      } catch (_error) {
+        // Regenerated alerts can race backend indexing; retry until timeout.
+      }
+      if (index < attempts - 1) {
+        await new Promise((resolve) => {
+          window.setTimeout(resolve, intervalMs);
+        });
+      }
+    }
+    return { ready: false, payload: latestPayload, attempts };
+  }
+
+  async function regenerateSelectedAlertAnalysis(modeOverride) {
+    if (!selectedAlertRow || selectedAlertRegeneration.loading) {
+      return;
+    }
+    const canonicalIncidentId = String(selectedAlertWorkflow?.incident?.id || selectedAlertWorkflow?.incident_id || "").trim();
+    if (!canonicalIncidentId) {
+      setSelectedAlertRegeneration({
+        loading: false,
+        message: "This alert was deduplicated or is still awaiting incident correlation. RCA runs only for a persisted canonical incident.",
+        error: "",
+      });
+      return;
+    }
+    const alertId = String(selectedAlertRow?.id || selectedAlertRow?.alert_id || selectedAlertId || "").trim();
+    const requestedMode = typeof modeOverride === "string" && ["smart", "fresh", "cache"].includes(modeOverride)
+      ? modeOverride
+      : rcaAnalysisMode;
+    setSelectedAlertRegeneration({ loading: true, message: "", error: "" });
+    try {
+      if (!ALERT_UUID_PATTERN.test(alertId)) {
+        throw new Error("The alert is still being persisted. Wait for its canonical alert ID, then retry RCA.");
+      }
+      const command = await fetchJson(`/api-gateway/analysis/alerts/${encodeURIComponent(alertId)}/regenerate`, authenticatedOptions({
+        method: "POST",
+        body: JSON.stringify({ mode: requestedMode }),
+        timeoutMs: 30000,
+        maxAttempts: 1,
+      }));
+      const acceptedRequestId = String(command?.request_id || "").trim();
+      const acceptedIncidentId = String(command?.incident_id || selectedAlertWorkflow?.incident?.id || "").trim();
+      const expectedRecommendationId = String(command?.expected_recommendation_id || "").trim();
+      setSelectedAlertRegeneration({
+        loading: true,
+        message: acceptedRequestId
+          ? `Analysis request ${acceptedRequestId.slice(0, 8)} accepted. Collecting evidence and generating RCA in the governed backend workflow…`
+          : "Analysis request accepted. Collecting evidence and generating RCA in the governed backend workflow…",
+        error: "",
+      });
+      const persistedAnalysis = await waitForAlertAnalysis(alertId, {
+        attempts: 100,
+        intervalMs: Number(command?.poll_after_ms || 3000),
+        requestId: acceptedRequestId,
+        incidentId: acceptedIncidentId,
+        expectedRecommendationId,
+      });
+      if (persistedAnalysis.terminal) {
+        throw new Error(persistedAnalysis.error);
+      }
+      if (persistedAnalysis.payload) {
+        // Keep React Query and the local cockpit state on the same immutable
+        // recommendation revision. Without this write-through, a subsequent
+        // detail hydration can restore the pre-regeneration cached payload.
+        queryClient.setQueryData(["alert-processed-result", alertId], persistedAnalysis.payload);
+        setSelectedAlertData((current) => String(current.alertId || "") === alertId
+          ? { loading: false, payload: persistedAnalysis.payload, error: "", alertId }
+          : current);
+      } else {
+        await loadAlertDetails(alertId);
+      }
+      await loadSelectedAlertDocumentLinks(alertId);
+      setSelectedAlertRegeneration({
+        loading: false,
+        message: persistedAnalysis.ready
+          ? requestedMode === "fresh"
+            ? `Fresh context and RCA analysis completed for alert ${alertId}.`
+            : requestedMode === "cache"
+              ? `Verified cached context and RCA loaded for alert ${alertId}.`
+              : `Smart analysis completed for alert ${alertId}; verified context was reused when eligible.`
+          : `Analysis for alert ${alertId} is still running in the backend. You can leave this page and refresh the incident later.`,
+        error: "",
+      });
+      void Promise.all([loadRecentAlerts(), loadLandingPadRecent(), loadGatewayRecent(), loadGatewaySummary()])
+        .catch(() => {});
+    } catch (error) {
+      setSelectedAlertRegeneration({
+        loading: false,
+        message: "",
+        error: String(error?.message || "Unable to run the selected RCA analysis mode"),
+      });
+    }
+  }
+
+  async function submitAiRecommendationFeedback(feedback) {
+    const payload = typeof feedback === "string" ? { decision: feedback } : feedback;
+    const decision = String(payload?.decision || "").trim().toLowerCase();
+    if (!selectedAlertRecommendationId || aiFeedbackState.loading) {
+      setAiFeedbackState({ loading: false, decision: "", message: "", error: "Feedback requires a persisted recommendation ID." });
+      return;
+    }
+    setAiFeedbackState({ loading: true, decision, message: "", error: "" });
+    try {
+      const response = unwrap(await fetchJson(
+        `/api-gateway/evaluations/by-recommendation/${encodeURIComponent(selectedAlertRecommendationId)}/feedback`,
+        authenticatedOptions({
+          method: "POST",
+          body: JSON.stringify({
+            ...payload,
+            decision,
+            approver: adminSession?.user?.username || "operator",
+            comment: String(payload?.comment || `RCA recommendation marked ${decision} from the incident cockpit.`),
+          }),
+        }),
+      ));
+      setAiFeedbackState({
+        loading: false,
+        decision,
+        message: response?.updated === false
+          ? "Feedback received, but no persisted evaluation was linked to this recommendation."
+          : `Feedback recorded: ${decision}.`,
+        error: "",
+      });
+    } catch (error) {
+      setAiFeedbackState({ loading: false, decision: "", message: "", error: String(error?.message || "Unable to record feedback") });
+    }
+  }
+
   function adminHeaders() {
     const token = String(adminSession.accessToken || "").trim();
     return token ? { Authorization: `Bearer ${token}` } : {};
+  }
+
+  function expireAdminSession() {
+    clearStoredSession(); const expired = {
+      loading: false,
+      accessToken: "",
+      refreshToken: "",
+      user: null,
+      error: "Session expired. Please sign in again.",
+    };
+    adminSessionRef.current = expired;
+    setAdminSession(expired);
+    setAdminUsers({ loading: false, rows: [], error: "" });
+    setActiveTab("home");
+  }
+
+  async function refreshAdminAccessToken() {
+    if (adminRefreshPromiseRef.current) {
+      return adminRefreshPromiseRef.current;
+    }
+    const refreshToken = String(adminSessionRef.current?.refreshToken || "").trim();
+    if (!refreshToken) {
+      expireAdminSession();
+      return null;
+    }
+    adminRefreshPromiseRef.current = (async () => {
+      try {
+        const response = await fetchJson("/api-gateway/auth/refresh", {
+          method: "POST",
+          maxAttempts: 1,
+          body: JSON.stringify({ refresh_token: refreshToken }),
+        });
+        const renewed = {
+          loading: false,
+          accessToken: response?.access_token || "",
+          refreshToken: response?.refresh_token || "",
+          user: response?.user || adminSessionRef.current?.user || null,
+          error: "",
+        };
+        if (!renewed.accessToken || !renewed.refreshToken) {
+          throw new Error("Token refresh returned an incomplete session.");
+        }
+        adminSessionRef.current = renewed; storeSessionTokens(renewed);
+        setAdminSession(renewed);
+        return { Authorization: `Bearer ${renewed.accessToken}` };
+      } catch (_error) {
+        expireAdminSession();
+        return null;
+      } finally {
+        adminRefreshPromiseRef.current = null;
+      }
+    })();
+    return adminRefreshPromiseRef.current;
   }
 
   function authenticatedOptions(options = {}) {
@@ -7435,23 +2393,14 @@ export default function App() {
     return {
       ...options,
       authenticated: true,
-      onUnauthorized: () => {
-        setAdminSession({
-          loading: false,
-          accessToken: "",
-          refreshToken: "",
-          user: null,
-          error: "Session expired. Please sign in again.",
-        });
-        setAdminUsers({ loading: false, rows: [], error: "" });
-        setActiveTab("home");
-      },
+      onUnauthorized: refreshAdminAccessToken,
       headers: {
         ...headers,
         ...(options.headers || {}),
       },
     };
   }
+  const evidenceDraftApi = useEvidenceDraftBundle({ fetchJson, authenticatedOptions, unwrap });
 
   async function adminLogin(event) {
     event.preventDefault();
@@ -7465,20 +2414,31 @@ export default function App() {
           device: String(adminAuthForm.device || "react-ui").trim(),
         }),
       });
-      setAdminSession({
+      const authenticatedSession = {
         loading: false,
         accessToken: response?.access_token || "",
         refreshToken: response?.refresh_token || "",
         user: response?.user || null,
         error: "",
-      });
+      };
+      adminSessionRef.current = authenticatedSession; storeSessionTokens(authenticatedSession);
+      setAdminSession(authenticatedSession);
     } catch (error) {
       setAdminSession((current) => ({ ...current, loading: false, error: error.message }));
     }
   }
 
+  async function oidcLogin() {
+    setAdminSession((current) => ({ ...current, loading: true, error: "" }));
+    try {
+      await beginOidcLogin(authConfig);
+    } catch (error) {
+      setAdminSession((current) => ({ ...current, loading: false, error: String(error?.message || error) }));
+    }
+  }
+
   async function adminLogout() {
-    const headers = adminHeaders();
+    clearStoredSession(); const headers = adminHeaders();
     try {
       if (headers.Authorization) {
         await fetchJson("/api-gateway/auth/logout", { method: "POST", headers, body: JSON.stringify({}) });
@@ -7486,7 +2446,9 @@ export default function App() {
     } catch (_error) {
       // Ignore logout errors and clear local session regardless.
     }
-    setAdminSession({ loading: false, accessToken: "", refreshToken: "", user: null, error: "" });
+    const clearedSession = { loading: false, accessToken: "", refreshToken: "", user: null, error: "" };
+    adminSessionRef.current = clearedSession;
+    setAdminSession(clearedSession);
     setAdminUsers({ loading: false, rows: [], error: "" });
     setAdminEditUser({ id: null, username: "", email: "", first_name: "", last_name: "", role_id: 1, status: "active", is_active: true });
     setAdminEditPanelOpen(false);
@@ -7625,14 +2587,30 @@ export default function App() {
       ...curr,
       name: String(row.project_name || projectPayload.name || curr.name || "").trim(),
       owner_team: String(row.owner_team || projectPayload.owner_team || curr.owner_team || "").trim(),
+      description: String(projectPayload.description || "").trim(),
+      business_service: String(projectPayload.business_service || "").trim(),
+      owner_email: String(projectPayload.owner_email || "").trim(),
+      criticality: String(projectPayload.criticality || "medium").trim(),
+      cost_center: String(projectPayload.cost_center || "").trim(),
+      repository_url: String(projectPayload.repository_url || "").trim(),
       environment: String(row.environment || projectPayload.environment || curr.environment || "prod").trim(),
       region: String(row.region || projectPayload.region || curr.region || "").trim(),
-      deployment_mode: String(connectivityPayload.deployment_mode || curr.deployment_mode || "on_prem").trim(),
+      deployment_mode: String(connectivityPayload.deployment_mode || curr.deployment_mode || "cloud_neutral").trim(),
       monitoring_tool: monitoring.tool,
       monitoring_url: monitoring.url,
       prometheus_url: monitoring.tool === "prometheus" ? monitoring.url : "",
       new_relic_url: monitoring.tool === "new_relic" ? monitoring.url : "",
       datadog_url: monitoring.tool === "datadog" ? monitoring.url : "",
+      logs_url: String(connectivityPayload.logs_url || "").trim(),
+      traces_url: String(connectivityPayload.traces_url || "").trim(),
+      telemetry_url: String(connectivityPayload.telemetry_url || "").trim(),
+      ticketing_url: String(connectivityPayload.ticketing_url || "").trim(),
+      email_url: String(connectivityPayload.email_url || "").trim(),
+      healthcheck_url: String(connectivityPayload.healthcheck_url || "").trim(),
+      network_zone: String(connectivityPayload.network_zone || "").trim(),
+      connection_auth_type: String(connectivityPayload.monitoring_sources?.[0]?.auth_type || "none").trim(),
+      connection_secret_ref: String(connectivityPayload.monitoring_sources?.[0]?.secret_ref || "").trim(),
+      context_strategy: String(connectivityPayload.context_strategy || "auto").trim(),
       azure_subscription_id: String(connectivityPayload.azure_subscription_id || curr.azure_subscription_id || "").trim(),
       azure_resource_group: String(connectivityPayload.azure_resource_group || curr.azure_resource_group || "").trim(),
       azure_service_bus_namespace: String(connectivityPayload.azure_service_bus_namespace || curr.azure_service_bus_namespace || "").trim(),
@@ -7665,6 +2643,12 @@ export default function App() {
       ...curr,
       name: "",
       owner_team: "",
+      description: "",
+      business_service: "",
+      owner_email: "",
+      criticality: "high",
+      cost_center: "",
+      repository_url: "",
       environment: "prod",
       region: curr.region || "us-east-1",
       monitoring_tool: "prometheus",
@@ -7672,6 +2656,16 @@ export default function App() {
       prometheus_url: "http://prometheus:9090",
       new_relic_url: "",
       datadog_url: "",
+      logs_url: "",
+      traces_url: "",
+      telemetry_url: "",
+      ticketing_url: "",
+      email_url: "",
+      healthcheck_url: "",
+      network_zone: "",
+      connection_auth_type: "none",
+      connection_secret_ref: "",
+      context_strategy: "auto",
       assignment_username: "",
       assignment_project: "",
       onboarding_path: "setup_monitoring",
@@ -7684,10 +2678,12 @@ export default function App() {
   async function loadModelProviderStatus() {
     setModelProviderStatus((curr) => ({ ...curr, loading: true, error: "" }));
     try {
-      const payload = await fetchJson("/api-gateway/model/providers/status");
+      const payload = await fetchJson("/api-gateway/model/providers/status", { timeoutMs: 15000, maxAttempts: 3 });
       setModelProviderStatus({ loading: false, data: unwrap(payload), error: "" });
     } catch (error) {
-      setModelProviderStatus({ loading: false, data: null, error: error.message });
+      // Preserve last-known health during a rolling restart. The recurring
+      // status refresh replaces stale data when the route is available again.
+      setModelProviderStatus((current) => ({ ...current, loading: false, error: error.message }));
     }
   }
 
@@ -7741,7 +2737,7 @@ export default function App() {
     let failed = 0;
     for (const row of rows) {
       try {
-        await fetchJson("/api-gateway/rag/documents", authenticatedOptions({
+        await fetchJson("/api-gateway/rag/knowledge-drafts", authenticatedOptions({
           method: "POST",
           body: JSON.stringify(row),
         }));
@@ -7833,7 +2829,7 @@ export default function App() {
     service: "Which service or application is this knowledge for?",
     environment: "Which environment should this apply to?",
     owner_team: "Which team owns this service?",
-    dependencies: "Which upstream/downstream dependencies should KaiOps check during triage?",
+    dependencies: "Which upstream/downstream dependencies should KaiMS check during triage?",
     alert_patterns: "Which alert conditions should create monitoring rules?",
     commands: "Which commands, scripts, or queries are safe for operators to review?",
     rollback_plan: "What rollback or failback plan should be used if remediation fails?",
@@ -7957,7 +2953,7 @@ export default function App() {
   );
   const knowledgeReviewSummary = useMemo(() => {
     if (!onboardingKnowledgePack) {
-      return "Describe the service, alerts, dependencies, checks, commands, rollback, and owner. KaiOps will extract the details for review.";
+      return "Describe the service, alerts, dependencies, checks, commands, rollback, and owner. KaiMS will extract the details for review.";
     }
     if (knowledgeReviewReady) {
       return "All required details are accepted. Review the table once, then approve Service Knowledge.";
@@ -8509,14 +3505,30 @@ export default function App() {
         ...curr,
         name: String(project?.name || curr.name || "").trim(),
         owner_team: String(project?.owner_team || curr.owner_team || "").trim(),
+        description: String(project?.description || curr.description || "").trim(),
+        business_service: String(project?.business_service || curr.business_service || "").trim(),
+        owner_email: String(project?.owner_email || curr.owner_email || "").trim(),
+        criticality: String(project?.criticality || curr.criticality || "medium").trim(),
+        cost_center: String(project?.cost_center || curr.cost_center || "").trim(),
+        repository_url: String(project?.repository_url || curr.repository_url || "").trim(),
         environment: String(project?.environment || curr.environment || "prod").trim(),
         region: String(project?.region || curr.region || "").trim(),
-        deployment_mode: String(connectivity?.deployment_mode || curr.deployment_mode || "on_prem").trim(),
+        deployment_mode: String(connectivity?.deployment_mode || curr.deployment_mode || "cloud_neutral").trim(),
         monitoring_tool: monitoring.tool,
         monitoring_url: monitoring.url,
         prometheus_url: monitoring.tool === "prometheus" ? monitoring.url : "",
         new_relic_url: monitoring.tool === "new_relic" ? monitoring.url : "",
         datadog_url: monitoring.tool === "datadog" ? monitoring.url : "",
+        logs_url: String(connectivity?.logs_url || curr.logs_url || "").trim(),
+        traces_url: String(connectivity?.traces_url || curr.traces_url || "").trim(),
+        telemetry_url: String(connectivity?.telemetry_url || curr.telemetry_url || "").trim(),
+        ticketing_url: String(connectivity?.ticketing_url || curr.ticketing_url || "").trim(),
+        email_url: String(connectivity?.email_url || curr.email_url || "").trim(),
+        healthcheck_url: String(connectivity?.healthcheck_url || curr.healthcheck_url || "").trim(),
+        network_zone: String(connectivity?.network_zone || curr.network_zone || "").trim(),
+        connection_auth_type: String(connectivity?.monitoring_sources?.[0]?.auth_type || curr.connection_auth_type || "none").trim(),
+        connection_secret_ref: String(connectivity?.monitoring_sources?.[0]?.secret_ref || curr.connection_secret_ref || "").trim(),
+        context_strategy: ({ continuous: "auto", immediate: "realtime" }[String(connectivity?.context_strategy || "").trim()] || String(connectivity?.context_strategy || curr.context_strategy || "auto").trim()),
         azure_subscription_id: String(connectivity?.azure_subscription_id || curr.azure_subscription_id || "").trim(),
         azure_resource_group: String(connectivity?.azure_resource_group || curr.azure_resource_group || "").trim(),
         azure_service_bus_namespace: String(connectivity?.azure_service_bus_namespace || curr.azure_service_bus_namespace || "").trim(),
@@ -8579,15 +3591,31 @@ export default function App() {
         new_relic_url: selectedMonitoringTool === "new_relic" ? monitoringUrl : "",
         datadog_url: selectedMonitoringTool === "datadog" ? monitoringUrl : "",
       };
+      const monitoringSources = buildOnboardingSources(onboardingForm, selectedMonitoringTool, monitoringUrl);
       const payload = {
         project: {
           name: String(onboardingForm.name || "").trim(),
           owner_team: String(onboardingForm.owner_team || "").trim(),
+          description: String(onboardingForm.description || "").trim(),
+          business_service: String(onboardingForm.business_service || "").trim(),
+          owner_email: String(onboardingForm.owner_email || "").trim(),
+          criticality: String(onboardingForm.criticality || "medium").trim(),
+          cost_center: String(onboardingForm.cost_center || "").trim(),
+          repository_url: String(onboardingForm.repository_url || "").trim(),
           environment: String(onboardingForm.environment || "prod").trim(),
           region: String(onboardingForm.region || "").trim(),
         },
-        deployment_mode: String(onboardingForm.deployment_mode || "on_prem").trim(),
+        deployment_mode: String(onboardingForm.deployment_mode || "cloud_neutral").trim(),
         ...monitoringUrls,
+        monitoring_sources: monitoringSources,
+        logs_url: String(onboardingForm.logs_url || "").trim(),
+        traces_url: String(onboardingForm.traces_url || "").trim(),
+        telemetry_url: String(onboardingForm.telemetry_url || "").trim(),
+        ticketing_url: String(onboardingForm.ticketing_url || "").trim(),
+        email_url: String(onboardingForm.email_url || "").trim(),
+        healthcheck_url: String(onboardingForm.healthcheck_url || "").trim(),
+        network_zone: String(onboardingForm.network_zone || "").trim(),
+        context_strategy: String(onboardingForm.context_strategy || "auto").trim(),
         azure_subscription_id: String(onboardingForm.azure_subscription_id || "").trim(),
         azure_resource_group: String(onboardingForm.azure_resource_group || "").trim(),
         azure_service_bus_namespace: String(onboardingForm.azure_service_bus_namespace || "").trim(),
@@ -8709,7 +3737,7 @@ export default function App() {
       business_owner: "",
       technical_owner: "",
       technology_stack: [],
-      cloud_provider: onboardingForm.deployment_mode === "azure_cloud" ? "azure" : "on_prem",
+      cloud_provider: ({ azure_cloud: "azure", aws_cloud: "aws", gcp_cloud: "gcp", private_cloud: "private-cloud", on_prem: "on-prem" }[onboardingForm.deployment_mode] || "cloud-neutral"),
       region: String(onboardingForm.region || "").trim(),
       monitoring_platforms: MONITORING_TOOL_OPTIONS.includes(selectedMonitoringTool) ? [selectedMonitoringTool] : ["prometheus"],
       notification_platforms: ["slack", "teams", "pagerduty"],
@@ -8784,7 +3812,7 @@ export default function App() {
       const targetPlatforms = MONITORING_TOOL_OPTIONS.includes(selectedTool) ? [selectedTool] : ["prometheus"];
       const discoveryInputs = {
         endpoint_url: simplifyMonitoringUrl(onboardingForm.monitoring_url),
-        deployment_mode: String(onboardingForm.deployment_mode || "on_prem").trim(),
+        deployment_mode: String(onboardingForm.deployment_mode || "cloud_neutral").trim(),
         environment: String(onboardingForm.environment || "prod").trim(),
         generated_from_plain_language: true,
       };
@@ -9081,7 +4109,10 @@ export default function App() {
       workflowPayload = selectedAlertData.payload?.data || selectedAlertData.payload;
     } else if (alertId) {
       try {
-        const payload = await fetchJson(`/monitoring-adapter/alerts/${alertId}/processed-result`);
+        const payload = await fetchJson(
+          `/api-gateway/alerts/${encodeURIComponent(alertId)}/processed-result`,
+          authenticatedOptions({ timeoutMs: 12000, maxAttempts: 1 }),
+        );
         workflowPayload = payload?.data || payload;
       } catch (_error) {
         workflowPayload = {};
@@ -9144,7 +4175,7 @@ export default function App() {
       // Show the real saved document instead of a freshly generated draft.
       setAlertOnboardingState({ loading: true, result: null, error: "" });
       try {
-        const full = unwrap(await fetchJson(`/api-gateway/rag/documents/content?path=${encodeURIComponent(existingDoc.path)}`));
+        const full = unwrap(await fetchJson(`/api-gateway/rag/documents/content?path=${encodeURIComponent(existingDoc.path)}`, authenticatedOptions()));
         setAlertOnboarding((curr) => ({
           ...curr,
           kind: normalizedKind,
@@ -9485,9 +4516,9 @@ export default function App() {
       const draft = await buildAlertDocumentDraftWithAnalysis(alertRow, preferredKind);
       const existingDoc = findMatchingRagDocument(alertRow, draft.kind);
       const payload = buildDocPayloadFromDraft(draft);
-      const response = await fetchJson("/api-gateway/rag/documents", authenticatedOptions({
-        method: existingDoc?.path ? "PUT" : "POST",
-        body: JSON.stringify(existingDoc?.path ? { ...payload, path: existingDoc.path } : payload),
+      const response = await fetchJson("/api-gateway/rag/knowledge-drafts", authenticatedOptions({
+        method: "POST",
+        body: JSON.stringify(payload),
       }));
       const responseData = response?.data || response || {};
       setAlertOnboardingState({
@@ -9531,9 +4562,9 @@ export default function App() {
         const draft = await buildAlertDocumentDraftWithAnalysis(alertRow, kind);
         const existingDoc = findMatchingRagDocument(alertRow, kind);
         const payload = buildDocPayloadFromDraft(draft);
-        const response = await fetchJson("/api-gateway/rag/documents", authenticatedOptions({
-          method: existingDoc?.path ? "PUT" : "POST",
-          body: JSON.stringify(existingDoc?.path ? { ...payload, path: existingDoc.path } : payload),
+        const response = await fetchJson("/api-gateway/rag/knowledge-drafts", authenticatedOptions({
+          method: "POST",
+          body: JSON.stringify(payload),
         }));
         results.push({ kind, path: response?.data?.path || response?.path || existingDoc?.path || "" });
       }
@@ -9582,7 +4613,7 @@ export default function App() {
           criticality: String(row?.severity || "high").trim().toLowerCase() === "critical" ? "high" : "medium",
           support_team: String(onboardingForm.owner_team || "platform-ops").trim(),
           region: String(onboardingForm.region || "us-east-1").trim(),
-          cloud_provider: onboardingForm.deployment_mode === "azure_cloud" ? "azure" : "on_prem",
+          cloud_provider: ({ azure_cloud: "azure", aws_cloud: "aws", gcp_cloud: "gcp", private_cloud: "private-cloud", on_prem: "on-prem" }[onboardingForm.deployment_mode] || "cloud-neutral"),
           monitoring_platforms: [platform],
           notification_platforms: ["slack", "teams"],
         },
@@ -9624,9 +4655,9 @@ export default function App() {
         severity: String(alertOnboarding.severity || "").trim(),
       };
       const isUpdate = docPromptMode === "update" && Boolean(docPromptExistingDoc?.path);
-      const response = await fetchJson("/api-gateway/rag/documents", authenticatedOptions({
-        method: isUpdate ? "PUT" : "POST",
-        body: JSON.stringify(isUpdate ? { ...payload, path: docPromptExistingDoc.path } : payload),
+      const response = await fetchJson("/api-gateway/rag/knowledge-drafts", authenticatedOptions({
+        method: "POST",
+        body: JSON.stringify(payload),
       }));
       const responseData = response?.data || response || {};
       const normalizedKind = String(payload.kind || docPromptKind || "runbook").trim().toLowerCase();
@@ -9702,7 +4733,7 @@ export default function App() {
     };
 
     try {
-      const response = await fetchJson("/api-gateway/rag/documents", authenticatedOptions({
+      const response = await fetchJson("/api-gateway/rag/knowledge-drafts", authenticatedOptions({
         method: "POST",
         body: JSON.stringify(buildDocPayloadFromDraft(autoDraft)),
       }));
@@ -9733,6 +4764,7 @@ export default function App() {
       setDocPromptAlert(null);
       return;
     }
+    docPromptReturnFocusRef.current = document.activeElement;
     const byKind = {};
     ALERT_DOC_KIND_OPTIONS.forEach((kind) => {
       const doc = findMatchingRagDocument(row, kind);
@@ -9763,36 +4795,27 @@ export default function App() {
     setDocPromptKind("runbook");
     setDocPromptMode("create");
     setAlertRuleState({ loading: false, result: null, error: "" });
+    window.setTimeout(() => docPromptReturnFocusRef.current?.focus?.(), 0);
   }
 
 
-  async function refreshAll() {
+  async function refreshAll({ includeAlerts = true } = {}) {
     if (!Boolean(String(adminSession.accessToken || "").trim())) {
       return;
     }
     // Stage loading so login does not blast all heavy endpoints concurrently.
     await Promise.allSettled([
       checkHealth(),
-      loadRecentAlerts(),
-      loadFlows(),
+      checkQueueHealth({ background: true }),
+      includeAlerts ? loadRecentAlerts() : Promise.resolve(),
+      loadMonitorApplications(),
     ]);
     window.setTimeout(() => {
-      Promise.allSettled([
-        loadMonitorApplications(),
-        loadAlertSeverityOverrides(),
-        loadModelProviderStatus(),
-        loadLandingPadRecent(),
-        loadRagDocs(),
-      ]).catch(() => {});
+      if (activeTab === "stream") void loadLandingPadRecent({ background: true });
+      if (activeTab === "summary") void Promise.allSettled([loadGatewaySummary(), loadIncidentMetadata({ background: true })]);
+      void loadModelProviderStatus();
+      if (activeTab === "admin" && adminWorkspace === "alerts") void loadAlertSeverityOverrides();
     }, 250);
-
-    window.setTimeout(() => {
-      Promise.allSettled([
-        loadGatewaySummary(),
-        loadGatewayRecent(),
-        loadIncidentMetadata(),
-      ]).catch(() => {});
-    }, 1500);
   }
 
   async function refreshViewsAfterSubmit() {
@@ -9805,6 +4828,66 @@ export default function App() {
       await loadMonitoringApplicationDetails(selectedMonitoringAppId);
     }
   }
+
+  useEffect(() => {
+    let cancelled = false;
+    const initializeAuthentication = async () => {
+      try {
+        const config = await fetchJson("/api-gateway/auth/config", { headers: { Accept: "application/json" }, maxAttempts: 1, staleTimeMs: 60_000 });
+        if (cancelled) return;
+        setAuthConfig({ ...config, loading: false, error: "" });
+        if (config.mode === "oidc" && new URLSearchParams(window.location.search).has("code")) {
+          const accessToken = await completeOidcLogin(config);
+          if (!accessToken) throw new Error("Identity provider did not return an access token");
+          const me = await fetchJson("/api-gateway/auth/me", { headers: { Authorization: `Bearer ${accessToken}` }, maxAttempts: 1 });
+          const session = { loading: false, accessToken, refreshToken: "", user: me.user || null, error: "" };
+          adminSessionRef.current = session; storeSessionTokens(session);
+          setAdminSession(session);
+        } else { const session = await restoreStoredSession(config, fetchJson); if (session) { adminSessionRef.current = session; storeSessionTokens(session); setAdminSession(session); } else setAdminSession((current) => ({ ...current, loading: false })); }
+      } catch (error) {
+        if (!cancelled) { clearStoredSession(); setAuthConfig((current) => ({ ...current, loading: false, error: String(error?.message || error) }));
+          setAdminSession((current) => ({ ...current, loading: false, error: String(error?.message || error) }));
+        }
+      }
+    };
+    void initializeAuthentication();
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    if (!String(adminSession.accessToken || "").trim()) {
+      return undefined;
+    }
+    // Recover from api-gateway/model-router startup races instead of pinning a
+    // transient provider-status error in the global shell for the whole login.
+    const initialRetry = window.setTimeout(() => { void loadModelProviderStatus(); }, 1_500);
+    const interval = window.setInterval(() => { void loadModelProviderStatus(); }, 30_000);
+    return () => {
+      window.clearTimeout(initialRetry);
+      window.clearInterval(interval);
+    };
+  }, [adminSession.accessToken]);
+
+  useEffect(() => {
+    if (VALID_LEGACY_TABS.has(initialTab) && initialTab !== activeTab) {
+      // The router is authoritative for top-level navigation. Without this
+      // guard, the following effect can publish the previous local tab during
+      // the same commit and bounce the URL back, continuously remounting the
+      // active route (most visible as Live Alerts / Approvals flicker).
+      skipNextActiveTabNavigationRef.current = true;
+      setActiveTab(initialTab);
+    }
+  }, [initialTab]);
+
+  useEffect(() => {
+    if (skipNextActiveTabNavigationRef.current) {
+      skipNextActiveTabNavigationRef.current = false;
+      return;
+    }
+    if (typeof onActiveTabChange === "function") {
+      onActiveTabChange(activeTab);
+    }
+  }, [activeTab, onActiveTabChange]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -9829,15 +4912,20 @@ export default function App() {
         if (typeof prefs.selectedFlow === "string" && prefs.selectedFlow.trim()) {
           setSelectedFlow(prefs.selectedFlow);
         }
-        if (typeof prefs.activeTab === "string" && VALID_TABS.has(prefs.activeTab)) {
-          setActiveTab(prefs.activeTab);
-        }
-        if (prefs.metadataFilters && typeof prefs.metadataFilters === "object") {
-          setMetadataFilters((current) => ({ ...current, ...prefs.metadataFilters }));
-        }
+        // The URL is authoritative for the top-level destination. Keep reading
+        // the remaining legacy preferences until their owning features move to
+        // typed route state.
         if (prefs.closedFilters && typeof prefs.closedFilters === "object") {
           setClosedFilters((current) => ({ ...current, ...prefs.closedFilters }));
         }
+        if (prefs.ingestionStreamFilters && typeof prefs.ingestionStreamFilters === "object") {
+          // Live Stream is always scoped to the selected project. Do not let a
+          // legacy preference restore the former global feed.
+          const savedFilters = { ...prefs.ingestionStreamFilters, application: "selected" };
+          setIngestionStreamFilters((current) => ({ ...current, ...savedFilters }));
+        }
+        if (typeof prefs.ingestionStreamView === "string") setIngestionStreamView(prefs.ingestionStreamView);
+        if (typeof prefs.ingestionStreamSection === "string") setIngestionStreamSection(prefs.ingestionStreamSection);
       }
     } catch (_error) {
       // Ignore malformed preference payloads and continue with defaults.
@@ -9865,17 +4953,21 @@ export default function App() {
     if (typeof window === "undefined") {
       return;
     }
+    if (skipInitialPreferencesPersistRef.current) { skipInitialPreferencesPersistRef.current = false; return; }
     const payload = {
       applicationToMonitor,
       uiDensity,
       uiTheme,
       selectedFlow,
       activeTab,
-      metadataFilters,
       closedFilters,
+      ingestionStreamFilters,
+      ingestionStreamView,
+      ingestionStreamSection,
+      liveStreamScopeVersion: 2,
     };
     window.localStorage.setItem(PREFERENCE_STORAGE_KEY, JSON.stringify(payload));
-  }, [applicationToMonitor, uiDensity, uiTheme, selectedFlow, activeTab, metadataFilters, closedFilters]);
+  }, [applicationToMonitor, uiDensity, uiTheme, selectedFlow, activeTab, closedFilters, ingestionStreamFilters, ingestionStreamView, ingestionStreamSection]);
 
   useEffect(() => {
     const onKeyDown = (event) => {
@@ -9884,7 +4976,7 @@ export default function App() {
         return;
       }
       const roleName = normalizeRoleName(adminSession?.user?.role_name);
-      const roleTabs = ROLE_ALLOWED_TABS[roleName] || ["home"];
+      const roleTabs = allowedLegacyTabsForRole(roleName);
       if (!event.altKey) {
         return;
       }
@@ -9893,7 +4985,7 @@ export default function App() {
       if (tagName === "input" || tagName === "textarea" || tagName === "select" || target?.isContentEditable) {
         return;
       }
-      const tabId = TAB_SHORTCUT_MAP[event.code];
+      const tabId = TAB_SHORTCUT_BY_CODE[event.code];
       if (!tabId) {
         return;
       }
@@ -9909,21 +5001,36 @@ export default function App() {
   }, [adminSession.accessToken, adminSession?.user?.role_name]);
 
   useEffect(() => {
+    // Application names are non-secret workspace metadata and the selector is
+    // shown before authentication. Load them on mount so registered workspaces
+    // such as ParaBank are available at sign-in, not only after sign-in.
+    loadMonitorApplications({ preLogin: true });
+  }, []);
+
+  useEffect(() => {
+    incidentMetadataFiltersRef.current = metadataFilters;
+  }, [metadataFilters]);
+
+  useEffect(() => {
     if (!Boolean(String(adminSession.accessToken || "").trim())) {
       return;
     }
-    refreshAll();
+    refreshAll({ includeAlerts: false });
   }, [adminSession.accessToken]);
 
   useEffect(() => {
     if (!Boolean(String(adminSession.accessToken || "").trim())) {
       return;
     }
-    if (alertsLimit === 50) {
-      return;
-    }
     loadRecentAlerts();
   }, [adminSession.accessToken, alertsLimit]);
+
+  useEffect(() => {
+    if (!Boolean(String(adminSession.accessToken || "").trim()) || activeTab !== "safety") {
+      return;
+    }
+    void Promise.allSettled([loadGatewaySummary(), loadGatewayRecent(), loadLandingPadRecent({ force: true })]);
+  }, [adminSession.accessToken, activeTab]);
 
   useEffect(() => {
     if (!Boolean(String(adminSession.accessToken || "").trim())) {
@@ -9941,15 +5048,56 @@ export default function App() {
       }
       alertStreamRefreshInFlight.current = true;
       try {
-        const tasks = [loadRecentAlerts({ background: true })];
+        const tasks = [
+          loadRecentAlerts({ background: true }),
+          loadIncidentMetadata({ background: true, ignoreFilters: true }),
+          loadClosedIncidents(),
+          loadGatewaySummary(),
+          loadGatewayRecent(),
+        ];
         await Promise.allSettled(tasks);
       } finally {
         alertStreamRefreshInFlight.current = false;
       }
     };
-    const timer = window.setInterval(refreshAlertStream, 30000);
+    void refreshAlertStream();
+    const timer = window.setInterval(refreshAlertStream, 60000);
     return () => window.clearInterval(timer);
   }, [adminSession.accessToken, activeTab, alertsLimit, applicationToMonitor]);
+
+  useEffect(() => {
+    if (!Boolean(String(adminSession.accessToken || "").trim())) {
+      return;
+    }
+    if (activeTab !== "stream") {
+      return undefined;
+    }
+    if (ingestionStreamPaused) {
+      return undefined;
+    }
+    const refreshLandingPadStream = async () => {
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+        return;
+      }
+      if (landingPadStreamRefreshInFlight.current) {
+        return;
+      }
+      landingPadStreamRefreshInFlight.current = true;
+      try {
+        await Promise.allSettled([
+          loadLandingPadRecent({ background: true }),
+          loadIncidentMetadata({ background: true, ignoreFilters: true }),
+        ]);
+      } finally {
+        landingPadStreamRefreshInFlight.current = false;
+      }
+    };
+    refreshLandingPadStream();
+    // Event delivery is primary; this bounded 15-second poll covers dropped
+    // events and keeps the visible Live Stream honest.
+    const timer = window.setInterval(refreshLandingPadStream, 15000);
+    return () => window.clearInterval(timer);
+  }, [adminSession.accessToken, activeTab, ingestionStreamPaused]);
 
   useEffect(() => {
     if (activeTab !== "home") {
@@ -9974,7 +5122,12 @@ export default function App() {
       if (!requestState.inFlight || ageMs <= 16000) {
         return;
       }
-      recentAlertsRequestRef.current = { inFlight: false, requestId: "", startedAt: 0 };
+      recentAlertsRequestRef.current = {
+        ...recentAlertsRequestRef.current,
+        inFlight: false,
+        requestId: "",
+        startedAt: 0,
+      };
       setAlerts((prev) => ({
         ...prev,
         loading: false,
@@ -9988,7 +5141,7 @@ export default function App() {
     if (!Boolean(String(adminSession.accessToken || "").trim())) {
       return;
     }
-    if (activeTab !== "summary") {
+    if (!["summary", "approval"].includes(activeTab)) {
       return;
     }
     loadIncidentMetadata();
@@ -10001,6 +5154,25 @@ export default function App() {
     metadataFilters.service,
     adminSession.accessToken,
   ]);
+
+  // SSE is the fast path, but the incident list must still converge if a
+  // proxy, browser, or network temporarily interrupts the event stream.
+  useEffect(() => {
+    if (!Boolean(String(adminSession.accessToken || "").trim()) || activeTab !== "summary") {
+      return undefined;
+    }
+    const refreshVisibleIncidents = () => {
+      if (document.visibilityState === "visible") {
+        void loadIncidentMetadata({ background: true });
+      }
+    };
+    const timer = window.setInterval(refreshVisibleIncidents, 20000);
+    document.addEventListener("visibilitychange", refreshVisibleIncidents);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", refreshVisibleIncidents);
+    };
+  }, [adminSession.accessToken, activeTab]);
 
   useEffect(() => {
     if (!Boolean(String(adminSession.accessToken || "").trim())) {
@@ -10044,18 +5216,13 @@ export default function App() {
   }, [adminSession.accessToken]);
 
   useEffect(() => {
-    if (
-      activeTab !== "stream"
-      || !Boolean(String(adminSession.accessToken || "").trim())
-    ) {
-      return undefined;
-    }
-    loadLandingPadRecent();
-    const timer = window.setInterval(() => {
-      loadLandingPadRecent();
-    }, 10_000);
-    return () => window.clearInterval(timer);
-  }, [activeTab, adminSession.accessToken]);
+    const discovered = alerts.rows.map(projectIdentityFromAlert).map(visibleManagedApplication).filter(Boolean);
+    if (!discovered.length) return;
+    setMonitorApplications((current) => {
+      const merged = uniqueMonitorApplications([...current, ...discovered]);
+      return merged.join("\u0000") === current.join("\u0000") ? current : merged;
+    });
+  }, [alerts.rows]);
 
   const latestWorkflow = useMemo(() => {
     return workflowState?.result?.data || {};
@@ -10070,7 +5237,12 @@ export default function App() {
   }, [latestWorkflow]);
 
   const monitorScopedAlerts = useMemo(() => {
-    return filterAlertsForMonitor(alerts.rows, applicationToMonitor);
+    const scopedRows = filterAlertsForMonitor(alerts.rows, applicationToMonitor);
+    return capLatestAlertsPerSource(
+      // Source balancing must never escape the selected application scope.
+      // Using the global list here reintroduced test/demo alerts into Real.
+      ensureMinimumAlertsBySource(scopedRows, scopedRows)
+    );
   }, [alerts.rows, applicationToMonitor]);
 
   const monitorScopedRecentClosedAlerts = useMemo(() => {
@@ -10111,11 +5283,17 @@ export default function App() {
   }, [visibleAlerts]);
 
   const dashboardVisibleAlerts = useMemo(() => {
-    const query = String(dashboardAlertQuery || "").trim().toLowerCase();
+    const query = String(dashboardAlertQueryDebounced || "").trim().toLowerCase();
     return visibleAlerts.filter((row) => {
       const severity = String(row?.severity || "").toLowerCase();
       const status = String(row?.status || row?.state || "open").toLowerCase();
       const generatedOrTest = isGeneratedOrTestAlert(row);
+      const sourceChannels = Array.isArray(row?.source_channels) && row.source_channels.length
+        ? row.source_channels.map((channel) => String(channel || "").trim().toLowerCase())
+        : [normalizeAlertChannel(row)];
+      if (dashboardAlertSource !== "all" && !sourceChannels.includes(dashboardAlertSource)) {
+        return false;
+      }
       if (dashboardAlertFocus === "ops" && generatedOrTest) {
         return false;
       }
@@ -10155,16 +5333,47 @@ export default function App() {
         .join(" ");
       return haystack.includes(query);
     });
-  }, [visibleAlerts, dashboardAlertFocus, dashboardAlertQuery]);
+  }, [visibleAlerts, dashboardAlertFocus, dashboardAlertQueryDebounced, dashboardAlertSource]);
 
   const monitorScopedIncidentMetadata = useMemo(() => {
-    return filterRowsForMonitor(incidentMetadata.rows, applicationToMonitor);
-  }, [incidentMetadata.rows, applicationToMonitor]);
+    const scoped = filterRowsForMonitor(incidentMetadata.rows, applicationToMonitor);
+    return scoped.map((incidentRow) => {
+      const projection = incidentRow?.projection_payload && typeof incidentRow.projection_payload === "object" ? incidentRow.projection_payload : {};
+      const eventPayload = projection?.event_payload && typeof projection.event_payload === "object" ? projection.event_payload : {};
+      const alertId = String(incidentRow?.alert_id || projection?.alert_id || eventPayload?.alert_id || "").trim();
+      const alertRow = alerts.rows.find((row) => String(row?.alert_id || row?.id || "").trim() === alertId);
+      return alertRow ? { ...incidentRow, source_alert: alertRow } : incidentRow;
+    });
+  }, [incidentMetadata.rows, alerts.rows, applicationToMonitor]);
 
   const selectedMonitorScopeLabel = useMemo(
     () => monitorScopeLabel(applicationToMonitor),
     [applicationToMonitor],
   );
+  const monitorApplicationGroups = useMemo(() => {
+    const rowByName = new Map();
+    monitoringApps.rows.forEach((row) => {
+      const name = String(row?.name || row?.application || "").trim();
+      if (name) rowByName.set(name.toLowerCase(), row);
+    });
+    alerts.rows.forEach((row) => {
+      const name = projectIdentityFromAlert(row);
+      if (name && !rowByName.has(name.toLowerCase())) rowByName.set(name.toLowerCase(), row);
+    });
+    const groups = { applications: [], tests: [], platform: [] };
+    monitorApplications.forEach((name) => {
+      if ([REAL_USE_CASE_SCOPE, TEST_USE_CASE_SCOPE].includes(name)) return;
+      const row = rowByName.get(String(name).toLowerCase());
+      if (CORE_MONITOR_PROJECTS.some((item) => item.toLowerCase() === String(name).toLowerCase())) {
+        groups.platform.push(name);
+      } else if (row && isTestApplicationRecord(row)) {
+        groups.tests.push(name);
+      } else {
+        groups.applications.push(name);
+      }
+    });
+    return groups;
+  }, [alerts.rows, monitorApplications, monitoringApps.rows]);
 
   const visibleAlertSourceSummary = useMemo(() => {
     const summary = { prometheus: 0, telemetry: 0, email: 0, ticket: 0, log: 0 };
@@ -10183,8 +5392,70 @@ export default function App() {
   }, [visibleAlerts]);
 
   const selectedAlertRow = useMemo(() => {
-    return visibleAlerts.find((row) => String(row?.alert_id || row?.id || row?.incident_id || "") === selectedAlertId) || null;
-  }, [visibleAlerts, selectedAlertId]);
+    const matchedRow = visibleAlerts.find(
+      (row) => String(row?.alert_id || row?.id || row?.incident_id || "") === selectedAlertId
+    );
+    const snapshotId = String(
+      selectedAlertSnapshot?.alert_id
+      || selectedAlertSnapshot?.id
+      || selectedAlertSnapshot?.incident_id
+      || ""
+    );
+    const snapshotRow = snapshotId === selectedAlertId ? selectedAlertSnapshot : null;
+    const payload = selectedAlertData?.payload?.data || selectedAlertData?.payload || {};
+    const processedAlert = payload?.alert && typeof payload.alert === "object" ? payload.alert : {};
+    const processedIncident = payload?.incident && typeof payload.incident === "object" ? payload.incident : {};
+    const processedAlertId = String(processedAlert.alert_id || processedAlert.id || selectedAlertId || "").trim();
+    const processedMatchesSelection = Boolean(
+      processedAlertId
+      && processedAlertId === String(selectedAlertId || "")
+      && Object.keys(processedAlert).length
+    );
+    const baseRow = matchedRow || snapshotRow || (processedMatchesSelection ? processedAlert : null);
+    if (!baseRow) return null;
+
+    // Summary projections make the cockpit available immediately. Once the
+    // processed result arrives, overlay its canonical fields so both views
+    // describe the same record without losing the alert/incident relationship.
+    return {
+      ...baseRow,
+      ...processedIncident,
+      ...processedAlert,
+      id: processedAlertId || baseRow.id,
+      alert_id: processedAlertId || baseRow.alert_id,
+      incident_id: processedIncident.id || processedIncident.incident_id || baseRow.incident_id,
+      projection_payload: baseRow.projection_payload,
+    };
+  }, [visibleAlerts, selectedAlertId, selectedAlertSnapshot, selectedAlertData.payload, applicationToMonitor]);
+
+  const evidenceDraftLoadRef = useRef({ key: "", loadedAt: 0 });
+
+  // A landing-pad filename can be selected briefly while the backend promotes
+  // it to a canonical alert. Never carry an RCA error from that transient
+  // identity into the fully persisted incident cockpit.
+  useEffect(() => {
+    setSelectedAlertRegeneration({ loading: false, message: "", error: "" });
+  }, [selectedAlertId]);
+
+  const selectedAlertNavigation = useMemo(() => {
+    const selectedIdentities = new Set([
+      selectedAlertId,
+      selectedAlertRow?.alert_id,
+      selectedAlertRow?.id,
+      selectedAlertRow?.incident_id,
+    ].map((value) => String(value || "").trim()).filter(Boolean));
+    const index = dashboardVisibleAlerts.findIndex((row) => [
+      row?.alert_id,
+      row?.id,
+      row?.incident_id,
+    ].some((value) => selectedIdentities.has(String(value || "").trim())));
+    return {
+      index,
+      total: dashboardVisibleAlerts.length,
+      previous: index > 0 ? dashboardVisibleAlerts[index - 1] : null,
+      next: index >= 0 && index < dashboardVisibleAlerts.length - 1 ? dashboardVisibleAlerts[index + 1] : null,
+    };
+  }, [dashboardVisibleAlerts, selectedAlertId, selectedAlertRow]);
 
   const selectedAlertPayload = useMemo(() => {
     return selectedAlertData?.payload?.data || selectedAlertData?.payload || {};
@@ -10463,6 +5734,26 @@ export default function App() {
     }));
   }, [modelProviderStatus]);
 
+  const aiCapabilityStatus = useMemo(() => {
+    const explicitStatus = String(modelProviderStatus?.data?.status || modelProviderStatus?.data?.overall_status || "").trim().toLowerCase();
+    const configuredProviders = selectedModelProviderRows.filter((provider) => provider.configured);
+    const unhealthyProviders = configuredProviders.filter((provider) => !provider.healthy || provider.circuitOpen);
+    const statusUnavailable = Boolean(modelProviderStatus.error) && !modelProviderStatus.data;
+    const degraded = ["degraded", "unavailable", "error", "failed", "unhealthy"].includes(explicitStatus)
+      || unhealthyProviders.length > 0
+      || statusUnavailable;
+    const affectedProviders = unhealthyProviders.map((provider) => provider.name).join(", ");
+    return {
+      degraded,
+      loading: Boolean(modelProviderStatus.loading),
+      message: affectedProviders
+          ? `${affectedProviders} reported an unhealthy or open-circuit state. Deterministic monitoring remains active and execution stays governed by backend policy.`
+          : statusUnavailable
+            ? "Provider status is unavailable. AI investigation may be delayed; deterministic monitoring remains active and execution stays governed by backend policy."
+            : "",
+    };
+  }, [modelProviderStatus, selectedModelProviderRows]);
+
   const selectedAlertRouting = useMemo(() => extractObservedRoutingMetrics(selectedAlertWorkflow), [selectedAlertWorkflow]);
 
   const selectedAlertEvaluation = useMemo(() => {
@@ -10470,29 +5761,81 @@ export default function App() {
       ? selectedAlertWorkflow.recommendation
       : {};
     const metadata = recommendation?.metadata && typeof recommendation.metadata === "object" ? recommendation.metadata : {};
-    const evaluation = metadata?.evaluation && typeof metadata.evaluation === "object" ? metadata.evaluation : {};
+    const workflowIncidentId = String(selectedAlertWorkflow?.incident?.id || selectedAlertWorkflow?.incident_id || "").trim();
+    const incidentMetaMatch = [
+      ...monitorScopedIncidentMetadata,
+      ...incidentMetadata.rows,
+    ].find((row) => {
+      const rowIncidentId = String(row?.incident_id || "").trim();
+      const rowAlertId = String(row?.alert_id || "").trim();
+      return (workflowIncidentId && rowIncidentId === workflowIncidentId)
+        || (selectedAlertId && rowAlertId === selectedAlertId);
+    }) || null;
+    const projectionPayload =
+      incidentMetaMatch?.projection_payload && typeof incidentMetaMatch.projection_payload === "object"
+        ? incidentMetaMatch.projection_payload
+        : {};
+    const projectionEventPayload =
+      projectionPayload?.event_payload && typeof projectionPayload.event_payload === "object"
+        ? projectionPayload.event_payload
+        : {};
+    const projectedEvaluation =
+      (projectionEventPayload?.evaluation && typeof projectionEventPayload.evaluation === "object" && projectionEventPayload.evaluation)
+      || (projectionPayload?.evaluation && typeof projectionPayload.evaluation === "object" && projectionPayload.evaluation)
+      || {};
+    const evaluation =
+      (metadata?.evaluation && typeof metadata.evaluation === "object" && metadata.evaluation)
+      || projectedEvaluation
+      || {};
     const ragMatches = Array.isArray(metadata.rag_matches) ? metadata.rag_matches : [];
     const bestRagMatch = ragMatches.reduce((best, row) => {
       const value = Number(row?.match_confidence ?? row?._similarity ?? row?.similarity ?? row?.score ?? 0);
       return Number.isFinite(value) ? Math.max(best, value) : best;
     }, Number(metadata.rag_top_similarity || 0) || 0);
+    const projectedCitationCoverage = Number(projectedEvaluation?.citation_coverage ?? projectedEvaluation?.citationCoverage);
+    const projectedEvidenceCoverage = Number(projectedEvaluation?.evidence_coverage ?? projectedEvaluation?.evidenceCoverage);
+    const projectedConfidence = Number(projectedEvaluation?.confidence_score ?? projectedEvaluation?.confidenceScore);
+    const projectedRagMatch = Number(projectedEvaluation?.rag_match_score ?? projectedEvaluation?.ragMatchScore);
     const citations = Array.isArray(metadata.citations) ? metadata.citations : [];
     return normalizeEvaluationEnvelope(evaluation, {
-      confidence: recommendation?.confidence,
-      ragMatchScore: bestRagMatch,
-      citationCoverage: Math.min(citations.length / 3, 1),
-      evidenceCoverage: Math.min(
+      confidence: Number.isFinite(projectedConfidence) ? projectedConfidence : recommendation?.confidence,
+      ragMatchScore: bestRagMatch || (Number.isFinite(projectedRagMatch) ? projectedRagMatch : 0),
+      citationCoverage: Number.isFinite(projectedCitationCoverage)
+        ? projectedCitationCoverage
+        : Math.min(citations.length / 3, 1),
+      evidenceCoverage: Number.isFinite(projectedEvidenceCoverage)
+        ? projectedEvidenceCoverage
+        : Math.min(
         (metadata.runbook_found ? 0.35 : 0)
         + (ragMatches.length ? 0.4 : 0)
         + (selectedAlertRagDocuments.length ? 0.25 : 0),
         1,
       ),
     });
-  }, [selectedAlertWorkflow, selectedAlertRagDocuments.length]);
+  }, [
+    selectedAlertWorkflow,
+    selectedAlertRagDocuments.length,
+    monitorScopedIncidentMetadata,
+    incidentMetadata.rows,
+    selectedAlertId,
+  ]);
 
   const selectedIncidentId = useMemo(() => {
-    return String(selectedAlertWorkflow?.incident?.id || selectedAlertWorkflow?.incident_id || "").trim();
-  }, [selectedAlertWorkflow]);
+    const projection = selectedAlertRow?.projection_payload && typeof selectedAlertRow.projection_payload === "object"
+      ? selectedAlertRow.projection_payload
+      : {};
+    const eventPayload = projection?.event_payload && typeof projection.event_payload === "object"
+      ? projection.event_payload
+      : {};
+    return String(
+      selectedAlertWorkflow?.incident?.id
+      || selectedAlertWorkflow?.incident_id
+      || selectedAlertRow?.incident_id
+      || projection?.incident_id
+      || eventPayload?.incident_id
+      || ""
+    ).trim();
+  }, [selectedAlertWorkflow, selectedAlertRow]);
 
   const selectedIncidentMetadataRow = useMemo(() => {
     if (!selectedIncidentId) {
@@ -10508,17 +5851,30 @@ export default function App() {
   }, [selectedIncidentId, monitorScopedIncidentMetadata, incidentMetadata.rows]);
 
   const selectedCanonicalIncidentStatus = useMemo(
-    () => canonicalIncidentStatus(
-      selectedStageCompleteness.data?.status,
-      selectedIncidentMetadataRow?.status,
-      selectedAlertWorkflow?.incident?.status,
-      selectedAlertRow?.status,
-      selectedAlertRow?.state,
+    () => effectiveIncidentStatus(
+      selectedIncidentMetadataRow?.status
+        || selectedStageCompleteness.data?.status
+        || canonicalIncidentStatus(
+        selectedAlertWorkflow?.incident?.status,
+        selectedAlertRow?.status,
+        selectedAlertRow?.state,
+        ),
+      selectedIncidentMetadataRow?.approval_status
+        || selectedIncidentMetadataRow?.projection_payload?.approval_status
+        || (selectedIncidentMetadataRow?.latest_event_type === "incident.approval.recorded"
+          ? selectedIncidentMetadataRow?.projection_payload?.event_payload?.decision
+          : "")
+        || selectedAlertWorkflow?.approval?.status,
     ),
     [
       selectedStageCompleteness.data?.status,
       selectedIncidentMetadataRow?.status,
       selectedAlertWorkflow?.incident?.status,
+      selectedAlertWorkflow?.approval?.status,
+      selectedIncidentMetadataRow?.approval_status,
+      selectedIncidentMetadataRow?.projection_payload?.approval_status,
+      selectedIncidentMetadataRow?.projection_payload?.event_payload?.decision,
+      selectedIncidentMetadataRow?.latest_event_type,
       selectedAlertRow?.status,
       selectedAlertRow?.state,
     ],
@@ -10535,6 +5891,161 @@ export default function App() {
       || ""
     );
   }, [selectedIncidentId, selectedIncidentMetadataRow, selectedAlertWorkflow, selectedAlertData?.payload]);
+
+  const selectedAiTrust = useMemo(() => {
+    const recommendation = selectedAlertWorkflow?.recommendation && typeof selectedAlertWorkflow.recommendation === "object"
+      ? selectedAlertWorkflow.recommendation
+      : {};
+    const metadata = recommendation?.metadata && typeof recommendation.metadata === "object" ? recommendation.metadata : {};
+    const canonical = canonicalIncidentEvidence(selectedAlertWorkflow);
+    const hasAcceptedEvidence = canonical.evidence.some((row) => row.accepted === true);
+    const providerRow = selectedAlertUsage.find((row) => row.provider !== "-" || row.model !== "-");
+    const fallbackUsed = selectedAlertUsage.some((row) => row.fallback);
+    const confidenceReasons = [
+      `${canonical.evidence.length} linked evidence source(s)`,
+      `${formatQualityPercent(selectedAlertEvaluation.citationCoverage)} citation coverage`,
+      `${formatQualityPercent(selectedAlertEvaluation.groundingScore)} grounding`,
+      canonical.missing.length ? `${canonical.missing.length} evidence gap(s)` : "No declared evidence gaps",
+    ];
+    return {
+      ...canonical,
+      confidence: hasAcceptedEvidence ? canonical.confidence : 0,
+      confidenceLabel: hasAcceptedEvidence ? canonical.confidenceLabel : "Ungrounded",
+      confidenceActionable: hasAcceptedEvidence && canonical.confidenceActionable === true,
+      providerRow,
+      fallbackUsed,
+      confidenceReasons,
+    };
+  }, [selectedAlertWorkflow, selectedAlertUsage, selectedAlertEvaluation]);
+
+  const selectedRcaDecision = useMemo(() => {
+    const analysis = canonicalIncidentAnalysis(selectedAlertWorkflow, selectedAlertRow);
+    const impact = analysis.impactAnalysis && typeof analysis.impactAnalysis === "object" ? analysis.impactAnalysis : {};
+    const impactedServices = Array.isArray(impact.impacted_services)
+      ? impact.impacted_services.map((value) => cleanRecommendationText(value, "")).filter(Boolean)
+      : [];
+    const evidenceUsed = Array.isArray(impact.evidence_used) ? impact.evidence_used.map((value) => cleanRecommendationText(value, "")).filter(Boolean) : [];
+    const causalDetails = cleanRecommendationText(
+      analysis.rca?.causal_chain || analysis.rca?.mechanism || analysis.rca?.reasoning || analysis.rca?.contributing_factors,
+      "The causal mechanism was not supplied by the current analysis.",
+    );
+    const hasLinkedEvidence = selectedAiTrust.evidence.some((row) => row.accepted === true);
+    // This is the backend's bounded diagnostic confidence. Grounding and
+    // execution eligibility are enforced independently below.
+    const confidence = Number(selectedAiTrust.confidence ?? 0);
+    const investigation = selectedAlertWorkflow?.recommendation?.metadata?.investigation_report
+      || selectedAlertWorkflow?.recommendation?.metadata?.iterative_investigation
+      || {};
+    const investigationConclusive = investigation?.conclusive === true
+      && String(investigation?.status || "").toLowerCase() === "conclusive";
+    const investigationConfidence = Number(investigation?.conclusion?.confidence || 0);
+    const groundingScore = Number(selectedAlertEvaluation.groundingScore || 0);
+    const reviewRequired = Boolean(
+      selectedAlertEvaluation.requiresReview
+      || !hasLinkedEvidence
+      || confidence < 0.85
+      || groundingScore < 0.85
+      || !investigationConclusive
+      || investigationConfidence < 0.85
+      || selectedAiTrust.missing.length
+      || selectedAiTrust.conflicting.length
+      || analysis.status !== "resolved-analysis"
+    );
+    return {
+      ...analysis,
+      confidence,
+      reviewRequired,
+      confidenceKind: selectedAiTrust.confidenceKind,
+      confidenceActionable: selectedAiTrust.confidenceActionable,
+      confidenceLabel: !hasLinkedEvidence ? "Ungrounded" : selectedAiTrust.confidenceLabel,
+      impactedServices,
+      causalDetails,
+      impactEvidence: evidenceUsed,
+      customerImpact: readableImpactText(
+        impact.customer_impact || impact.user_impact || impact.business_impact,
+        "No confirmed customer or business impact was found in the collected evidence.",
+      ),
+      serviceImpact: readableImpactText(
+        impact.observed_impact || impact.service_impact || impact.impact_summary || analysis.impact,
+        impactedServices.length
+          ? `Observed operational signals affect ${impactedServices.join(", ")}; customer impact remains unconfirmed.`
+          : "Observed service impact is not yet quantified.",
+      ),
+      dependencyImpact: readableImpactText(impact.dependency_impact, "Dependency impact was not established by the collected evidence."),
+      urgency: cleanRecommendationText(impact.severity_rationale || impact.urgency, selectedAlertRow?.severity ? `${selectedAlertRow.severity} alert priority; business urgency requires operator validation.` : "Operational urgency was not established."),
+    };
+  }, [selectedAlertWorkflow, selectedAlertRow, selectedAlertEvaluation, selectedAiTrust.evidence.length, selectedAiTrust.missing.length, selectedAiTrust.conflicting.length]);
+
+  const selectedInvestigationReport = selectedAlertWorkflow?.recommendation?.metadata?.investigation_report
+    || selectedAlertWorkflow?.recommendation?.metadata?.iterative_investigation
+    || {};
+  const selectedInvestigationConclusive = selectedInvestigationReport?.conclusive === true
+    && String(selectedInvestigationReport?.status || "").toLowerCase() === "conclusive";
+  const selectedInvestigationConfidence = Number(selectedInvestigationReport?.conclusion?.confidence || 0);
+
+  const selectedRelevantRcaEvidence = useMemo(() => {
+    // Preserve backend-linked evidence; free-text rematching can discard normalized records.
+    return selectedAiTrust.evidence;
+  }, [selectedAiTrust.evidence]);
+  const selectedAlertAuthenticity = String(
+    selectedAlertRow?.labels?.event_authenticity
+    || selectedAlertRow?.event_authenticity
+    || "unverified"
+  ).toLowerCase();
+
+  useEffect(() => {
+    const alertId = String(selectedAlertId || "").trim();
+    if (!adminSession.accessToken || !alertId || selectedAlertDocumentLinks.loading || selectedAlertDocumentLinks.rows.length) {
+      if (selectedAlertDocumentLinks.rows.length) setEvidenceDraftReview({ loading: false, draft: null, content: "", notes: "", error: "", message: "" });
+      return;
+    }
+    const requestKey = [
+      alertId,
+      selectedAlertDocumentLinks.rows.length,
+      selectedRcaDecision.rootCause,
+      selectedRelevantRcaEvidence.length,
+      selectedRcaDecision.reviewRequired,
+    ].join("|");
+    const now = Date.now();
+    if (
+      evidenceDraftLoadRef.current.key === requestKey
+      && now - evidenceDraftLoadRef.current.loadedAt < 30_000
+    ) return;
+    evidenceDraftLoadRef.current = { key: requestKey, loadedAt: now };
+    let cancelled = false;
+    setEvidenceDraftReview((current) => ({ ...current, loading: true, error: "" }));
+    fetchJson(`/api-gateway/rag/evidence-drafts?alert_id=${encodeURIComponent(alertId)}`, authenticatedOptions())
+      .then(async (response) => {
+        if (cancelled) return;
+        let drafts = unwrap(response)?.drafts || [];
+        let draft = drafts[0] || null;
+        if (drafts.filter((item) => item?.document_kind).length < ALERT_DOC_KIND_OPTIONS.length && selectedRcaDecision.rootCause && selectedRelevantRcaEvidence.length) {
+          const evidenceIds = selectedRelevantRcaEvidence.map((row) => row.id || row.evidence_id).filter(Boolean);
+          const sourceUris = selectedRelevantRcaEvidence.map((row) => row.source_uri || row.uri || row.path).filter(Boolean);
+          const content = buildRcaEvidenceDocumentDraft({ alertId, alert: selectedAlertRow, decision: selectedRcaDecision, workflow: selectedAlertWorkflow, evidence: selectedRelevantRcaEvidence });
+          const binding = selectedAlertWorkflow?.incident_investigation || {}; const created = await fetchJson("/api-gateway/rag/evidence-drafts", authenticatedOptions({ method: "POST", body: JSON.stringify({ incident_id: binding.incident_id || selectedIncidentId, alert_id: binding.alert_id || alertId, analysis_request_id: binding.analysis_request_id, context_snapshot_id: binding.context_snapshot_id, context_fingerprint: binding.context_fingerprint, recommendation_id: binding.recommendation_id, rca_version: binding.rca_version, alert_type: selectedAlertRow?.name || selectedAlertRow?.alert_name, severity: selectedAlertRow?.severity, environment: selectedAlertRow?.environment, content, services: [selectedAlertRow?.service].filter(Boolean), evidence_ids: evidenceIds, source_uris: sourceUris }) }));
+          drafts = unwrap(created)?.drafts || [unwrap(created)?.draft].filter(Boolean);
+          draft = unwrap(created)?.draft || drafts[0] || null;
+        }
+        const draftContent = String(draft?.content || "");
+        const canonicalContent = buildRcaEvidenceDocumentDraft({
+          alertId,
+          alert: selectedAlertRow,
+          decision: selectedRcaDecision,
+          workflow: selectedAlertWorkflow,
+          evidence: selectedRelevantRcaEvidence,
+        });
+        const resolvedDraftContent = incidentDraftHasSubstantiveContent(draftContent)
+          ? draftContent
+          : canonicalContent;
+        const alreadyContainsRca = Boolean(selectedRcaDecision.rootCause && resolvedDraftContent.toLowerCase().includes(String(selectedRcaDecision.rootCause).trim().toLowerCase()));
+        const rcaAppendix = draft && selectedRcaDecision.rootCause && !selectedRcaDecision.reviewRequired && selectedRelevantRcaEvidence.length && !alreadyContainsRca ? ["", "## Completed RCA", selectedRcaDecision.rootCause, "", "## Impact", selectedRcaDecision.customerImpact, "", "## Recommended response", selectedRcaDecision.action || "No action supplied.", "", `Confidence: ${Math.round(Number(selectedRcaDecision.confidence || 0) * 100)}%`].join("\n") : "";
+        const insufficientMessage = selectedRelevantRcaEvidence.length ? "A root-cause hypothesis is not available yet. Continue investigation before creating a review draft." : "Relevant project evidence is missing. KaiMS will not generate or publish an RCA until real source evidence arrives.";
+        setEvidenceDraftReview({ loading: false, drafts, draft, content: draft ? `${resolvedDraftContent}${rcaAppendix}` : "", notes: "", error: draft ? "" : insufficientMessage, message: draft ? "Document drafts created and stored automatically. Review and edit each draft before publication." : "" });
+      })
+      .catch((error) => { if (!cancelled) setEvidenceDraftReview((current) => ({ ...current, loading: false, error: String(error?.message || error) })); });
+    return () => { cancelled = true; };
+  }, [adminSession.accessToken, selectedAlertId, selectedAlertDocumentLinks.loading, selectedAlertDocumentLinks.rows.length, selectedRcaDecision.rootCause, selectedRcaDecision.customerImpact, selectedRcaDecision.action, selectedRcaDecision.reviewRequired, selectedRelevantRcaEvidence]);
 
   const selectedExecutionPlan = useMemo(() => {
     const projectionPayload =
@@ -10573,6 +6084,10 @@ export default function App() {
       approval,
     };
     const commands = deriveExecutionCommands(workflowForExecution, selectedAlertEventTrace);
+    const catalogPlan =
+      (typeof recommendationMetadata?.execution_plan === "object" && recommendationMetadata.execution_plan)
+      || (typeof decision?.execution_plan === "object" && decision.execution_plan)
+      || {};
 
     return {
       action:
@@ -10581,6 +6096,13 @@ export default function App() {
         || selectedAlertRouting?.next_action
         || selectedAlertWorkflow?.next_step
         || "-",
+      target:
+        catalogPlan?.remediation_target
+        || catalogPlan?.actions?.[0]?.target_resource_id
+        || "",
+      expectedOutcome:
+        catalogPlan?.actions?.[0]?.expected_outcome
+        || "",
       rationale:
         recommendation?.rationale
         || remediationAction?.reason
@@ -10588,20 +6110,40 @@ export default function App() {
         || recommendation?.policy_reason
         || "-",
       requiresApproval:
+        // Unlike the other fields on this object, this one is consumed as a
+        // This value controls approval routing and must remain a real boolean;
+        // the shared "-" placeholder would be truthy and incorrectly require
+        // approval when no routing decision is available yet.
         selectedAlertRouting?.requires_approval
         ?? decision?.requires_approval
         ?? selectedAlertWorkflow?.approval?.required
-        ?? "-",
+        ?? false,
       workflow: selectedAlertRouting?.workflow || decision?.workflow || selectedAlertWorkflow?.scenario?.id || "-",
       executionMode: selectedAlertRouting?.execution_mode || decision?.execution_mode || "-",
       riskTier: selectedAlertRouting?.risk_tier || decision?.risk_tier || "-",
       provider: selectedAlertRouting?.message_bus_provider || decision?.message_bus_provider || "-",
       incidentStatus: selectedCanonicalIncidentStatus,
-      approvalStatus: approval?.status || projectionPayload?.approval_status || "pending",
+      approvalStatus:
+        approval?.status
+        || projectionPayload?.approval_status
+        || (selectedIncidentMetadataRow?.latest_event_type === "incident.approval.recorded"
+          ? projectionPayload?.event_payload?.decision
+          : "")
+        || "pending",
+      approval,
       commands,
+      catalogPlan,
+      recommendationId: String(recommendation?.id || recommendation?.recommendation_id || "").trim(),
       remediationAction,
+      remediationAnalysis: typeof recommendationMetadata?.remediation_analysis === "object" ? recommendationMetadata.remediation_analysis : {},
     };
   }, [selectedAlertWorkflow, selectedAlertRouting, selectedAlertEventTrace, selectedIncidentMetadataRow, selectedCanonicalIncidentStatus]);
+  const selectedGovernedExecutionTarget = String(
+    selectedExecutionPlan.target
+    || selectedExecutionPlan.catalogPlan?.remediation_target
+    || selectedExecutionPlan.catalogPlan?.actions?.[0]?.target_resource_id
+    || ""
+  ).trim();
   const selectedExecutionBreakdown = useMemo(() => {
     const grouped = { commands: [], scripts: [], queries: [] };
     (Array.isArray(selectedExecutionPlan.commands) ? selectedExecutionPlan.commands : []).forEach((item) => {
@@ -10627,6 +6169,13 @@ export default function App() {
       }
       grouped.commands.push(normalized);
     });
+    const agentValidation = Array.isArray(selectedExecutionPlan.remediationAnalysis?.validation_queries)
+      ? selectedExecutionPlan.remediationAnalysis.validation_queries
+      : [];
+    agentValidation.forEach((item) => {
+      const query = String(item || "").trim();
+      if (query && !grouped.queries.includes(query)) grouped.queries.push(query);
+    });
     const hasPlan = grouped.commands.length > 0 || grouped.scripts.length > 0 || grouped.queries.length > 0;
     return {
       ...grouped,
@@ -10638,11 +6187,59 @@ export default function App() {
   const selectedRemediationOutcome = useMemo(() => {
     const latestResponse = unwrap(remediationExecutionState.result);
     const responseOutcome = remediationOutcomeFromAction(latestResponse);
+    const persistedAction = selectedExecutionPlan.remediationAction;
+    const persistedOutcome = remediationOutcomeFromAction(persistedAction);
+    const responseId = String(latestResponse?.id || "");
+    const persistedId = String(persistedAction?.id || "");
+    const persistedStatus = String(persistedAction?.status || "").trim().toLowerCase();
+    const persistedIsTerminal = ["succeeded", "failed", "skipped", "completed", "closed", "resolved", "policy_blocked", "dispatch_failed", "execution_failed", "validation_failed", "rolled_back", "rollback_failed", "timed_out", "cancelled", "manual_intervention_required"].includes(persistedStatus);
+    // Hydrated persistence is authoritative once it represents the same
+    // action. Temporal acknowledges an asynchronous execution with a preview
+    // action ID, while the worker may persist the completed action under a
+    // different ID. A terminal action for this selected incident must replace
+    // that non-terminal preview or the cockpit remains stuck on "running".
+    if (persistedOutcome && (persistedIsTerminal || (responseId && responseId === persistedId))) {
+      return persistedOutcome;
+    }
     if (responseOutcome) {
       return responseOutcome;
     }
-    return remediationOutcomeFromAction(selectedExecutionPlan.remediationAction);
+    return persistedOutcome;
   }, [remediationExecutionState.result, selectedExecutionPlan.remediationAction]);
+  const selectedExecutionTechnicalResponse = useMemo(() => {
+    const latestResponse = unwrap(remediationExecutionState.result);
+    const persistedAction = selectedExecutionPlan.remediationAction;
+    const responseId = String(latestResponse?.id || "");
+    const persistedId = String(persistedAction?.id || "");
+    const persistedStatus = String(persistedAction?.status || "").trim().toLowerCase();
+    const persistedIsTerminal = ["succeeded", "failed", "skipped", "completed", "closed", "resolved", "policy_blocked", "dispatch_failed", "execution_failed", "validation_failed", "rolled_back", "rollback_failed", "timed_out", "cancelled", "manual_intervention_required"].includes(persistedStatus);
+    const candidates = [
+      ...(persistedIsTerminal || (responseId && responseId === persistedId) ? [persistedAction?.parameters?.execution_result, persistedAction] : []),
+      latestResponse?.parameters?.execution_result,
+      latestResponse,
+      persistedAction?.parameters?.execution_result,
+      persistedAction,
+    ];
+    return candidates.find((value) => value && typeof value === "object" && Object.keys(value).length > 0) || { message: "No executor details were returned." };
+  }, [remediationExecutionState.result, selectedExecutionPlan.remediationAction]);
+
+  const persistedExecutionStatus = String(selectedExecutionPlan.remediationAction?.status || "").trim().toLowerCase();
+  useEffect(() => {
+    if (!remediationExecutionState.loading || !remediationExecutionState.result) return;
+    if (!["succeeded", "failed", "skipped", "completed", "closed", "resolved", "policy_blocked", "dispatch_failed", "execution_failed", "validation_failed", "rolled_back", "rollback_failed", "timed_out", "cancelled", "manual_intervention_required"].includes(persistedExecutionStatus)) return;
+    setRemediationExecutionState((current) => ({ ...current, loading: false }));
+  }, [persistedExecutionStatus, remediationExecutionState.loading, remediationExecutionState.result]);
+
+  useEffect(() => {
+    if (!remediationExecutionState.loading || !remediationExecutionState.result || !selectedAlertId) return undefined;
+    // Execution is asynchronous. Keep the selected workflow hydrated until the
+    // remediation action reaches a terminal state so Act and Validate advance
+    // without requiring an operator to reload the page.
+    const timer = window.setTimeout(() => {
+      void loadAlertDetails(selectedAlertId, selectedAlertRow, { background: true });
+    }, 3000);
+    return () => window.clearTimeout(timer);
+  }, [remediationExecutionState.loading, remediationExecutionState.result, persistedExecutionStatus, selectedAlertId, selectedAlertData.payload]);
 
   const selectedApplicationConnection = useMemo(() => {
     const workflowContext = typeof selectedAlertWorkflow?.context === "object" && selectedAlertWorkflow.context
@@ -10655,6 +6252,18 @@ export default function App() {
       ? selectedAlertWorkflow.recommendation
       : {};
     const metadata = typeof recommendation?.metadata === "object" && recommendation.metadata ? recommendation.metadata : {};
+    const workflowDecision =
+      (typeof selectedAlertWorkflow?.decision === "object" && selectedAlertWorkflow.decision)
+      || (typeof selectedAlertWorkflow?.orchestration_decision === "object" && selectedAlertWorkflow.orchestration_decision)
+      || (typeof metadata?.orchestration_decision === "object" && metadata.orchestration_decision)
+      || selectedAlertRouting
+      || {};
+    const resolvedExecutionPlan = typeof workflowDecision?.execution_plan === "object" && workflowDecision.execution_plan
+      ? workflowDecision.execution_plan
+      : {};
+    const resolvedConnector = typeof resolvedExecutionPlan?.connection?.connector === "object" && resolvedExecutionPlan.connection.connector
+      ? resolvedExecutionPlan.connection.connector
+      : {};
     const service = String(
       selectedAlertRow?.service
       || incident?.service
@@ -10679,7 +6288,7 @@ export default function App() {
     const endpoint = String(
       metadata?.connection_url
       || metadata?.endpoint_url
-      || workflowContext?.deployment
+      || resolvedConnector?.endpoint
       || workflowContext?.observability?.metrics_endpoint
       || appRow?.metrics_endpoint
       || onboardingForm.monitoring_url
@@ -10695,29 +6304,54 @@ export default function App() {
       || "prod"
     ).trim();
     const namespace = String(metadata?.namespace || appRow?.namespace || environment || "prod").trim();
+    // Older persisted incidents may predate execution-connector metadata. The
+    // governed connector catalog resolves those services through generic-api,
+    // whose production credential reference is the default platform token.
+    // Persist/reference the URI only; no credential value is exposed here.
+    const governedDefaultCredential = ["prod", "production"].includes(environment.toLowerCase())
+      ? "vault://kaiops/prod/default-token"
+      : `vault://kaiops/${environment.toLowerCase() || "local"}/default-token`;
+    const credentialRef = String(
+      metadata?.credential_ref
+      || metadata?.secret_ref
+      || resolvedConnector?.secret_ref
+      || appRow?.secret_ref
+      || onboardingForm.connection_secret_ref
+      || governedDefaultCredential
+    ).trim();
     return {
       application: application || "-",
       service: service || "-",
       environment: environment || "prod",
       namespace,
       endpoint: endpoint || "Not configured",
-      connection_type: endpoint ? "metrics/application endpoint" : "missing connection details",
-      source: endpoint ? "onboarding/application metadata" : "missing",
+      connection_type: String(resolvedConnector?.type || (endpoint ? "metrics/application endpoint" : "missing connection details")),
+      source: Object.keys(resolvedConnector).length ? "resolved workflow connector" : endpoint ? "onboarding/application metadata + governed default identity" : "governed default connector",
+      credential_ref: credentialRef,
+      credential_store: credentialRef.startsWith("arn:aws:secretsmanager:")
+        ? "aws_secrets_manager"
+        : credentialRef.startsWith("k8s-secret://")
+          ? "kubernetes_secret"
+          : credentialRef.startsWith("https://") && credentialRef.includes(".vault.azure.net/secrets/")
+            ? "azure_key_vault"
+            : "hashicorp_vault",
     };
   }, [
     selectedAlertWorkflow,
     selectedAlertRow,
     selectedIncidentMetadataRow,
+    selectedAlertRouting,
     monitoringApps.rows,
     onboardingForm.monitoring_url,
     onboardingForm.prometheus_url,
+    onboardingForm.connection_secret_ref,
     applicationToMonitor,
   ]);
 
   useEffect(() => {
     const suggestedScript = selectedExecutionBreakdown.scripts.length
       ? selectedExecutionBreakdown.scripts.join("\n")
-      : selectedExecutionBreakdown.hasPlan
+      : !selectedExecutionBreakdown.commands.length && selectedExecutionBreakdown.hasPlan
         ? buildKaiOpsRemediationScript({
             service: selectedApplicationConnection.service !== "-" ? selectedApplicationConnection.service : selectedApplicationConnection.application,
             environment: selectedApplicationConnection.environment,
@@ -10732,28 +6366,109 @@ export default function App() {
         : "";
     setRemediationPlanEditor({
       commands: suggestedScript ? "" : selectedExecutionBreakdown.commands.join("\n"),
-      scripts: suggestedScript,
-      queries: suggestedScript ? "" : selectedExecutionBreakdown.queries.join("\n"),
-      connection_url: selectedApplicationConnection.endpoint === "Not configured" ? "" : selectedApplicationConnection.endpoint,
-      connection_type: selectedApplicationConnection.connection_type || "application",
+      scripts: redactOperationalSecrets(suggestedScript),
+      // Validation is an independent safety contract. A remediation script
+      // must never hide or discard the checks that prove recovery.
+      queries: selectedExecutionBreakdown.queries.join("\n"),
+      connection_url: selectedExecutionBreakdown.hasPlan
+        ? LOCAL_JENKINS_ENDPOINT
+        : selectedApplicationConnection.endpoint === "Not configured" ? "" : selectedApplicationConnection.endpoint,
+      connection_type: selectedExecutionBreakdown.hasPlan ? "jenkins" : selectedApplicationConnection.connection_type || "application",
+      executor_type: selectedExecutionBreakdown.hasPlan ? "jenkins" : "",
+      job_name: selectedExecutionBreakdown.hasPlan ? LOCAL_JENKINS_JOB : "",
       namespace: selectedApplicationConnection.namespace || "",
+      credential_ref: selectedExecutionBreakdown.hasPlan
+        ? selectedApplicationConnection.credential_ref || LOCAL_JENKINS_CREDENTIAL_REF
+        : selectedApplicationConnection.credential_ref || "",
+      credential_store: selectedApplicationConnection.credential_store || "hashicorp_vault",
       notes: "",
     });
     setRemediationExecutionState({ loading: false, result: null, error: "" });
   }, [
     selectedAlertId,
-    selectedExecutionBreakdown.commands,
-    selectedExecutionBreakdown.scripts,
-    selectedExecutionBreakdown.queries,
+    selectedExecutionBreakdown.commands.join("\n"),
+    selectedExecutionBreakdown.scripts.join("\n"),
+    selectedExecutionBreakdown.queries.join("\n"),
+    selectedExecutionBreakdown.hasPlan,
     selectedApplicationConnection.endpoint,
     selectedApplicationConnection.connection_type,
     selectedApplicationConnection.namespace,
     selectedApplicationConnection.service,
     selectedApplicationConnection.application,
     selectedApplicationConnection.environment,
+    selectedApplicationConnection.credential_ref,
+    selectedApplicationConnection.credential_store,
     onboardingForm.prometheus_url,
     onboardingForm.monitoring_url,
   ]);
+
+  useEffect(() => {
+    setExecutionPreflightState({ signature: "", checkedAt: "", passed: false });
+    setApprovedExecutionSignature("");
+    setApprovedExecutionApprovalId("");
+    setExecutionApprovalRequiresRenewal(false);
+    setExecutionConfirmationText("");
+    setRemediationExecutionState({ loading: false, result: null, error: "" });
+  }, [selectedAlertId]);
+
+  const dangerousProductionAction = ["prod", "production"].includes(String(selectedApplicationConnection.environment || "").toLowerCase())
+    && (["high", "critical"].includes(String(selectedExecutionPlan.riskTier || selectedAlertRow?.severity || "").toLowerCase()) || selectedExecutionBreakdown.hasPlan);
+  const executionPlanLines = [...toPlanLines(remediationPlanEditor.commands), ...toPlanLines(remediationPlanEditor.scripts)]
+    .map((line) => line.trim().toLowerCase())
+    .filter((line) => line && !line.startsWith("#"));
+  const executionIsReadOnly = executionPlanLines.length > 0 && executionPlanLines.every((line) => {
+    // This script is a diagnostic collector for every flag value. The legacy
+    // --dry-run switch never adds a corrective capability.
+    if (/kaiops_alert_health_triage\.sh\b/.test(line)) return true;
+    if (/^(set\s+-|[a-z_][a-z0-9_]*=|echo\b|printf\b)/.test(line)) return true;
+    if (/--dry-run(?:=|\s+)(?:true|1)\b/.test(line)) return true;
+    if (/^kubectl\s+(?:get|describe|logs|top|auth\s+can-i)\b/.test(line)) return true;
+    if (/^kubectl\s+rollout\s+(?:status|history)\b/.test(line)) return true;
+    if (/^(?:systemctl|service)\s+status\b/.test(line)) return true;
+    if (/^(?:mysql|psql)\b/.test(line) && /\b(?:select|show|describe|explain)\b/.test(line) && !/\b(?:update|insert|delete|alter|drop|truncate|grant|revoke)\b/.test(line)) return true;
+    if (/^curl\b/.test(line) && !/(?:\s-x\s*(?:post|put|patch|delete)\b|\s--request\s+(?:post|put|patch|delete)\b|\s(?:-d|--data(?:-raw|-binary)?)\b)/.test(line)) return true;
+    return false;
+  });
+  // Only the persisted execution plan is authoritative for the diagnostic
+  // completion transition. The model's remediation_analysis is advisory and
+  // may describe an earlier diagnostic proposal that the catalog subsequently
+  // replaced with a corrective plan.
+  const finalizedExecutionIsDiagnosticOnly = String(selectedExecutionPlan.catalogPlan?.plan_kind || "").trim().toLowerCase() === "diagnostic"
+    || selectedExecutionPlan.catalogPlan?.diagnostic_only === true
+    || selectedExecutionPlan.catalogPlan?.classification?.diagnostic_only === true
+    || selectedExecutionPlan.catalogPlan?.execution_ready === false;
+  const analysisSuggestsDiagnosticOnly = String(selectedExecutionPlan.remediationAnalysis?.plan_kind || "").trim().toLowerCase() === "diagnostic"
+    || selectedExecutionPlan.remediationAnalysis?.execution_ready === false;
+  const inferredExecutionIsDiagnosticOnly = executionIsReadOnly
+    || finalizedExecutionIsDiagnosticOnly
+    || analysisSuggestsDiagnosticOnly
+    || selectedExecutionPlan.remediationAction?.parameters?.diagnostic_closure === true;
+  const watchOnlyCandidates = [
+    selectedAlertWorkflow?.recommendation,
+    selectedAlertWorkflow?.recommendation?.metadata,
+    selectedAlertWorkflow?.decision,
+    selectedAlertWorkflow?.incident,
+    selectedAlertRow,
+    selectedAlertRow?.metadata,
+  ].filter((value) => value && typeof value === "object");
+  const resolutionControl = resolveResolutionControl(watchOnlyCandidates, {
+    diagnosticOnly: inferredExecutionIsDiagnosticOnly,
+    finalizedDiagnostic: finalizedExecutionIsDiagnosticOnly,
+  });
+  const executionIsDiagnosticOnly = resolutionControl.diagnosticOnly;
+  const executionIsWatchOnly = resolutionControl.disposition === "watch_only";
+  // Viewing an incident must never mutate its lifecycle. Watch-only closure is
+  // rendered only after the backend has persisted a terminal incident state;
+  // it is not initiated by opening the cockpit.
+  const executionAutoCloses = resolutionControl.autoClose
+    && ["closed", "resolved"].includes(selectedCanonicalIncidentStatus);
+  const executionRequiresCredential = dangerousProductionAction && !executionIsReadOnly;
+  const executionEndpoint = String(remediationPlanEditor.connection_url || "").trim();
+  const executionEndpointValid = !executionEndpoint || /^https?:\/\/[^\s/$.?#].[^\s]*$/i.test(executionEndpoint);
+  const jenkinsExecutorSelected = remediationPlanEditor.executor_type === "jenkins" || remediationPlanEditor.connection_type === "jenkins";
+  const liveExecutionPlanAvailable = executionPlanLines.length > 0 && !executionIsReadOnly;
+  const executionConfirmationPhrase = `EXECUTE ${String(selectedGovernedExecutionTarget || "GOVERNED-TARGET").toUpperCase()}`;
+  const executionConfirmationValid = !dangerousProductionAction || executionConfirmationText.trim() === executionConfirmationPhrase;
 
   const selectedAlertTimelineRows = useMemo(() => {
     const ingestAt =
@@ -11154,6 +6869,11 @@ export default function App() {
   }, [panelWorkflowUsage, selectedAlertUsage, latestWorkflow, monitorScopedIncidentMetadata, gatewayRecent.rows]);
 
   useEffect(() => {
+    const validDiagnosticsTabs = new Set(["pipeline", "processing", "timeline", "context", "events", "finops", "api", "raw"]);
+    if (!validDiagnosticsTabs.has(diagnosticsDetailTab)) {
+      setDiagnosticsDetailTab("pipeline");
+      return;
+    }
     if (diagnosticsDetailTab === "application" || diagnosticsDetailTab === "topics") {
       setDiagnosticsDetailTab("processing");
     }
@@ -11298,6 +7018,10 @@ export default function App() {
     const p95LatencyMs = percentile(latencyValues, 0.95);
 
     const latencyTrend = rows
+      .filter((row) => {
+        const value = Number(row?.latency_ms ?? row?.gateway?.latency_ms ?? row?.latency);
+        return Number.isFinite(value) && value > 0;
+      })
       .slice(0, 12)
       .reverse()
       .map((row, index) => {
@@ -11390,7 +7114,9 @@ export default function App() {
       closureRate: rows.length ? (restored / rows.length) * 100 : 0,
       riskItems,
       modeItems,
-      recentRows: rows.slice(0, 15),
+      // MTTR must use the complete loaded closure population; truncating this
+      // list silently removed Sev 2 samples when newer Sev 1 rows dominated.
+      recentRows: rows,
     };
   }, [closedIncidents.rows]);
 
@@ -11404,76 +7130,6 @@ export default function App() {
       recommendation_id: latestRecommendationId || current.recommendation_id,
     }));
   }, [latestIncidentId, latestRecommendationId]);
-
-  function approvalIncidentId(row) {
-    return String(row?.incident_id || row?.id || row?.alert_id || "").trim();
-  }
-
-  function approvalRecommendationId(row) {
-    const candidates = [
-      row?.recommendation_id,
-      row?.recommendation?.id,
-      row?.remediation_recommendation_id,
-      row?.recommended_action_id,
-    ];
-    for (const candidate of candidates) {
-      const token = String(candidate || "").trim();
-      if (looksLikeUuid(token)) {
-        return token;
-      }
-    }
-    return "";
-  }
-
-  function approvalFlowId(row) {
-    return String(row?.flow_id || row?.workflow_id || row?.flow || "").trim();
-  }
-
-  function approvalTraceId(row) {
-    return String(row?.trace_id || row?.correlation_id || "").trim();
-  }
-
-  function approvalRecommendationFromPayload(payload) {
-    const normalized = payload && typeof payload === "object" ? payload : {};
-    const data = normalized.data && typeof normalized.data === "object" ? normalized.data : {};
-    const recommendation = normalized.recommendation && typeof normalized.recommendation === "object"
-      ? normalized.recommendation
-      : data.recommendation && typeof data.recommendation === "object"
-        ? data.recommendation
-        : {};
-    const approval = normalized.approval && typeof normalized.approval === "object"
-      ? normalized.approval
-      : data.approval && typeof data.approval === "object"
-        ? data.approval
-        : {};
-    const sourcePayload = normalized.source_payload && typeof normalized.source_payload === "object"
-      ? normalized.source_payload
-      : data.source_payload && typeof data.source_payload === "object"
-        ? data.source_payload
-        : {};
-    const sourceRecommendation = sourcePayload.recommendation && typeof sourcePayload.recommendation === "object"
-      ? sourcePayload.recommendation
-      : {};
-    const candidates = [
-      normalized.recommendation_id,
-      data.recommendation_id,
-      recommendation.id,
-      approval.recommendation_id,
-      normalized.remediation_recommendation_id,
-      data.remediation_recommendation_id,
-      normalized.recommended_action_id,
-      data.recommended_action_id,
-      sourcePayload.recommendation_id,
-      sourceRecommendation.id,
-    ];
-    for (const candidate of candidates) {
-      const token = String(candidate || "").trim();
-      if (looksLikeUuid(token)) {
-        return token;
-      }
-    }
-    return "";
-  }
 
   function mergeRecommendationIdIntoApprovalRow(incidentId, recommendationId) {
     const normalizedIncidentId = String(incidentId || "").trim();
@@ -11500,24 +7156,6 @@ export default function App() {
       ...prev,
       rows: Array.isArray(prev.rows) ? prev.rows.map(patchRow) : prev.rows,
     }));
-  }
-
-  function approvalFlowFromPayload(payload) {
-    const normalized = payload && typeof payload === "object" ? payload : {};
-    const decision = normalized.decision && typeof normalized.decision === "object" ? normalized.decision : {};
-    const recommendation = normalized.recommendation && typeof normalized.recommendation === "object"
-      ? normalized.recommendation
-      : {};
-    return String(
-      normalized.flow_id
-      || decision.flow_id
-      || recommendation.flow_id
-      || normalized.trace_id
-      || recommendation.trace_id
-      || normalized.correlation_id
-      || recommendation.correlation_id
-      || ""
-    ).trim();
   }
 
   async function loadApprovalIncidentContext(incidentId, options = {}) {
@@ -11589,6 +7227,39 @@ export default function App() {
       return mode === "human-approval" && !isApprovalResolvedStatus(status);
     });
   }, [monitorScopedIncidentMetadata]);
+
+  const globalOperationalData = useMemo(() => {
+    const username = String(adminSession?.user?.username || "").trim().toLowerCase();
+    const query = globalOperationsQuery.trim().toLowerCase();
+    const results = [];
+    const push = (kind, label, meta, row) => {
+      const haystack = `${label} ${meta}`.toLowerCase();
+      if (query && haystack.includes(query)) results.push({ kind, label, meta, row });
+    };
+    monitorScopedAlerts.forEach((row) => {
+      const alertId = String(row?.alert_id || row?.id || "");
+      const ticket = String(row?.ticket_id || row?.external_ticket_id || row?.labels?.ticket_id || "");
+      push("Alert", row?.name || alertId || "Alert", `${alertId} ${row?.service || ""} ${row?.application || ""} ${ticket}`, row);
+      if (ticket) push("Ticket", ticket, `${row?.name || ""} ${row?.service || ""}`, row);
+    });
+    monitorScopedIncidentMetadata.forEach((row) => push("Incident", row?.incident_id || row?.id || "Incident", `${row?.service || ""} ${row?.status || ""} ${row?.ticket_id || ""}`, row));
+    monitoringApps.rows.forEach((row) => push("Application", row?.name || row?.id || "Application", `${row?.service || ""} ${row?.namespace || ""} ${row?.environment || ""}`, row));
+    Array.from(new Set(monitorScopedAlerts.map((row) => String(row?.service || "").trim()).filter(Boolean))).forEach((service) => push("Service", service, "Service in current monitoring scope", { service }));
+
+    const assignedIncidents = monitorScopedIncidentMetadata.filter((row) => [row?.owner, row?.assignee, row?.assigned_engineer, row?.assigned_to].some((value) => String(value || "").trim().toLowerCase() === username));
+    const failedActions = monitorScopedIncidentMetadata.filter((row) => ["failed", "rollback_failed", "remediation_failed"].includes(String(row?.status || row?.remediation_status || "").toLowerCase()));
+    const myWork = [
+      ...assignedIncidents.map((row) => ({ kind: "Assigned incident", label: row?.incident_id || row?.id || "Incident", meta: `${row?.service || "-"} · ${row?.status || "-"}`, row })),
+      ...pendingApprovals.map((row) => ({ kind: "Approval", label: row?.incident_id || row?.id || "Incident", meta: `${row?.service || "-"} · ${row?.risk_tier || row?.severity || "unknown"} risk`, row })),
+      ...failedActions.map((row) => ({ kind: "Failed action", label: row?.incident_id || row?.id || "Incident", meta: `${row?.service || "-"} · ${row?.status || "failed"}`, row })),
+    ];
+    const notifications = [
+      ...pendingApprovals.map((row) => ({ kind: "Approval reminder", label: row?.incident_id || row?.id || "Incident", meta: `${row?.service || "-"} requires review`, row })),
+      ...monitorScopedAlerts.filter((row) => ["critical", "high"].includes(String(row?.severity || "").toLowerCase())).slice(0, 8).map((row) => ({ kind: "Alert", label: row?.name || row?.id || "Alert", meta: `${row?.severity || "-"} · ${row?.service || "-"}`, row })),
+      ...(closedIncidents.rows || []).slice(0, 5).map((row) => ({ kind: String(row?.status || "").toLowerCase().includes("reopen") ? "Reopened" : "Resolved", label: row?.incident_id || row?.id || "Incident", meta: `${row?.service || "-"} · ${row?.status || "closed"}`, row })),
+    ];
+    return { results: results.slice(0, 12), myWork, notifications };
+  }, [adminSession?.user?.username, closedIncidents.rows, globalOperationsQuery, monitorScopedAlerts, monitorScopedIncidentMetadata, monitoringApps.rows, pendingApprovals]);
 
   const filteredPendingApprovals = useMemo(() => {
     return pendingApprovals.filter((row) => {
@@ -11730,7 +7401,7 @@ export default function App() {
   }, [selectedApprovalIncidentId, selectedApprovalRecommendationId]);
 
   useEffect(() => {
-    if (activeTab === "home" && homeDetailTab === "timeline" && selectedIncidentId) {
+    if (activeTab === "home" && homeDetailTab === "approval" && selectedIncidentId) {
       return;
     }
     if (!filteredPendingApprovals.length) {
@@ -11754,7 +7425,7 @@ export default function App() {
   }, [selectedApprovalIncidentId]);
 
   useEffect(() => {
-    if (activeTab !== "home" || homeDetailTab !== "actions" || !selectedIncidentId) {
+    if (activeTab !== "home" || homeDetailTab !== "execution" || !selectedIncidentId) {
       return;
     }
     setSelectedApprovalIncidentId((current) => current === selectedIncidentId ? current : selectedIncidentId);
@@ -11958,16 +7629,24 @@ export default function App() {
   }
 
   const approvalReady = useMemo(() => {
-    const cockpitIncidentId = activeTab === "home" && homeDetailTab === "timeline" ? selectedIncidentId : "";
-    const hasBase = String(cockpitIncidentId || approvalForm.incident_id || selectedApprovalIncidentId || "").trim() && String(approvalForm.approver || "").trim();
+    const cockpitIncidentId = activeTab === "home" && ["approval", "execution"].includes(homeDetailTab) ? selectedIncidentId : "";
+    const approvalIncidentId = String(cockpitIncidentId || approvalForm.incident_id || selectedApprovalIncidentId || "").trim();
+    const hasBase = approvalIncidentId && String(approvalForm.approver || "").trim();
     if (!hasBase) {
       return false;
     }
-    if (approvalForm.action !== "modify") {
+    if (approvalForm.action !== "approve") {
+      if (approvalForm.action === "modify") {
+        return String(approvalForm.modified_action || "").trim().length > 0;
+      }
       return true;
     }
-    return String(approvalForm.modified_action || "").trim().length > 0;
-  }, [activeTab, approvalForm, homeDetailTab, selectedApprovalIncidentId, selectedIncidentId]);
+    if (approvalIncidentContext.incident_id !== approvalIncidentId) {
+      return false;
+    }
+    const contextRoot = unwrap(approvalIncidentContext.payload) || {};
+    return canonicalApprovalEligibility({ workflow: contextRoot }).executionEligible;
+  }, [activeTab, approvalForm, approvalIncidentContext, homeDetailTab, selectedApprovalIncidentId, selectedIncidentId]);
 
   async function executeApprovalAction({
     incidentId,
@@ -11977,6 +7656,7 @@ export default function App() {
     channel,
     comment,
     modifiedAction,
+    authorizationScope = "execution",
   }) {
     const normalizedIncidentId = String(incidentId || "").trim();
     const normalizedRecommendationId = String(recommendationId || "").trim();
@@ -11985,19 +7665,102 @@ export default function App() {
     if (!looksLikeUuid(normalizedIncidentId)) {
       throw new Error("Approval requires a valid incident_id. Select a pending approval incident first.");
     }
+    if (normalizedAction === "modify") {
+      throw new Error("Free-text approval modifications are disabled. Generate and approve a new typed plan.");
+    }
+
+    let contextRoot = unwrap(approvalIncidentContext.payload) || {};
+    const contextRecommendation = contextRoot?.recommendation && typeof contextRoot.recommendation === "object"
+      ? contextRoot.recommendation
+      : {};
+    const contextPlan = contextRecommendation?.metadata?.execution_plan
+      && typeof contextRecommendation.metadata.execution_plan === "object"
+      ? contextRecommendation.metadata.execution_plan
+      : {};
+    let selectedPlan = normalizedIncidentId === String(selectedIncidentId || "")
+      ? selectedExecutionPlan.catalogPlan || {}
+      : contextPlan;
+    let boundRecommendationId = normalizedRecommendationId;
+
+    if (normalizedAction === "approve") {
+      // Approval must bind to the context returned by this request, not a
+      // previous React render. State updates from queue selection are async
+      // and previously caused plan_id/fingerprint to be omitted from the POST.
+      const liveResponse = await fetchJson(
+        `/api-gateway/approval/incident/${encodeURIComponent(normalizedIncidentId)}`,
+        authenticatedOptions({ timeoutMs: 30000, maxAttempts: 1 }),
+      );
+      const liveRoot = unwrap(liveResponse) || {};
+      const liveRecommendation = liveRoot?.recommendation && typeof liveRoot.recommendation === "object"
+        ? liveRoot.recommendation
+        : {};
+      const livePlan = liveRecommendation?.metadata?.execution_plan
+        && typeof liveRecommendation.metadata.execution_plan === "object"
+        ? liveRecommendation.metadata.execution_plan
+        : {};
+      const liveRecommendationId = String(
+        liveRecommendation?.id
+        || liveRecommendation?.recommendation_id
+        || liveRoot?.recommendation_id
+        || "",
+      ).trim();
+      setApprovalIncidentContext({
+        loading: false,
+        incident_id: normalizedIncidentId,
+        payload: liveRoot,
+        error: "",
+      });
+      if (boundRecommendationId && liveRecommendationId && boundRecommendationId !== liveRecommendationId) {
+        throw new Error("The approval queue changed while this incident was open. Review the latest recommendation before approving.");
+      }
+      boundRecommendationId = liveRecommendationId || boundRecommendationId;
+      contextRoot = liveRoot;
+      selectedPlan = livePlan;
+
+      const planId = String(selectedPlan?.plan_id || "").trim();
+      const planFingerprint = String(selectedPlan?.plan_fingerprint || "").trim();
+      if (!planId || !/^sha256:[0-9a-f]{64}$/.test(planFingerprint)) {
+        throw new Error(
+          "Approval unavailable: this recommendation has no current governed execution plan. Open the incident, run fresh analysis, then review the new plan.",
+        );
+      }
+      const eligibility = canonicalApprovalEligibility({ workflow: liveRoot, plan: selectedPlan });
+      if (!eligibility.executionEligible) {
+        const missingDetail = eligibility.reasons.length ? ` Missing controls: ${eligibility.reasons.join(", ")}.` : "";
+        throw new Error(
+          `Approval unavailable: the backend has not marked this plan execution-eligible.${missingDetail} Refresh evidence or regenerate analysis before approval.`,
+        );
+      }
+    }
+    const tenantId = String(
+      adminSession?.user?.tenant_id
+      || selectedPlan?.tenant_id
+      || contextRoot?.tenant_id
+      || contextRoot?.incident?.tenant_id
+      || selectedAlertWorkflow?.context?.tenant_id
+      || selectedAlertRow?.tenant_id
+      || (authConfig.mode === "local" && authConfig.local_development_only ? "default" : "")
+      || ""
+    ).trim();
+    if (!tenantId) {
+      throw new Error("Approval requires a verified tenant identity from the authenticated session.");
+    }
 
     const payload = {
+      tenant_id: tenantId,
       incident_id: normalizedIncidentId,
       approver: String(approver || "").trim(),
       channel: String(channel || "web").trim(),
       comment: String(comment || "").trim() || null,
+      authorization_scope: authorizationScope,
     };
-    if (looksLikeUuid(normalizedRecommendationId)) {
-      payload.recommendation_id = normalizedRecommendationId;
+    if (looksLikeUuid(boundRecommendationId)) {
+      payload.recommendation_id = boundRecommendationId;
     }
 
-    if (normalizedAction === "modify") {
-      payload.modified_action = String(modifiedAction || "").trim();
+    if (normalizedAction === "approve") {
+      payload.plan_id = selectedPlan?.plan_id;
+      payload.plan_fingerprint = selectedPlan?.plan_fingerprint;
     }
 
     return fetchJson(`/api-gateway/approval/${normalizedAction}`, authenticatedOptions({
@@ -12037,30 +7800,44 @@ export default function App() {
     return "";
   }
 
+  function toPlanLines(value) {
+    if (Array.isArray(value)) {
+      return value.map((item) => String(item || "").trim()).filter(Boolean);
+    }
+    return String(value || "")
+      .split(/\r?\n/)
+      .map((item) => item.trim())
+      .filter(Boolean);
+  }
+
   function buildEditedRemediationPlan() {
     return {
+      ...(selectedExecutionPlan.catalogPlan && typeof selectedExecutionPlan.catalogPlan === "object" ? selectedExecutionPlan.catalogPlan : {}),
       commands: toPlanLines(remediationPlanEditor.commands),
       scripts: toPlanLines(remediationPlanEditor.scripts),
       queries: toPlanLines(remediationPlanEditor.queries),
     };
   }
 
-  function buildRemediationExecutionPayload({ incidentId, recommendationId, approver, action, comment, editedPlan }) {
-    const decision = action === "modify" ? "modified" : "approved";
-    const planText = [
-      editedPlan.commands.length ? `Commands:\n${editedPlan.commands.map((item) => `- ${item}`).join("\n")}` : "",
-      editedPlan.scripts.length ? `Scripts:\n${editedPlan.scripts.map((item) => `- ${item}`).join("\n")}` : "",
-      editedPlan.queries.length ? `Queries:\n${editedPlan.queries.map((item) => `- ${item}`).join("\n")}` : "",
-    ].filter(Boolean).join("\n\n");
+  function buildRemediationExecutionPayload({ incidentId, recommendationId, approvalId, approver, action, comment, editedPlan }) {
+    const decision = action === "reject" ? "rejected" : "approved";
+    const executionTarget = [
+      editedPlan?.remediation_target,
+      editedPlan?.actions?.[0]?.target_resource_id,
+    ].map((value) => String(value || "").trim()).find((value) => value && value !== "-" && !looksLikeUuid(value));
 
     return {
+      ...(looksLikeUuid(approvalId) ? { id: approvalId } : {}),
+      tenant_id: String(editedPlan?.tenant_id || selectedAlertWorkflow?.context?.tenant_id || selectedAlertRow?.tenant_id || "").trim(),
       incident_id: incidentId,
       recommendation_id: recommendationId,
+      plan_id: editedPlan?.plan_id,
+      plan_fingerprint: editedPlan?.plan_fingerprint,
+      approval_expires_at: editedPlan?.expiry,
       decision,
       approver,
       channel: approvalForm.channel || "web",
       comment: String(comment || remediationPlanEditor.notes || "approved remediation execution").trim(),
-      modified_action: planText,
       metadata: {
         recommended_action: selectedExecutionPlan.action,
         recommended_commands: [
@@ -12069,19 +7846,27 @@ export default function App() {
           ...editedPlan.queries.map((item) => `query: ${item}`),
         ],
         execution_plan: editedPlan,
-        service: selectedApplicationConnection.service !== "-" ? selectedApplicationConnection.service : undefined,
-        environment: selectedApplicationConnection.environment,
-        remediation_target: selectedApplicationConnection.service !== "-" ? selectedApplicationConnection.service : selectedApplicationConnection.application,
+        rollback_plan: executionRollbackPlan || undefined,
+        execution_confirmation_required: true,
+        service: executionTarget,
+        environment: editedPlan?.environment || selectedApplicationConnection.environment,
+        remediation_target: executionTarget,
         connection_profile: {
-          application: selectedApplicationConnection.application,
-          service: selectedApplicationConnection.service,
-          environment: selectedApplicationConnection.environment,
+          application: selectedApplicationConnection.application !== "-" ? selectedApplicationConnection.application : undefined,
+          service: executionTarget,
+          environment: editedPlan?.environment || selectedApplicationConnection.environment,
           namespace: String(remediationPlanEditor.namespace || selectedApplicationConnection.namespace || "").trim(),
           endpoint_url: String(remediationPlanEditor.connection_url || "").trim(),
           connection_type: String(remediationPlanEditor.connection_type || selectedApplicationConnection.connection_type || "").trim(),
+          executor_type: String(remediationPlanEditor.executor_type || "").trim(),
+          job_name: String(remediationPlanEditor.job_name || "").trim(),
+          timeout_seconds: 1200,
+          allowed_operations: ["rollback_deployment", "restart_pod", "scale_deployment", "restart_service", "clear_cache", "failover_database", "terraform_rollback"],
           source: selectedApplicationConnection.source,
+          credential_ref: String(remediationPlanEditor.credential_ref || selectedApplicationConnection.credential_ref || "").trim() || undefined,
         },
-        ui_edited: true,
+        ui_edited: false,
+        plan_source: "approved_catalog",
       },
     };
   }
@@ -12092,18 +7877,96 @@ export default function App() {
       body: JSON.stringify(payload),
     }));
     const action = unwrap(response);
-    setRemediationExecutionState({ loading: false, result: response, error: "" });
     const status = String(action?.status || "").toLowerCase();
+    const terminal = ["succeeded", "failed", "skipped", "completed", "closed", "resolved"].includes(status);
+    // Submission acknowledgement is not an execution result. Keep the gate
+    // locked until a terminal action status is observed from the backend.
+    setRemediationExecutionState({ loading: !terminal, result: response, error: "" });
     applyApprovalResolutionToUi(
       incidentId,
       status === "succeeded" ? "validating" : status === "failed" || status === "skipped" ? "failed" : "remediating",
       comment
     );
     await refreshApprovalDrivenViews(incidentId);
+    void pollIncidentTerminalStatus(incidentId);
     return response;
   }
 
-  async function approveIncidentRow(row) {
+  async function requestEmergencyStop(actionId) {
+    const reason = String(emergencyStopState.reason || "").trim();
+    if (!looksLikeUuid(String(actionId || ""))) {
+      setEmergencyStopState((current) => ({ ...current, error: "A persisted remediation action is required before emergency stop is available." }));
+      return;
+    }
+    if (reason.length < 8) {
+      setEmergencyStopState((current) => ({ ...current, error: "Add a clear emergency-stop reason of at least 8 characters." }));
+      return;
+    }
+    setEmergencyStopState((current) => ({ ...current, loading: true, error: "", message: "" }));
+    try {
+      const response = await fetchJson(`/api-gateway/remediation/actions/${encodeURIComponent(actionId)}/emergency-stop`, authenticatedOptions({ method: "POST", body: JSON.stringify({ reason }) }));
+      setRemediationExecutionState({ loading: false, result: response, error: "" });
+      setEmergencyStopState({ reason: "", loading: false, error: "", message: "Emergency stop accepted. The executor and durable workflow were cancelled." });
+      await refreshApprovalDrivenViews(selectedIncidentId);
+      if (selectedAlertId) await loadAlertDetails(selectedAlertId, selectedAlertRow, { background: true });
+    } catch (error) {
+      setEmergencyStopState((current) => ({ ...current, loading: false, error: String(error?.message || "Emergency stop failed."), message: "" }));
+    }
+  }
+
+  async function approveEvidenceDraft() {
+    const draft = evidenceDraftReview.draft; if (!draft?.draft_id) return;
+    setEvidenceDraftReview((current) => ({ ...current, loading: true, error: "", message: "" }));
+    try {
+      const reviewed = unwrap(await evidenceDraftApi.review(draft, evidenceDraftReview.content, evidenceDraftReview.notes))?.draft;
+      const response = await evidenceDraftApi.approve(reviewed); const next = unwrap(response)?.draft || reviewed;
+      setEvidenceDraftReview((current) => ({ ...current, loading: false, draft: next, message: "Approved — indexing pending." }));
+      await Promise.allSettled([loadRagDocs(), loadSelectedAlertDocumentLinks(selectedAlertId)]);
+    } catch (error) {
+      if (isEvidenceDraftConflict(error)) {
+        const latest = await evidenceDraftApi.load(String(selectedAlertId)); const next = latest.find((item) => item.draft_id === draft.draft_id) || latest[0] || draft;
+        setEvidenceDraftReview((current) => ({ ...current, loading: false, drafts: latest, draft: next, content: next.content || "", error: evidenceDraftApi.conflictMessage }));
+      } else setEvidenceDraftReview((current) => ({ ...current, loading: false, error: String(error?.message || error) }));
+    }
+  }
+  async function saveEvidenceDraft() {
+    const draft = evidenceDraftReview.draft; if (!draft?.draft_id) return;
+    setEvidenceDraftReview((current) => ({ ...current, loading: true, error: "", message: "" }));
+    try {
+      const response = await evidenceDraftApi.review(draft, evidenceDraftReview.content, evidenceDraftReview.notes); setEvidenceDraftReview((current) => ({ ...current, loading: false, draft: unwrap(response)?.draft || { ...draft, status: "reviewed" }, message: "Draft saved. It remains blocked from reusable knowledge until an authorized user approves it." }));
+    } catch (error) {
+      if (isEvidenceDraftConflict(error)) {
+        const latest = await evidenceDraftApi.load(String(selectedAlertId)); const next = latest.find((item) => item.draft_id === draft.draft_id) || latest[0] || draft;
+        setEvidenceDraftReview((current) => ({ ...current, loading: false, drafts: latest, draft: next, content: next.content || "", error: evidenceDraftApi.conflictMessage }));
+      } else setEvidenceDraftReview((current) => ({ ...current, loading: false, error: String(error?.message || error) }));
+    }
+  }
+  async function approveExecutionOutcomeForReuse() {
+    if (!selectedRemediationOutcome) return;
+    setExecutionOutcomeReview((current) => ({ ...current, loading: true, error: "", message: "" }));
+    try {
+      const plan = remediationPlanEditor.scripts || remediationPlanEditor.commands;
+      const reviewer = adminSession?.user?.username || "operator";
+      const content = [`# Validated remediation: ${selectedAlertRow?.name || "incident"}`, "", `Service: ${selectedApplicationConnection.service}`, `Environment: ${selectedApplicationConnection.environment}`, `Outcome: ${executionOutcomeReview.outcome}`, `Reviewed by: ${reviewer}`, "", "## Approved execution plan", plan || "No reusable execution command supplied.", "", "## Validation", ...editedExecutionPlan.queries, "", "## Rollback", executionRollbackPlan || "Not supplied", "", "## Operator review", executionOutcomeReview.notes || "No additional notes."].join("\n");
+      if (executionOutcomeReview.reusable && plan) {
+        await fetchJson("/api-gateway/rag/knowledge-drafts", authenticatedOptions({ method: "POST", body: JSON.stringify({ kind: "remediation", alert_id: selectedAlertId, alert_type: selectedAlertRow?.name || selectedAlertRow?.alert_name, severity: selectedAlertRow?.severity, title: `Validated remediation for ${selectedAlertRow?.name || selectedApplicationConnection.service}`, summary: "Operator-reviewed remediation outcome awaiting governed review.", content, services: [selectedApplicationConnection.service], source_system: "kaims-execution-review", source_ref: `execution-review://${selectedAlertId}`, resolved_by: reviewer, metadata: { approval_status: "pending_review", execution_outcome: String(executionOutcomeReview.outcome), reusable: "false" } }) }));
+      }
+      if (selectedAlertRecommendationId) await fetchJson(`/api-gateway/evaluations/by-recommendation/${encodeURIComponent(selectedAlertRecommendationId)}/feedback`, authenticatedOptions({ method: "POST", body: JSON.stringify({ decision: executionOutcomeReview.outcome === "successful" ? "approve" : "reject", approver: reviewer, comment: executionOutcomeReview.notes || `Execution outcome: ${executionOutcomeReview.outcome}` }) })).catch(() => null);
+      setExecutionOutcomeReview((current) => ({ ...current, loading: false, reviewedAlertId: String(selectedAlertId || ""), message: current.reusable && plan ? "Outcome reviewed. The approved script is now reusable knowledge." : "Outcome review recorded without publishing a reusable script." }));
+      const incidentId = String(selectedIncidentId || selectedApprovalIncidentId || approvalForm.incident_id || "").trim();
+      await Promise.allSettled([
+        loadRagDocs(),
+        loadSelectedAlertDocumentLinks(selectedAlertId, selectedAlertRow),
+        loadAlertDetails(selectedAlertId, selectedAlertRow, { background: true }),
+        incidentId ? loadIncidentStageCompleteness(incidentId, { background: true }) : Promise.resolve(),
+      ]);
+      setHomeDetailTab("audit");
+    } catch (error) {
+      setExecutionOutcomeReview((current) => ({ ...current, loading: false, error: String(error?.message || error) }));
+    }
+  }
+
+  async function approveIncidentRow(row, authorizationScope = "execution") {
     const incidentId = approvalIncidentId(row);
     const rowRecommendationId = approvalRecommendationId(row);
     setSelectedApprovalIncidentId(incidentId);
@@ -12124,9 +7987,12 @@ export default function App() {
         approver: approvalForm.approver,
         channel: approvalForm.channel,
         comment: approvalForm.comment,
+        authorizationScope,
       });
       setRemediationExecutionState({ loading: true, result: null, error: "" });
-      const remediationResponse = await postRemediationExecution(unwrap(response), incidentId, approvalForm.comment);
+      const remediationResponse = authorizationScope === "dry_run"
+        ? await fetchJson("/api-gateway/remediation/dry-run", authenticatedOptions({ method: "POST", body: JSON.stringify(unwrap(response)) }))
+        : await postRemediationExecution(unwrap(response), incidentId, approvalForm.comment);
       const remediationStatus = String(unwrap(remediationResponse)?.status || "").toLowerCase();
       setApprovalForm((current) => ({
         ...current,
@@ -12149,6 +8015,27 @@ export default function App() {
         : raw;
       setApprovalState({ loading: false, result: null, error: concise });
       setRemediationExecutionState((current) => current.loading ? { loading: false, result: null, error: concise } : current);
+    }
+  }
+
+  async function requestMoreEvidence(row, reason) {
+    const incidentId = approvalIncidentId(row);
+    const recommendationId = await resolveRecommendationIdForIncident(incidentId, approvalRecommendationId(row));
+    setApprovalState({ loading: true, result: null, error: "" });
+    try {
+      const response = await executeApprovalAction({
+        incidentId,
+        recommendationId,
+        action: "request-evidence",
+        approver: approvalForm.approver,
+        channel: approvalForm.channel,
+        comment: reason,
+      });
+      applyApprovalResolutionToUi(incidentId, "investigating", reason);
+      setApprovalState({ loading: false, result: response, error: "" });
+      await refreshApprovalDrivenViews(incidentId);
+    } catch (error) {
+      setApprovalState({ loading: false, result: null, error: String(error?.message || error) });
     }
   }
 
@@ -12199,7 +8086,7 @@ export default function App() {
     event.preventDefault();
     setApprovalState({ loading: true, result: null, error: "" });
     try {
-      const cockpitIncidentId = activeTab === "home" && homeDetailTab === "timeline" ? selectedIncidentId : "";
+      const cockpitIncidentId = activeTab === "home" && ["approval", "execution"].includes(homeDetailTab) ? selectedIncidentId : "";
       const incidentId = String(cockpitIncidentId || approvalForm.incident_id || selectedApprovalIncidentId || "").trim();
       const approver = String(approvalForm.approver || adminSession?.user?.username || "admin").trim();
       if (!looksLikeUuid(incidentId)) {
@@ -12207,6 +8094,11 @@ export default function App() {
       }
       if (!approver) {
         throw new Error("Approver is required.");
+      }
+      if (["high", "critical"].includes(String(selectedExecutionPlan.riskTier || selectedAlertRow?.severity || "").toLowerCase())
+        && ["approve", "modify"].includes(approvalForm.action)
+        && !String(approvalForm.comment || "").trim()) {
+        throw new Error("A reason is required for high-risk approval or override.");
       }
       const recommendationIdCandidate = String(
         (cockpitIncidentId ? selectedAlertRecommendationId : "")
@@ -12235,6 +8127,7 @@ export default function App() {
           const executionPayload = buildRemediationExecutionPayload({
             incidentId,
             recommendationId,
+            approvalId: String(unwrap(response)?.id || ""),
             approver,
             action: approvalForm.action,
             comment: approvalForm.comment,
@@ -12278,7 +8171,7 @@ export default function App() {
       || selectedAlertWorkflow?.recommendation?.id
       || ""
     ).trim();
-    const approver = String(approvalForm.approver || adminSession?.user?.username || "admin").trim();
+    const approver = String(adminSession?.user?.username || "").trim();
     const approvalStatus = normalizeApprovalStatus(selectedExecutionPlan.approvalStatus || approvalForm.action);
     const editedPlan = buildEditedRemediationPlan();
     const hasPlan = editedPlan.commands.length || editedPlan.scripts.length || editedPlan.queries.length;
@@ -12295,27 +8188,32 @@ export default function App() {
       if (!hasPlan) {
         throw new Error("Add at least one command, script, or validation query before executing.");
       }
-      if (!["approved", "modified"].includes(approvalStatus) && approvalForm.action !== "approve" && approvalForm.action !== "modify") {
-        throw new Error("Approve or modify the remediation first, then execute the approved plan.");
+      const liveTarget = [editedPlan?.remediation_target, editedPlan?.actions?.[0]?.target_resource_id]
+        .map((value) => String(value || "").trim())
+        .find((value) => value && value !== "-" && !looksLikeUuid(value));
+      if (!liveTarget) {
+        throw new Error("Execution requires an approved service or resource target. Add the application/service mapping before running this plan.");
+      }
+      if (executionIsReadOnly || editedPlan.execution_ready === false) {
+        throw new Error("Execution unavailable: this plan is diagnostic-only and has no reviewed corrective capability.");
+      }
+      if (!approver) {
+        throw new Error("An authenticated operator identity is required for execution.");
+      }
+      if (approvalStatus !== "approved" && approvalForm.action !== "approve") {
+        throw new Error("Approve the immutable remediation plan before execution.");
       }
 
-      if (!["approved", "modified"].includes(approvalStatus) && (approvalForm.action === "approve" || approvalForm.action === "modify")) {
-        const approvalResponse = await executeApprovalAction({
-          incidentId,
-          recommendationId,
-          action: approvalForm.action,
-          approver,
-          channel: approvalForm.channel,
-          comment: approvalForm.comment,
-          modifiedAction: approvalForm.modified_action,
-        });
-        setApprovalState({ loading: false, result: approvalResponse, error: "" });
+      const approvalAction = "approve";
+      if (approvedExecutionSignature !== executionPlanSignature) {
+        throw new Error("This plan has changed since approval. Review and approve the current plan once before execution.");
       }
 
       const payload = buildRemediationExecutionPayload({
         incidentId,
         recommendationId,
-        action: approvalForm.action,
+        approvalId: approvedExecutionApprovalId,
+        action: approvalAction,
         approver,
         comment: String(approvalForm.comment || remediationPlanEditor.notes || "approved remediation execution").trim(),
         editedPlan,
@@ -12326,29 +8224,140 @@ export default function App() {
     }
   }
 
-  const tabs = [
-    { id: "home", label: "Dashboard" },
-    { id: "stream", label: "Alert Ingestion Stream" },
-    { id: "copilot", label: "Copilot Studio" },
-    { id: "executive", label: "Executive Dashboard" },
-    { id: "admin", label: "Admin Center" },
-    { id: "trace", label: "Agent Flow" },
-    { id: "safety", label: "Gateway Safety" },
-    { id: "rag", label: "Message Bus" },
-    { id: "closed", label: "Closed Tickets" },
-    { id: "summary", label: "Incident Metadata Explorer" },
-    { id: "approval", label: "Approval Queue (Legacy)" },
-  ];
+  async function runExecutionPreflight() {
+    const passed = blockingPreflightFailures.length === 0;
+    if (!passed) {
+      if (executionRequiresCredential && !remediationPlanEditor.credential_ref) setShowExecutionCredential(true);
+      setExecutionPreflightState({ signature: executionPlanSignature, checkedAt: new Date().toISOString(), passed: false });
+      setRemediationExecutionState((current) => ({ ...current, error: `Dry run blocked: ${blockingPreflightFailures.map((check) => check.label).join(", ")}.` }));
+      return;
+    }
+    setRemediationExecutionState((current) => ({ ...current, loading: true, error: "" }));
+    try {
+      const incidentId = String(approvalForm.incident_id || selectedIncidentId || selectedApprovalIncidentId || "").trim();
+      const recommendationId = await resolveRecommendationIdForIncident(incidentId, String(approvalForm.recommendation_id || selectedApprovalRecommendationId || "").trim());
+      const payload = buildRemediationExecutionPayload({ incidentId, recommendationId, action: "approve", approver: String(adminSession?.user?.username || ""), comment: approvalForm.comment || "operator dry run", editedPlan: buildEditedRemediationPlan() });
+      const response = await fetchJson("/api-gateway/remediation/dry-run", authenticatedOptions({ method: "POST", body: JSON.stringify(payload) }));
+      const result = unwrap(response);
+      if (String(result?.status || "").toLowerCase() !== "passed") throw new Error(result?.message || "Dry run was blocked by remediation policy.");
+      setExecutionPreflightState({ signature: executionPlanSignature, checkedAt: new Date().toISOString(), passed: true });
+      setRemediationExecutionState({ loading: false, result: response, error: "" });
+    } catch (error) {
+      setExecutionPreflightState({ signature: executionPlanSignature, checkedAt: new Date().toISOString(), passed: false });
+      const message = String(error?.message || error);
+      const credentialError = message.includes("valid enterprise secret-manager reference");
+      if (credentialError) setShowExecutionCredential(true);
+      setRemediationExecutionState({ loading: false, result: null, error: credentialError ? "Dry run blocked: enter a valid enterprise secret-manager URI in Execution identity, then retry." : `Dry run failed: ${message}` });
+    }
+  }
 
-  const sidebarSections = [
-    { id: "home", icon: "DB", shortLabel: "Dashboard", label: "Dashboard", tone: "ops" },
-    { id: "stream", icon: "LS", shortLabel: "Live Stream", label: "Alert Ingestion Stream", tone: "meta" },
-    { id: "approval", icon: "AL", shortLabel: "Approval", label: "Human Approval", tone: "risk" },
-    { id: "executive", icon: "EX", shortLabel: "Executive", label: "Executive Dashboard", tone: "meta" },
-    { id: "admin", icon: "AD", shortLabel: "Admin", label: "Admin Center", tone: "bus" },
-  ];
+  async function approveCockpitRemediationPlan(actionOverride = "") {
+    const incidentId = String(approvalForm.incident_id || selectedIncidentId || selectedApprovalIncidentId || "").trim();
+    const recommendationIdCandidate = String(approvalForm.recommendation_id || selectedApprovalRecommendationId || selectedAlertRecommendationId || "").trim();
+    const approver = String(adminSession?.user?.username || "").trim();
+    setApprovalState({ loading: true, result: null, error: "" });
+    try {
+      if (!looksLikeUuid(incidentId)) throw new Error("A valid incident is required before this plan can be approved.");
+      if (!approver) throw new Error("An authenticated operator identity is required for approval.");
+      const requestedAction = actionOverride === "reject" || approvalForm.action === "reject" ? "reject" : "approve";
+      if (requestedAction !== "reject" && !editedExecutionPlan.commands.length && !editedExecutionPlan.scripts.length) throw new Error("Review or add an executable command or script before approval.");
+      if (requestedAction !== "reject" && (executionIsReadOnly || editedExecutionPlan.execution_ready === false)) throw new Error("A diagnostic-only plan cannot be approved for execution. Reject automation and escalate it for manual remediation instead.");
+      if ((requestedAction === "reject" || ["high", "critical"].includes(String(selectedExecutionPlan.riskTier || selectedAlertRow?.severity || "").toLowerCase())) && !String(approvalForm.comment || "").trim()) throw new Error(requestedAction === "reject" ? "Add an escalation reason before rejecting automation." : "Add an approval reason for this high-risk plan.");
+      const recommendationId = await resolveRecommendationIdForIncident(incidentId, recommendationIdCandidate);
+      const action = requestedAction;
+      const response = await executeApprovalAction({ incidentId, recommendationId, action, approver, channel: approvalForm.channel, comment: approvalForm.comment, modifiedAction: "" });
+      setApprovalForm((current) => ({ ...current, action, incident_id: incidentId, recommendation_id: recommendationId, approver }));
+      applyApprovalResolutionToUi(incidentId, action === "reject" ? "failed" : "approved", approvalForm.comment);
+      setApprovedExecutionSignature(executionPlanSignature);
+      const approvalId = String(unwrap(response)?.id || "");
+      setApprovedExecutionApprovalId(approvalId);
+      setExecutionApprovalRequiresRenewal(false);
+      const riskTier = String(selectedExecutionPlan.riskTier || selectedAlertRow?.severity || "").toLowerCase();
+      const autoDispatchAfterApproval = action === "approve"
+        && !dangerousProductionAction
+        && !["high", "critical"].includes(riskTier)
+        && liveExecutionPlanAvailable
+        && blockingPreflightFailures.length === 0;
+      let remediationResponse = null;
+      if (autoDispatchAfterApproval) {
+        setRemediationExecutionState({ loading: true, result: null, error: "" });
+        try {
+          const payload = buildRemediationExecutionPayload({
+            incidentId,
+            recommendationId,
+            approvalId,
+            approver,
+            action,
+            comment: approvalForm.comment,
+            editedPlan: buildEditedRemediationPlan(),
+          });
+          remediationResponse = await postRemediationExecution(payload, incidentId, approvalForm.comment);
+        } catch (executionError) {
+          const message = String(executionError?.message || executionError);
+          setRemediationExecutionState({ loading: false, result: null, error: `Approval was recorded, but execution could not start: ${message}` });
+          setApprovalState({ loading: false, result: response, error: "Approval recorded. Review the execution blocker below and retry without approving again." });
+          await refreshApprovalDrivenViews(incidentId);
+          return;
+        }
+      }
+      setApprovalState({ loading: false, result: remediationResponse ? { approval: response, remediation: remediationResponse } : response, error: "" });
+      await refreshApprovalDrivenViews(incidentId);
+    } catch (error) {
+      setApprovalState({ loading: false, result: null, error: String(error?.message || error) });
+    }
+  }
+
+  function confirmAndExecuteRemediationPlan() {
+    const target = `${selectedGovernedExecutionTarget || "no governed target"} (${selectedApplicationConnection.environment})`;
+    if (!window.confirm(`Execute the approved remediation plan against ${target}? This action is recorded in the audit trail.`)) {
+      return;
+    }
+    executeApprovedRemediationPlan();
+  }
+
+  function buildRequiredExecutor() {
+    const service = String(selectedGovernedExecutionTarget || "service").trim();
+    const environment = String(selectedApplicationConnection.environment || "prod").trim();
+    setRemediationPlanEditor((current) => ({
+      ...current,
+      executor_type: "jenkins",
+      connection_type: "jenkins",
+      connection_url: current.connection_type === "jenkins" && current.connection_url ? current.connection_url : LOCAL_JENKINS_ENDPOINT,
+      job_name: current.job_name || LOCAL_JENKINS_JOB,
+      namespace: current.namespace || environment,
+      credential_ref: current.credential_ref || LOCAL_JENKINS_CREDENTIAL_REF,
+      credential_store: current.credential_store || "hashicorp_vault",
+      queries: current.queries || `max_over_time(up{job='${service}'}[5m])`,
+    }));
+    setShowExecutionCredential(true);
+    setExecutionPreflightState({ signature: "", checkedAt: "", passed: false });
+    setApprovedExecutionSignature("");
+    setApprovedExecutionApprovalId("");
+    setExecutionApprovalRequiresRenewal(true);
+    setExecutionConfirmationText("");
+  }
 
   const currentRole = useMemo(() => normalizeRoleName(adminSession?.user?.role_name), [adminSession?.user?.role_name]);
+  const navigationGroups = useMemo(() => groupedNavigationForRole(currentRole), [currentRole]);
+  const currentNavigationItem = useMemo(() => navigationItemForPath(currentPath), [currentPath]);
+  const currentBreadcrumb = useMemo(() => breadcrumbForPath(currentPath), [currentPath]);
+  const restrictedDestination = useMemo(() => new URLSearchParams(currentSearch).get("destination") || "", [currentSearch]);
+  const kaiStateSummary = useMemo(() => {
+    const rows = monitorScopedIncidentMetadata || [];
+    const statusIncludes = (row, values) => values.some((value) => String(row?.status || row?.state || row?.remediation_status || "").toLowerCase().includes(value));
+    const terminal = (row) => statusIncludes(row, ["closed", "resolved", "cancelled"]);
+    const resolving = rows.filter((row) => statusIncludes(row, ["execut", "remediat", "rollback"])).length;
+    const validating = rows.filter((row) => statusIncludes(row, ["validat", "verif"])).length;
+    const blocked = rows.filter((row) => statusIncludes(row, ["blocked", "failed", "manual_intervention"])).length;
+    const investigating = rows.filter((row) => !terminal(row) && !statusIncludes(row, ["approval", "execut", "remediat", "rollback", "validat", "verif", "blocked", "failed"])).length;
+    return [
+      { label: "Investigating", value: investigating, tone: "active" },
+      { label: "Resolving", value: resolving, tone: "active" },
+      { label: "Waiting approval", value: pendingApprovals.length, tone: pendingApprovals.length ? "attention" : "calm" },
+      { label: "Validating", value: validating, tone: "active" },
+      { label: "Blocked", value: blocked, tone: blocked ? "attention" : "calm" },
+    ];
+  }, [monitorScopedIncidentMetadata, pendingApprovals]);
   const projectOnboardingRows = useMemo(
     () => (onboardingState.rows || []).filter((row) => String(row?.provider_name || "").trim().toLowerCase() === "project"),
     [onboardingState.rows],
@@ -12386,21 +8395,9 @@ export default function App() {
     }),
     [onboardingState.rows],
   );
-  const allowedTabs = useMemo(() => ROLE_ALLOWED_TABS[currentRole] || ["home"], [currentRole]);
-  const visibleSidebarSections = useMemo(
-    () => sidebarSections.filter((tab) => {
-      if (!allowedTabs.includes(tab.id)) {
-        return false;
-      }
-      if (tab.id === "approval" && !APPROVAL_NAV_PRIMARY_ROLES.has(currentRole)) {
-        return false;
-      }
-      return true;
-    }),
-    [sidebarSections, allowedTabs, currentRole],
-  );
-  const ingestionStreamRows = useMemo(
-    () => (Array.isArray(landingPadRecent.rows) ? landingPadRecent.rows : [])
+  const allowedTabs = useMemo(() => allowedLegacyTabsForRole(currentRole), [currentRole]);
+  const ingestionStreamRows = useMemo(() => {
+    const landingRows = (Array.isArray(landingPadRecent.rows) ? landingPadRecent.rows : [])
       .map((row, index) => {
         const mapped = mapLandingPadRowToAlertStreamRow(row, index);
         return {
@@ -12410,31 +8407,111 @@ export default function App() {
           error: row?.error || "",
           source_channel: normalizeAlertChannel(mapped),
         };
-      })
-      .sort((left, right) => alertTimeMs(right) - alertTimeMs(left)),
-    [landingPadRecent.rows],
+      });
+
+    const alertRows = (Array.isArray(alerts.rows) ? alerts.rows : []).map((row, index) => {
+      const mapped = mapLandingPadRowToAlertStreamRow({ ...row, _stream_kind: row?._stream_kind || "alerts_api" }, index);
+      return {
+        ...mapped,
+        file: row?.file || "-",
+        path: row?.path || "",
+        error: row?.error || "",
+        source_channel: normalizeAlertChannel(mapped),
+      };
+    });
+
+    const allStreamRows = [...landingRows, ...alertRows];
+    const consolidatedRows = dedupeAndConsolidateAlertRows(allStreamRows, {
+        channels: ALERT_SOURCE_CHANNELS,
+        preferLatestState: true,
+      });
+    const incidentByAlertId = new Map();
+    (Array.isArray(incidentMetadata.rows) ? incidentMetadata.rows : []).forEach((incident) => {
+      const projection = incident?.projection_payload && typeof incident.projection_payload === "object" ? incident.projection_payload : {};
+      const eventPayload = projection?.event_payload && typeof projection.event_payload === "object" ? projection.event_payload : {};
+      [incident?.alert_id, projection?.alert_id, eventPayload?.alert_id]
+        .map((value) => String(value || "").trim())
+        .filter(Boolean)
+        .forEach((alertId) => incidentByAlertId.set(alertId, incident));
+    });
+    const enrichedRows = consolidatedRows.map((row) => {
+      const alertId = String(row?.alert_id || row?.id || "").trim();
+      const incident = incidentByAlertId.get(alertId);
+      if (!incident) return row;
+      return {
+        ...row,
+        incident_id: incident?.incident_id || incident?.id || row?.incident_id,
+        ticket_id: incident?.ticket_id || incident?.jira_key || row?.ticket_id,
+        jira_key: incident?.jira_key || incident?.ticket_id || row?.jira_key,
+        jira_url: incident?.jira_url || row?.jira_url,
+        incident_projection: incident,
+      };
+    });
+    return capLatestAlertsPerSource(
+      ensureMinimumAlertsBySource(enrichedRows, allStreamRows)
+    );
+  }, [landingPadRecent.rows, alerts.rows, incidentMetadata.rows]);
+  // Live Stream is a project workspace: rows and all derived counts must stay
+  // within the project selected in the global monitor selector.
+  const scopedIngestionStreamRows = ingestionStreamRows;
+  const applicationScopedIngestionStreamRows = useMemo(
+    () => filterAlertsForMonitor(scopedIngestionStreamRows, applicationToMonitor),
+    [applicationToMonitor, scopedIngestionStreamRows],
   );
   const ingestionStreamCounts = useMemo(() => {
-    const counts = { all: ingestionStreamRows.length, email: 0, log: 0, prometheus: 0, telemetry: 0, ticket: 0, failed: 0 };
-    ingestionStreamRows.forEach((row) => {
-      const channel = String(row?.source_channel || "prometheus");
-      counts[channel] = Number(counts[channel] || 0) + 1;
+    // Source cards describe the currently selected lifecycle section. Counting
+    // resolved rows while the Active tab hides them produces a contradictory
+    // "3 arrivals / 0 results" view.
+    const sectionRows = applicationScopedIngestionStreamRows.filter((row) => {
+      const failed = String(row?.status || "").toLowerCase() === "failed" || Boolean(row?.error);
+      const status = String(row?.alert_status || row?.status || "").toLowerCase();
+      const resolved = ["resolved", "closed", "completed", "inactive"].includes(status);
+      const timestamp = alertTimeMs(row);
+      if (ingestionStreamSection === "active") return !failed && !resolved;
+      if (ingestionStreamSection === "resolved") return resolved;
+      if (ingestionStreamSection === "failed") return failed;
+      if (ingestionStreamSection === "historical") return Boolean(timestamp && Date.now() - timestamp >= 86400000);
+      return true;
+    });
+    const counts = { all: sectionRows.length, email: 0, log: 0, prometheus: 0, telemetry: 0, ticket: 0, failed: 0 };
+    sectionRows.forEach((row) => {
+      const channels = Array.isArray(row?.source_channels) && row.source_channels.length
+        ? row.source_channels
+        : [String(row?.source_channel || "prometheus")];
+      Array.from(new Set(channels)).forEach((channel) => {
+        counts[channel] = Number(counts[channel] || 0) + 1;
+      });
       if (String(row?.status || "").toLowerCase() === "failed" || row?.error) {
         counts.failed += 1;
       }
     });
     return counts;
-  }, [ingestionStreamRows]);
+  }, [applicationScopedIngestionStreamRows, ingestionStreamSection]);
   const visibleIngestionStreamRows = useMemo(() => {
     const query = String(ingestionStreamQuery || "").trim().toLowerCase();
-    return ingestionStreamRows.filter((row) => {
+    const now = Date.now();
+    const timeWindowMs = { "1h": 3600000, "24h": 86400000, "7d": 604800000 }[ingestionStreamFilters.timeRange] || 0;
+    return applicationScopedIngestionStreamRows.filter((row) => {
       const failed = String(row?.status || "").toLowerCase() === "failed" || Boolean(row?.error);
+      const status = String(row?.alert_status || row?.status || "").toLowerCase();
+      const resolved = ["resolved", "closed", "completed", "inactive"].includes(status);
+      const timestamp = alertTimeMs(row);
+      if (ingestionStreamSection === "active" && (failed || resolved)) return false;
+      if (ingestionStreamSection === "resolved" && !resolved) return false;
+      if (ingestionStreamSection === "failed" && !failed) return false;
+      if (ingestionStreamSection === "historical" && (!timestamp || now - timestamp < 86400000)) return false;
       if (ingestionStreamChannel === "failed" && !failed) {
         return false;
       }
-      if (!["all", "failed"].includes(ingestionStreamChannel) && row.source_channel !== ingestionStreamChannel) {
+      const rowChannels = Array.isArray(row?.source_channels) && row.source_channels.length
+        ? row.source_channels
+        : [row.source_channel];
+      if (!["all", "failed"].includes(ingestionStreamChannel) && !rowChannels.includes(ingestionStreamChannel)) {
         return false;
       }
+      if (timeWindowMs && (!timestamp || now - timestamp > timeWindowMs)) return false;
+      if (ingestionStreamFilters.severity !== "all" && String(row?.severity || "").toLowerCase() !== ingestionStreamFilters.severity) return false;
+      if (ingestionStreamFilters.environment !== "all" && String(row?.environment || row?.labels?.environment || "unknown").toLowerCase() !== ingestionStreamFilters.environment) return false;
       if (!query) {
         return true;
       }
@@ -12448,11 +8525,192 @@ export default function App() {
         row.status,
         row.error,
       ].map((value) => String(value || "").toLowerCase()).join(" ").includes(query);
-    });
-  }, [ingestionStreamRows, ingestionStreamChannel, ingestionStreamQuery]);
+    }).slice(0, 50);
+  }, [applicationScopedIngestionStreamRows, ingestionStreamChannel, ingestionStreamFilters, ingestionStreamQuery, ingestionStreamSection]);
+  const ingestionFilterOptions = useMemo(() => ({
+    applications: Array.from(new Set(scopedIngestionStreamRows.map((row) => String(row?.application || row?.project_name || row?.project || "").trim()).filter(Boolean))).sort(),
+    environments: Array.from(new Set(applicationScopedIngestionStreamRows.map((row) => String(row?.environment || row?.labels?.environment || "unknown").trim().toLowerCase()).filter(Boolean))).sort(),
+  }), [applicationScopedIngestionStreamRows, scopedIngestionStreamRows]);
   const isAuthenticated = Boolean(String(adminSession.accessToken || "").trim());
   const isAdministrator = currentRole === "administrator";
   const canUseApprovalActions = allowedTabs.includes("approval");
+  const executionRollbackPlan = String(
+    selectedAlertWorkflow?.recommendation?.rollback
+    || selectedAlertWorkflow?.recommendation?.rollback_plan
+    || (Array.isArray(selectedExecutionPlan.catalogPlan?.rollback_commands) ? selectedExecutionPlan.catalogPlan.rollback_commands.join("\n") : selectedExecutionPlan.catalogPlan?.rollback_commands)
+    || (Array.isArray(selectedExecutionPlan.catalogPlan?.rollback) ? selectedExecutionPlan.catalogPlan.rollback.join("\n") : selectedExecutionPlan.catalogPlan?.rollback)
+    || selectedExecutionPlan.remediationAction?.rollback
+    || selectedExecutionPlan.remediationAction?.parameters?.rollback_plan
+    || (Array.isArray(selectedExecutionPlan.remediationAnalysis?.rollback_plan) ? selectedExecutionPlan.remediationAnalysis.rollback_plan.join(" ") : selectedExecutionPlan.remediationAnalysis?.rollback_plan)
+    || ""
+  ).trim();
+  const editedExecutionPlan = buildEditedRemediationPlan();
+  const effectiveCredentialRef = String(remediationPlanEditor.credential_ref || selectedApplicationConnection.credential_ref || "").trim();
+  const executionPlanSignature = JSON.stringify({
+    // Incident/recommendation IDs can be hydrated while the dry-run request is
+    // in flight. They identify backend records but do not change the reviewed
+    // plan. Use the stable selected alert so hydration cannot invalidate a
+    // successful dry run and send the operator back to step 1.
+    alert: selectedAlertId || "",
+    target_service: selectedGovernedExecutionTarget,
+    target_environment: selectedApplicationConnection.environment,
+    connection: remediationPlanEditor.connection_url,
+    executor_type: remediationPlanEditor.executor_type,
+    job_name: remediationPlanEditor.job_name,
+    namespace: remediationPlanEditor.namespace,
+    credential_ref: effectiveCredentialRef,
+    ...editedExecutionPlan,
+  });
+  const credentialReferenceValid = !executionRequiresCredential || /^(?:vault:\/\/|arn:aws:secretsmanager:|gcp-secret:\/\/|k8s-secret:\/\/)/.test(effectiveCredentialRef) || /^https:\/\/[^/]+\.vault\.azure\.net\/secrets\/[^/]+(?:\/[^/]+)?$/i.test(effectiveCredentialRef);
+  const executionPreflightChecks = [
+    { id: "incident", label: "Incident identity", detail: "A durable incident ID is attached.", passed: looksLikeUuid(String(approvalForm.incident_id || selectedIncidentId || selectedApprovalIncidentId || "")), blocking: true },
+    { id: "approval", label: "Approval state", detail: "Approval is bound to the exact reviewed plan.", passed: selectedExecutionBreakdown.approvalStatus === "approved", blocking: false },
+    { id: "role", label: "Operator permission", detail: "The signed-in role can approve and execute remediation.", passed: canUseApprovalActions, blocking: true },
+    { id: "target", label: "Execution target", detail: `${selectedGovernedExecutionTarget || "No governed target"} in ${selectedApplicationConnection.environment}.`, passed: Boolean(selectedGovernedExecutionTarget && !looksLikeUuid(selectedGovernedExecutionTarget)), blocking: true },
+    { id: "plan", label: "Corrective capability", detail: executionIsReadOnly ? "This plan collects evidence but does not change the target." : `${editedExecutionPlan.commands.length} command(s), ${editedExecutionPlan.scripts.length} script(s).`, passed: Boolean((editedExecutionPlan.commands.length || editedExecutionPlan.scripts.length) && !executionIsReadOnly && editedExecutionPlan.execution_ready !== false), blocking: true },
+    { id: "connection", label: "Connector endpoint", detail: executionEndpointValid ? "Endpoint format is valid." : "Use an http:// or https:// endpoint; deployment names are not URLs.", passed: executionEndpointValid, blocking: Boolean(executionEndpoint) },
+    { id: "executor", label: "Governed executor", detail: jenkinsExecutorSelected ? remediationPlanEditor.job_name && executionEndpoint ? `Jenkins job ${remediationPlanEditor.job_name} is configured.` : "Add the Jenkins URL and job path." : executionIsReadOnly ? "Read-only validation does not require a live executor." : "Build a connector for this live action.", passed: executionIsReadOnly || (jenkinsExecutorSelected && Boolean(remediationPlanEditor.job_name) && Boolean(executionEndpoint)), blocking: !executionIsReadOnly },
+    { id: "emergency-stop", label: "Emergency stop", detail: executionIsReadOnly ? "Not required for a read-only plan." : jenkinsExecutorSelected ? "Queued and running Jenkins actions can be cancelled and audited." : "The selected executor has no implemented emergency-stop adapter.", passed: executionIsReadOnly || jenkinsExecutorSelected, blocking: !executionIsReadOnly },
+    { id: "credential", label: "Credential reference", detail: !executionRequiresCredential ? "Not required for this read-only plan." : credentialReferenceValid ? "A valid enterprise secret-manager URI is attached." : "Use an Azure Key Vault, HashiCorp Vault, AWS Secrets Manager, or Kubernetes Secret URI.", passed: credentialReferenceValid, blocking: executionRequiresCredential },
+    { id: "rollback", label: "Rollback coverage", detail: executionRollbackPlan || "No explicit rollback plan is attached.", passed: Boolean(executionRollbackPlan), blocking: !executionIsReadOnly },
+    { id: "validation", label: "Recovery validation", detail: editedExecutionPlan.queries.length ? `${editedExecutionPlan.queries.length} post-check(s) supplied.` : "No explicit validation query is attached.", passed: editedExecutionPlan.queries.length > 0, blocking: !executionIsReadOnly },
+  ];
+  const blockingPreflightFailures = executionPreflightChecks.filter((check) => check.blocking && !check.passed);
+  const approvalWillAutoExecute = !dangerousProductionAction
+    && !["high", "critical"].includes(String(selectedExecutionPlan.riskTier || selectedAlertRow?.severity || "").toLowerCase())
+    && liveExecutionPlanAvailable
+    && blockingPreflightFailures.length === 0;
+  const executionAwaitingTerminalResult = remediationExecutionState.loading && Boolean(remediationExecutionState.result);
+  const executionSetupBlocked = !executionAwaitingTerminalResult && blockingPreflightFailures.length > 0;
+  const cockpitApprovalAccepted = executionAwaitingTerminalResult || (!executionApprovalRequiresRenewal && selectedExecutionBreakdown.approvalStatus === "approved")
+    || approvedExecutionSignature === executionPlanSignature;
+  const executionAllowed = !remediationExecutionState.loading
+    && cockpitApprovalAccepted
+    && executionConfirmationValid
+    && liveExecutionPlanAvailable
+    && blockingPreflightFailures.length === 0;
+  const executionCapabilityBlocked = !executionAwaitingTerminalResult
+    && cockpitApprovalAccepted
+    && executionConfirmationValid
+    && !liveExecutionPlanAvailable;
+  const executionActivationMessage = remediationExecutionState.loading
+    ? "Execution submitted — waiting for the terminal run status"
+    : executionAllowed
+      ? "Ready for guarded execution"
+      : !cockpitApprovalAccepted
+          ? executionIsReadOnly ? "Choose manual escalation or regenerate a reviewed corrective plan" : "Approve the reviewed plan"
+      : blockingPreflightFailures.length
+        ? `Complete: ${blockingPreflightFailures.map((check) => check.label).join(", ")}`
+          : !liveExecutionPlanAvailable
+            ? "Validation-only plan: attach a governed live executor before execution"
+          : !executionConfirmationValid
+            ? `Type ${executionConfirmationPhrase} in the production confirmation field`
+            : "Execution is temporarily unavailable";
+  const cockpitApprovalComplete = ["approved", "rejected"].includes(selectedExecutionBreakdown.approvalStatus);
+  const manualEscalationRecorded = approvalForm.action === "reject" && (
+    ["rejected", "failed"].includes(selectedExecutionBreakdown.approvalStatus)
+    || Boolean(approvalState.result && !approvalState.error)
+  );
+  const activeEmergencyStopStatuses = ["pending", "policy_checked", "approved", "dispatching", "executor_accepted", "running", "verifying"];
+  const responseAction = unwrap(remediationExecutionState.result);
+  const emergencyStopAction = responseAction?.id ? responseAction : selectedExecutionPlan.remediationAction;
+  const emergencyStopAvailable = looksLikeUuid(String(emergencyStopAction?.id || "")) && activeEmergencyStopStatuses.includes(String(emergencyStopAction?.status || "").toLowerCase());
+  const blockedRecommendationId = String(
+    selectedExecutionPlan.remediationAction?.metadata?.recommendation_id
+    || selectedExecutionPlan.remediationAction?.parameters?.recommendation_id
+    || "",
+  ).trim();
+  const policyBlockBelongsToOlderPlan = Boolean(
+    blockedRecommendationId
+    && selectedExecutionPlan.recommendationId
+    && blockedRecommendationId !== selectedExecutionPlan.recommendationId,
+  );
+  const blockedActionStatus = String(selectedExecutionPlan.remediationAction?.status || "").trim().toLowerCase();
+  const rawExecutionPolicyBlock = (
+    String(selectedExecutionPlan.remediationAction?.action_type || "").trim().toLowerCase() === "policy-blocked"
+    || blockedActionStatus === "policy_blocked"
+    || selectedExecutionPlan.remediationAction?.metadata?.policy_blocked === true
+  );
+  // Automatic policy evaluation records an audit action with action_type
+  // policy-blocked and status awaiting_approval when HITL may continue. That
+  // is a handoff to an operator, not a permanent execution terminal state.
+  const policyBlockAwaitingHumanReview = rawExecutionPolicyBlock
+    && (
+      ["awaiting_approval", "pending", "pending_approval"].includes(blockedActionStatus)
+      || ["awaiting_approval", "pending", "pending_approval"].includes(selectedCanonicalIncidentStatus)
+      || ["awaiting_approval", "pending", "pending_approval"].includes(selectedExecutionBreakdown.approvalStatus)
+    );
+  const executionPolicyBlocked = rawExecutionPolicyBlock
+    && !policyBlockBelongsToOlderPlan
+    && !policyBlockAwaitingHumanReview;
+  const persistedDiagnosticCompletion = String(selectedExecutionPlan.remediationAction?.action_type || "").trim().toLowerCase() === "diagnostic_completion"
+    && selectedExecutionPlan.remediationAction?.parameters?.diagnostic_closure === true;
+  const recordedExecutionStatus = persistedDiagnosticCompletion
+    ? "diagnostic_completed"
+    : executionAutoCloses
+      ? ""
+    : policyBlockBelongsToOlderPlan || policyBlockAwaitingHumanReview
+    ? ""
+    : blockedActionStatus;
+  const terminalIncidentStatus = String(selectedExecutionBreakdown.incidentStatus || "").trim().toLowerCase();
+  const cockpitExecutionStatus = effectiveExecutionStatus(
+    terminalIncidentStatus,
+    recordedExecutionStatus,
+    selectedExecutionTechnicalResponse?.queue_url,
+  );
+  const resolveStageDescription = (() => {
+    if (executionAutoCloses) {
+      return ["closed", "resolved"].includes(selectedCanonicalIncidentStatus)
+        ? "Watch-only closed"
+        : "Watch-only auto-closing";
+    }
+    if (executionIsDiagnosticOnly) return "Investigation requires action";
+    if (executionPolicyBlocked) return "Execution blocked — action required";
+    if (
+      ["awaiting_approval", "pending", "pending_approval"].includes(cockpitExecutionStatus)
+      || ["awaiting_approval", "pending", "pending_approval"].includes(selectedCanonicalIncidentStatus)
+      || ["awaiting_approval", "pending", "pending_approval"].includes(selectedExecutionBreakdown.approvalStatus)
+    ) return "Waiting for approval";
+    if (selectedExecutionBreakdown.approvalStatus === "approved" && !cockpitExecutionStatus) return "Approved — ready to execute";
+    const labels = {
+      dispatching: "Starting remediation",
+      executor_accepted: "Queued for execution",
+      running: "Remediation running",
+      verifying: "Validating recovery",
+      succeeded: "Remediation completed",
+      execution_failed: "Execution failed",
+      validation_failed: "Recovery validation failed",
+      failed: "Execution failed",
+    };
+    return labels[cockpitExecutionStatus] || cockpitExecutionStatus || "Plan, approve, execute";
+  })();
+  const cockpitAnalysis = canonicalIncidentAnalysis(selectedAlertWorkflow, selectedAlertRow);
+  const executionOutcomeReviewed = String(executionOutcomeReview.reviewedAlertId || "") === String(selectedAlertId || "")
+    || selectedAlertRagDocuments.some((document) => String(document?.source_system || document?.metadata?.source_system || "").toLowerCase() === "kaims-execution-review");
+  const incidentCockpitStages = [
+    { id: "overview", short: "01", label: "Orient", accessibleLabel: "Overview", description: "Identity and lifecycle", complete: Boolean(selectedAlertId) },
+    { id: "evidence", short: "02", label: "Evidence & Understanding", accessibleLabel: "Evidence, RCA, and impact", description: `${selectedAiTrust.evidence.length} linked record(s) · RCA and impact`, complete: selectedAiTrust.evidence.length > 0 && Boolean(cockpitAnalysis.rootCause && cockpitAnalysis.rootCause !== "-") },
+    { id: "execution", short: "03", label: "Resolve", accessibleLabel: "Resolve incident", description: resolveStageDescription, complete: persistedDiagnosticCompletion || (["closed", "resolved"].includes(selectedCanonicalIncidentStatus) && executionAutoCloses) || (!executionPolicyBlocked && !executionAutoCloses && ["succeeded", "skipped", "failed", "dispatch_failed", "execution_failed", "validation_failed", "rolled_back", "rollback_failed", "timed_out", "cancelled", "manual_intervention_required"].includes(cockpitExecutionStatus)) },
+    { id: "audit", short: "04", label: "Validate", accessibleLabel: "Audit Trail", description: selectedCanonicalIncidentStatus === "closed" ? "closed" : executionOutcomeReviewed ? "outcome reviewed" : "audit and recovery", complete: selectedCanonicalIncidentStatus === "closed" || executionOutcomeReviewed },
+  ];
+  const cockpitRecommendedStage = (() => {
+    if (!incidentCockpitStages.find((stage) => stage.id === "evidence")?.complete || selectedAlertEvaluation.requiresReview) return "evidence";
+    if (!cockpitAnalysis.action || cockpitAnalysis.action === "-") return "execution";
+    if (!cockpitApprovalComplete || !cockpitExecutionStatus) return "execution";
+    return "audit";
+  })();
+  const cockpitRecommended = incidentCockpitStages.find((stage) => stage.id === cockpitRecommendedStage) || incidentCockpitStages[0];
+
+  useEffect(() => {
+    if (!isAuthenticated || canAccessDestination(currentRole, currentNavigationItem.id)) {
+      return;
+    }
+    skipNextActiveTabNavigationRef.current = true;
+    setActiveTab("home");
+    if (typeof onNavigatePath === "function") {
+      onNavigatePath(`/?access=restricted&destination=${encodeURIComponent(currentNavigationItem.label)}`);
+    }
+  }, [currentNavigationItem.id, currentNavigationItem.label, currentRole, isAuthenticated, onNavigatePath]);
   const canManageSeverityOverride = ["administrator", "l2_engineer", "l3_engineer", "p2", "p3"].includes(currentRole);
   const canProvideAlertDocuments = DOCUMENT_PROVIDER_ROLES.has(currentRole);
   const onboardingSourceDocRows = useMemo(
@@ -12463,6 +8721,23 @@ export default function App() {
     }),
     [onboardingSourceDocs.rows],
   );
+  const selectedJenkinsProcess = useMemo(() => {
+    const response = selectedExecutionTechnicalResponse && typeof selectedExecutionTechnicalResponse === "object" ? selectedExecutionTechnicalResponse : {};
+    const submitted = response.submitted_parameters && typeof response.submitted_parameters === "object" ? response.submitted_parameters : {};
+    const executor = String(response.executor || remediationPlanEditor.executor_type || remediationPlanEditor.connection_type || "").toLowerCase();
+    const resolutionId = String(submitted.KAI_OPS_RESOLUTION_ID || response.resolution_id || selectedExecutionPlan.remediationAction?.parameters?.resolution_id || selectedExecutionPlan.remediationAction?.action_type || "").trim();
+    const submittedDryRun = submitted.KAI_OPS_DRY_RUN ?? response.dry_run ?? selectedExecutionPlan.remediationAction?.parameters?.dry_run;
+    const presentation = executionProcessPresentation(cockpitExecutionStatus, submittedDryRun, executor === "jenkins");
+    return {
+      ...presentation,
+      configured: executor === "jenkins",
+      jobName: String(response.job_name || remediationPlanEditor.job_name || ""),
+      queueUrl: String(response.queue_url || ""),
+      resolutionId: resolutionId || "Not selected",
+      hasResolution: Boolean(resolutionId),
+      applicationId: String(submitted.KAI_OPS_APPLICATION_ID || selectedExecutionPlan.remediationAction?.parameters?.application_id || selectedApplicationConnection.application || "Not recorded"),
+    };
+  }, [selectedExecutionTechnicalResponse, cockpitExecutionStatus, selectedExecutionPlan, remediationPlanEditor, selectedApplicationConnection]);
   const onboardingSourceDocCount = onboardingSourceDocRows.length;
   const severityOverrideByKey = useMemo(() => {
     const map = new Map();
@@ -12539,6 +8814,9 @@ export default function App() {
     if (isSetupMonitoringPath && !String(onboardingForm.monitoring_url || "").trim()) {
       errors.push("Prometheus endpoint URL is required for Configure Prometheus Monitoring path.");
     }
+    if (String(onboardingForm.connection_auth_type || "none") !== "none" && !String(onboardingForm.connection_secret_ref || "").trim()) {
+      errors.push("A secret reference is required when monitoring authentication is enabled. Do not enter the secret value.");
+    }
     return errors;
   }, [
     onboardingForm.name,
@@ -12552,6 +8830,8 @@ export default function App() {
     onboardingForm.onboarding_path,
     onboardingForm.monitoring_url,
     onboardingForm.rule_onboarding_plain_language,
+    onboardingForm.connection_auth_type,
+    onboardingForm.connection_secret_ref,
     onboardingSourceDocs.rows,
     onboardingSourceDocCount,
   ]);
@@ -12837,11 +9117,14 @@ export default function App() {
     const setupSaved = Boolean(String(onboardingState.success || "").trim()) && !onboardingState.loading && !onboardingState.error;
     const monitoringDone = Boolean(String(onboardingForm.name || "").trim())
       && Boolean(String(onboardingForm.owner_team || "").trim())
-      && Boolean(String(onboardingForm.region || "").trim());
+      && Boolean(String(onboardingForm.region || "").trim())
+      && Boolean(String(onboardingForm.monitoring_url || "").trim());
     const docsRulesDone = Boolean(onboardingSourceDocCount > 0 || onboardingRulePromptLines.length > 0 || onboardingGeneratedDocs.length > 0 || setupSaved);
     return [
-      { id: "docs_rules", label: "1. Guided Setup", hint: "Describe, auto-complete, score, approve", complete: docsRulesDone },
-      { id: "setup", label: "2. Connection Setup", hint: "Monitoring tool, endpoint, landing pad", complete: monitoringDone },
+      { id: "setup", label: "1. Profile & Sources", hint: "Project, owners, monitoring, connections", complete: monitoringDone },
+      { id: "docs_rules", label: "2. Knowledge & Rules", hint: "Context, SLOs, alerts, runbooks", complete: docsRulesDone },
+      { id: "review", label: "3. Review & Approve", hint: "Rules, documents, metadata", complete: Boolean(onboardingDocApprovalState.approved) },
+      { id: "status", label: "4. Activate & Verify", hint: "Workflow, validation, dashboards", complete: Boolean(setupSaved && (onboardingDocApprovalState.approved || onboardingWorkflowSteps.length > 0)) },
     ];
   }, [
     onboardingForm.name,
@@ -12853,6 +9136,9 @@ export default function App() {
     onboardingState.loading,
     onboardingState.error,
     onboardingGeneratedDocs.length,
+    onboardingDocApprovalState.approved,
+    onboardingWorkflowSteps.length,
+    onboardingForm.monitoring_url,
   ]);
   const showProjectStep = (stepId) => adminWorkspace !== "project" || projectSetupShowAll || projectSetupStep === stepId;
   const navigateAdminJourney = (stepId) => {
@@ -13012,19 +9298,44 @@ export default function App() {
     setActiveTab(tabId);
   }
 
+  function openNavigationItem(item) {
+    if (!allowedTabs.includes(item.legacyTab)) {
+      return;
+    }
+    if (typeof onNavigatePath === "function") {
+      skipNextActiveTabNavigationRef.current = true;
+      setActiveTab(item.legacyTab);
+      onNavigatePath(item.path);
+      return;
+    }
+    setActiveTab(item.legacyTab);
+  }
+
+  function applyIngestionSavedView(viewId) {
+    const view = INGESTION_SAVED_VIEWS.find((candidate) => candidate.id === viewId) || INGESTION_SAVED_VIEWS[0];
+    setIngestionStreamView(view.id);
+    setIngestionStreamSection(view.section);
+    setIngestionStreamChannel(view.channel);
+    setIngestionStreamFilters(view.filters);
+  }
+
   function openCopilotWorkspace(workspace) {
     if (workspace === "users" && !isAdministrator) {
       return;
     }
     if (workspace === "users") {
       setAdminWorkspace("users");
+      onNavigatePath?.("/admin");
     } else if (workspace === "monitoring") {
       setAdminWorkspace("project");
+      onNavigatePath?.("/integrations");
     } else if (workspace === "project") {
       setAdminWorkspace("project");
+      onNavigatePath?.("/integrations");
     } else if (workspace === "alerts") {
       setAdminWorkspace("alerts");
       setAlertKnowledgeView("onboarding");
+      onNavigatePath?.("/applications?workspace=knowledge");
     }
     setActiveTab("admin");
   }
@@ -13264,6 +9575,59 @@ export default function App() {
     return { cards, nextAction };
   }, [monitorScopedAlerts, pendingApprovals.length, selectedAlertEventsDisplay]);
 
+  const roleDashboard = useMemo(() => {
+    const openAlerts = monitorScopedAlerts.filter((row) => !isApprovalResolvedStatus(row?.status || row?.state));
+    const priorityIncidents = monitorScopedIncidentMetadata.filter((row) => ["critical", "high"].includes(String(row?.severity || row?.risk_tier || row?.risk || "").toLowerCase()));
+    const failedAutomation = selectedAlertEventsDisplay.filter((row) => [row?.status, row?.detail, row?.message].some((value) => /failed|error/i.test(String(value || "")))).length;
+    const connectorRows = (Array.isArray(monitoringApps.rows) ? monitoringApps.rows : []).filter((row) => {
+      const name = String(row?.name || row?.application || "").trim().toLowerCase();
+      return !applicationToMonitor || name === String(applicationToMonitor).trim().toLowerCase();
+    });
+    const unhealthyConnectors = connectorRows.filter((row) => /failed|error|unhealthy|disabled/i.test(String(row?.status || ""))).length;
+    const hasScopedAlertSelection = Boolean(selectedAlertRow);
+    const isManagedPlatformScope = ["kaims", "telemetry"].includes(String(applicationToMonitor || "").trim().toLowerCase());
+    const shared = {
+      period: "Current operational window",
+      timezone: "Asia/Kolkata (IST)",
+      partial: Boolean(alerts.error || incidentMetadata.error || approvalState.error || monitoringApps.error),
+      refreshing: Boolean(alerts.loading || incidentMetadata.loading || approvalState.loading || monitoringApps.loading),
+    };
+    if (currentRole === "executive") {
+      return { ...shared, kind: "Executive", title: "Business reliability attention", description: "Service health, response speed, automation, and impact for the current window.", cards: [
+        { label: "Service Health", value: health.ok ? "Healthy" : "Check", detail: "API gateway health probe status.", tone: health.ok ? "clear" : "attention", tab: "executive" },
+        { label: "MTTA", value: `${executiveInsights.avgApprovalWaitMinutes.toFixed(1)} min`, detail: "Proxy: mean current approval wait; dedicated acknowledgement timestamps are not available.", tone: "info", tab: "executive" },
+        { label: "MTTR", value: "Partial", detail: "Closure durations are incomplete in the current response contract.", tone: "attention", tab: "closed" },
+        { label: "Automation Rate", value: `${executiveInsights.automationRate.toFixed(1)}%`, detail: "Automatically executed closures / all closed incidents.", tone: "clear", tab: "executive" },
+        { label: "Business Impact", value: executiveInsights.slaAtRisk, detail: "Open high-risk or manual-mode incidents currently at SLA risk.", tone: executiveInsights.slaAtRisk ? "attention" : "clear", tab: "summary" },
+      ] };
+    }
+    if (["l2_engineer", "l3_engineer"].includes(currentRole)) {
+      return { ...shared, kind: "Approver", title: "Decisions requiring review", description: "Pending gates with risk, evidence, and execution readiness.", cards: [
+        { label: "Pending Approvals", value: pendingApprovals.length, detail: "Approval records whose status is not resolved.", tone: pendingApprovals.length ? "attention" : "clear", tab: "approval" },
+        { label: "High-Risk Incidents", value: priorityIncidents.length, detail: "Open incident projections classified high or critical.", tone: priorityIncidents.length ? "attention" : "clear", tab: "summary" },
+        { label: "Planned Commands", value: selectedExecutionBreakdown.commands.length, detail: "Guarded execution commands for the selected incident.", tone: "info", tab: "home" },
+        { label: "Rollback Readiness", value: selectedExecutionBreakdown.scripts.length ? "Review" : "Missing", detail: "A script exists for review; explicit rollback metadata is not available.", tone: selectedExecutionBreakdown.scripts.length ? "info" : "attention", tab: "home" },
+        { label: "Approval SLA", value: `${executiveInsights.avgApprovalWaitMinutes.toFixed(1)} min`, detail: "Mean age of pending approval records.", tone: "info", tab: "approval" },
+      ] };
+    }
+    if (currentRole === "administrator") {
+      return { ...shared, kind: "Administrator", title: `${selectedMonitorScopeLabel} operations`, description: "Application health and activity, with platform-wide infrastructure clearly identified.", cards: [
+        { label: "Application Connector", value: isManagedPlatformScope && !connectorRows.length ? "Managed" : !connectorRows.length ? "Not configured" : unhealthyConnectors ? "Attention" : "Healthy", detail: isManagedPlatformScope && !connectorRows.length ? `${selectedMonitorScopeLabel} uses KaiMS-managed platform monitoring; no separate onboarding record is required.` : !connectorRows.length ? `${selectedMonitorScopeLabel} has no registered monitoring connector.` : `${connectorRows.length} connector record(s) scoped to ${selectedMonitorScopeLabel}; ${unhealthyConnectors} unhealthy.`, tone: isManagedPlatformScope && !connectorRows.length ? "info" : !connectorRows.length || unhealthyConnectors ? "attention" : "clear", tab: "admin" },
+        { label: "Queue Health", value: queueHealth.loading ? "Checking" : queueHealth.healthy ? "Healthy" : queueHealth.status === "attention" ? "Attention" : "Unavailable", detail: queueHealth.loading ? "Reading live broker telemetry." : `${String(queueHealth.provider || "rabbitmq").toUpperCase()} · ${queueHealth.queues || 0} queues · ${queueHealth.ready || 0} ready · ${queueHealth.unacknowledged || 0} in flight.`, tone: queueHealth.healthy ? "clear" : "attention", tab: "rag" },
+        { label: "Selected Incident Activity", value: hasScopedAlertSelection ? selectedAlertEventsDisplay.length : "No selection", detail: hasScopedAlertSelection ? `Persisted agent or trace events for the selected ${selectedMonitorScopeLabel} incident.` : `Open a ${selectedMonitorScopeLabel} alert to inspect agent activity.`, tone: hasScopedAlertSelection && selectedAlertEventsDisplay.length ? "clear" : "info", tab: "trace" },
+        { label: "Selected Workflow", value: !hasScopedAlertSelection ? "No selection" : failedAutomation ? `${failedAutomation} failed` : "No failures", detail: hasScopedAlertSelection ? "Failure state for the selected in-scope incident workflow." : "Workflow status is shown only after an in-scope alert is selected.", tone: failedAutomation ? "attention" : "info", tab: "trace" },
+        { label: "Telemetry", value: gatewayRecent.rows.length, detail: "API gateway telemetry events in the current loaded window.", tone: gatewayRecent.rows.length ? "info" : "attention", tab: "safety" },
+      ] };
+    }
+    return { ...shared, kind: "Operator", title: "What requires attention now?", description: "Active signals, priority incidents, failed automation, and SLA risk.", cards: [
+      { label: "Active Alerts", value: openAlerts.length, detail: "Current alerts not in a resolved or closed state.", tone: openAlerts.length ? "attention" : "clear", tab: "stream" },
+      { label: "Priority Incidents", value: priorityIncidents.length, detail: "Open high or critical incident projections.", tone: priorityIncidents.length ? "attention" : "clear", tab: "summary" },
+      { label: "Failed Automation", value: failedAutomation, detail: "Selected workflow events reporting failed or error state.", tone: failedAutomation ? "attention" : "clear", tab: "home" },
+      { label: "Assigned Work", value: "Partial", detail: "Assignment data is not exposed by the current dashboard contract.", tone: "info", tab: "home" },
+      { label: "SLA Risks", value: executiveInsights.slaAtRisk, detail: "Open high-risk or manual-mode incidents.", tone: executiveInsights.slaAtRisk ? "attention" : "clear", tab: "home" },
+    ] };
+  }, [alerts.error, alerts.loading, approvalState.error, approvalState.loading, applicationToMonitor, currentRole, executiveInsights, gatewayRecent.rows.length, health.ok, incidentMetadata.error, incidentMetadata.loading, monitorScopedAlerts, monitorScopedIncidentMetadata, monitoringApps.error, monitoringApps.loading, monitoringApps.rows, pendingApprovals.length, queueHealth, selectedAlertEventsDisplay, selectedAlertRow, selectedExecutionBreakdown.commands.length, selectedExecutionBreakdown.scripts.length, selectedMonitorScopeLabel]);
+
   function downloadFullHtmlReportPack() {
     const now = new Date();
     const generatedAt = formatIstTimestamp(now.toISOString());
@@ -13426,7 +9790,7 @@ export default function App() {
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>KaiOps Report Pack - ${htmlEscape(selectedMonitorScopeLabel)}</title>
+  <title>KaiMS Report Pack - ${htmlEscape(selectedMonitorScopeLabel)}</title>
   <style>
     :root { color-scheme: light; }
     body { margin: 0; padding: 24px; font-family: "Segoe UI", Tahoma, sans-serif; background: #f5f8fb; color: #10233b; }
@@ -13443,7 +9807,7 @@ export default function App() {
   </style>
 </head>
 <body>
-  <h1>KaiOps Full HTML Report Pack</h1>
+  <h1>KaiMS Full HTML Report Pack</h1>
   <p class="meta">Application: ${htmlEscape(selectedMonitorScopeLabel)} | Generated: ${htmlEscape(generatedAt)}</p>
   ${sections.join("\n")}
 </body>
@@ -13460,24 +9824,79 @@ export default function App() {
     URL.revokeObjectURL(objectUrl);
   }
 
+  if (adminSession.loading || authConfig.loading) return <main className="app-route-loading" aria-busy="true">Restoring authenticated session…</main>;
   if (!isAuthenticated) {
     return (
-      <main className={`app-shell density-${uiDensity}`}>
-        <section className="grid single-col">
-          <article className="panel" style={{ maxWidth: 560, margin: "48px auto" }}>
-            <div className="panel-head">
-              <div>
-                <h2>Login</h2>
-                <p>Sign in to access role-based KaiOps workspaces.</p>
+      <main className={`app-shell auth-shell density-${uiDensity}`}>
+        <section className="auth-stage">
+          <aside className="auth-brand-story">
+            <KaiMSBrand inverse />
+            <div className="auth-story-copy">
+              <span className="auth-kicker auth-kicker-live"><i aria-hidden="true" /> Autonomous operations workspace</span>
+              <h1>From first signal to <em>verified recovery.</em></h1>
+              <p>KaiMS connects evidence, human judgment, and guarded action in one accountable incident workflow.</p>
+              <div className="auth-signal-chain" aria-label="KaiMS operating model">
+                <span><b>01</b><strong>Observe</strong><small>Unify operational signals</small></span>
+                <i aria-hidden="true">→</i>
+                <span><b>02</b><strong>Understand</strong><small>Explain cause and impact</small></span>
+                <i aria-hidden="true">→</i>
+                <span><b>03</b><strong>Resolve</strong><small>Act safely and verify</small></span>
+              </div>
+              <div className="auth-live-assurance"><i aria-hidden="true" /><span><strong>Operations fabric online</strong><small>Evidence, approvals, and recovery controls connected</small></span></div>
+            </div>
+            <div className="auth-proof-grid" aria-label="KaiMS platform capabilities">
+              <span><strong>Evidence first</strong><small>Every conclusion retains its source</small></span>
+              <span><strong>Human governed</strong><small>Operators stay in control of action</small></span>
+              <span><strong>Recovery verified</strong><small>Closure follows measured health</small></span>
+            </div>
+          </aside>
+          <article className="panel auth-card">
+            <div className="auth-card-toolbar">
+              <KaiMSBrand compact />
+              <div className="auth-theme-switch" role="group" aria-label="Login theme">
+                {[
+                  ["auto", "Auto"],
+                  ["light", "Light"],
+                  ["dark", "Dark"],
+                ].map(([value, label]) => (
+                  <button
+                    key={value}
+                    type="button"
+                    className={uiTheme === value ? "active" : ""}
+                    aria-pressed={uiTheme === value}
+                    onClick={() => setUiTheme(value)}
+                  >
+                    {label}
+                  </button>
+                ))}
               </div>
             </div>
-            <form className="form" onSubmit={adminLogin}>
-              <label>Username<input value={adminAuthForm.username} onChange={(e) => setAdminAuthForm((curr) => ({ ...curr, username: e.target.value }))} /></label>
-              <label>Password<input type="password" value={adminAuthForm.password} onChange={(e) => setAdminAuthForm((curr) => ({ ...curr, password: e.target.value }))} /></label>
-              <button className="button-primary" type="submit" disabled={adminSession.loading}>{adminSession.loading ? "Signing in..." : "Sign In"}</button>
-            </form>
-            {adminSession.error ? <p className="error">{adminSession.error}</p> : null}
-            <p className="subtitle">Role access: Admin = all screens and document provisioning, L3/L2 = investigations plus Provide Documents, L1 = monitoring dashboard and escalation.</p>
+            <div className="panel-head">
+              <div>
+                <span className="auth-kicker">Protected access</span>
+                <h2>Welcome back</h2>
+                <p>Sign in to your operational command center.</p>
+              </div>
+            </div>
+            <label className="auth-application-select"><span>Application workspace</span><select aria-label="Application workspace" value={applicationToMonitor} onChange={(event) => setApplicationToMonitor(event.target.value)}>{monitorApplications.map((name) => <option key={name} value={name}>{name}</option>)}</select><small>Your session opens scoped to this application.</small></label>
+            {authConfig.mode === "oidc" ? (
+              <div className="form auth-login-form">
+                <p className="auth-sso-note">Enterprise single sign-on is required. Your identity-provider role controls KaiMS access.</p>
+                <button className="button-primary auth-submit" type="button" onClick={oidcLogin} disabled={adminSession.loading || authConfig.loading}>{adminSession.loading ? "Redirecting..." : <><span>Continue with SSO</span><b aria-hidden="true">→</b></>}</button>
+              </div>
+            ) : (
+              <form className="form auth-login-form" onSubmit={adminLogin}>
+                <div className="auth-access-mode"><span><i aria-hidden="true" /> Secure local access</span><small>Development environment</small></div>
+                <label className="auth-field"><span>Username</span><div className="auth-input-frame"><b aria-hidden="true">@</b><input autoComplete="username" value={adminAuthForm.username} onChange={(e) => setAdminAuthForm((curr) => ({ ...curr, username: e.target.value }))} /></div></label>
+                <label className="auth-field"><span>Password</span><div className="auth-input-frame"><b className="auth-lock-mark" aria-hidden="true" /><input type={loginPasswordVisible ? "text" : "password"} autoComplete="current-password" value={adminAuthForm.password} onChange={(e) => setAdminAuthForm((curr) => ({ ...curr, password: e.target.value }))} /><button type="button" className="auth-password-toggle" aria-label={loginPasswordVisible ? "Conceal entered value" : "Reveal entered value"} aria-pressed={loginPasswordVisible} onClick={() => setLoginPasswordVisible((visible) => !visible)}>{loginPasswordVisible ? "Hide" : "Show"}</button></div></label>
+                <div className="auth-session-meta"><span><i aria-hidden="true" /> Encrypted session</span><span>Role-scoped access</span></div>
+                <button className="button-primary auth-submit" type="submit" disabled={adminSession.loading}>{adminSession.loading ? <><i className="auth-submit-spinner" aria-hidden="true" /> Signing in...</> : <><span>Sign in securely</span><b aria-hidden="true">→</b></>}</button>
+              </form>
+            )}
+            {adminSession.error ? <p className="error auth-login-error" role="alert">{adminSession.error}</p> : null}
+            {authConfig.error ? <p className="error auth-login-error" role="alert">{authConfig.error}</p> : null}
+            <div className="auth-security-note"><span aria-hidden="true">✓</span><div><strong>Accountable by design</strong><small>{authConfig.mode === "local" ? "Local access is enabled for this development environment." : "Session tokens remain in memory and are never written to local storage."}</small></div></div>
+            <p className="auth-role-note">Your navigation, decisions, and available actions adapt automatically to your assigned role.</p>
           </article>
         </section>
       </main>
@@ -13485,28 +9904,54 @@ export default function App() {
   }
 
   return (
-    <main className={`app-shell density-${uiDensity}`}>
-      <div className="app-layout">
-        <aside className="sidebar panel sidebar-panel">
+    <div className={`app-shell density-${uiDensity} ${routeOutlet ? "app-shell-routed" : ""}`}>
+      <a className="skip-link" href="#workspace-content">Skip to workspace content</a>
+      {!isBrowserOnline ? (
+        <aside className="connectivity-banner" role="alert" aria-live="assertive">
+          <div><strong>Connection lost</strong><span>Live updates are paused. Existing information remains visible and may be stale.</span></div>
+          <button type="button" className="button-secondary" onClick={() => { if (navigator.onLine) { setIsBrowserOnline(true); refreshAll(); } }}>Retry connection</button>
+        </aside>
+      ) : null}
+      <KaiOperationsShell
+        navigationGroups={navigationGroups}
+        currentItem={currentNavigationItem}
+        currentPath={currentPath}
+        role={currentRole}
+        onNavigate={openNavigationItem}
+        projects={monitorApplications}
+        project={applicationToMonitor}
+        onProjectChange={setApplicationToMonitor}
+        environment={selectedApplicationConnection.environment}
+        health={health}
+        aiCapability={aiCapabilityStatus}
+        autonomyMode={selectedAlertRouting?.execution_mode || observedRouting?.execution_mode || ""}
+        approvalCount={pendingApprovals.length}
+        notificationCount={globalOperationalData.notifications.length}
+        operationalQuery={globalOperationsQuery}
+        onOperationalQueryChange={setGlobalOperationsQuery}
+        operationalResults={globalOperationalData.results}
+        notifications={globalOperationalData.notifications}
+        onOpenOperationalItem={openGlobalOperationalItem}
+        onOpenNotifications={() => { setGlobalOperationsView("notifications"); setGlobalOperationsOpen(true); }}
+        onAskKai={() => setIsCopilotOpen(true)}
+        user={adminSession?.user}
+        density={uiDensity}
+        theme={uiTheme}
+        onDensityChange={setUiDensity}
+        onThemeChange={setUiTheme}
+        onLogout={adminLogout}
+        kaiStates={kaiStateSummary}
+        restrictedDestination={restrictedDestination}
+      >
+      <div className={`app-layout kai-legacy-frame ${routeOutlet ? "kai-routed-frame" : ""}`}>
+        {!routeOutlet ? <aside className="sidebar panel sidebar-panel">
           <div className="sidebar-head">
-            <h2>Control Panel</h2>
-            <p className="subtitle">Essential navigation.</p>
+            <KaiMSBrand onActivate={() => onNavigatePath?.("/")} />
+            <p className="sidebar-mission">From signal to verified resolution.</p>
           </div>
 
-          <div className="sidebar-group">
-            <h3>Monitor</h3>
-            <label>
-              Application
-              <select value={applicationToMonitor} onChange={(e) => setApplicationToMonitor(e.target.value)}>
-                {monitorApplications.map((app) => (
-                  <option key={app} value={app}>{monitorScopeLabel(app)}</option>
-                ))}
-              </select>
-            </label>
-            <HealthBadge ok={health.ok} label={health.message} />
-          </div>
-
-          <div className="sidebar-group">
+          <details className="sidebar-group sidebar-preferences">
+            <summary>Display preferences</summary>
             <h3>View Density</h3>
             <div className="density-switch" role="group" aria-label="Density options">
               <button
@@ -13548,50 +9993,100 @@ export default function App() {
                 Dark
               </button>
             </div>
-          </div>
+          </details>
 
-          <div className="sidebar-group">
-            <h3>Sections</h3>
+          <nav className="sidebar-group" aria-label="Primary navigation">
             <div className="sidebar-sections-wrap">
-              <div className="sidebar-sections">
-                {visibleSidebarSections.map((tab) => (
-                  <button
-                    key={`sidebar-${tab.id}`}
-                    type="button"
-                    className={`sidebar-section ${activeTab === tab.id ? "active" : ""}`}
-                    onClick={() => openSection(tab.id)}
-                    title={tab.label}
-                  >
-                    <span className={`sidebar-icon sidebar-icon-${tab.tone || "ops"}`} aria-hidden="true">{tab.icon}</span>
-                    <span>{tab.shortLabel}</span>
-                  </button>
-                ))}
+              <div className="sidebar-navigation-groups">
+                {navigationGroups.map((group) => <div className={`sidebar-navigation-group sidebar-navigation-group-${group.id}`} key={group.id}>
+                  <h3>{group.label}</h3>
+                  <div className="sidebar-sections">
+                    {group.items.map((item) => {
+                      const SidebarIcon = NAVIGATION_ICONS[item.icon] || Database;
+                      return <button
+                        key={`sidebar-${item.id}`}
+                        type="button"
+                        className={`sidebar-section ${currentPath === item.path ? "active" : ""}`}
+                        onClick={() => openNavigationItem(item)}
+                        title={item.label}
+                        aria-current={currentPath === item.path ? "page" : undefined}
+                      >
+                        <span className={`sidebar-icon sidebar-icon-${item.group}`} aria-hidden="true"><SidebarIcon /></span>
+                        <span>{item.label}</span>
+                      </button>;
+                    })}
+                  </div>
+                </div>)}
               </div>
             </div>
-          </div>
+          </nav>
 
-          <div className="sidebar-group compact-tools">
-            <button className="button-secondary" onClick={refreshAll}>Refresh</button>
-            <button className="button-secondary" onClick={checkHealth} disabled={health.loading}>
-              {health.loading ? "Checking..." : "Health"}
-            </button>
-          </div>
-        </aside>
+        </aside> : null}
 
-        <section className="content-area">
+        <section className="content-area" id="legacy-workspace-content" tabIndex={-1}>
           <header className="hero">
-            <p className="eyebrow">KaiMS</p>
-            <h1>Operational Workspace</h1>
-            <p className="subtitle">Business-level view of reliability, risk, and cost.</p>
+            <nav className="route-breadcrumbs" aria-label="Breadcrumb">
+              {currentBreadcrumb.map((item, index) => <span key={`${item.label}-${index}`}>
+                {index ? <span aria-hidden="true">/</span> : null}{item.label}
+              </span>)}
+            </nav>
+            <h1>{currentNavigationItem.pageTitle}</h1>
+            <p className="subtitle">{currentNavigationItem.description}</p>
+            {restrictedDestination ? <div className="permission-navigation-notice" role="status">{restrictedDestination} is not available to your current role. Ask an administrator if your responsibilities require access.</div> : null}
+            <label className="mobile-navigation">
+              <span>Navigate to</span>
+              <select value={currentNavigationItem.path} onChange={(event) => {
+                const item = navigationGroups.flatMap((group) => group.items).find((candidate) => candidate.path === event.target.value);
+                if (item) openNavigationItem(item);
+              }}>
+                {navigationGroups.map((group) => <optgroup key={group.id} label={group.label}>{group.items.map((item) => <option key={item.id} value={item.path}>{item.label}</option>)}</optgroup>)}
+              </select>
+            </label>
             <div className="hero-actions">
               <HealthBadge ok={health.ok} label={health.message} />
-              <span className="subtitle">Monitoring: {selectedMonitorScopeLabel}</span>
-              <span className="subtitle">Signed in: {adminSession?.user?.username || "-"} ({adminSession?.user?.role_name || "-"})</span>
+              <span className="hero-user" title={`Signed in as ${adminSession?.user?.username || "-"}`}>{adminSession?.user?.username || "-"} · {adminSession?.user?.role_name || "-"}</span>
+              <KaiCommandPalette role={currentRole} onNavigate={(path) => onNavigatePath?.(path)} />
+              <button className="button-primary" type="button" onClick={() => setIsCopilotOpen(!isCopilotOpen)}>
+                <Bot size={16} /> {isCopilotOpen ? "Close KAI" : "Ask KAI"}
+              </button>
               <button className="button-secondary" type="button" onClick={adminLogout}>Logout</button>
             </div>
+            {currentNavigationItem.related?.length ? <nav className="contextual-navigation" aria-label="Related workflow destinations">
+              <span>Continue workflow:</span>
+              {currentNavigationItem.related.map((relatedId) => {
+                const item = navigationGroups.flatMap((group) => group.items).find((candidate) => candidate.id === relatedId);
+                return item ? <button className="button-secondary" type="button" key={item.id} onClick={() => openNavigationItem(item)}>{item.label}</button> : null;
+              })}
+            </nav> : null}
           </header>
 
-          <section className="report-banner panel">
+          <details className="global-operations-bar panel" aria-label="Global operational capabilities">
+            <summary className="global-operations-summary"><span>Search &amp; personal work</span><small>Find records, assignments, and notifications</small></summary>
+            <div className="global-operations-body">
+            <div className="global-operations-tabs" role="tablist" aria-label="Global operations">
+              {[['search', 'Search'], ['work', `My Work (${globalOperationalData.myWork.length})`], ['notifications', `Notifications (${globalOperationalData.notifications.length})`]].map(([id, label]) => (
+                <button key={id} type="button" role="tab" aria-selected={globalOperationsView === id} className={globalOperationsView === id ? "active" : ""} onClick={() => setGlobalOperationsView(id)}>{label}</button>
+              ))}
+            </div>
+            {globalOperationsView === "search" ? <div className="global-search-workspace">
+              <label><span>Global search</span><input type="search" value={globalOperationsQuery} onChange={(event) => setGlobalOperationsQuery(event.target.value)} placeholder="Alert, incident, application, service, or ticket ID" /></label>
+              {globalOperationsQuery ? <div className="global-operations-results" role="list" aria-label="Global search results">
+                {globalOperationalData.results.length ? globalOperationalData.results.map((item, index) => <button type="button" role="listitem" key={`${item.kind}-${item.label}-${index}`} onClick={() => openGlobalOperationalItem(item)}><strong>{item.kind}: {item.label}</strong><span>{item.meta}</span></button>) : <p>No matching loaded operational records.</p>}
+              </div> : <p className="subtitle">Searches currently loaded, role-authorized operational records.</p>}
+            </div> : null}
+            {globalOperationsView === "work" ? <div className="global-work-list">
+              {globalOperationalData.myWork.length ? globalOperationalData.myWork.slice(0, 12).map((item, index) => <button type="button" key={`${item.kind}-${item.label}-${index}`} onClick={() => openGlobalOperationalItem(item)}><span className="workflow-pill workflow-pill-idle">{item.kind}</span><strong>{item.label}</strong><small>{item.meta}</small></button>) : <p>No assigned incidents, pending approvals, or failed actions in the loaded scope.</p>}
+              <aside className="unsupported-collaboration"><strong>Collaboration unavailable</strong><span>Notes, mentions, and watchers need an authenticated backend collaboration contract. No local-only success is shown.</span><button type="button" disabled title="Backend collaboration API is not available">Add note / watcher unavailable</button></aside>
+            </div> : null}
+            {globalOperationsView === "notifications" ? <div className="global-notification-workspace">
+              <p className="subtitle">Operational signals derived from current alerts and incidents; this is not a delivery receipt inbox.</p>
+              <div className="global-work-list">{globalOperationalData.notifications.length ? globalOperationalData.notifications.map((item, index) => <button type="button" key={`${item.kind}-${item.label}-${index}`} onClick={() => openGlobalOperationalItem(item)}><span className="workflow-pill workflow-pill-idle">{item.kind}</span><strong>{item.label}</strong><small>{item.meta}</small></button>) : <p>No current operational signals.</p>}</div>
+              <aside className="unsupported-collaboration"><strong>Delivery preferences unavailable</strong><span>Severity/application subscriptions, email, Slack/Teams, quiet hours, maintenance windows, grouping, and reminder preferences need durable per-user backend contracts.</span><button type="button" disabled title="Notification preference API is not available">Configure delivery unavailable</button></aside>
+            </div> : null}
+            </div>
+          </details>
+
+          {!routeOutlet && activeTab !== "home" ? <section className="report-banner panel">
             <div className="panel-head">
               <div>
                 <h2>{reportConfig.title}</h2>
@@ -13634,152 +10129,271 @@ export default function App() {
                 </button>
               </div>
             ) : null}
-          </section>
+          </section> : null}
 
-          {activeTab === "stream" ? (
-            <section className="grid single-col ingestion-stream-page">
-              <article className="ingestion-stream-hero">
-                <div>
-                  <span className="discovery-eyebrow">Live multi-source intake</span>
-                  <h2>Alert Ingestion Stream</h2>
-                  <p>Email, logs, Prometheus, Telemetry, and ticketing events as they land in KaiOps.</p>
-                </div>
-                <div className="ingestion-live-state">
-                  <span className={`ingestion-live-dot ${landingPadRecent.loading ? "is-loading" : ""}`} aria-hidden="true" />
+          <RouteRuntimeProvider value={{
+            session: { accessToken: String(adminSession.accessToken || ""), username: String(adminSession?.user?.username || "operator") },
+            dashboard: {
+              role: roleDashboard,
+              allowedTabs,
+              projects: monitoringApps.rows || [],
+              observedProjects: monitorApplications,
+              selectedProject: String(applicationToMonitor || ""),
+              workflow: workflowGuide,
+              openSection,
+              refreshProjects: () => Promise.allSettled([loadMonitorApplications(), loadMonitoringApplications(), checkQueueHealth(), loadIncidentMetadata({ background: true })]),
+              selectProject: setApplicationToMonitor,
+            },
+            copilot: {
+              isAdministrator,
+              projectCount: onboardingState.rows.length,
+              alertDocumentCount: ragDocs.rows.length,
+              userCount: adminUsers.rows.length,
+              platformReady: health.ok,
+              openWorkspace: openCopilotWorkspace,
+              openIncidentMetadata: () => {
+                setActiveTab("summary");
+                onNavigatePath?.("/incidents");
+              },
+              refresh: refreshAll,
+            },
+            closed: {
+              rows: filteredClosedRows,
+              risk: closedFilters.risk,
+              mode: closedFilters.mode,
+              riskOptions: closedRiskOptions,
+              modeOptions: closedModeOptions,
+              loading: closedIncidents.loading,
+              error: closedIncidents.error || "",
+              refresh: loadClosedIncidents,
+              setRisk: (risk) => setClosedFilters((current) => ({ ...current, risk })),
+              setMode: (mode) => setClosedFilters((current) => ({ ...current, mode })),
+            },
+            agentFlow: {
+              workflowRows: workflowEventRows,
+              gatewayRows: gatewayRecent.rows,
+              gatewayLoading: gatewayRecent.loading,
+              gatewayError: gatewayRecent.error || "",
+              workflowResult: workflowState.result,
+            },
+            safety: {
+              summary: gatewaySummary.data,
+              summaryError: gatewaySummary.error || "",
+              events: gatewayRecent.rows,
+              landingRows: landingPadRecent.rows,
+              landingError: landingPadRecent.error || "",
+              refresh: () => { loadGatewaySummary(); loadGatewayRecent(); loadLandingPadRecent(); },
+            },
+            knowledge: {
+              actual: messageBusActual,
+              configuredRows: messageBusTopicRows,
+              routing: observedRouting,
+              primaryTopic: onboardingForm.azure_service_bus_topic,
+              application: applicationToMonitor,
+              providers: selectedModelProviderRows,
+              providersLoading: modelProviderStatus.loading,
+              providersError: modelProviderStatus.error || "",
+              refreshProviders: loadModelProviderStatus,
+              refresh: () => Promise.allSettled([
+                loadGatewayRecent(),
+                selectedAlertId
+                  ? loadAlertDetails(selectedAlertId, selectedAlertRow, { background: true })
+                  : loadRecentAlerts({ background: true }),
+              ]),
+            },
+            incidents: {
+              // Keep the inbox aligned with the same production/test and
+              // application scope used by Live Alerts.
+              rows: monitorScopedIncidentMetadata,
+              page: incidentMetadata.page || {},
+              loading: incidentMetadata.loading,
+              error: incidentMetadata.error || "",
+              application: applicationToMonitor,
+              filters: metadataFilters,
+              refresh: loadIncidentMetadata,
+              loadPage: (cursor = "") => loadIncidentMetadata({ cursor, limit: 10 }),
+              updateFilter: (name, value) => setMetadataFilters((current) => ({ ...current, [name]: value })),
+              open: (row) => {
+                const path = durableIncidentPath(row);
+                if (path && typeof onNavigatePath === "function") {
+                  onNavigatePath(path);
+                  return;
+                }
+              },
+              openTechnical: (row, stage = "overview") => openAlertDetailsFromIncident(row, stage),
+            },
+            alerts: {
+              loading: landingPadRecent.loading,
+              error: landingPadRecent.error || "",
+              paused: ingestionStreamPaused,
+              liveState: liveEvents.state,
+              lastEventAt: liveEvents.lastEventAt,
+              rows: visibleIngestionStreamRows, inboxRows: applicationScopedIngestionStreamRows,
+              totalRows: applicationScopedIngestionStreamRows.length,
+              project: selectedMonitorScopeLabel,
+              updatedAt: ingestionStreamUpdatedAt,
+              section: ingestionStreamSection,
+              view: ingestionStreamView,
+              savedViews: INGESTION_SAVED_VIEWS,
+              filters: ingestionStreamFilters,
+              filterOptions: ingestionFilterOptions,
+              density: uiDensity,
+              counts: ingestionStreamCounts,
+              channel: ingestionStreamChannel,
+              query: ingestionStreamQuery,
+              refresh: () => { loadRecentAlerts({ background: true }); loadLandingPadRecent(); },
+              open: openAlertDetails,
+              openIncident: (row) => {
+                const path = durableIncidentPath(row);
+                if (path && typeof onNavigatePath === "function") onNavigatePath(path);
+              },
+              togglePaused: () => setIngestionStreamPaused((current) => !current),
+              setSection: setIngestionStreamSection,
+              setView: setIngestionStreamView,
+              applyView: applyIngestionSavedView,
+              updateFilter: (name, value) => setIngestionStreamFilters((current) => ({ ...current, [name]: value })),
+              setDensity: setUiDensity,
+              setChannel: setIngestionStreamChannel,
+              setQuery: setIngestionStreamQuery,
+            },
+            executive: {
+              statCards: [
+                { label: "Open Alerts", value: monitorScopedAlerts.length },
+                { label: "Total Requests", value: executiveMetrics.totalRequests },
+                { label: "Failures", value: executiveMetrics.failedRequests },
+                { label: "P95 Latency", value: `${executiveMetrics.p95LatencyMs.toFixed(1)} ms` },
+                { label: "Closed Tickets", value: executiveClosedSummary.total },
+                { label: "Closure Rate", value: `${executiveClosedSummary.closureRate.toFixed(1)}%` },
+                { label: "Pending Approvals", value: pendingApprovals.length },
+                { label: "SLA At Risk", value: executiveInsights.slaAtRisk },
+                { label: "Avg Approval Wait", value: `${executiveInsights.avgApprovalWaitMinutes.toFixed(1)} min` },
+                { label: "Auto Remediation", value: `${executiveInsights.automationRate.toFixed(1)}%` },
+                { label: "LLM Cost", value: `$${executiveMetrics.finopsCost.toFixed(6)}` },
+              ],
+              requestChart: [{ label: "Total", value: executiveMetrics.totalRequests, tone: "meta" }, { label: "Success", value: executiveMetrics.successRequests, tone: "ops" }, { label: "Failure", value: executiveMetrics.failedRequests, tone: "risk" }],
+              successRequests: executiveMetrics.successRequests,
+              failedRequests: executiveMetrics.failedRequests,
+              latencyChart: executiveMetrics.latencyTrend,
+              latencySubtitle: `Avg ${executiveMetrics.avgLatencyMs.toFixed(1)} ms | P95 ${executiveMetrics.p95LatencyMs.toFixed(1)} ms`,
+              finopsChart: [{ label: "Model Calls", value: executiveMetrics.finopsCalls, tone: "meta" }, { label: "Tokens", value: executiveMetrics.finopsTokens, tone: "cost" }, { label: "Cost USD", value: executiveMetrics.finopsCost, displayValue: `$${executiveMetrics.finopsCost.toFixed(6)}`, tone: "bus" }],
+              riskChart: executiveClosedSummary.riskItems,
+              modeChart: executiveClosedSummary.modeItems,
+              weeklyOpenChart: executiveInsights.weeklyOpenTrend,
+              weeklyClosedChart: executiveInsights.weeklyClosedTrend,
+              workflowStages: selectedWorkflowFlowStages,
+              serviceFlow: SERVICE_TOPIC_FLOW,
+              finopsRows: finopsByProvider,
+              slaAtRisk: executiveInsights.slaAtRisk,
+              approvalWaitMinutes: executiveInsights.avgApprovalWaitMinutes,
+              automationRate: executiveInsights.automationRate,
+              incidents: monitorScopedIncidentMetadata,
+              recentlyClosed: executiveClosedSummary.recentRows,
+              application: applicationToMonitor,
+              openIncident: (row) => { const path = durableIncidentPath(row); if (path && typeof onNavigatePath === "function") onNavigatePath(path); },
+            },
+            approvals: {
+              guidanceQuery,
+              guidanceRows: guidanceState.rows,
+              guidanceLoading: guidanceState.loading,
+              guidanceError: guidanceState.error || "",
+              filter: approvalFilter,
+              rows: filteredPendingApprovals,
+              selectedIncidentId: selectedApprovalIncidentId,
+              selectedRecommendationId: selectedApprovalRecommendationId,
+              selectedFlowContext: selectedApprovalFlowContext,
+              latestIncidentId,
+              contextLoading: approvalIncidentContext.loading,
+              contextError: approvalIncidentContext.error || "",
+              contextPayload: approvalIncidentContext.incident_id === selectedApprovalIncidentId
+                ? approvalIncidentContext.payload
+                : null,
+              showAdvanced: showAdvancedApprovalForm,
+              form: approvalForm,
+              ready: approvalReady,
+              actionLoading: approvalState.loading,
+              actionError: approvalState.error || "",
+              actionResult: approvalState.result,
+              inlineReject: inlineRejectState,
+              setGuidanceQuery,
+              searchGuidance: searchGuidanceDocs,
+              setFilter: setApprovalFilter,
+              incidentId: approvalIncidentId,
+              recommendationId: approvalRecommendationId,
+              select: selectApprovalIncident,
+              open: openAlertDetailsFromIncident,
+              approve: (row) => approveIncidentRow(row, "execution"),
+              approveDryRun: (row) => approveIncidentRow(row, "dry_run"),
+              approveExecution: (row) => approveIncidentRow(row, "execution"),
+              requestEvidence: requestMoreEvidence,
+              toggleReject: (incidentId) => { setApprovalState({ loading: false, result: null, error: "" }); setInlineRejectState((current) => current.incidentId === incidentId ? { incidentId: "", comment: "" } : { incidentId, comment: "" }); },
+              setRejectComment: (incidentId, comment) => setInlineRejectState({ incidentId, comment }),
+              reject: rejectIncidentRow,
+              refresh: () => loadIncidentMetadata({ background: true, ignoreFilters: true }),
+              openIncidents: () => setActiveTab("summary"),
+              openAgentFlow: () => setActiveTab("trace"),
+              sync: () => selectedApprovalIncidentId && loadApprovalIncidentContext(selectedApprovalIncidentId, { force: true }),
+              toggleAdvanced: () => setShowAdvancedApprovalForm((current) => !current),
+              updateForm: (name, value) => setApprovalForm((current) => ({ ...current, [name]: value })),
+              submit: submitApproval,
+            },
+            admin: {
+              sessionUser: adminSession.user,
+              sessionError: adminSession.error || "",
+              authenticated: Boolean(adminSession.accessToken),
+              users: adminUsers.rows,
+              roles: adminRoles,
+              loading: adminUsers.loading,
+              error: adminUsers.error || "",
+              createForm: adminCreateUser,
+              editForm: adminEditUser,
+              resetUserId: adminResetPasswordForm.user_id,
+              resetPassword: adminResetPasswordForm.new_password,
+              refresh: loadAdminUsersAndRoles,
+              selectUser: selectAdminUserForEdit,
+              updateCreate: (name, value) => setAdminCreateUser((current) => ({ ...current, [name]: value })),
+              updateEdit: (name, value) => setAdminEditUser((current) => ({ ...current, [name]: value })),
+              setResetPassword: (new_password) => setAdminResetPasswordForm((current) => ({ ...current, new_password })),
+              create: createAdminUser,
+              update: updateAdminUser,
+              reset: resetAdminUserPassword,
+            },
+          }}>
+            <div className={`workspace-with-copilot ${isCopilotOpen ? "copilot-open" : ""}`}>
+              <div className="workspace-main-content">
+                {currentSearch.includes("workspace=alert") ? null : routeOutlet}
+                {activeTab === "home" && (!routeOutlet || currentSearch.includes("workspace=alert")) ? (
+                  <section className={`grid single-col ${routeOutlet ? "legacy-dashboard-cockpit" : ""}`}>
+                    <article className={`panel role-dashboard role-dashboard-${roleDashboard.kind.toLowerCase()}`}>
+                <div className="panel-head role-dashboard-header">
                   <div>
-                    <strong>{landingPadRecent.loading ? "Syncing now" : "Live · 10s refresh"}</strong>
-                    <small>{visibleIngestionStreamRows.length} of {ingestionStreamRows.length} arrivals shown</small>
+                    <span className="discovery-eyebrow">{roleDashboard.kind} dashboard</span>
+                    <h2>{roleDashboard.title}</h2>
+                    <p>{roleDashboard.description}</p>
                   </div>
-                  <button type="button" className="button-secondary" onClick={loadLandingPadRecent} disabled={landingPadRecent.loading}>
-                    {landingPadRecent.loading ? "Refreshing..." : "Refresh now"}
-                  </button>
-                </div>
-              </article>
-
-              <div className="ingestion-channel-grid" aria-label="Alert source counts">
-                {[
-                  ["all", "ALL", "All arrivals", ingestionStreamCounts.all],
-                  ["prometheus", "PR", "Prometheus", ingestionStreamCounts.prometheus],
-                  ["telemetry", "OT", "Telemetry", ingestionStreamCounts.telemetry],
-                  ["email", "EM", "Email", ingestionStreamCounts.email],
-                  ["log", "LG", "Logs / OpenSearch", ingestionStreamCounts.log],
-                  ["ticket", "TK", "Tickets / Jira", ingestionStreamCounts.ticket],
-                  ["failed", "!", "Failed intake", ingestionStreamCounts.failed],
-                ].map(([channel, icon, label, count]) => (
-                  <button
-                    type="button"
-                    key={`stream-channel-${channel}`}
-                    className={`ingestion-channel-card channel-${channel} ${ingestionStreamChannel === channel ? "is-active" : ""}`}
-                    onClick={() => setIngestionStreamChannel(channel)}
-                    aria-pressed={ingestionStreamChannel === channel}
-                  >
-                    <span>{icon}</span>
-                    <div><strong>{count}</strong><small>{label}</small></div>
-                  </button>
-                ))}
-              </div>
-
-              <article className="panel ingestion-stream-panel">
-                <div className="ingestion-stream-toolbar">
-                  <div>
-                    <span className="discovery-eyebrow">Landing-pad events</span>
-                    <h3>
-                      {ingestionStreamChannel === "all"
-                        ? "All source activity"
-                        : ingestionStreamChannel === "failed"
-                          ? "Failed ingestion activity"
-                          : `${sourceChannelLabel(ingestionStreamChannel)} activity`}
-                    </h3>
+                  <div className="role-dashboard-window">
+                    <span>{roleDashboard.period}</span>
+                    <strong>{roleDashboard.timezone}</strong>
+                    <span className={`workflow-pill ${roleDashboard.partial ? "workflow-pill-idle" : roleDashboard.refreshing ? "workflow-pill-active" : "workflow-pill-clear"}`}>
+                      {roleDashboard.partial ? "partial data" : roleDashboard.refreshing ? "refreshing" : "current data"}
+                    </span>
                   </div>
-                  <label>
-                    <span>Search stream</span>
-                    <input
-                      value={ingestionStreamQuery}
-                      onChange={(event) => setIngestionStreamQuery(event.target.value)}
-                      placeholder="Alert, service, project, source, file"
-                    />
-                  </label>
                 </div>
-                {landingPadRecent.error ? <p className="error">{landingPadRecent.error}</p> : null}
-                <div className="ingestion-stream-list">
-                  {visibleIngestionStreamRows.map((row, index) => {
-                    const channel = row.source_channel || "prometheus";
-                    const failed = String(row.status || "").toLowerCase() === "failed" || Boolean(row.error);
-                    return (
-                      <article className={`ingestion-event channel-${channel} ${failed ? "is-failed" : ""}`} key={`${row.file || row.id || "arrival"}-${index}`}>
-                        <div className="ingestion-event-marker">
-                          <span>{channel === "email" ? "EM" : channel === "log" ? "LG" : channel === "ticket" ? "TK" : channel === "telemetry" ? "OT" : "PR"}</span>
-                          <i aria-hidden="true" />
-                        </div>
-                        <div className="ingestion-event-main">
-                          <header>
-                            <div>
-                              <strong>{row.name || row.alert_name || "Unnamed alert"}</strong>
-                              <span className={`source-badge source-${channel}`}>{sourceChannelLabel(channel)}</span>
-                              <span className={`pill ${failed ? "status-failed" : statusPillClass(row.status || "processed")}`}>{row.status || "processed"}</span>
-                            </div>
-                            <time>{formatIstTimestamp(row.received_at || row.created_at || row.modified_at)}</time>
-                          </header>
-                          <p>{row.description || row.annotations?.description || row.error || "Alert received and normalized by the landing pad."}</p>
-                          <footer>
-                            <span><b>Service</b>{row.service || "-"}</span>
-                            <span><b>Project</b>{row.application || row.project_name || row.project || "-"}</span>
-                            <span><b>Severity</b>{String(row.severity || "-").toUpperCase()}</span>
-                            <span title={row.file}><b>File</b>{compactText(row.file, 44)}</span>
-                          </footer>
-                          {row.error ? <small className="ingestion-event-error">{row.error}</small> : null}
-                        </div>
-                      </article>
-                    );
+                <div className="role-dashboard-grid">
+                  {roleDashboard.cards.map((card) => {
+                    const accessible = allowedTabs.includes(card.tab);
+                    return <article className={`role-attention-card is-${card.tone}`} key={`${roleDashboard.kind}-${card.label}`}>
+                      <span>{card.label}</span>
+                      <strong>{card.value}</strong>
+                      <p>{card.detail}</p>
+                      <button type="button" className="button-secondary" disabled={!accessible} title={accessible ? `Open ${card.label}` : "This destination is not available to your role"} onClick={() => accessible && openSection(card.tab)}>View records</button>
+                    </article>;
                   })}
-                  {!visibleIngestionStreamRows.length && !landingPadRecent.loading ? (
-                    <div className="ingestion-stream-empty">
-                      <strong>No arrivals match this view.</strong>
-                      <p>Choose another source, clear the search, or verify that its connector is delivering files or webhooks to the landing pad.</p>
-                    </div>
-                  ) : null}
                 </div>
-              </article>
-            </section>
-          ) : null}
-
-          {activeTab === "home" ? (
-            <section className="grid single-col">
-              <article className="panel monitoring-projects-panel">
-                <div className="panel-head">
-                  <div>
-                    <span className="discovery-eyebrow">Monitoring projects</span>
-                    <h2>KaiOps + Telemetry</h2>
-                    <p>Select a project to scope alerts, incidents, discovery evidence, and timeline events.</p>
-                  </div>
-                  <button type="button" className="button-secondary" onClick={loadMonitorApplications}>Refresh Projects</button>
-                </div>
-                <div className="monitoring-project-grid">
-                  {CORE_MONITOR_PROJECTS.map((projectName) => {
-                    const project = (monitoringApps.rows || []).find(
-                      (row) => String(row?.name || "").trim().toLowerCase() === projectName.toLowerCase()
-                    );
-                    const selected = String(applicationToMonitor || "").toLowerCase() === projectName.toLowerCase();
-                    return (
-                      <button
-                        type="button"
-                        className={`monitoring-project-card ${selected ? "is-selected" : ""}`}
-                        key={projectName}
-                        onClick={() => setApplicationToMonitor(projectName)}
-                      >
-                        <span className="monitoring-project-icon">{projectName === "Telemetry" ? "OT" : "KO"}</span>
-                        <span className="monitoring-project-copy">
-                          <strong>{projectName}</strong>
-                          <small>{project?.namespace || (projectName === "Telemetry" ? "telemetry" : "kaiops")} namespace</small>
-                          <code>{project?.metrics_endpoint || (projectName === "Telemetry" ? "Prometheus :19090" : "API Gateway metrics")}</code>
-                        </span>
-                        <span className={`pill ${String(project?.status || "").includes("failed") ? "status-failed" : "status-closed"}`}>
-                          {project?.status || "registered"}
-                        </span>
-                      </button>
-                    );
-                  })}
-                </div>
+                <details className="role-dashboard-definitions">
+                  <summary>Metric definitions and data quality</summary>
+                  <ul>{roleDashboard.cards.map((card) => <li key={`definition-${card.label}`}><strong>{card.label}:</strong> {card.detail}</li>)}</ul>
+                  <p>Counts distinguish currently loaded alerts, incident projections, approval records, workflow events, and closures. They are not interchangeable totals.</p>
+                </details>
               </article>
               <article className="panel workflow-guide-panel">
                 <div className="panel-head">
@@ -13811,8 +10425,10 @@ export default function App() {
                       <option value={25}>25</option>
                       <option value={50}>50</option>
                       <option value={100}>100</option>
+                      {/* Fetch is hard-capped at 200 (sourceBalancedFetchLimit
+                          in loadRecentAlerts) regardless of this selection —
+                          don't offer a value the backend call can't honor. */}
                       <option value={200}>200</option>
-                      <option value={500}>500</option>
                     </select>
                     alerts
                   </label>
@@ -13823,7 +10439,7 @@ export default function App() {
                 {alerts.error ? <p className="error">{alerts.error}</p> : null}
                 {alertSeverityOverrides.error ? <p className="error">{alertSeverityOverrides.error}</p> : null}
                 <div className="dashboard-alert-toolbar">
-                  <div className="dashboard-alert-focus" role="tablist" aria-label="Alert triage focus">
+                  <div className="dashboard-alert-focus" role="group" aria-label="Alert triage focus">
                     <button type="button" className={`dashboard-focus-chip ${dashboardAlertFocus === "ops" ? "active" : ""}`} onClick={() => setDashboardAlertFocus("ops")}>Ops {dashboardAlertSummary.ops}</button>
                     <button type="button" className={`dashboard-focus-chip ${dashboardAlertFocus === "all" ? "active" : ""}`} onClick={() => setDashboardAlertFocus("all")}>All {dashboardAlertSummary.total}</button>
                     <button type="button" className={`dashboard-focus-chip ${dashboardAlertFocus === "critical" ? "active" : ""}`} onClick={() => setDashboardAlertFocus("critical")}>Critical {dashboardAlertSummary.critical}</button>
@@ -13846,173 +10462,74 @@ export default function App() {
                 </div>
                 <p className="subtitle">
                   Showing {dashboardVisibleAlerts.length} of {visibleAlerts.length} alerts for {selectedMonitorScopeLabel}.
+                  {dashboardAlertSource !== "all" ? ` Source filter: ${sourceChannelLabel(dashboardAlertSource)}.` : ""}
                   {dashboardAlertFocus === "ops" && dashboardAlertSummary.test > 0 ? ` ${dashboardAlertSummary.test} smoke/stress alerts are hidden in Ops view.` : ""}
                   {monitorScopedRecentClosedAlerts.length > 0 ? ` Includes ${monitorScopedRecentClosedAlerts.length} recent closed incident(s).` : ""}
                 </p>
-                <div className="alert-source-breakdown" aria-label="Alert source visibility">
-                  <span className="source-badge source-prometheus">Prometheus {visibleAlertSourceSummary.prometheus}</span>
-                  <span className="source-badge source-telemetry">Telemetry {visibleAlertSourceSummary.telemetry}</span>
-                  <span className="source-badge source-email">Email {visibleAlertSourceSummary.email}</span>
-                  <span className="source-badge source-ticket">Ticket {visibleAlertSourceSummary.ticket}</span>
-                  <span className="source-badge source-log">Logs {visibleAlertSourceSummary.log}</span>
+                <div className="alert-source-breakdown" role="group" aria-label="Filter dashboard alerts by source">
+                  {[
+                    ["all", "All", visibleAlerts.length],
+                    ["prometheus", "Prometheus", visibleAlertSourceSummary.prometheus],
+                    ["telemetry", "Telemetry", visibleAlertSourceSummary.telemetry],
+                    ["email", "Email", visibleAlertSourceSummary.email],
+                    ["ticket", "Ticket", visibleAlertSourceSummary.ticket],
+                    ["log", "Logs", visibleAlertSourceSummary.log],
+                  ].map(([channel, label, count]) => (
+                    <button
+                      type="button"
+                      key={`dashboard-source-${channel}`}
+                      className={`source-badge source-filter source-${channel} ${dashboardAlertSource === channel ? "is-active" : ""}`}
+                      onClick={() => setDashboardAlertSource((current) => current === channel && channel !== "all" ? "all" : channel)}
+                      aria-pressed={dashboardAlertSource === channel}
+                    >
+                      {label} {count}
+                    </button>
+                  ))}
                 </div>
                 {canManageSeverityOverride ? (
                   <p className="subtitle">L2/L3/Admin can set future severity overrides by alert name + service + environment.</p>
                 ) : null}
-                <div className="table-wrap table-wrap-scroll-x alert-stream-wrap">
-                  <table className="alert-stream-table">
-                    <thead>
-                      <tr>
-                        <th>Alert ID</th>
-                        <th>Time (UTC)</th>
-                        <th className="alert-name-col">Name</th>
-                        <th>Rule</th>
-                        <th>Application</th>
-                        <th>Service</th>
-                        <th>Source</th>
-                        <th>Severity</th>
-                        <th>Tier</th>
-                        <th>Status</th>
-                        <th>Action</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {dashboardVisibleAlerts.map((row, index) => {
-                        const rowId = String(row.alert_id || row.id || row.incident_id || index);
-                        const fullAlertId = String(row.alert_id || row.id || row.incident_id || "-");
-                        const compactAlertId = fullAlertId.length > 16 ? `${fullAlertId.slice(0, 8)}...${fullAlertId.slice(-6)}` : fullAlertId;
-                        const severity = String(row.severity || "-").toUpperCase();
-                        const supportTier = String(row.labels?.support_tier || "-");
-                        const status = String(row.status || row.state || "open");
-                        const application = row.application || row.project_name || row.project || row.service || "-";
-                        const sourceChannels = Array.isArray(row?.source_channels) && row.source_channels.length
-                          ? row.source_channels
-                          : [normalizeAlertChannel(row)];
-                        const alertRuleName = String(
-                          row.rule_name
-                          || row.rule
-                          || row.alert_rule
-                          || row.labels?.alertname
-                          || row.name
-                          || row.alert_name
-                          || "-"
-                        ).trim();
-                        return (
-                          <tr
-                            key={rowId}
-                            className={`alert-row ${selectedAlertId === rowId ? "row-selected" : ""}`}
-                            onClick={() => openAlertDetails(row)}
-                            onKeyDown={(event) => {
-                              if (event.key === "Enter" || event.key === " ") {
-                                event.preventDefault();
-                                openAlertDetails(row);
-                              }
-                            }}
-                            tabIndex={0}
-                            role="button"
-                            aria-label={`Open alert ${rowId}`}
-                          >
-                            <td title={fullAlertId}>{compactAlertId}</td>
-                            <td>{formatUtcTimestamp(row.created_at || row.starts_at || row.closed_at)}</td>
-                            <td className="alert-name-col">{row.name || row.alert_name || "-"}</td>
-                            <td title={String(row.expression || row.expr || row.query || row.description || row.annotations?.description || "").trim()}>{alertRuleName}</td>
-                            <td>{application}</td>
-                            <td>{row.service || "-"}</td>
-                            <td>
-                              <div className="alert-source-chips">
-                                {sourceChannels.map((sourceChannel) => {
-                                  const sourceKey = String(sourceChannel || "").toLowerCase();
-                                  return (
-                                    <span key={`${rowId}-${sourceKey}`} className={`source-badge source-${sourceKey}`}>
-                                      {sourceChannelLabel(sourceKey)}
-                                    </span>
-                                  );
-                                })}
-                              </div>
-                            </td>
-                            <td><span className={`pill severity-${severity.toLowerCase()}`}>{severity}</span></td>
-                            <td><span className={`pill tier-${supportTier.toLowerCase().replace("/", "-")}`}>{supportTier}</span></td>
-                            <td><span className={`pill status-${status.toLowerCase()}`}>{status}</span></td>
-                            <td>
-                              <button
-                                type="button"
-                                className="button-secondary"
-                                onClick={(event) => {
-                                  event.stopPropagation();
-                                  openAlertDetails(row);
-                                }}
-                              >
-                                Inspect
-                              </button>
-                            </td>
-                          </tr>
-                        );
-                      })}
-                      {!dashboardVisibleAlerts.length && !alerts.loading ? (
-                        <tr>
-                          <td colSpan={10}>No alerts match current filters for {selectedMonitorScopeLabel}.</td>
-                        </tr>
-                      ) : null}
-                    </tbody>
-                  </table>
-                </div>
+                <AlertStreamTable
+                  rows={dashboardVisibleAlerts}
+                  loading={alerts.loading}
+                  selectedAlertId={selectedAlertId}
+                  onSelectAlert={openAlertDetails}
+                  scopeLabel={selectedMonitorScopeLabel}
+                />
               </article>
 
-              {selectedAlertRow ? (
-                <article className="panel">
-                  <div className="panel-head">
-                    <h3>Guided Incident Cockpit</h3>
-                    <p>Selected alert actions, evidence, documents, approval, and remediation stay in one workspace.</p>
+              {selectedAlertRow && !routeOutlet ? (
+                <article className="panel guided-cockpit-launcher">
+                  <header className="guided-cockpit-header">
+                    <div>
+                      <span className="discovery-eyebrow">Guided Incident Cockpit</span>
+                      <h2>{String(selectedAlertRow?.name || selectedAlertRow?.alert_name || "Selected alert")}</h2>
+                      <p>{selectedAlertRuleSummary.summary || "Investigate the alert, confirm evidence, decide, execute, and validate recovery."}</p>
+                    </div>
+                    <div className="guided-cockpit-badges">
+                      <span className={`pill severity-${String(selectedAlertRow?.severity || "unknown").toLowerCase()}`}>{String(selectedAlertRow?.severity || "unknown").toUpperCase()}</span>
+                      <span className={`pill ${statusPillClass(selectedCanonicalIncidentStatus)}`}>{incidentStatusLabel(selectedCanonicalIncidentStatus)}</span>
+                    </div>
+                  </header>
+                  <div className="guided-cockpit-summary">
+                    <span><small>Service</small><strong>{selectedAlertRow?.service || "-"}</strong></span>
+                    <span><small>Environment</small><strong>{selectedAlertRow?.environment || "-"}</strong></span>
+                    <span><small>Evidence</small><strong>{selectedAlertRagDocuments.length} linked</strong></span>
+                    <span><small>Grounding</small><strong>{formatQualityPercent(selectedAlertEvaluation.groundingScore)}</strong></span>
                   </div>
-                  <div className="filter-grid">
-                    <label>Alert
-                      <input value={String(selectedAlertRow?.name || selectedAlertRow?.alert_name || "-")} readOnly />
-                    </label>
-                    <label>Service
-                      <input value={String(selectedAlertRow?.service || "-")} readOnly />
-                    </label>
-                    <label>Status
-                      <input value={selectedCanonicalIncidentStatus} readOnly />
-                    </label>
-                    <label>Current Severity
-                      <input value={String(selectedAlertRow?.severity || "-").toUpperCase()} readOnly />
-                    </label>
-                  </div>
-                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
-                    <button type="button" className="button-primary" onClick={() => openAlertDetails(selectedAlertRow)}>Inspect Cockpit</button>
-                    <span className="cockpit-action-note">
-                      Evidence, documents, approval, remediation, and timeline are inside the cockpit.
-                    </span>
-                  </div>
-                  <div className="alert-rule-summary-grid">
-                    <article className="alert-rule-summary-card">
-                      <span>Raised By Rule{selectedAlertRuleSummary.rules.length > 1 ? "s" : ""}</span>
-                      <strong>{selectedAlertRuleSummary.rules.length} matched rule{selectedAlertRuleSummary.rules.length === 1 ? "" : "s"}</strong>
-                      <div className="alert-rule-match-list">
-                        {selectedAlertRuleSummary.rules.map((rule, index) => (
-                          <div key={`selected-alert-rule-${index}-${rule.name}`}>
-                            <b>{index + 1}. {rule.name}</b>
-                            <small>{rule.expression || "Expression was not included in the event payload."}</small>
-                          </div>
-                        ))}
-                      </div>
-                    </article>
-                    <article className="alert-rule-summary-card">
-                      <span>Rule Source</span>
-                      <strong>{selectedAlertRuleSummary.source}</strong>
-                      <small>{selectedAlertRuleSummary.note}</small>
-                    </article>
-                    <article className="alert-rule-summary-card">
-                      <span>Rule Severity</span>
-                      <strong>{selectedAlertRuleSummary.severity.toUpperCase()}</strong>
-                      <small>This rule context stays visible beside the live remediation actions.</small>
-                    </article>
-                    <article className="alert-rule-summary-card">
-                      <span>Incident Summary</span>
-                      <strong>{selectedAlertRuleSummary.ruleName}</strong>
-                      <small>{selectedAlertRuleSummary.summary}</small>
-                    </article>
-                  </div>
+                  <section className="guided-cockpit-next" aria-labelledby="guided-next-action">
+                    <div><span className="eyebrow">Recommended next step</span><h3 id="guided-next-action">{cockpitRecommended.label}</h3><p>{cockpitRecommended.description}. KaiMS will keep your selected incident and context in view.</p></div>
+                    <button type="button" className="button-primary" onClick={() => { openAlertDetails(selectedAlertRow); setHomeDetailTab(cockpitRecommendedStage); }}>Continue to {cockpitRecommended.label}</button>
+                  </section>
+                  <nav className="guided-cockpit-mini-journey" aria-label="Incident progress">
+                    {incidentCockpitStages.map((stage) => <button key={`launcher-${stage.id}`} type="button" className={stage.complete ? "is-complete" : stage.id === cockpitRecommendedStage ? "is-current" : ""} onClick={() => { openAlertDetails(selectedAlertRow); setHomeDetailTab(stage.id); }}><span>{stage.complete ? <CircleCheckBig size={14} strokeWidth={2.5} aria-hidden="true" /> : stage.short}</span><strong>{stage.label}</strong></button>)}
+                  </nav>
+                  <details className="k-technical-details guided-cockpit-context">
+                    <summary>Rule context and severity controls</summary>
+                    <div className="alert-rule-summary-grid">
+                      <article className="alert-rule-summary-card"><span>Raised by</span><strong>{selectedAlertRuleSummary.rules.length} matched rule{selectedAlertRuleSummary.rules.length === 1 ? "" : "s"}</strong><small>{selectedAlertRuleSummary.ruleName}</small></article>
+                      <article className="alert-rule-summary-card"><span>Rule source</span><strong>{selectedAlertRuleSummary.source}</strong><small>{selectedAlertRuleSummary.note}</small></article>
+                    </div>
                   {selectedAlertActionContext ? (
                     <>
                       <p className="subtitle">
@@ -14035,12 +10552,23 @@ export default function App() {
                               <option value="critical">critical</option>
                             </select>
                           </label>
+                          <label>Reason for correction
+                            <input
+                              value={alertSeverityReasons[selectedAlertActionContext.overrideKey] || ""}
+                              onChange={(event) => setAlertSeverityReasons((current) => ({
+                                ...current,
+                                [selectedAlertActionContext.overrideKey]: event.target.value,
+                              }))}
+                              placeholder="Explain the evidence or business impact"
+                              maxLength={4000}
+                            />
+                          </label>
                           <div style={{ display: "flex", alignItems: "end", gap: 8 }}>
                             <button
                               type="button"
                               className="button-secondary"
                               onClick={() => applyAlertSeverityOverrideRule(selectedAlertRow)}
-                              disabled={selectedAlertActionContext.overrideSaving || alertSeverityOverrides.loading || !selectedAlertActionContext.alertName}
+                              disabled={selectedAlertActionContext.overrideSaving || alertSeverityOverrides.loading || !selectedAlertActionContext.alertName || String(alertSeverityReasons[selectedAlertActionContext.overrideKey] || "").trim().length < 10}
                             >
                               {selectedAlertActionContext.overrideSaving ? "Saving..." : "Apply Override"}
                             </button>
@@ -14057,13 +10585,14 @@ export default function App() {
                       ) : null}
                     </>
                   ) : null}
+                  </details>
                 </article>
               ) : null}
 
               {docPromptAlert && canProvideAlertDocuments ? (
-                <article className="panel" role="dialog" aria-label="Provide documents for alert" ref={docPromptRef}>
+                <article className="panel document-prompt-dialog" role="dialog" aria-modal="true" aria-labelledby="document-prompt-title" ref={docPromptRef}>
                   <div className="panel-head">
-                    <h3>Provide Documents</h3>
+                    <h3 id="document-prompt-title">Provide Documents</h3>
                     <button type="button" className="button-secondary" onClick={closeDocumentPrompt}>Close</button>
                   </div>
                   <p className="subtitle">
@@ -14215,11 +10744,30 @@ export default function App() {
               ) : null}
 
               {selectedAlertRow ? (
-                <article className="panel alert-details-cockpit" ref={alertDetailsRef}>
-                  <div className="panel-head">
+                <article className="panel alert-details-cockpit" ref={alertDetailsRef} tabIndex={-1}>
+                  <div className="panel-head incident-sticky-header">
                     <div>
-                      <h2>Alert Details Cockpit</h2>
-                      <p>One guided workspace for evidence, documents, approval, remediation, and timeline review.</p>
+                      <span className="discovery-eyebrow">Guided Incident Cockpit</span>
+                      <h2>Incident Response</h2>
+                      <h3>{selectedAlertRow?.service || "Incident"}: {selectedAlertRow?.name || selectedAlertRow?.alert_name || "Alert investigation"}</h3>
+                      <p>Work one guided path from combined evidence, RCA, and impact through execution and verified recovery. Current task: <strong>{incidentCockpitStages.find((stage) => stage.id === homeDetailTab)?.label || "Investigate"}</strong>. Recommended next: <strong>{cockpitRecommended.label}</strong>.</p>
+                    </div>
+                    <div className="incident-record-navigation" aria-label="Incident record navigation">
+                      <button type="button" className="button-secondary" disabled={!selectedAlertNavigation.previous} onClick={() => {
+                        if (selectedAlertNavigation.previous) {
+                          const section = homeDetailTab;
+                          openAlertDetails(selectedAlertNavigation.previous);
+                          setHomeDetailTab(section);
+                        }
+                      }}>Previous</button>
+                      <span>{selectedAlertNavigation.index >= 0 ? selectedAlertNavigation.index + 1 : "-"} of {selectedAlertNavigation.total}</span>
+                      <button type="button" className="button-secondary" disabled={!selectedAlertNavigation.next} onClick={() => {
+                        if (selectedAlertNavigation.next) {
+                          const section = homeDetailTab;
+                          openAlertDetails(selectedAlertNavigation.next);
+                          setHomeDetailTab(section);
+                        }
+                      }}>Next</button>
                     </div>
                   </div>
                   <div className="detail-context">
@@ -14229,7 +10777,7 @@ export default function App() {
                     <span>
                       <strong>Status:</strong>{" "}
                       <span className={`pill ${statusPillClass(selectedCanonicalIncidentStatus)}`}>
-                        {selectedCanonicalIncidentStatus}
+                        {incidentStatusLabel(selectedCanonicalIncidentStatus)}
                       </span>
                     </span>
                   </div>
@@ -14250,46 +10798,39 @@ export default function App() {
                       || selectedAlertWorkflow?.decision?.requires_approval
                       || isApprovalPendingStatus(approvalStatus)
                     );
-                    const hasActionableApproval = Boolean(matchedApproval && !isResolved);
+                    const approvalInvestigationReady = Boolean(
+                      selectedAiTrust.contractValid === true
+                      && selectedAiTrust.integrityVerified === true
+                      && selectedAiTrust.executionReady === true
+                      && selectedExecutionPlan?.catalogPlan?.execution_ready === true
+                    );
+                    const hasUnresolvedApproval = Boolean(matchedApproval && !isResolved);
+                    const hasActionableApproval = Boolean(hasUnresolvedApproval && approvalInvestigationReady);
+                    const approvalBlocked = Boolean(hasUnresolvedApproval && !approvalInvestigationReady);
 
                     if (!requiresApproval) {
                       return null;
                     }
 
                     return (
-                      <article
-                        className="panel"
-                        style={{
-                          marginBottom: 10,
-                          borderColor: hasActionableApproval ? "#ef9a9a" : "#c7d7ea",
-                          boxShadow: hasActionableApproval ? "0 10px 24px rgba(183, 28, 28, 0.14)" : "none",
-                        }}
-                      >
-                        <div className="panel-head">
-                          <h3>Decision Gate</h3>
+                      <section className={`incident-decision-strip ${hasActionableApproval ? "is-actionable" : ""}`} aria-label="Incident decision gate">
+                        <div className="incident-decision-copy">
+                          <span className="discovery-eyebrow">{hasActionableApproval ? "Decision required" : approvalBlocked ? "Decision blocked" : "Decision status"}</span>
+                          <strong>{hasActionableApproval ? "Manual approval is ready for review" : approvalBlocked ? "Approval is blocked until investigation is ready" : matchedApproval ? `Approval ${approvalStatus || "resolved"}` : "No active approval is linked"}</strong>
+                          <small>
+                            {hasActionableApproval
+                              ? "Review the proposed change and safety evidence in Resolve. Approval applies to this exact plan."
+                              : approvalBlocked
+                                ? "The linked approval is retained for audit, but this investigation contract or execution plan is not currently eligible for approval. Run fresh analysis and review the replacement plan."
+                              : `Incident ${incidentId || "-"} is ${incidentStatusLabel(selectedCanonicalIncidentStatus).toLowerCase()}.`}
+                          </small>
                         </div>
-                        <p className="subtitle">
-                          {hasActionableApproval
-                            ? `Matched incident ${incidentId || "-"} with approval status ${approvalStatus || "pending"}.`
-                            : matchedApproval
-                              ? `Approval is already ${approvalStatus || "resolved"} for this incident.`
-                              : `Incident is ${selectedCanonicalIncidentStatus}; no active pending approval is linked.`}
-                        </p>
-                        <div className="table-wrap">
-                          <table>
-                            <tbody>
-                              <tr><th>Incident</th><td>{incidentId || "-"}</td></tr>
-                              <tr>
-                                <th>Incident Status</th>
-                                <td><span className={`pill ${statusPillClass(selectedCanonicalIncidentStatus)}`}>{selectedCanonicalIncidentStatus}</span></td>
-                              </tr>
-                              <tr><th>Approval Status</th><td>{approvalStatus || (hasActionableApproval ? "pending" : "not active")}</td></tr>
-                              <tr><th>Role Eligible</th><td>{canUseApprovalActions ? "yes" : "no"}</td></tr>
-                            </tbody>
-                          </table>
+                        <div className="incident-decision-state">
+                          <span className={`pill ${statusPillClass(selectedCanonicalIncidentStatus)}`}>{incidentStatusLabel(selectedCanonicalIncidentStatus)}</span>
+                          <span className="pill pill-info">Approval: {approvalBlocked ? "blocked" : approvalStatus || (hasActionableApproval ? "pending" : "not active")}</span>
                         </div>
                         {hasActionableApproval ? (
-                          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                          <div className="incident-decision-actions">
                           <button
                             type="button"
                             className="button-secondary"
@@ -14305,58 +10846,39 @@ export default function App() {
                           <button
                             type="button"
                             className="button-primary"
-                            onClick={() => setHomeDetailTab("timeline")}
+                            onClick={() => setHomeDetailTab("execution")}
                           >
-                            Review Decision
+                            Review and approve
                           </button>
-                          {canUseApprovalActions ? (
-                            <button
-                              type="button"
-                              className="button-secondary"
-                              onClick={() => selectApprovalIncident(matchedApproval)}
-                              disabled={approvalState.loading}
-                            >
-                              Load Decision Form
-                            </button>
-                          ) : null}
                           </div>
                         ) : null}
-                      </article>
+                      </section>
                     );
                   })()}
 
-                  <div className="detail-tabs">
-                    {["timeline", "discovery", "raw"].map((tab) => (
+                  <div className="detail-tabs incident-section-navigation cockpit-stage-navigation" role="tablist" aria-label="Incident workspace sections">
+                    {incidentCockpitStages.map((stage) => (
                       <button
-                        key={`detail-${tab}`}
+                        key={`detail-${stage.id}`}
                         type="button"
-                        className={`detail-tab ${homeDetailTab === tab ? "active" : ""}`}
-                        onClick={() => setHomeDetailTab(tab)}
+                        className={`detail-tab ${homeDetailTab === stage.id ? "active" : ""} ${stage.complete ? "is-complete" : ""} ${cockpitRecommendedStage === stage.id ? "is-recommended" : ""}`}
+                        onClick={() => setHomeDetailTab(stage.id)}
+                        role="tab"
+                        aria-selected={homeDetailTab === stage.id}
+                        aria-label={stage.accessibleLabel || stage.label}
                       >
-                        {tab === "timeline" ? "Incident Workspace" : tab === "discovery" ? "Discovery + Context" : "Raw Data"}
+                        <span>{stage.complete ? <CircleCheckBig size={14} strokeWidth={2.5} aria-hidden="true" /> : stage.short}</span>
+                        <strong>{stage.label}</strong>
+                        <small>{stage.description}</small>
                       </button>
                     ))}
                   </div>
 
-                  {false && homeDetailTab === "diagnostics" ? (
-                    <div className="detail-tabs" style={{ marginTop: 8 }}>
-                      {["processing", "timeline", "context", "events", "finops", "api", "raw", "pipeline"].map((tab) => (
-                        <button
-                          key={`diag-${tab}`}
-                          type="button"
-                          className={`detail-tab ${diagnosticsDetailTab === tab ? "active" : ""}`}
-                          onClick={() => setDiagnosticsDetailTab(tab)}
-                        >
-                          {tab === "pipeline" ? "Pipeline" : tab === "processing" ? "Processing Flow" : tab === "timeline" ? "Flow Timeline" : tab === "context" ? "Context Flow" : tab === "events" ? "Agent Events" : tab === "finops" ? "FinOps" : tab === "api" ? "API Gateway" : "Raw Payload"}
-                        </button>
-                      ))}
-                    </div>
-                  ) : null}
 
                   {selectedAlertData.loading ? <p className="subtitle">Loading selected alert details...</p> : null}
                   {selectedAlertData.error ? <p className="error">{selectedAlertData.error}</p> : null}
                   {selectedAlertId ? (
-                    <div style={{ marginBottom: 8 }}>
+                    <div className="rca-analysis-toolbar">
                       <button
                         type="button"
                         className="button-secondary"
@@ -14365,92 +10887,64 @@ export default function App() {
                       >
                         {selectedAlertData.loading ? "Refreshing..." : "Reload Alert Details"}
                       </button>
+                      {homeDetailTab === "evidence" ? <><div className="rca-analysis-mode" role="group" aria-label="RCA analysis mode">
+                        {[
+                          ["smart", "Smart reuse", "Reuse verified analysis; refresh when needed"],
+                          ["fresh", "Fresh context", "Always recollect evidence and regenerate RCA"],
+                          ["cache", "Cache only", "Use verified stored analysis without model work"],
+                        ].map(([mode, label, description]) => <button key={mode} type="button" className={rcaAnalysisMode === mode ? "active" : ""} aria-pressed={rcaAnalysisMode === mode} title={description} onClick={() => setRcaAnalysisMode(mode)} disabled={selectedAlertRegeneration.loading}><strong>{label}</strong><small>{description}</small></button>)}
+                      </div>
+                      <button type="button" className="button-primary" onClick={regenerateSelectedAlertAnalysis} disabled={!selectedAlertRow || !selectedIncidentId || selectedAlertRegeneration.loading} title={!selectedIncidentId ? "RCA becomes available after this alert is linked to a canonical incident." : undefined}>
+                        {selectedAlertRegeneration.loading ? "Running analysis..." : !selectedIncidentId ? "Awaiting incident" : rcaAnalysisMode === "fresh" ? "Run fresh analysis" : rcaAnalysisMode === "cache" ? "Load verified analysis" : "Run smart analysis"}
+                      </button></> : null}
                     </div>
                   ) : null}
+                  {selectedAlertRegeneration.error ? <p className="error" role="alert">{selectedAlertRegeneration.error}</p> : null}
+                  {selectedAlertRegeneration.message ? <p className="subtitle">{selectedAlertRegeneration.message}</p> : null}
 
-                  {homeDetailTab === "discovery" ? (
-                    <section className="combined-analysis-page">
-                      <header className="combined-analysis-hero">
-                        <div>
-                          <span className="discovery-eyebrow">Investigation overview</span>
-                          <h3>Discovery + Context</h3>
-                          <p>See what KaiOps found, what it means, and what to do next.</p>
-                        </div>
-                        <div className="combined-analysis-kpis">
-                          <span><strong>{selectedAlertTimelineRows.length}</strong> timeline stages</span>
-                          <span><strong>{selectedAlertRagDocuments.length}</strong> linked docs</span>
-                          <span><strong>{formatQualityPercent(selectedAlertEvaluation.overallScore)}</strong> quality</span>
-                          <span><strong>{Array.isArray(selectedAlertRow?.source_channels) ? selectedAlertRow.source_channels.map(sourceChannelLabel).join(" + ") : sourceChannelLabel(normalizeAlertChannel(selectedAlertRow))}</strong> sources</span>
-                        </div>
-                      </header>
-                      <div className="combined-analysis-source-rail">
-                        <strong>Connected evidence</strong>
-                        <span className="source-badge source-prometheus">Prometheus</span>
-                        <span className="source-badge">Jaeger traces</span>
-                        <span className="source-badge">OpenSearch logs</span>
-                        <span className="source-badge source-email">Email</span>
-                        <span className="source-badge source-ticket">Jira / tickets</span>
-                        <span className="source-badge">Source code</span>
-                      </div>
-                      <IntelligenceConnectionView
-                        workflow={selectedAlertWorkflow}
-                        documents={selectedAlertRagDocuments}
-                        onDownloadDocument={downloadRagDocument}
-                      />
-                      <details className="investigation-deep-dive">
-                        <summary>
-                          <span>
-                            <strong>Open technical retrieval trace</strong>
-                            <small>Inspect every discovery query, context lookup, document score, agent handoff, and raw evidence record</small>
-                          </span>
-                          <b>Expand</b>
-                        </summary>
-                        <div className="combined-analysis-grid">
-                          <article className="combined-analysis-card combined-analysis-discovery">
-                            <DiscoveryFlowView
-                              workflow={selectedAlertWorkflow}
-                              timelineRows={selectedAlertTimelineRows}
-                              selectedAlert={selectedAlertRow}
-                              compact
-                            />
-                          </article>
-                          <article className="combined-analysis-card combined-analysis-context">
-                            <ContextRetrievalGraph
-                              workflow={selectedAlertWorkflow}
-                              timelineRows={selectedAlertTimelineRows}
-                              documents={selectedAlertRagDocuments}
-                              evaluation={selectedAlertEvaluation}
-                              documentContract={selectedAlertDocumentContract}
-                              onLoadDocumentContent={loadRagDocumentContent}
-                              onDownloadDocument={downloadRagDocument}
-                              compact
-                            />
-                          </article>
-                        </div>
-                      </details>
-                    </section>
+                  {homeDetailTab === "evidence" ? (
+                    <>
+                    <RcaPanel
+                      rcaDetailView={rcaDetailView}
+                      onSetRcaDetailView={setRcaDetailView}
+                      onSetHomeDetailTab={setHomeDetailTab}
+                      selectedAlertTimelineRows={selectedAlertTimelineRows}
+                      selectedAlertRagDocuments={selectedAlertRagDocuments}
+                      selectedAlertEvaluation={selectedAlertEvaluation}
+                      selectedAlertRow={selectedAlertRow}
+                      selectedRcaDecision={selectedRcaDecision}
+                      selectedAiTrust={selectedAiTrust}
+                      selectedAlertWorkflow={selectedAlertWorkflow}
+                      selectedAlertRegeneration={selectedAlertRegeneration}
+                      selectedAlertRecommendationId={selectedAlertRecommendationId}
+                      selectedAlertDocumentContract={selectedAlertDocumentContract}
+                      selectedAlertId={selectedAlertId}
+                      aiFeedbackState={aiFeedbackState}
+                      rcaAnalysisMode={rcaAnalysisMode}
+                      onSetRcaAnalysisMode={setRcaAnalysisMode}
+                      onRerunRca={regenerateSelectedAlertAnalysis}
+                      onRefreshSelectedAlert={() => loadAlertDetails(selectedAlertId, selectedAlertRow, { background: true })}
+                      onDownloadRagDocument={downloadRagDocument}
+                      onLoadRagDocumentContent={loadRagDocumentContent}
+                      onSubmitAiRecommendationFeedback={submitAiRecommendationFeedback}
+                    /></>
                   ) : null}
 
-                  {homeDetailTab === "timeline" ? (
+                  {homeDetailTab === "overview" ? (
                     <>
-                      <header className="incident-workspace-hero">
+                      <header className="incident-workspace-hero" id="incident-workspace-overview">
                         <div>
                           <span className="discovery-eyebrow">Unified response cockpit</span>
                           <h3>Incident Workspace</h3>
                           <p>Follow the incident, verify the evidence, make the decision, and execute recovery without switching tabs.</p>
                         </div>
                         <div className="incident-workspace-kpis">
-                          <span><strong>{selectedCanonicalIncidentStatus}</strong> lifecycle</span>
+                          <span><strong>{incidentStatusLabel(selectedCanonicalIncidentStatus)}</strong> lifecycle</span>
                           <span><strong>{selectedAlertTimelineRows.length}</strong> events</span>
-                          <span><strong>{selectedAlertRagDocuments.length}</strong> documents</span>
-                          <span><strong>{formatQualityPercent(selectedAlertEvaluation.groundingScore)}</strong> grounded</span>
+                          <span><strong>{selectedAiTrust.evidence.filter((row) => row.accepted).length}</strong> RCA-supporting evidence</span>
+                          <span className={Number(selectedRcaDecision.confidence || 0) < 0.5 ? "is-quality-warning" : ""}><strong>{formatQualityPercent(selectedRcaDecision.confidence)}</strong> {selectedRcaDecision.confidenceLabel}</span>
                         </div>
                       </header>
-                      <UnifiedIncidentTimeline
-                        workflow={selectedAlertWorkflow}
-                        rows={selectedAlertTimelineRows}
-                        documents={selectedAlertRagDocuments}
-                      />
                       <details className="panel incident-workspace-section workspace-collapsible" open>
                       <summary className="panel-head">
                         <div>
@@ -14470,10 +10964,39 @@ export default function App() {
                               <th>Persisted Incident Status</th>
                               <td>
                                 <span className={`pill ${statusPillClass(selectedCanonicalIncidentStatus)}`}>
-                                  {selectedCanonicalIncidentStatus}
+                                  {incidentStatusLabel(selectedCanonicalIncidentStatus)}
                                 </span>
                               </td>
                             </tr>
+                            <tr>
+                               <th>Jira Ticket</th>
+                               <td>
+                                 {(selectedAlertWorkflow?.incident?.ticket_id || selectedAlertWorkflow?.ticket_id) ? (
+                                   <a
+                                     href={selectedAlertWorkflow?.incident?.jira_link || selectedAlertWorkflow?.jira_link || `https://kaiops-test.atlassian.net/browse/${selectedAlertWorkflow?.incident?.ticket_id || selectedAlertWorkflow?.ticket_id}`}
+                                     target="_blank"
+                                     rel="noopener noreferrer"
+                                     style={{ color: "#22d3ee", textDecoration: "underline", fontWeight: "bold" }}
+                                   >
+                                     {selectedAlertWorkflow?.incident?.ticket_id || selectedAlertWorkflow?.ticket_id}
+                                   </a>
+                                 ) : (
+                                   "-"
+                                 )}
+                               </td>
+                             </tr>
+                             <tr>
+                               <th>Jira Status</th>
+                               <td>
+                                 {(selectedAlertWorkflow?.incident?.ticket_id || selectedAlertWorkflow?.ticket_id) ? (
+                                   <span className={`pill ${(selectedAlertWorkflow?.incident?.jira_status || selectedAlertWorkflow?.jira_status) === "Done" ? "status-success" : "status-warning"}`}>
+                                     {selectedAlertWorkflow?.incident?.jira_status || selectedAlertWorkflow?.jira_status || "In Progress"}
+                                   </span>
+                                 ) : (
+                                   "-"
+                                 )}
+                               </td>
+                             </tr>
                             <tr><th>Closed At</th><td>{formatIstTimestamp(selectedAlertWorkflow?.incident?.closed_at)}</td></tr>
                             <tr><th>Service</th><td>{selectedAlertRow?.service || selectedAlertWorkflow?.alert?.service || "-"}</td></tr>
                             <tr><th>Analysis Status</th><td>{canonicalIncidentAnalysis(selectedAlertWorkflow, selectedAlertRow).status}</td></tr>
@@ -14489,13 +11012,13 @@ export default function App() {
                       <div className="alert-rule-summary-grid">
                         <article className="alert-rule-summary-card">
                           <span>Overall Quality</span>
-                          <strong>{formatQualityPercent(selectedAlertEvaluation.overallScore)}</strong>
-                          <small>{selectedAlertEvaluation.qualityLabel} | {selectedAlertEvaluation.provider}</small>
+                          <strong>{selectedAiTrust.evidence.length ? formatQualityPercent(selectedAlertEvaluation.overallScore) : "Unavailable"}</strong>
+                          <small>{selectedAiTrust.evidence.length ? `${selectedAlertEvaluation.qualityLabel} | ${selectedAlertEvaluation.provider}` : "No linked evidence"}</small>
                         </article>
                         <article className="alert-rule-summary-card">
-                          <span>Confidence</span>
-                          <strong>{formatQualityPercent(selectedAlertEvaluation.confidenceScore)}</strong>
-                          <small>Recommendation certainty</small>
+                          <span>{selectedAiTrust.confidenceLabel}</span>
+                          <strong>{selectedAiTrust.evidence.length ? formatQualityPercent(selectedRcaDecision.confidence) : "Unavailable"}</strong>
+                          <small>{selectedAiTrust.confidenceActionable ? "Confirmed and evidence-grounded" : "Diagnostic score; not execution permission"}</small>
                         </article>
                         <article className="alert-rule-summary-card">
                           <span>Grounding</span>
@@ -14551,13 +11074,14 @@ export default function App() {
                             <article className="alert-rule-summary-card">
                               <span>Remediation Safety</span>
                               <strong>{selectedAlertDocumentContract.remediation_safety?.contract_version || "-"}</strong>
-                              <small>Dry run: {selectedAlertDocumentContract.remediation_safety?.dry_run_required ? "required" : "optional"}</small>
+                              <small>Execution safeguards: {selectedAlertDocumentContract.remediation_safety?.dry_run_required ? "enabled" : "standard"}</small>
                             </article>
                           </div>
                         </>
                       ) : null}
 
                       <h3>Persisted Stage Completeness</h3>
+                      <p className="subtitle">A stage is complete only when durable event or relational evidence confirms it. Pending work is never counted as completed.</p>
                       {selectedStageCompleteness.loading ? <p className="subtitle">Loading stage completeness...</p> : null}
                       {selectedStageCompleteness.error ? <p className="error">{selectedStageCompleteness.error}</p> : null}
                       {selectedStageCompleteness.data ? (
@@ -14566,20 +11090,22 @@ export default function App() {
                             <thead>
                               <tr>
                                 <th>Stage</th>
-                                <th>Persisted</th>
-                                <th>Matched Event Types</th>
+                                <th>Status</th>
+                                <th>Persisted evidence</th>
+                                <th>Required next action</th>
                               </tr>
                             </thead>
                             <tbody>
                               {(selectedStageCompleteness.data?.stages || []).map((row, index) => (
                                 <tr key={`stage-${row.stage || index}`}>
                                   <td>{row.label || row.stage || "-"}</td>
-                                  <td>{row.persisted ? "yes" : "no"}</td>
-                                  <td>{Array.isArray(row.matched_event_types) && row.matched_event_types.length ? row.matched_event_types.join(" | ") : "-"}</td>
+                                  <td><span className={`stage-state stage-state-${row.state || (row.persisted ? "complete" : "waiting")}`}>{row.state === "in_progress" ? "In progress" : row.persisted ? "Complete" : "Waiting"}</span></td>
+                                  <td>{Array.isArray(row.evidence_sources) && row.evidence_sources.length ? row.evidence_sources.join(" · ") : Array.isArray(row.matched_event_types) && row.matched_event_types.length ? row.matched_event_types.join(" · ") : "No durable evidence yet"}</td>
+                                  <td>{row.next_action || (row.persisted ? "Completed." : "Complete the preceding workflow stage.")}</td>
                                 </tr>
                               ))}
                               {!Array.isArray(selectedStageCompleteness.data?.stages) || !selectedStageCompleteness.data.stages.length ? (
-                                <tr><td colSpan={3}>No persisted stage rows found for incident.</td></tr>
+                                <tr><td colSpan={4}>No persisted stage rows found for incident.</td></tr>
                               ) : null}
                             </tbody>
                           </table>
@@ -14587,16 +11113,19 @@ export default function App() {
                       ) : null}
 
                       {selectedStageCompleteness.data ? (
-                        <p className="subtitle">
+                        <div className="stage-completion-summary">
+                          <progress max={selectedStageCompleteness.data?.stage_completion?.total || 1} value={selectedStageCompleteness.data?.stage_completion?.completed || 0} />
+                          <p className="subtitle">
                           Completion: {selectedStageCompleteness.data?.stage_completion?.completed ?? 0}/{selectedStageCompleteness.data?.stage_completion?.total ?? 0}
                           {" "}({selectedStageCompleteness.data?.stage_completion?.percentage ?? 0}%)
-                        </p>
+                          </p>
+                        </div>
                       ) : null}
                       </details>
                     </>
                   ) : null}
 
-                  {homeDetailTab === "timeline" ? (
+                  {homeDetailTab === "evidence" ? (
                     <details className="panel incident-workspace-section workspace-collapsible evidence-workspace">
                       <summary className="panel-head">
                         <div>
@@ -14631,63 +11160,8 @@ export default function App() {
                     </details>
                   ) : null}
 
-                  {homeDetailTab === "timeline" ? (
-                    <details className="panel incident-workspace-section workspace-collapsible approval-workspace" open>
-                      <summary className="panel-head">
-                        <div>
-                          <span className="workspace-section-number">03</span>
-                          <h3>Decision & Approval</h3>
-                          <p>Review evidence quality and approve, reject, or modify the proposed response.</p>
-                        </div>
-                        <span className="section-toggle-indicator" />
-                      </summary>
-                      <div className="table-wrap">
-                        <table>
-                          <tbody>
-                            <tr><th>Incident</th><td>{approvalForm.incident_id || selectedAlertWorkflow?.incident?.id || "-"}</td></tr>
-                            <tr><th>Recommendation</th><td>{approvalForm.recommendation_id || "-"}</td></tr>
-                            <tr><th>Current Approval Status</th><td>{selectedApprovalStatus || (selectedMatchedApproval ? "pending" : "not active")}</td></tr>
-                            <tr><th>Role Eligible</th><td>{canUseApprovalActions ? "yes" : "no"}</td></tr>
-                            <tr><th>Evaluation Quality</th><td>{formatQualityPercent(selectedAlertEvaluation.overallScore)} ({selectedAlertEvaluation.qualityLabel})</td></tr>
-                            <tr><th>Grounding / Hallucination Risk</th><td>{formatQualityPercent(selectedAlertEvaluation.groundingScore)} / {formatQualityPercent(selectedAlertEvaluation.hallucinationRisk)}</td></tr>
-                            <tr><th>Review Required</th><td>{selectedAlertEvaluation.requiresReview ? "yes" : "no"}</td></tr>
-                          </tbody>
-                        </table>
-                      </div>
-                      {canUseApprovalActions ? (
-                        <form className="form" onSubmit={submitApproval}>
-                          <div className="filter-grid">
-                            <label>Action
-                              <select value={approvalForm.action} onChange={(e) => setApprovalForm({ ...approvalForm, action: e.target.value })}>
-                                <option value="approve">approve</option>
-                                <option value="reject">reject</option>
-                                <option value="modify">modify</option>
-                              </select>
-                            </label>
-                            <label>Channel
-                              <select value={approvalForm.channel} onChange={(e) => setApprovalForm({ ...approvalForm, channel: e.target.value })}>
-                                <option value="web">web</option>
-                                <option value="slack">slack</option>
-                                <option value="teams">teams</option>
-                                <option value="email">email</option>
-                              </select>
-                            </label>
-                          </div>
-                          {approvalForm.action === "modify" ? (
-                            <label>Modified Action<textarea rows={2} value={approvalForm.modified_action} onChange={(e) => setApprovalForm({ ...approvalForm, modified_action: e.target.value })} /></label>
-                          ) : null}
-                          <label>Comment<textarea rows={2} value={approvalForm.comment} onChange={(e) => setApprovalForm({ ...approvalForm, comment: e.target.value })} /></label>
-                          <button className="button-primary" type="submit" disabled={!approvalReady || approvalState.loading}>
-                            {approvalState.loading ? "Submitting..." : "Submit Approval Action"}
-                          </button>
-                        </form>
-                      ) : (
-                        <p className="subtitle">Login with an approval-eligible role to submit actions. You can still view full approval context here.</p>
-                      )}
-                    </details>
-                  ) : null}
 
-                  {homeDetailTab === "timeline" ? (
+                  {homeDetailTab === "evidence" ? (
                     <details className="panel alert-documents-panel incident-workspace-section workspace-collapsible">
                       <summary className="panel-head">
                         <div>
@@ -14755,33 +11229,33 @@ export default function App() {
                       ) : (
                         <div className="alert-documents-empty">
                           <div>
-                            <strong>No alert documents linked yet.</strong>
+                            <strong>{evidenceDraftReview.draft ? "KaiMS prepared the missing alert document" : "Preparing the missing alert document"}</strong>
                             <p className="subtitle">
-                              Use the same Provide Documents workflow for this alert to review the generated draft, upload content,
-                              and save downloadable documents back to this tab.
+                              RCA, impact, diagnostics, resolution, validation, rollback, and cited evidence are assembled automatically. Review and edit the draft before approval.
                             </p>
                           </div>
                           <div className="alert-documents-kind-row">
                             {ALERT_DOC_KIND_OPTIONS.map((kind) => (
-                              <span key={`empty-doc-kind-${kind}`}>{kind}</span>
+                              <button type="button" key={`empty-doc-kind-${kind}`} className={(evidenceDraftReview.draft?.document_kind || "incident") === kind ? "active" : ""} disabled={!evidenceDraftReview.drafts?.some((item) => (item.document_kind || "incident") === kind)} onClick={() => { const next = evidenceDraftReview.drafts?.find((item) => (item.document_kind || "incident") === kind); if (next) setEvidenceDraftReview((current) => ({ ...current, draft: next, content: String(next.content || ""), notes: String(next.review_notes || ""), error: "", message: "" })); }}>{kind === "jira" ? "Jira ticket" : kind}</button>
                             ))}
                           </div>
+                          {evidenceDraftReview.loading && !evidenceDraftReview.draft ? <div className="alert-document-generation-state"><span className="spinner" aria-hidden="true" /><span>Completing the RCA-derived document draft…</span></div> : null}
+                          {canProvideAlertDocuments && evidenceDraftReview.draft ? <div className="alert-document-draft-editor">
+                            <div className="alert-document-draft-heading"><div><span className="eyebrow">{evidenceDraftReview.draft.document_kind || "incident"} · version {evidenceDraftReview.draft.document_version || 1}</span><h4>{evidenceDraftReview.draft.title || "Incident knowledge document"}</h4><small>Reviewer: {evidenceDraftReview.draft.reviewed_by || "Not reviewed"}</small></div><span className={`workflow-pill ${evidenceDraftReview.draft.status === "reviewed" || evidenceDraftReview.draft.status === "approved" ? "workflow-pill-clear" : "workflow-pill-attention"}`}>{evidenceDraftReview.draft.status === "approved_pending_index" ? "Approved — indexing pending" : evidenceDraftReview.draft.status || "draft"}</span></div>
+                            <div className="report-view-switch" role="tablist" aria-label="Incident report detail"><button type="button" role="tab" aria-selected={incidentReportView === "simple"} className={incidentReportView === "simple" ? "active" : ""} onClick={() => setIncidentReportView("simple")}>Simple</button><button type="button" role="tab" aria-selected={incidentReportView === "detailed"} className={incidentReportView === "detailed" ? "active" : ""} onClick={() => setIncidentReportView("detailed")}>Detailed</button></div>
+                            {incidentReportView === "simple" ? <pre className="simple-incident-report">{simpleIncidentReport(evidenceDraftReview.content)}</pre> : <><label>Document content<textarea rows={18} value={evidenceDraftReview.content} onChange={(event) => setEvidenceDraftReview((current) => ({ ...current, content: event.target.value }))} disabled={evidenceDraftReview.loading || ["approved", "approved_pending_index"].includes(evidenceDraftReview.draft.status)} /></label><label>Reviewer notes<textarea rows={3} value={evidenceDraftReview.notes} onChange={(event) => setEvidenceDraftReview((current) => ({ ...current, notes: event.target.value }))} placeholder="Record corrections, exclusions, and evidence that still needs confirmation." disabled={evidenceDraftReview.loading || ["approved", "approved_pending_index"].includes(evidenceDraftReview.draft.status)} /></label></>}
+                            {selectedRcaDecision.reviewRequired ? <p className="subtitle" role="status">The current RCA remains inconclusive. You may still correct and publish verified historical facts for future investigations; publication does not increase this incident's confidence or authorize execution.</p> : null}
+                            <div className="alert-documents-empty-actions"><button type="button" className="button-secondary" onClick={saveEvidenceDraft} disabled={evidenceDraftReview.loading || evidenceDraftReview.content.trim().length < 20 || ["approved", "approved_pending_index"].includes(evidenceDraftReview.draft.status)}>Save review</button><button type="button" className="button-primary" onClick={approveEvidenceDraft} disabled={evidenceDraftReview.loading || evidenceDraftReview.draft.status !== "reviewed" || !evidenceDraftReview.draft.evidence_ids?.length || !evidenceDraftReview.draft.source_uris?.length}>Approve reviewed version</button><button type="button" className="button-ghost" onClick={() => selectedAlertRow && openDocumentPrompt(selectedAlertRow)}>Add source document</button></div>
+                          </div> : null}
                           <div className="alert-documents-empty-actions">
-                            {canProvideAlertDocuments ? (
-                              <button
-                                type="button"
-                                className="button-primary"
-                                onClick={() => selectedAlertRow && openDocumentPrompt(selectedAlertRow)}
-                                disabled={!selectedAlertRow || selectedAlertActionContext?.alertClosed}
-                              >
-                                Provide Documents
-                              </button>
-                            ) : (
-                              <button type="button" className="button-secondary" onClick={() => setHomeDetailTab("timeline")}>
+                            {!canProvideAlertDocuments ? (
+                              <button type="button" className="button-secondary" onClick={() => setHomeDetailTab("audit")}>
                                 Escalate To L2/L3
                               </button>
-                            )}
+                            ) : !evidenceDraftReview.draft && !evidenceDraftReview.loading ? <button type="button" className="button-secondary" onClick={() => selectedAlertRow && openDocumentPrompt(selectedAlertRow)}>Add supporting document</button> : null}
                           </div>
+                          {evidenceDraftReview.error ? <p className="error">{evidenceDraftReview.error}</p> : null}
+                          {evidenceDraftReview.message ? <p className="status-message">{evidenceDraftReview.message}</p> : null}
                           {selectedAlertActionContext?.alertClosed ? (
                             <p className="subtitle">This alert is closed, so document creation is disabled.</p>
                           ) : null}
@@ -14959,203 +11433,204 @@ export default function App() {
                     </div>
                   ) : null}
 
-                  {homeDetailTab === "timeline" ? (
+                  {homeDetailTab === "execution" ? (
                     <>
+                      <ResolutionPanel
+                        workflow={selectedAlertWorkflow}
+                        alertRow={selectedAlertRow}
+                        confidenceScore={Number(selectedAlertEvaluation.confidenceScore || 0)}
+                        executionPlan={selectedExecutionPlan}
+                        readinessChecks={[
+                          { id: "citations", label: "Traceable evidence", detail: Number(selectedAlertEvaluation.citationCoverage || 0) > 0 ? `${formatQualityPercent(selectedAlertEvaluation.citationCoverage)} citation coverage.` : "No supporting citations are attached.", passed: Number(selectedAlertEvaluation.citationCoverage || 0) > 0, action: "review and attach supporting evidence" },
+                          { id: "investigation", label: "Iterative investigation", detail: selectedInvestigationConclusive ? "A corroborated conclusion was reached." : "The investigation is missing or inconclusive.", passed: selectedInvestigationConclusive, action: "continue read-only investigation" },
+                          { id: "confidence", label: "Evidence confidence", detail: `${formatQualityPercent(selectedInvestigationConfidence)} investigation confidence.`, passed: selectedInvestigationConfidence >= 0.85, action: "raise evidence-derived confidence to at least 85%" },
+                          { id: "grounding", label: "Evidence coverage", detail: `${formatQualityPercent(selectedAlertEvaluation.groundingScore)} grounding coverage.`, passed: Number(selectedAlertEvaluation.groundingScore || 0) >= 0.85, action: "raise grounding coverage to at least 85%" },
+                          { id: "freshness", label: "Fresh context", detail: selectedAiTrust.evidence.some((row) => !row.cached) ? "Live incident evidence is linked." : "Only cached or unknown evidence is available.", passed: selectedAiTrust.evidence.some((row) => !row.cached), action: "refresh incident context" },
+                          { id: "conflicts", label: "Conflicts resolved", detail: selectedAiTrust.conflicting.length ? `${selectedAiTrust.conflicting.length} conflict(s) remain.` : "No conflicts were declared.", passed: selectedAiTrust.conflicting.length === 0, action: "resolve conflicting evidence" },
+                          { id: "runbook", label: "Corrective capability", detail: editedExecutionPlan.commands.length || editedExecutionPlan.scripts.length ? "An executable command or playbook is attached." : "No executable corrective plan is attached.", passed: Boolean((editedExecutionPlan.commands.length || editedExecutionPlan.scripts.length) && editedExecutionPlan.execution_ready !== false), action: "attach an approved corrective playbook" },
+                          { id: "preflight", label: "Preflight readiness", detail: blockingPreflightFailures.length ? `${blockingPreflightFailures.length} blocking preflight check(s) remain.` : "All blocking preflight checks pass.", passed: blockingPreflightFailures.length === 0, action: "complete blocking preflight checks" },
+                          { id: "rollback", label: "Rollback readiness", detail: executionRollbackPlan || "No rollback instructions are attached.", passed: Boolean(executionRollbackPlan), action: "attach rollback instructions" },
+                          { id: "validation", label: "Recovery validation", detail: editedExecutionPlan.queries.length ? `${editedExecutionPlan.queries.length} recovery check(s) supplied.` : "No recovery validation is attached.", passed: editedExecutionPlan.queries.length > 0, action: "add recovery validation checks" },
+                        ]}
+                        onNavigateTab={setHomeDetailTab}
+                        embedded
+                      />
                       <details className="panel remediation-workspace incident-workspace-section workspace-collapsible" open>
                         <summary className="panel-head">
                           <div>
                             <span className="workspace-section-number">04</span>
-                            <h3>Resolution & Remediation</h3>
-                            <p>Confirm the decision, review the guarded plan, execute, and validate recovery.</p>
+                            <h3>Resolution command center</h3>
+                            <p>Complete the one current action. Plan, safety, connector, and audit details stay available below.</p>
                           </div>
                           <span className="section-toggle-indicator" />
                         </summary>
-                        <div className="workflow-guide-grid remediation-flow-grid">
-                          {selectedWorkflowFlowStages.map((stage) => (
-                            <div className="workflow-guide-card remediation-flow-card" key={stage.id}>
-                              <strong>{stage.label}</strong>
-                              <span className={`workflow-pill workflow-pill-${stage.status}`}>{stage.status.toUpperCase()}</span>
-                              <p>{stage.detail}</p>
+                        {executionIsDiagnosticOnly && !executionAutoCloses ? <div className="production-action-banner is-nonproduction">
+                          <strong>Investigation remains open</strong>
+                          <span>No corrective execution or verified recovery has been recorded.</span>
+                          <span>Regenerate a corrective plan or escalate for manual remediation; viewing this workspace will not close the incident.</span>
+                        </div> : <div className={`production-action-banner ${dangerousProductionAction ? "is-production" : "is-nonproduction"}`}>
+                          <strong>{dangerousProductionAction ? "Dangerous production action" : "Non-production or lower-risk action"}</strong>
+                          <span>Action: {selectedExecutionPlan.action === "-" ? selectedRcaDecision.action : selectedExecutionPlan.action}</span>
+                          <span>Target: {selectedGovernedExecutionTarget || "Not governed"} · {selectedApplicationConnection.environment} · Risk: {selectedExecutionPlan.riskTier || "unknown"}</span>
+                          <span>Duplicate execution is guarded by the remediation idempotency contract; repeated clicks are disabled while a request is active.</span>
+                        </div>}
+                        {!executionIsDiagnosticOnly ? <details className="resolution-configuration-details">
+                          <summary><div><strong>Automation and plan setup</strong><small>{jenkinsExecutorSelected ? `${remediationPlanEditor.job_name || "Jenkins job required"} · ${executionPreflightChecks.filter((check) => check.passed).length}/${executionPreflightChecks.length} checks ready` : "Connector setup required"}</small></div><span>Review setup</span></summary>
+                        {jenkinsExecutorSelected && !executionIsDiagnosticOnly ? <section className={`jenkins-process-panel ${selectedJenkinsProcess.configured ? "is-configured" : "is-pending"}`} aria-labelledby="jenkins-process-heading">
+                          <header><div><span className="eyebrow">Application automation</span><h3 id="jenkins-process-heading">Jenkins Resolution Process</h3><p>Governed execution from resolution selection through recovery validation.</p></div><span className={`pill ${selectedJenkinsProcess.badgeClass}`}>{selectedJenkinsProcess.badgeLabel}</span></header>
+                          <dl className="jenkins-process-summary"><div><dt>Application</dt><dd>{selectedJenkinsProcess.applicationId}</dd></div><div><dt>Jenkins job</dt><dd>{selectedJenkinsProcess.jobName || "Job path required"}</dd></div><div><dt>Resolution</dt><dd>{selectedJenkinsProcess.resolutionId}</dd></div><div><dt>Execution</dt><dd>{selectedJenkinsProcess.executionMode}</dd></div></dl>
+                          <ol className="jenkins-process-flow" aria-label="Jenkins resolution progress">
+                            <li className={selectedJenkinsProcess.hasResolution ? "is-complete" : "is-current"}><span>1</span><div><strong>Resolution selected</strong><small>{selectedJenkinsProcess.resolutionId}</small></div></li>
+                            <li className={cockpitApprovalAccepted ? "is-complete" : "is-current"}><span>2</span><div><strong>Approval</strong><small>{cockpitApprovalAccepted ? "Recorded" : "Pending"}</small></div></li>
+                            <li className={selectedJenkinsProcess.succeeded ? "is-complete" : selectedJenkinsProcess.submitted ? "is-current" : cockpitApprovalAccepted ? "is-current" : ""}><span>3</span><div><strong>Jenkins execution</strong><small>{selectedJenkinsProcess.executionStageLabel}</small></div></li>
+                            <li className={selectedJenkinsProcess.succeeded ? "is-complete" : ""}><span>4</span><div><strong>Validate and close</strong><small>{selectedJenkinsProcess.succeeded ? `${editedExecutionPlan.queries.length} check(s)` : selectedJenkinsProcess.validationStageLabel}</small></div></li>
+                          </ol>
+                          <footer><div><strong>Rollback</strong><span>{executionRollbackPlan || "Rollback instructions are required before live execution."}</span></div>{selectedJenkinsProcess.queueUrl ? <a className="button-secondary" href={selectedJenkinsProcess.queueUrl} target="_blank" rel="noreferrer">Open Jenkins build</a> : <button type="button" className="button-secondary" onClick={() => document.querySelector(".remediation-connection-panel")?.scrollIntoView({ behavior: "smooth", block: "start" })}>{selectedJenkinsProcess.configured ? "Review Jenkins setup" : "Configure Jenkins"}</button>}</footer>
+                        </section> : null}
+                        {!executionIsDiagnosticOnly ? <details className="execution-safety-details">
+                          <summary>Safety checks <span>{executionPreflightChecks.filter((check) => check.passed).length}/{executionPreflightChecks.length} ready</span></summary>
+                          <div className="execution-decision-grid">
+                          <section className={`execution-readiness ${blockingPreflightFailures.length ? "is-blocked" : "is-ready"}`} aria-labelledby="execution-readiness-heading">
+                            <div className="panel-head">
+                              <div>
+                                <span className="eyebrow">Execution readiness</span>
+                                <h3 id="execution-readiness-heading">{blockingPreflightFailures.length ? "Complete required setup" : "Required checks ready"}</h3>
+                              </div>
+                              <strong>{executionPreflightChecks.filter((check) => check.passed).length}/{executionPreflightChecks.length}</strong>
                             </div>
+                            <p>{blockingPreflightFailures.length ? `${blockingPreflightFailures.length} blocking issue(s) must be resolved.` : "Policy, target, approval, identity, and idempotency are enforced when execution is submitted."}</p>
+                          </section>
+                          </div>
+                          <div className="execution-checklist" aria-label="Execution readiness checks">
+                          {executionPreflightChecks.map((check) => (
+                            <article className={`execution-check ${check.passed ? "is-pass" : check.blocking ? "is-block" : "is-warn"}`} key={check.id}>
+                              <span aria-hidden="true">{check.passed ? "✓" : check.blocking ? "×" : "!"}</span>
+                              <div><strong>{check.label}</strong><p>{check.detail}</p></div>
+                              <small>{check.passed ? "Ready" : check.blocking ? "Required" : "Recommended"}</small>
+                            </article>
                           ))}
-                        </div>
-                        <div className="table-wrap table-wrap-scroll-x remediation-service-flow">
-                          <table>
-                            <thead>
-                              <tr>
-                                <th>Backend Service</th>
-                                <th>Consumes</th>
-                                <th>Publishes</th>
-                                <th>Processing Agent</th>
-                              </tr>
-                            </thead>
-                            <tbody>
-                              {SERVICE_TOPIC_FLOW.map((stage) => (
-                                <tr key={`service-flow-${stage.service}`}>
-                                  <td>{stage.service}</td>
-                                  <td>{stage.consumes}</td>
-                                  <td>{stage.publishes}</td>
-                                  <td>{stage.agent}</td>
-                                </tr>
-                              ))}
-                            </tbody>
-                          </table>
-                        </div>
-                        <div className="filter-grid remediation-kpi-grid">
-                          <div className="remediation-kpi">
-                            <span>Incident</span>
-                            <p>
-                              <span className={`pill ${statusPillClass(selectedExecutionBreakdown.incidentStatus)}`}>
-                                {selectedExecutionPlan.incidentStatus || "-"}
-                              </span>
-                            </p>
                           </div>
-                          <div className="remediation-kpi">
-                            <span>Approval</span>
-                            <p>
-                              <span className={`pill ${statusPillClass(selectedExecutionBreakdown.approvalStatus)}`}>
-                                {selectedExecutionPlan.approvalStatus || "pending"}
-                              </span>
-                            </p>
-                          </div>
-                          <div className="remediation-kpi">
-                            <span>Commands</span>
-                            <p>{selectedExecutionBreakdown.commands.length}</p>
-                          </div>
-                          <div className="remediation-kpi">
-                            <span>Scripts</span>
-                            <p>{selectedExecutionBreakdown.scripts.length}</p>
-                          </div>
-                          <div className="remediation-kpi">
-                            <span>Queries</span>
-                            <p>{selectedExecutionBreakdown.queries.length}</p>
-                          </div>
-                        </div>
-                        <p className="subtitle">
-                          {selectedExecutionBreakdown.hasPlan
-                            ? "Plan is ready. Modify commands, scripts, or validation queries before executing the approved run path."
-                            : "No remediation plan is available yet. Ensure recommendation and workflow events have been generated."}
-                        </p>
-                        {selectedRemediationOutcome ? (
-                          <div className={`remediation-outcome remediation-outcome-${selectedRemediationOutcome.status}`}>
-                            <div>
-                              <strong>{selectedRemediationOutcome.title}</strong>
-                              <p>{selectedRemediationOutcome.detail}</p>
-                            </div>
-                            <dl>
-                              <dt>Action</dt>
-                              <dd>{selectedRemediationOutcome.actionType}</dd>
-                              <dt>Target</dt>
-                              <dd>{selectedRemediationOutcome.target}</dd>
-                            </dl>
-                          </div>
-                        ) : null}
-                        <article className="panel remediation-connection-panel">
-                          <div className="panel-head">
-                            <h3>Application Connection Details</h3>
-                            <p>Execution target used for approval, dry-run context, and live executor dispatch.</p>
-                          </div>
+                        </details> : null}
+                        {!executionIsDiagnosticOnly ? <details className="panel remediation-connection-panel">
+                          <summary className="panel-head"><div><h3>Connection details</h3><p>{selectedApplicationConnection.service} · {selectedApplicationConnection.environment} · {selectedApplicationConnection.source}</p></div><span className="section-toggle-indicator" /></summary>
                           <div className="filter-grid">
                             <label>Application<input value={selectedApplicationConnection.application} readOnly /></label>
                             <label>Service<input value={selectedApplicationConnection.service} readOnly /></label>
                             <label>Environment<input value={selectedApplicationConnection.environment} readOnly /></label>
                             <label>Source<input value={selectedApplicationConnection.source} readOnly /></label>
                             <label>Connection Type<input value={remediationPlanEditor.connection_type} onChange={(e) => setRemediationPlanEditor((curr) => ({ ...curr, connection_type: e.target.value }))} /></label>
-                            <label>Endpoint URL<input value={remediationPlanEditor.connection_url} placeholder="https://app-or-metrics-endpoint" onChange={(e) => setRemediationPlanEditor((curr) => ({ ...curr, connection_url: e.target.value }))} /></label>
+                            <label>Executor<select value={remediationPlanEditor.executor_type} onChange={(e) => setRemediationPlanEditor((curr) => ({ ...curr, executor_type: e.target.value, connection_type: e.target.value || curr.connection_type }))}><option value="">Validation only</option><option value="jenkins">Jenkins</option></select></label>
+                            <label>Endpoint URL<input className={executionEndpoint && !executionEndpointValid ? "input-invalid" : ""} aria-invalid={Boolean(executionEndpoint && !executionEndpointValid)} value={remediationPlanEditor.connection_url} placeholder="https://app-or-metrics-endpoint" onChange={(e) => setRemediationPlanEditor((curr) => ({ ...curr, connection_url: e.target.value }))} /><span className="field-hint">{executionEndpoint && !executionEndpointValid ? "Enter an HTTP(S) endpoint, not a deployment or release name." : "Optional connector endpoint used for validation and execution."}</span></label>
+                            {jenkinsExecutorSelected ? <label>Jenkins Job Path<input value={remediationPlanEditor.job_name} placeholder="service/rollback" onChange={(e) => setRemediationPlanEditor((curr) => ({ ...curr, job_name: e.target.value }))} /><span className="field-hint">Folders are supported. KaiMS triggers this job only after approval and confirmation.</span></label> : null}
                             <label>Namespace / Runtime<input value={remediationPlanEditor.namespace} placeholder="prod / namespace / resource group" onChange={(e) => setRemediationPlanEditor((curr) => ({ ...curr, namespace: e.target.value }))} /></label>
                           </div>
-                        </article>
-                        <article className="panel remediation-editor-panel">
-                          <div className="panel-head">
-                            <h3>Editable Remediation Script</h3>
-                            <p>Review one guarded script with connection details. The approved edited script is submitted to the remediation engine.</p>
+                        </details> : null}
+                        {!executionIsDiagnosticOnly ? <details className="panel remediation-editor-panel">
+                          <summary>Execution plan <span>{editedExecutionPlan.commands.length + editedExecutionPlan.scripts.length} executable step(s) · {editedExecutionPlan.queries.length} validation check(s)</span></summary>
+                          <div className="panel-head remediation-editor-actions">
+                            <div><h3>Governed execution plan</h3><p>This versioned catalog plan is immutable in the standard workflow. Request a new plan version when the action or checks must change.</p></div>
                           </div>
-                          <div className="remediation-editor-grid">
-                            <label>Single Remediation Script<textarea rows={8} value={remediationPlanEditor.scripts} onChange={(e) => setRemediationPlanEditor((curr) => ({ ...curr, scripts: e.target.value }))} /></label>
-                            <label>Additional Commands<textarea rows={8} value={remediationPlanEditor.commands} onChange={(e) => setRemediationPlanEditor((curr) => ({ ...curr, commands: e.target.value }))} /></label>
-                            <label>Additional Validation Queries<textarea rows={8} value={remediationPlanEditor.queries} onChange={(e) => setRemediationPlanEditor((curr) => ({ ...curr, queries: e.target.value }))} /></label>
+                          <div className="remediation-editor-grid compact-plan-editor governed-plan-view">
+                            <section><span>Remediation playbook</span><small>{editedExecutionPlan.scripts.length ? `${editedExecutionPlan.scripts.length} step(s)` : "No script artifact"}</small><pre>{editedExecutionPlan.scripts.join("\n") || "No reviewed remediation playbook supplied."}</pre></section>
+                            <section><span>Execution commands</span><small>{editedExecutionPlan.commands.length} command(s)</small><pre>{editedExecutionPlan.commands.join("\n") || "No approved execution commands supplied."}</pre></section>
+                            <section><span>Recovery validation</span><small>{editedExecutionPlan.queries.length} check(s)</small><pre>{editedExecutionPlan.queries.join("\n") || "No recovery validation supplied."}</pre></section>
                           </div>
-                          <label>Execution Notes<textarea rows={2} value={remediationPlanEditor.notes} onChange={(e) => setRemediationPlanEditor((curr) => ({ ...curr, notes: e.target.value }))} /></label>
-                          <div className="remediation-execute-row">
-                            <button
-                              type="button"
-                              className="button-primary"
-                              onClick={executeApprovedRemediationPlan}
-                              disabled={remediationExecutionState.loading || !canUseApprovalActions}
-                              title={canUseApprovalActions ? "Execute the approved edited plan through remediation-engine" : "Approval-eligible role required"}
-                            >
-                              {remediationExecutionState.loading ? "Executing..." : "Execute Approved Plan"}
-                            </button>
-                            <button
-                              type="button"
-                              className="button-secondary"
-                              onClick={() => setRemediationPlanEditor((curr) => ({
-                                ...curr,
-                                commands: "",
-                                scripts: selectedExecutionBreakdown.scripts.length
-                                  ? selectedExecutionBreakdown.scripts.join("\n")
-                                  : buildKaiOpsRemediationScript({
-                                      service: selectedApplicationConnection.service !== "-" ? selectedApplicationConnection.service : selectedApplicationConnection.application,
-                                      environment: selectedApplicationConnection.environment,
-                                      apiGatewayUrl: "http://api-gateway:8000",
-                                      prometheusUrl: selectedApplicationConnection.endpoint !== "Not configured"
-                                        ? selectedApplicationConnection.endpoint
-                                        : onboardingForm.prometheus_url || onboardingForm.monitoring_url || "http://prometheus:9090",
-                                      mysqlHost: "mysql",
-                                      mysqlDatabase: "kaiops",
-                                      mysqlUser: "kaiops",
-                                    }),
-                                queries: "",
-                              }))}
-                              disabled={remediationExecutionState.loading}
-                            >
-                              Reset To Suggested Plan
-                            </button>
+                        </details> : null}
+                        </details> : null}
+                        <section className="execution-guided-flow" aria-labelledby="guided-execution-heading">
+                          <div className="execution-guided-head"><div><span className="discovery-eyebrow">Guarded execution</span><h3 id="guided-execution-heading">{executionAutoCloses ? "Watch-only completion" : manualEscalationRecorded ? "Manual remediation requested" : "Complete the current step"}</h3><p>{executionAutoCloses ? "This alert is explicitly watch-only. KaiOps is recording the observation and closing it without execution." : manualEscalationRecorded ? "Automation remains safely locked while an operator handles the incident manually." : executionActivationMessage}</p></div><span className={`pill ${executionAllowed || manualEscalationRecorded || (executionAutoCloses && ["closed", "resolved"].includes(selectedCanonicalIncidentStatus)) ? "pill-success" : "pill-warning"}`}>{executionAutoCloses ? (["closed", "resolved"].includes(selectedCanonicalIncidentStatus) ? "Closed" : "Auto-closing") : manualEscalationRecorded ? "Escalated" : executionAllowed ? "Ready" : !cockpitApprovalAccepted ? "Decision required" : executionSetupBlocked || executionCapabilityBlocked ? "Blocked" : "In progress"}</span></div>
+                          {executionAutoCloses ? <ol className="execution-stepper" aria-label="Watch-only completion progress"><li className={["closed", "resolved"].includes(selectedCanonicalIncidentStatus) ? "is-complete" : "is-current"}><span>✓</span><div><strong>Record observation and close</strong><small>{["closed", "resolved"].includes(selectedCanonicalIncidentStatus) ? "Completed" : "In progress"}</small></div></li></ol> : !liveExecutionPlanAvailable ? <ol className="execution-stepper" aria-label="Diagnostic plan next steps"><li className="is-current"><span>1</span><div><strong>Choose next action</strong><small>Manual escalation or new plan required</small></div></li><li><span>2</span><div><strong>Review corrective plan</strong><small>Pending</small></div></li><li><span>3</span><div><strong>Execute</strong><small>Locked</small></div></li></ol> : <ol className="execution-stepper" aria-label="Execution progress">
+                            <li className={cockpitApprovalAccepted ? "is-complete" : "is-current"}><span>1</span><div><strong>Approve</strong><small>{cockpitApprovalAccepted ? "Recorded" : "Pending"}</small></div></li>
+                            <li className={cockpitApprovalAccepted && executionConfirmationValid ? "is-complete" : cockpitApprovalAccepted ? "is-current" : ""}><span>2</span><div><strong>Confirm</strong><small>{cockpitApprovalAccepted && executionConfirmationValid ? "Complete" : "Pending"}</small></div></li>
+                            <li className={remediationExecutionState.loading || executionAllowed ? "is-current" : ""}><span>3</span><div><strong>Execute</strong><small>{remediationExecutionState.loading ? "Running" : executionAllowed ? "Ready" : executionCapabilityBlocked ? "Executor required" : "Locked"}</small></div></li>
+                          </ol>}
+                          <div className="execution-current-step">
+                            {manualEscalationRecorded ? <div className="execution-step-form" role="status"><div><strong>Escalation recorded</strong><p>The incident remains open for manual remediation. Automated execution stays locked because no reviewed corrective action or recovery check is available.</p></div><button type="button" className="button-secondary" onClick={regenerateSelectedAlertAnalysis} disabled={selectedAlertRegeneration.loading}>{selectedAlertRegeneration.loading ? "Regenerating…" : "Generate a corrective plan instead"}</button></div> : <>
+                            {executionAutoCloses ? <div className="execution-step-form"><div><strong>{["closed", "resolved"].includes(selectedCanonicalIncidentStatus) ? "Watch-only observation recorded — incident closed" : "Automatic watch-only closure in progress"}</strong><p>No approval or execution is required because the resolution explicitly classified this alert as watch-only.</p></div></div> : !liveExecutionPlanAvailable ? <div className="execution-step-form"><div><strong>This recommendation cannot be approved for execution</strong><p>No current governed corrective plan is attached. Keep the incident open, escalate for manual remediation, or run fresh analysis to compile a reviewed plan.</p></div><label>Escalation reason<textarea rows={2} value={approvalForm.comment} placeholder="Why does this incident require manual remediation?" onChange={(event) => setApprovalForm((current) => ({ ...current, action: "reject", comment: event.target.value }))} /></label><div className="button-row"><button type="button" className="button-primary" onClick={() => void approveCockpitRemediationPlan("reject")} disabled={approvalState.loading}>{approvalState.loading ? "Recording escalation…" : "Escalate for manual remediation"}</button><button type="button" className="button-secondary" onClick={regenerateSelectedAlertAnalysis} disabled={selectedAlertRegeneration.loading}>{selectedAlertRegeneration.loading ? "Regenerating…" : "Generate governed plan"}</button></div></div> : !cockpitApprovalAccepted ? <div className="execution-step-form"><div className="credential-method-grid"><label>Decision<select value={approvalForm.action} onChange={(event) => setApprovalForm((current) => ({ ...current, action: event.target.value }))}><option value="approve">Approve immutable plan</option><option value="reject">Reject automation and escalate</option></select></label><label>Approver<input value={adminSession?.user?.username || "Authenticated operator"} readOnly /></label></div><label>Decision reason<textarea rows={2} value={approvalForm.comment} placeholder={approvalForm.action === "reject" ? "Why must this incident be escalated for manual remediation?" : "Why is this plan safe and appropriate?"} onChange={(event) => setApprovalForm((current) => ({ ...current, comment: event.target.value }))} /></label><button type="button" className="button-primary" onClick={() => void approveCockpitRemediationPlan()} disabled={approvalState.loading}>{approvalState.loading ? (approvalWillAutoExecute ? "Approving and starting…" : "Recording decision…") : approvalForm.action === "reject" ? "Reject and escalate" : approvalWillAutoExecute ? "Approve and start remediation" : "Approve and continue"}</button><small className="execution-action-explainer">{approvalWillAutoExecute ? "This lower-risk non-production plan starts immediately after approval." : dangerousProductionAction ? "Production execution requires a separate typed confirmation after approval." : "Approval is recorded first; any missing executor setup is shown next."}</small></div> : executionSetupBlocked ? <div className="execution-step-form"><div><strong>Approval recorded — complete required setup</strong><p>{blockingPreflightFailures.map((check) => check.label).join(", ")}</p></div>{!jenkinsExecutorSelected ? <button type="button" className="button-primary" onClick={buildRequiredExecutor}>Build required process</button> : null}</div> : dangerousProductionAction && !executionConfirmationValid ? <div className="execution-step-form"><label className="typed-execution-confirmation">Approval recorded. Type <code>{executionConfirmationPhrase}</code> to confirm production execution<input value={executionConfirmationText} autoComplete="off" autoFocus onChange={(event) => setExecutionConfirmationText(event.target.value)} /></label></div> : executionCapabilityBlocked ? <div className="execution-step-form"><div><strong>Approval recorded — live execution is not configured</strong><p>This plan has no reviewed corrective capability. Regenerate it after adding a matching catalog playbook.</p></div></div> : <><div><strong>Approval and all safety gates passed</strong><p>{selectedGovernedExecutionTarget} · {selectedApplicationConnection.environment} · {selectedExecutionPlan.riskTier || "unknown risk"}</p></div><button type="button" className="button-primary execution-primary-action" onClick={confirmAndExecuteRemediationPlan} disabled={!executionAllowed}>{remediationExecutionState.loading ? "Executing…" : "Execute approved plan"}</button></>}
+                            </>}
                           </div>
                           {remediationExecutionState.error ? <p className="error">{remediationExecutionState.error}</p> : null}
-                          {remediationExecutionState.result ? (
-                            <pre className="result">{JSON.stringify(unwrap(remediationExecutionState.result), null, 2)}</pre>
-                          ) : null}
-                        </article>
-                        <div className="table-wrap remediation-step-table" style={{ marginTop: 8 }}>
-                          <table>
-                            <thead>
-                              <tr><th>Type</th><th>Step</th><th>Action</th></tr>
-                            </thead>
-                            <tbody>
-                              {selectedExecutionBreakdown.commands.map((step, index) => (
-                                <tr key={`summary-command-${index}`}>
-                                  <td>Command</td>
-                                  <td>{step}</td>
-                                  <td><button type="button" className="button-secondary" onClick={() => copyPlanStep(step)}>Copy</button></td>
-                                </tr>
-                              ))}
-                              {selectedExecutionBreakdown.scripts.map((step, index) => (
-                                <tr key={`summary-script-${index}`}>
-                                  <td>Script</td>
-                                  <td>{step}</td>
-                                  <td><button type="button" className="button-secondary" onClick={() => copyPlanStep(step)}>Copy</button></td>
-                                </tr>
-                              ))}
-                              {selectedExecutionBreakdown.queries.map((step, index) => (
-                                <tr key={`summary-query-${index}`}>
-                                  <td>Query</td>
-                                  <td>{step}</td>
-                                  <td><button type="button" className="button-secondary" onClick={() => copyPlanStep(step)}>Copy</button></td>
-                                </tr>
-                              ))}
-                              {!selectedExecutionBreakdown.hasPlan ? <tr><td colSpan={3}>No remediation steps available.</td></tr> : null}
-                            </tbody>
-                          </table>
-                        </div>
+                          {approvalState.error ? <p className="error" role="alert">{approvalState.error}</p> : null}
+                          {emergencyStopAvailable ? <section className="execution-emergency-stop" aria-labelledby="emergency-stop-title"><div><span className="eyebrow">Emergency control</span><h4 id="emergency-stop-title">Stop active remediation</h4><p>Stops the queued or running executor job, cancels durable orchestration, and records the authenticated operator and reason.</p></div><label>Required stop reason<textarea rows={2} value={emergencyStopState.reason} placeholder="Describe the unsafe condition or unexpected impact" onChange={(event) => setEmergencyStopState((current) => ({ ...current, reason: event.target.value, error: "" }))} /></label><button type="button" className="button-danger" disabled={emergencyStopState.loading || emergencyStopState.reason.trim().length < 8} onClick={() => requestEmergencyStop(emergencyStopAction.id)}>{emergencyStopState.loading ? "Stopping remediation…" : "Emergency stop"}</button></section> : null}
+                          {emergencyStopState.error ? <p className="error" role="alert">{emergencyStopState.error}</p> : null}
+                          {emergencyStopState.message ? <p className="status-message" role="status">{emergencyStopState.message}</p> : null}
+                        </section>
+                        <section className="execution-recovery-grid">
+                          <article className={`execution-recovery-card ${executionRollbackPlan ? "is-ready" : "is-missing"}`}>
+                            <span className="eyebrow">Rollback</span>
+                            <h3>{executionRollbackPlan ? "Rollback plan available" : "Rollback plan missing"}</h3>
+                            <p>{executionRollbackPlan || "Attach rollback instructions before treating this plan as production-ready."}</p>
+                          </article>
+                          <article className={`execution-recovery-card ${editedExecutionPlan.queries.length ? "is-ready" : "is-missing"}`}>
+                            <span className="eyebrow">Recovery validation</span>
+                            <h3>{editedExecutionPlan.queries.length ? `${editedExecutionPlan.queries.length} post-check(s)` : "Validation missing"}</h3>
+                            <p>{editedExecutionPlan.queries[0] || "Add a health, metrics, or data-integrity check to prove recovery."}</p>
+                          </article>
+                        </section>
+                        {selectedRemediationOutcome ? (
+                          <section className={`execution-result-card remediation-outcome-${selectedRemediationOutcome.status}`} aria-live="polite">
+                            <div className="panel-head"><div><span className="eyebrow">Execution result</span><h3>{selectedRemediationOutcome.title}</h3></div><span className={`pill ${statusPillClass(selectedRemediationOutcome.status)}`}>{selectedRemediationOutcome.status}</span></div>
+                            <p>{selectedRemediationOutcome.detail}</p>
+                            <dl><dt>Action</dt><dd>{selectedRemediationOutcome.actionType}</dd><dt>Target</dt><dd>{selectedRemediationOutcome.target}</dd></dl>
+                            <details className="k-technical-details"><summary>Technical response</summary><pre className="result">{JSON.stringify(selectedExecutionTechnicalResponse, null, 2)}</pre></details>
+                            {selectedRemediationOutcome.status === "succeeded" ? <section className="execution-outcome-review"><span className="eyebrow">Required human review</span><h4>Was this remediation effective?</h4><div className="outcome-choice" role="group" aria-label="Execution outcome">{[['successful','Successful'],['partial','Partially successful'],['failed','Failed']] .map(([value,label])=><button type="button" key={value} className={executionOutcomeReview.outcome===value?'active':''} onClick={()=>setExecutionOutcomeReview((current)=>({...current,outcome:value}))}>{label}</button>)}</div><label>Operator findings<textarea rows={3} value={executionOutcomeReview.notes} placeholder="What changed, what was validated, and any side effects." onChange={(e)=>setExecutionOutcomeReview((current)=>({...current,notes:e.target.value}))}/></label><label className="checkbox-row"><input type="checkbox" checked={executionOutcomeReview.reusable} onChange={(e)=>setExecutionOutcomeReview((current)=>({...current,reusable:e.target.checked}))}/>Approve this reviewed script for future matching incidents</label><button type="button" className="button-primary" onClick={approveExecutionOutcomeForReuse} disabled={executionOutcomeReview.loading||!executionOutcomeReview.notes.trim()}>{executionOutcomeReview.loading?'Saving review…':'Submit review and learning'}</button>{executionOutcomeReview.error?<p className="error">{executionOutcomeReview.error}</p>:null}{executionOutcomeReview.message?<p className="status-message">{executionOutcomeReview.message}</p>:null}</section> : null}
+                          </section>
+                        ) : null}
+                        <details className="k-technical-details execution-technical-details">
+                          <summary>Workflow and backend routing details</summary>
+                          <div className="workflow-guide-grid remediation-flow-grid">
+                            {selectedWorkflowFlowStages.map((stage) => (
+                              <div className="workflow-guide-card remediation-flow-card" key={stage.id}><strong>{stage.label}</strong><span className={`workflow-pill workflow-pill-${stage.status}`}>{stage.status.toUpperCase()}</span><p>{stage.detail}</p></div>
+                            ))}
+                          </div>
+                          <div className="table-wrap table-wrap-scroll-x remediation-service-flow"><table><thead><tr><th>Backend Service</th><th>Consumes</th><th>Publishes</th><th>Processing Agent</th></tr></thead><tbody>{SERVICE_TOPIC_FLOW.map((stage) => <tr key={`service-flow-${stage.service}`}><td>{stage.service}</td><td>{stage.consumes}</td><td>{stage.publishes}</td><td>{stage.agent}</td></tr>)}</tbody></table></div>
+                          <ExecutionPlanGraph plan={selectedExecutionPlan} />
+                        </details>
                       </details>
-                      <ExecutionPlanGraph plan={selectedExecutionPlan} />
                     </>
                   ) : null}
 
-                  {homeDetailTab === "raw" ? (
-                    <pre className="result">{JSON.stringify(selectedAlertData.payload || {}, null, 2)}</pre>
+                  {homeDetailTab === "audit" ? (
+                    <section className="incident-audit-section" role="tabpanel">
+                      <VerifyWorkspace
+                        incidentId={selectedIncidentId}
+                        incidentStatus={selectedCanonicalIncidentStatus}
+                        workflow={selectedAlertWorkflow}
+                        executionPlan={selectedExecutionPlan}
+                        remediationOutcome={selectedRemediationOutcome}
+                        timelineRows={selectedAlertTimelineRows}
+                        documentCount={selectedAlertRagDocuments.length}
+                      />
+                      <UnifiedIncidentTimeline workflow={selectedAlertWorkflow} rows={selectedAlertTimelineRows} documents={selectedAlertRagDocuments} />
+                      <details className="k-technical-details incident-raw-details">
+                        <summary>Technical details and raw workflow payload</summary>
+                        <pre className="result">{JSON.stringify(selectedAlertData.payload || {}, null, 2)}</pre>
+                      </details>
+                    </section>
                   ) : null}
+                </article>
+              ) : selectedAlertId ? (
+                <article className="panel alert-details-cockpit" ref={alertDetailsRef} tabIndex={-1} aria-busy={selectedAlertData.loading}>
+                  <div className="panel-head incident-sticky-header">
+                    <div>
+                      <span className="discovery-eyebrow">Guided Incident Cockpit</span>
+                      <h2>Alert Details Cockpit</h2>
+                      <p>{selectedAlertData.error ? "The alert details could not be loaded." : "Loading the selected alert and incident context..."}</p>
+                    </div>
+                    <span className={`pill ${selectedAlertData.error ? "pill-danger" : "pill-info"}`}>
+                      {selectedAlertData.error ? "Load failed" : "Loading"}
+                    </span>
+                  </div>
+                  {selectedAlertData.error ? (
+                    <div>
+                      <p className="error" role="alert">{selectedAlertData.error}</p>
+                      <button type="button" className="button-primary" onClick={() => loadAlertDetails(selectedAlertId)} disabled={selectedAlertData.loading}>
+                        {selectedAlertData.loading ? "Retrying..." : "Retry loading details"}
+                      </button>
+                    </div>
+                  ) : (
+                    <p className="subtitle" role="status">Retrieving processing history, Jira ticket, context, and RCA evidence.</p>
+                  )}
                 </article>
               ) : (
                 <article className="panel">
@@ -15165,311 +11640,7 @@ export default function App() {
             </section>
           ) : null}
 
-          {activeTab === "copilot" ? (
-            <section className="grid single-col">
-              <article className="panel copilot-panel">
-                <div className="panel-head">
-                  <h2>Copilot Studio</h2>
-                  <p>One guided place to onboard projects, create alert documents, and manage users.</p>
-                  <button className="button-secondary" onClick={refreshAll}>Refresh</button>
-                </div>
-
-                <div className="copilot-summary-grid">
-                  <div className="copilot-summary-card copilot-tone-ops">
-                    <strong>Project Onboarding</strong>
-                    <span>Set project identity, environment, and monitoring endpoints.</span>
-                    <button type="button" className="button-primary" onClick={() => openCopilotWorkspace("project")}>Open Unified Setup</button>
-                  </div>
-                  <div className="copilot-summary-card copilot-tone-bus">
-                    <strong>Alert Documents</strong>
-                    <span>Create onboarding docs and bulk alert knowledge from one place.</span>
-                    <button type="button" className="button-primary" onClick={() => openCopilotWorkspace("alerts")}>Open Docs</button>
-                  </div>
-                  <div className={`copilot-summary-card ${isAdministrator ? "copilot-tone-meta" : "copilot-tone-muted"}`}>
-                    <strong>User Management</strong>
-                    <span>{isAdministrator ? "Create, edit, and reset users." : "Administrator-only control."}</span>
-                    <button type="button" className="button-primary" onClick={() => openCopilotWorkspace("users")} disabled={!isAdministrator}>Open Users</button>
-                  </div>
-                </div>
-
-                <div className="copilot-flow-grid">
-                  <div className="copilot-flow-card">
-                    <span className="copilot-step">1</span>
-                    <div>
-                      <strong>Start from a project</strong>
-                      <p>Use the project onboarding form to register monitoring details and assignments.</p>
-                    </div>
-                  </div>
-                  <div className="copilot-flow-card">
-                    <span className="copilot-step">2</span>
-                    <div>
-                      <strong>Generate alert docs</strong>
-                      <p>Write onboarding docs or bulk import runbook-style alert guidance.</p>
-                    </div>
-                  </div>
-                  <div className="copilot-flow-card">
-                    <span className="copilot-step">3</span>
-                    <div>
-                      <strong>Manage access</strong>
-                      <p>Keep user roles, statuses, and passwords in the same workspace.</p>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="copilot-shortcuts">
-                  <button type="button" className="button-secondary" onClick={() => openCopilotWorkspace("project")}>Monitoring + Landing Pad Setup</button>
-                  <button type="button" className="button-secondary" onClick={() => openCopilotWorkspace("alerts")}>Alert Documents</button>
-                  <button type="button" className="button-secondary" onClick={() => openCopilotWorkspace("users")} disabled={!isAdministrator}>User Management</button>
-                  <button type="button" className="button-secondary" onClick={() => setActiveTab("summary")}>Incident Metadata</button>
-                </div>
-              </article>
-            </section>
-          ) : null}
-
-          {activeTab === "executive" ? (
-            <section className="grid single-col">
-              <article className="panel">
-                <div className="panel-head">
-                  <h2>Executive Dashboard</h2>
-                  <p>Leadership-level snapshot of reliability, risk, and closure trend.</p>
-                </div>
-                <div className="stat-grid">
-                  <div className="stat-card"><strong>Open Alerts</strong><span>{monitorScopedAlerts.length}</span></div>
-                  <div className="stat-card"><strong>Total Requests</strong><span>{executiveMetrics.totalRequests}</span></div>
-                  <div className="stat-card"><strong>Failures</strong><span>{executiveMetrics.failedRequests}</span></div>
-                  <div className="stat-card"><strong>P95 Latency</strong><span>{executiveMetrics.p95LatencyMs.toFixed(1)} ms</span></div>
-                  <div className="stat-card"><strong>Closed Tickets</strong><span>{executiveClosedSummary.total}</span></div>
-                  <div className="stat-card"><strong>Closure Rate</strong><span>{executiveClosedSummary.closureRate.toFixed(1)}%</span></div>
-                  <div className="stat-card"><strong>Pending Approvals</strong><span>{pendingApprovals.length}</span></div>
-                  <div className="stat-card"><strong>SLA At Risk</strong><span>{executiveInsights.slaAtRisk}</span></div>
-                  <div className="stat-card"><strong>Avg Approval Wait</strong><span>{executiveInsights.avgApprovalWaitMinutes.toFixed(1)} min</span></div>
-                  <div className="stat-card"><strong>Auto Remediation</strong><span>{executiveInsights.automationRate.toFixed(1)}%</span></div>
-                  <div className="stat-card"><strong>LLM Cost</strong><span>${executiveMetrics.finopsCost.toFixed(6)}</span></div>
-                </div>
-
-                <div className="executive-chart-grid">
-                  <HorizontalBarChart
-                    title="Request Volume"
-                    subtitle="Observed API gateway events in current window"
-                    items={[
-                      { label: "Total", value: executiveMetrics.totalRequests, tone: "meta" },
-                      { label: "Success", value: executiveMetrics.successRequests, tone: "ops" },
-                      { label: "Failure", value: executiveMetrics.failedRequests, tone: "risk" },
-                    ]}
-                  />
-                  <SuccessFailureDonut
-                    success={executiveMetrics.successRequests}
-                    failure={executiveMetrics.failedRequests}
-                  />
-                  <HorizontalBarChart
-                    title="Latency Trend"
-                    subtitle={`Avg ${executiveMetrics.avgLatencyMs.toFixed(1)} ms | P95 ${executiveMetrics.p95LatencyMs.toFixed(1)} ms`}
-                    items={executiveMetrics.latencyTrend}
-                  />
-                  <HorizontalBarChart
-                    title="FinOps Overview"
-                    subtitle="Aggregated LLM usage and spend"
-                    items={[
-                      { label: "Model Calls", value: executiveMetrics.finopsCalls, tone: "meta" },
-                      { label: "Tokens", value: executiveMetrics.finopsTokens, tone: "cost" },
-                      {
-                        label: "Cost USD",
-                        value: executiveMetrics.finopsCost,
-                        displayValue: `$${executiveMetrics.finopsCost.toFixed(6)}`,
-                        tone: "bus",
-                      },
-                    ]}
-                  />
-                  <HorizontalBarChart
-                    title="Closed Tickets by Risk"
-                    subtitle="Recent closure distribution"
-                    items={executiveClosedSummary.riskItems}
-                  />
-                  <HorizontalBarChart
-                    title="Closed Tickets by Execution Mode"
-                    subtitle="How incidents were handled"
-                    items={executiveClosedSummary.modeItems}
-                  />
-                  <HorizontalBarChart
-                    title="Weekly Open Incident Trend"
-                    subtitle="Open incidents observed per day (7-day window)"
-                    items={executiveInsights.weeklyOpenTrend}
-                  />
-                  <HorizontalBarChart
-                    title="Weekly Closed Incident Trend"
-                    subtitle="Closed incidents per day (7-day window)"
-                    items={executiveInsights.weeklyClosedTrend}
-                  />
-                </div>
-
-                <article className="panel executive-flow-panel">
-                  <div className="panel-head">
-                    <h3>End-to-End Processing + FinOps</h3>
-                    <p>Landing pad ingestion, parallel worker processing, remediation execution, and cost visibility in one leadership view.</p>
-                  </div>
-                  <div className="workflow-guide-grid executive-flow-grid">
-                    {selectedWorkflowFlowStages.map((stage) => (
-                      <div className="workflow-guide-card executive-flow-card" key={`exec-flow-${stage.id}`}>
-                        <strong>{stage.label}</strong>
-                        <span className={`workflow-pill workflow-pill-${stage.status}`}>{stage.status.toUpperCase()}</span>
-                        <p>{stage.detail}</p>
-                      </div>
-                    ))}
-                  </div>
-                  <div className="table-wrap table-wrap-scroll-x">
-                    <table>
-                      <thead>
-                        <tr>
-                          <th>Backend Service</th>
-                          <th>Consumes</th>
-                          <th>Publishes</th>
-                          <th>Processing Agent</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {SERVICE_TOPIC_FLOW.map((stage) => (
-                          <tr key={`exec-service-flow-${stage.service}`}>
-                            <td>{stage.service}</td>
-                            <td>{stage.consumes}</td>
-                            <td>{stage.publishes}</td>
-                            <td>{stage.agent}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                  <div className="table-wrap">
-                    <table>
-                      <thead>
-                        <tr>
-                          <th>Provider</th>
-                          <th>Calls</th>
-                          <th>Tokens</th>
-                          <th>Cost USD</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {finopsByProvider.map((row, index) => (
-                          <tr key={`exec-finops-${row.provider}-${index}`}>
-                            <td>{row.provider}</td>
-                            <td>{row.calls}</td>
-                            <td>{row.total_tokens}</td>
-                            <td>{Number(row.total_cost_usd || 0).toFixed(6)}</td>
-                          </tr>
-                        ))}
-                        {!finopsByProvider.length ? (
-                          <tr>
-                            <td colSpan={4}>No model calls recorded yet.</td>
-                          </tr>
-                        ) : null}
-                      </tbody>
-                    </table>
-                  </div>
-                </article>
-
-                <h3>Executive Risk & Operations Report</h3>
-                <div className="table-wrap">
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>Metric</th>
-                        <th>Value</th>
-                        <th>Interpretation</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      <tr>
-                        <td>SLA At Risk</td>
-                        <td>{executiveInsights.slaAtRisk}</td>
-                        <td>Open high/critical or manual-mode incidents that may affect business SLO/SLA outcomes.</td>
-                      </tr>
-                      <tr>
-                        <td>Average Approval Wait</td>
-                        <td>{executiveInsights.avgApprovalWaitMinutes.toFixed(1)} min</td>
-                        <td>Mean time pending in approval queue; useful for governance and response speed tracking.</td>
-                      </tr>
-                      <tr>
-                        <td>Auto Remediation Rate</td>
-                        <td>{executiveInsights.automationRate.toFixed(1)}%</td>
-                        <td>Share of closed incidents resolved using automatic execution modes.</td>
-                      </tr>
-                    </tbody>
-                  </table>
-                </div>
-
-                <div className="table-wrap">
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>Incident</th>
-                        <th>Service</th>
-                        <th>Risk</th>
-                        <th>Status</th>
-                        <th>Execution Mode</th>
-                        <th>Action</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {monitorScopedIncidentMetadata.slice(0, 20).map((row, index) => (
-                        <tr key={`exec-${row.incident_id || index}`}>
-                          <td>{row.incident_id || "-"}</td>
-                          <td>{row.service || "-"}</td>
-                          <td>{row.risk_tier || "-"}</td>
-                          <td><span className={`pill ${statusPillClass(row.status)}`}>{row.status || "-"}</span></td>
-                          <td>{row.execution_mode || "-"}</td>
-                          <td>
-                            <button type="button" className="button-secondary" onClick={() => openAlertDetailsFromIncident(row)}>
-                              Open
-                            </button>
-                          </td>
-                        </tr>
-                      ))}
-                      {!monitorScopedIncidentMetadata.length ? (
-                        <tr>
-                          <td colSpan={6}>No executive rows available for {applicationToMonitor}.</td>
-                        </tr>
-                      ) : null}
-                    </tbody>
-                  </table>
-                </div>
-
-                <h3>Recently Closed Tickets</h3>
-                <div className="table-wrap">
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>Incident</th>
-                        <th>Service</th>
-                        <th>Risk</th>
-                        <th>Execution Mode</th>
-                        <th>Status</th>
-                        <th>Closed At</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {executiveClosedSummary.recentRows.map((row, index) => (
-                        <tr key={`exec-closed-${row.incident_id || index}`}>
-                          <td>{row.incident_id || "-"}</td>
-                          <td>{row.service || "-"}</td>
-                          <td>{row.risk_tier || row.risk || row.severity || "-"}</td>
-                          <td>{row.execution_mode || "-"}</td>
-                          <td><span className={`pill ${statusPillClass(row.status || "closed")}`}>{row.status || "closed"}</span></td>
-                          <td>{formatIstTimestamp(row.closed_at || row.updated_at)}</td>
-                        </tr>
-                      ))}
-                      {!executiveClosedSummary.recentRows.length ? (
-                        <tr>
-                          <td colSpan={6}>No closed tickets are available yet.</td>
-                        </tr>
-                      ) : null}
-                    </tbody>
-                  </table>
-                </div>
-              </article>
-            </section>
-          ) : null}
-
-          {activeTab === "admin" && isAdministrator ? (
+          {activeTab === "admin" && isAdministrator && (!routeOutlet || currentSearch.includes("workspace=knowledge")) ? (
             <section className="grid single-col">
               <article className="panel admin-center-panel">
                 <div className="panel-head">
@@ -15505,8 +11676,9 @@ export default function App() {
 
                 <p className="subtitle">Navigate by stage: Access handles identity, Setup covers landing pad and approvals, Knowledge stores alert intelligence.</p>
                 <p className="subtitle"><strong>Current Stage:</strong> {adminWorkspaceCaptions[adminWorkspace] || "Administrative workspace controls."}</p>
+              </article>
 
-                {adminWorkspace === "users" ? (
+              {adminWorkspace === "users" ? (
                   <div className="grid single-col">
                     <article className="panel">
                       <h3>Session</h3>
@@ -15642,11 +11814,26 @@ export default function App() {
 
                 {adminWorkspace === "project" ? (
                   <div className="grid single-col admin-flow-section admin-flow-project">
+                    <section className="panel operating-mode-flow" aria-labelledby="operating-mode-title">
+                      <div className="panel-head"><div><span className="discovery-eyebrow">Incident operating model</span><h3 id="operating-mode-title">Immediate response, continuously improving context</h3><p>Both modes remain active. Continuous knowledge is the default context strategy for every newly onboarded application.</p></div><span className="workflow-pill workflow-pill-active">Continuous default</span></div>
+                      <div className="operating-mode-grid">
+                        <article className="operating-mode-card is-immediate">
+                          <header><span>01</span><div><small>Immediate</small><h3>Real-time Response</h3></div></header>
+                          <ol><li><strong>Process the alert</strong><span>Start as soon as an alert reaches the landing pad.</span></li><li><strong>Reuse known context</strong><span>Apply the latest validated knowledge before discovering missing evidence.</span></li><li><strong>Control the action</strong><span>Review, approve, remediate, validate, and close with a full audit trail.</span></li></ol>
+                        </article>
+                        <div className="operating-mode-loop" aria-label="AI learning feedback loop"><span>AI</span><strong>Context in</strong><i>↔</i><strong>Outcome back</strong></div>
+                        <article className="operating-mode-card is-continuous">
+                          <header><span>02</span><div><small>Continuous</small><h3>Proactive & Knowledge</h3></div></header>
+                          <ol><li><strong>Monitor all alert sources</strong><span>Aggregate new alert families and schedule recurring analysis.</span></li><li><strong>Curate understanding</strong><span>Persist context, RCA, impact, dependencies, and resolution guidance.</span></li><li><strong>Learn from outcomes</strong><span>Feed validated incident results back into the repository for future response.</span></li></ol>
+                        </article>
+                      </div>
+                      <div className="operating-mode-policy"><div><strong>New application context policy</strong><span>Choose when KaiMS may reuse periodic context and when it must query live systems.</span></div><select aria-label="Default context strategy" value={onboardingForm.context_strategy} onChange={(event) => setOnboardingForm((current) => ({ ...current, context_strategy: event.target.value }))}><option value="auto">Auto: reuse complete context</option><option value="historical">Historical snapshots only</option><option value="realtime">Real-time collection</option></select></div>
+                    </section>
                     <article className="panel project-stepper-panel">
                       <div className="panel-head">
                         <div>
                           <h3>Setup Wizard</h3>
-                          <p>Start with one plain-English setup prompt. KaiOps auto-completes details, scores the document, asks for missing values, then validates and updates knowledge/rules.</p>
+                          <p>Start with one plain-English setup prompt. KaiMS auto-completes details, scores the document, asks for missing values, then validates and updates knowledge/rules.</p>
                         </div>
                         <button
                           type="button"
@@ -15787,17 +11974,27 @@ export default function App() {
                           </summary>
                         <div className="filter-grid">
                           <label>Project Name *<input placeholder="example-payments" value={onboardingForm.name} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, name: e.target.value, assignment_project: e.target.value }))} /></label>
+                          <label>Business Service<input placeholder="Payments checkout" value={onboardingForm.business_service} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, business_service: e.target.value }))} /></label>
                           <label>Owner Team *<input placeholder="sre-platform" value={onboardingForm.owner_team} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, owner_team: e.target.value }))} /></label>
+                          <label>Owner Email<input type="email" placeholder="payments-sre@example.com" value={onboardingForm.owner_email} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, owner_email: e.target.value }))} /></label>
                           <label>Environment<select value={onboardingForm.environment} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, environment: e.target.value }))}><option value="dev">dev</option><option value="staging">staging</option><option value="prod">prod</option></select></label>
                           <label>Region *<input placeholder="ap-south-1" value={onboardingForm.region} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, region: e.target.value }))} /></label>
+                          <label>Business Criticality<select value={onboardingForm.criticality} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, criticality: e.target.value }))}><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="critical">critical</option></select></label>
+                          <label>Cost Center<input placeholder="CC-PLATFORM-01" value={onboardingForm.cost_center} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, cost_center: e.target.value }))} /></label>
+                          <label>Source Repository<input type="url" placeholder="https://github.com/org/service" value={onboardingForm.repository_url} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, repository_url: e.target.value }))} /></label>
                         </div>
+                        <label>Application Description<textarea rows={3} placeholder="Purpose, customers, dependencies, SLOs, and operational boundaries." value={onboardingForm.description} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, description: e.target.value }))} /></label>
                         <details className="setup-nested-details">
                           <summary>Advanced Settings (Optional)</summary>
                           <div className="filter-grid" style={{ marginTop: 10 }}>
                             <label>Deployment
                               <select value={onboardingForm.deployment_mode} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, deployment_mode: e.target.value }))}>
-                                <option value="on_prem">On-Prem</option>
-                                <option value="azure_cloud">Azure Cloud</option>
+                                <option value="cloud_neutral">Cloud neutral / portable</option>
+                                <option value="on_prem">On-premises</option>
+                                <option value="private_cloud">Private cloud</option>
+                                <option value="aws_cloud">AWS</option>
+                                <option value="azure_cloud">Azure</option>
+                                <option value="gcp_cloud">Google Cloud</option>
                               </select>
                             </label>
                             <label>Assign User (optional)<input placeholder="username" value={onboardingForm.assignment_username} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, assignment_username: e.target.value }))} /></label>
@@ -15860,8 +12057,8 @@ export default function App() {
                           </div>
                           <p className="subtitle" style={{ marginTop: 8 }}>
                             {onboardingForm.onboarding_path === "setup_monitoring"
-                              ? "KaiOps will generate Prometheus rules from the Documents & Rules step."
-                              : "Keep your current monitoring tool and send alert webhooks to KaiOps landing pad."}
+                              ? "KaiMS will generate Prometheus rules from the Documents & Rules step."
+                              : "Keep your current monitoring tool and send alert webhooks to the KaiMS landing pad."}
                           </p>
                           <div className="setup-message-bus-preview">
                             <div className="setup-route-strip" aria-label="Landing pad event route">
@@ -15938,7 +12135,7 @@ export default function App() {
                           </summary>
                           <div className="panel-head">
                             <h3>Landing Pad Details</h3>
-                            <p>Endpoint and payload guidance for alert ingestion into KaiOps workflow. Troubleshooting runbooks for ingested alerts are managed under Alert Knowledge.</p>
+                            <p>Endpoint and payload guidance for alert ingestion into the KaiMS workflow. Troubleshooting runbooks for ingested alerts are managed under Alert Knowledge.</p>
                           </div>
                           <div className="filter-grid">
                             <label>Ingestion Endpoint (UI/Gateway)
@@ -16030,9 +12227,31 @@ export default function App() {
                             <span className="field-hint">
                               {onboardingForm.onboarding_path === "setup_monitoring"
                                 ? "Required for Prometheus rule setup. In Docker Compose, use http://prometheus:9090."
-                                : "Optional. If provided, KaiOps stores endpoint metadata for your existing monitoring tool."}
+                                : "Optional. If provided, KaiMS stores endpoint metadata for your existing monitoring tool."}
                             </span>
                           </label>
+                          <section className="credential-config" aria-labelledby="credential-config-title">
+                            <header>
+                              <div><span className="discovery-eyebrow">Secure connection</span><h4 id="credential-config-title">Authentication &amp; credentials</h4><p>Connect using an identity or a reference to an existing secret. KaiMS never asks for or displays the secret value.</p></div>
+                              <span className={`credential-security-state ${onboardingForm.connection_auth_type === "none" ? "is-neutral" : "is-secure"}`}>{onboardingForm.connection_auth_type === "none" ? "No authentication" : "Reference only"}</span>
+                            </header>
+                            <div className="credential-method-grid">
+                              <label>Authentication method<select value={onboardingForm.connection_auth_type} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, connection_auth_type: e.target.value, connection_secret_ref: e.target.value === "none" || e.target.value === "managed_identity" ? "" : curr.connection_secret_ref }))}><option value="none">No authentication</option><option value="managed_identity">Azure managed identity</option><option value="bearer">Bearer token</option><option value="api_key">API key</option><option value="basic">Username and password</option><option value="oauth2">OAuth 2 client credentials</option></select><span className="field-hint">Choose the method required by the monitoring endpoint.</span></label>
+                              {!['none', 'managed_identity'].includes(onboardingForm.connection_auth_type) ? <label>Secret manager<select value={onboardingForm.connection_secret_store || "azure_key_vault"} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, connection_secret_store: e.target.value, connection_secret_ref: "" }))}><option value="azure_key_vault">Azure Key Vault</option><option value="hashicorp_vault">HashiCorp Vault</option><option value="aws_secrets_manager">AWS Secrets Manager</option><option value="kubernetes_secret">Kubernetes Secret</option></select><span className="field-hint">The runtime identity must have read access to this reference.</span></label> : null}
+                            </div>
+                            {onboardingForm.connection_auth_type === "managed_identity" ? <div className="credential-managed-identity"><strong>Managed identity selected</strong><span>KaiMS will use the workload identity assigned to the runtime. No stored secret is required.</span></div> : null}
+                            {!['none', 'managed_identity'].includes(onboardingForm.connection_auth_type) ? <label className="credential-reference-field">Secret reference<input spellCheck="false" autoComplete="off" placeholder={onboardingForm.connection_secret_store === "hashicorp_vault" ? "vault://kv/data/observability/prometheus#token" : onboardingForm.connection_secret_store === "aws_secrets_manager" ? "aws-sm://prod/observability/prometheus#api-key" : onboardingForm.connection_secret_store === "kubernetes_secret" ? "k8s-secret://monitoring/prometheus-credentials#token" : "azure-kv://kaims-prod/observability-prometheus/token"} value={onboardingForm.connection_secret_ref} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, connection_secret_ref: e.target.value }))} /><span className="field-hint">Paste the secret URI, not its value. Expected format includes the vault or namespace, secret name, and optional key/version.</span></label> : null}
+                            <footer><span aria-hidden="true"><CircleCheckBig size={16} strokeWidth={2.5} /></span><p><strong>Secrets stay outside KaiMS.</strong> Only this reference is saved with the application configuration and passed to authorized runtime connectors.</p></footer>
+                          </section>
+                          <label>Network Zone<input placeholder="prod-private / vnet name" value={onboardingForm.network_zone} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, network_zone: e.target.value }))} /></label>
+                          <label>Health Check URL<input type="url" placeholder="https://service/health" value={onboardingForm.healthcheck_url} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, healthcheck_url: e.target.value }))} /></label>
+                        </div>
+                        <div className="onboarding-source-grid">
+                          <label>Logs Source<input type="url" placeholder="https://opensearch.example.com" value={onboardingForm.logs_url} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, logs_url: e.target.value }))} /><span>OpenSearch, Loki, Splunk, or compatible endpoint</span></label>
+                          <label>Trace Source<input type="url" placeholder="https://jaeger.example.com" value={onboardingForm.traces_url} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, traces_url: e.target.value }))} /><span>Jaeger, Tempo, or tracing gateway</span></label>
+                          <label>Telemetry / OTLP<input type="url" placeholder="https://otel-collector:4318" value={onboardingForm.telemetry_url} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, telemetry_url: e.target.value }))} /><span>OpenTelemetry collector or observability gateway</span></label>
+                          <label>Ticketing / Change Source<input type="url" placeholder="https://jira.example.com" value={onboardingForm.ticketing_url} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, ticketing_url: e.target.value }))} /><span>Incident, change, and historical outcome source</span></label>
+                          <label>Email Alert Source<input placeholder="imaps://mail.example.com/INBOX" value={onboardingForm.email_url} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, email_url: e.target.value }))} /><span>IMAP/IMAPS mailbox or HTTPS email webhook; credentials remain secret references</span></label>
                         </div>
                         {onboardingForm.onboarding_path !== "setup_monitoring" ? (
                           <p className="subtitle">Alerts from your configured monitoring tool can be ingested into landing pad to trigger the remaining workflow.</p>
@@ -16052,7 +12271,7 @@ export default function App() {
                       <div className="panel-head">
                         <div>
                           <h3>Guided Setup</h3>
-                          <p>Enter the service details once. KaiOps extracts project, monitoring, alert, remediation, rollback, and validation facts.</p>
+                          <p>Enter the service details once. KaiMS extracts project, monitoring, alert, remediation, rollback, and validation facts.</p>
                         </div>
                         <button type="button" className="button-secondary" onClick={() => setProjectSetupStep("setup")}>Connection Setup</button>
                       </div>
@@ -16069,7 +12288,7 @@ export default function App() {
                           <div className="panel-head">
                             <div>
                               <h3>Project & Connection</h3>
-                              <p>Select an existing project or create a new one. Prometheus is used when KaiOps creates monitoring rules.</p>
+                              <p>Select an existing project or create a new one. Prometheus is used when KaiMS creates monitoring rules.</p>
                             </div>
                             <span className={`workflow-pill ${onboardingProjectMode === "new" ? "workflow-pill-active" : "workflow-pill-idle"}`}>
                               {onboardingProjectMode === "new" ? "new project" : "existing project"}
@@ -16202,8 +12421,8 @@ export default function App() {
                           </summary>
                           <div className="panel-head">
                             <div>
-                              <h3>Tell KaiOps What To Set Up</h3>
-                              <p>Paste a short description or runbook notes. KaiOps will complete the setup form and ask only for missing or low-confidence fields.</p>
+                              <h3>Tell KaiMS What To Set Up</h3>
+                              <p>Paste a short description or runbook notes. KaiMS will complete the setup form and ask only for missing or low-confidence fields.</p>
                             </div>
                             <button
                               type="button"
@@ -16237,7 +12456,7 @@ export default function App() {
                                 value={onboardingForm.service_knowledge_prompt}
                                 onChange={(event) => setOnboardingForm((curr) => ({ ...curr, service_knowledge_prompt: event.target.value }))}
                               />
-                              <span className="field-hint">Use plain English. KaiOps extracts setup fields, creates placeholders for missing values, and prepares rules from this prompt.</span>
+                              <span className="field-hint">Use plain English. KaiMS extracts setup fields, creates placeholders for missing values, and prepares rules from this prompt.</span>
                             </label>
                             <button
                               type="button"
@@ -16390,7 +12609,7 @@ export default function App() {
                           <div className="panel-head">
                             <div>
                               <h3>Rule Intent</h3>
-                              <p>Use extracted hints or type plain-English rules. KaiOps previews the Prometheus format before generation.</p>
+                              <p>Use extracted hints or type plain-English rules. KaiMS previews the Prometheus format before generation.</p>
                             </div>
                             <span className={`workflow-pill ${onboardingRulePromptVisible ? "workflow-pill-active" : "workflow-pill-idle"}`}>
                               {onboardingRulePromptVisible ? "ready" : "optional"}
@@ -16476,6 +12695,14 @@ export default function App() {
                         </div>
                       </div>
                       <p className="subtitle">After Create/Update Project: review generated artifacts, confirm each checklist item, then click Approve Documents.</p>
+                      <section className="onboarding-activation-summary" aria-label="Application configuration review">
+                        <div><span>Application</span><strong>{onboardingForm.name || "Not supplied"}</strong><small>{onboardingForm.business_service || onboardingForm.description || "Business context not supplied"}</small></div>
+                        <div><span>Ownership</span><strong>{onboardingForm.owner_team || "Not supplied"}</strong><small>{onboardingForm.owner_email || "Owner email not supplied"}</small></div>
+                        <div><span>Runtime</span><strong>{onboardingForm.environment} · {onboardingForm.region}</strong><small>{onboardingForm.network_zone || onboardingForm.deployment_mode}</small></div>
+                        <div><span>Monitoring</span><strong>{onboardingForm.monitoring_tool}</strong><small>{[onboardingForm.logs_url && "logs", onboardingForm.traces_url && "traces", onboardingForm.telemetry_url && "telemetry", onboardingForm.ticketing_url && "ITSM/Jira", onboardingForm.email_url && "email"].filter(Boolean).join(", ") || "primary source only"}</small></div>
+                        <div><span>Context policy</span><strong>{onboardingForm.context_strategy}</strong><small>{onboardingForm.context_strategy === "realtime" ? "Collect fresh context for every alert" : onboardingForm.context_strategy === "historical" ? "Use periodic historical snapshots only" : "Reuse complete context; refresh only when needed"}</small></div>
+                        <div><span>Credentials</span><strong>{onboardingForm.connection_auth_type}</strong><small>{onboardingForm.connection_secret_ref || "No secret reference required"}</small></div>
+                      </section>
                       <div className="filter-grid onboarding-review-checklist" style={{ marginBottom: 8 }}>
                         <label>
                           <input
@@ -16994,7 +13221,7 @@ export default function App() {
                           <h3>Service Knowledge Status</h3>
                           <button type="button" className="button-secondary" onClick={applyUploadedDocumentsToRuleIntent} disabled={!onboardingDerivedRequirements.length}>Apply To Rules</button>
                         </div>
-                        <p className="subtitle">Use the Service Knowledge upload above. KaiOps extracts and validates the important details in one flow.</p>
+                        <p className="subtitle">Use the Service Knowledge upload above. KaiMS extracts and validates the important details in one flow.</p>
                         <div className="approval-steps" style={{ marginTop: 10 }}>
                           <div className="approval-step">
                             <strong>Extract</strong>
@@ -17333,780 +13560,24 @@ export default function App() {
                     ) : null}
                   </div>
                 ) : null}
-              </article>
-            </section>
-          ) : null}
+                </section>
+              ) : null}
+              </div>
+              <aside className={`global-copilot-drawer ${isCopilotOpen ? "open" : ""}`}>
+                <div className="global-copilot-drawer-header">
+                  <h3><Bot size={18} /> Ask KAI</h3>
+                  <button className="button-secondary" onClick={() => setIsCopilotOpen(false)}>Close</button>
+                </div>
+                <div className="global-copilot-drawer-body">
+                  <CopilotRoute />
+                </div>
+              </aside>
+            </div>
+          </RouteRuntimeProvider>
 
-          {activeTab === "summary" ? (
-            <section className="grid single-col">
-              <article className="panel">
-                <div className="panel-head">
-                  <h2>Incident Metadata</h2>
-                  <p>Incident metadata explorer with policy, transport, and status context.</p>
-                  <button className="button-secondary" onClick={loadIncidentMetadata}>Refresh</button>
-                </div>
-                <div className="filter-grid sticky-controls">
-                  <label>
-                    Risk Tier
-                    <select
-                      value={metadataFilters.risk_tier}
-                      onChange={(e) => setMetadataFilters((curr) => ({ ...curr, risk_tier: e.target.value }))}
-                    >
-                      <option value="all">all</option>
-                      <option value="high">high</option>
-                      <option value="medium">medium</option>
-                      <option value="low">low</option>
-                    </select>
-                  </label>
-                  <label>
-                    Execution Mode
-                    <select
-                      value={metadataFilters.execution_mode}
-                      onChange={(e) => setMetadataFilters((curr) => ({ ...curr, execution_mode: e.target.value }))}
-                    >
-                      <option value="all">all</option>
-                      <option value="human-approval">human-approval</option>
-                      <option value="guided-auto">guided-auto</option>
-                      <option value="auto-execute">auto-execute</option>
-                    </select>
-                  </label>
-                  <label>
-                    Transport
-                    <select
-                      value={metadataFilters.transport_provider}
-                      onChange={(e) => setMetadataFilters((curr) => ({ ...curr, transport_provider: e.target.value }))}
-                    >
-                      <option value="all">all</option>
-                      <option value="kafka">kafka</option>
-                      <option value="rabbitmq">rabbitmq</option>
-                    </select>
-                  </label>
-                  <label>
-                    Status
-                    <select
-                      value={metadataFilters.status}
-                      onChange={(e) => setMetadataFilters((curr) => ({ ...curr, status: e.target.value }))}
-                    >
-                      <option value="all">all</option>
-                      <option value="open">open</option>
-                      <option value="investigating">investigating</option>
-                      <option value="awaiting_approval">awaiting_approval</option>
-                      <option value="remediating">remediating</option>
-                      <option value="validating">validating</option>
-                      <option value="closed">closed</option>
-                      <option value="failed">failed</option>
-                    </select>
-                  </label>
-                </div>
-                <label>
-                  Service contains
-                  <input
-                    value={metadataFilters.service}
-                    placeholder="payments"
-                    onChange={(e) => setMetadataFilters((curr) => ({ ...curr, service: e.target.value }))}
-                  />
-                </label>
-                {incidentMetadata.error ? <p className="error">{incidentMetadata.error}</p> : null}
-                <div className="table-wrap">
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>Incident</th>
-                        <th>Service</th>
-                        <th>Risk</th>
-                        <th>Execution Mode</th>
-                        <th>Provider</th>
-                        <th>Status</th>
-                        <th>Action</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {monitorScopedIncidentMetadata.map((row, index) => (
-                        <tr key={row.incident_id || row.id || index}>
-                          <td>{row.incident_id || row.id || "-"}</td>
-                          <td>{row.service || "-"}</td>
-                          <td>{row.risk_tier || "-"}</td>
-                          <td>{row.execution_mode || "-"}</td>
-                          <td>{row.transport_provider || "-"}</td>
-                          <td><span className={`pill ${statusPillClass(row.status)}`}>{row.status || "-"}</span></td>
-                          <td>
-                            <button type="button" className="button-secondary" onClick={() => openAlertDetailsFromIncident(row)}>
-                              Open
-                            </button>
-                          </td>
-                        </tr>
-                      ))}
-                      {!monitorScopedIncidentMetadata.length && !incidentMetadata.loading ? (
-                        <tr>
-                          <td colSpan={7}>No incidents available for {applicationToMonitor}. Run one sample flow from Home.</td>
-                        </tr>
-                      ) : null}
-                    </tbody>
-                  </table>
-                </div>
-              </article>
-            </section>
-          ) : null}
-
-          {activeTab === "approval" ? (
-            <section className="grid single-col">
-              <article className="panel">
-                <div className="panel-head">
-                  <h2>Human Approval Queue (Legacy)</h2>
-                  <p>Primary approval actions now run inside the Alert Details Cockpit on Dashboard for eligible roles.</p>
-                </div>
-                <p className="subtitle">Use this queue for cross-incident triage, bulk-style review, or manual fallback operations.</p>
-
-                <div className="search-row sticky-controls">
-                  <label>
-                    Search Guidance
-                    <input
-                      value={guidanceQuery}
-                      onChange={(e) => setGuidanceQuery(e.target.value)}
-                      placeholder="payments timeout rollback"
-                    />
-                  </label>
-                  <button className="button-secondary" type="button" onClick={searchGuidanceDocs} disabled={guidanceState.loading}>
-                    {guidanceState.loading ? "Searching..." : "Search Guidance"}
-                  </button>
-                </div>
-                {guidanceState.error ? <p className="error">{guidanceState.error}</p> : null}
-                <div className="table-wrap">
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>Kind</th>
-                        <th>Score</th>
-                        <th>Title</th>
-                        <th>Path</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {guidanceState.rows.map((row, index) => (
-                        <tr key={`${row.path || row.title || "match"}-${index}`}>
-                          <td>{row.kind || row.document_kind || "-"}</td>
-                          <td>{row.score ?? "-"}</td>
-                          <td>{row.title || row.id || "-"}</td>
-                          <td>{row.path || "-"}</td>
-                        </tr>
-                      ))}
-                      {!guidanceState.rows.length && !guidanceState.loading ? (
-                        <tr>
-                          <td colSpan={4}>Search guidance to view matching runbooks and incidents.</td>
-                        </tr>
-                      ) : null}
-                    </tbody>
-                  </table>
-                </div>
-
-                <div className="approval-steps">
-                  <div className="approval-step">
-                    <strong>Step 1</strong>
-                    <span>Select a pending incident from the table below.</span>
-                  </div>
-                  <div className="approval-step">
-                    <strong>Step 2</strong>
-                    <span>Review flow context and action details.</span>
-                  </div>
-                  <div className="approval-step">
-                    <strong>Step 3</strong>
-                    <span>Submit approve, reject, or modify.</span>
-                  </div>
-                </div>
-
-                <div className="filter-grid sticky-controls approval-controls">
-                  <label>
-                    Pending Filter
-                    <select value={approvalFilter} onChange={(e) => setApprovalFilter(e.target.value)}>
-                      <option value="all">all</option>
-                      <option value="awaiting_approval">awaiting_approval</option>
-                      <option value="critical">critical</option>
-                      <option value="high">high</option>
-                      <option value="medium">medium</option>
-                      <option value="low">low</option>
-                    </select>
-                  </label>
-                  <label>
-                    Selected Incident
-                    <input value={selectedApprovalRow ? approvalIncidentId(selectedApprovalRow) : ""} readOnly placeholder="Select from table" />
-                  </label>
-                  <label>
-                    Selected Recommendation
-                    <input value={selectedApprovalRecommendationId} readOnly placeholder="Autofills from selected incident" />
-                  </label>
-                  <label>
-                    Flow Context
-                    <input value={selectedApprovalFlowContext} readOnly placeholder="flow_id, trace_id, or correlation_id" />
-                  </label>
-                </div>
-
-                <div className="approval-nav-actions">
-                  <button className="button-secondary" type="button" onClick={() => setActiveTab("summary")}>Open Incident Metadata</button>
-                  <button className="button-secondary" type="button" onClick={() => setActiveTab("trace")}>Open Agent Flow</button>
-                  <button className="button-secondary" type="button" onClick={() => selectedApprovalIncidentId && loadApprovalIncidentContext(selectedApprovalIncidentId)} disabled={!selectedApprovalIncidentId || approvalIncidentContext.loading}>
-                    {approvalIncidentContext.loading ? "Syncing..." : "Sync From Approval API"}
-                  </button>
-                  <button className="button-secondary" type="button" onClick={() => setShowAdvancedApprovalForm((current) => !current)}>
-                    {showAdvancedApprovalForm ? "Hide Advanced Approval Form" : "Show Advanced Approval Form"}
-                  </button>
-                </div>
-                {approvalIncidentContext.error ? <p className="error">{approvalIncidentContext.error}</p> : null}
-
-                <p className="subtitle">Latest workflow incident: {latestIncidentId || "not available"}</p>
-                <div className="table-wrap" ref={approvalQueueRef}>
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>Select</th>
-                        <th>Incident</th>
-                        <th>Recommendation</th>
-                        <th>Service</th>
-                        <th>Severity</th>
-                        <th>Execution Mode</th>
-                        <th>Status</th>
-                        <th>Actions</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {filteredPendingApprovals.map((row, index) => {
-                        const incidentId = approvalIncidentId(row);
-                        const recommendationId = approvalRecommendationId(row);
-                        const selected = incidentId && incidentId === selectedApprovalIncidentId;
-                        const rowStatus = normalizeApprovalStatus(row?.status);
-                        const rowResolved = isApprovalResolvedStatus(rowStatus);
-                        const canQuickApprove = !rowResolved && looksLikeUuid(incidentId);
-                        const quickApproveBusy = approvalState.loading && selected && approvalForm.action === "approve";
-                        const quickRejectBusy = approvalState.loading && selected && approvalForm.action === "reject";
-                        const rejectExpanded = !rowResolved && inlineRejectState.incidentId === incidentId;
-                        return (
-                        <tr key={incidentId || index} className={selected ? "row-selected" : ""}>
-                          <td>
-                            <button className="button-secondary" type="button" onClick={() => selectApprovalIncident(row)}>
-                              {selected ? "Selected" : "Use"}
-                            </button>
-                          </td>
-                          <td>{incidentId || "-"}</td>
-                          <td>{recommendationId || "-"}</td>
-                          <td>{row.service || "-"}</td>
-                          <td>{row.severity || row.risk_tier || "-"}</td>
-                          <td>{row.execution_mode || "-"}</td>
-                          <td><span className={`pill ${statusPillClass(rowStatus)}`}>{rowStatus || "pending"}</span></td>
-                          <td>
-                            <button className="button-secondary" type="button" onClick={() => openAlertDetailsFromIncident(row)}>
-                              Open
-                            </button>
-                            {!rowResolved ? (
-                              <>
-                                <button
-                                  className="button-primary"
-                                  type="button"
-                                  onClick={() => approveIncidentRow(row)}
-                                  disabled={!canQuickApprove || approvalState.loading}
-                                  title={canQuickApprove ? "Approve this incident directly" : "Recommendation ID unavailable. Use Sync From Approval API first."}
-                                  style={{ marginLeft: 8 }}
-                                >
-                                  {quickApproveBusy ? "Approving..." : "Approve"}
-                                </button>
-                                <button
-                                  className="button-secondary"
-                                  type="button"
-                                  onClick={() => {
-                                    setApprovalState({ loading: false, result: null, error: "" });
-                                    setInlineRejectState((current) => current.incidentId === incidentId ? { incidentId: "", comment: "" } : { incidentId, comment: "" });
-                                  }}
-                                  disabled={!canQuickApprove || approvalState.loading}
-                                  title={canQuickApprove ? "Reject this incident with a comment" : "Recommendation ID unavailable. Use Sync From Approval API first."}
-                                  style={{ marginLeft: 8 }}
-                                >
-                                  {rejectExpanded ? "Cancel Reject" : "Reject"}
-                                </button>
-                              </>
-                            ) : (
-                              <span className={`pill ${statusPillClass(rowStatus)}`} style={{ marginLeft: 8 }}>
-                                {rowStatus}
-                              </span>
-                            )}
-                            {rejectExpanded ? (
-                              <div style={{ marginTop: 8, display: "grid", gap: 8 }}>
-                                <textarea
-                                  rows={2}
-                                  placeholder="Add rejection comment"
-                                  value={inlineRejectState.comment}
-                                  onChange={(e) => setInlineRejectState({ incidentId, comment: e.target.value })}
-                                />
-                                <button
-                                  className="button-primary"
-                                  type="button"
-                                  onClick={() => rejectIncidentRow(row)}
-                                  disabled={!String(inlineRejectState.comment || "").trim() || approvalState.loading}
-                                >
-                                  {quickRejectBusy ? "Rejecting..." : "Confirm Reject"}
-                                </button>
-                              </div>
-                            ) : null}
-                          </td>
-                        </tr>
-                      )})}
-                      {!filteredPendingApprovals.length ? (
-                        <tr>
-                          <td colSpan={8}>No pending approvals for this filter and monitor scope.</td>
-                        </tr>
-                      ) : null}
-                    </tbody>
-                  </table>
-                </div>
-                {showAdvancedApprovalForm ? (
-                  <>
-                    <form className="form" onSubmit={submitApproval}>
-                      <label>
-                        Action
-                        <select value={approvalForm.action} onChange={(e) => setApprovalForm({ ...approvalForm, action: e.target.value })}>
-                          <option value="approve">approve</option>
-                          <option value="reject">reject</option>
-                          <option value="modify">modify</option>
-                        </select>
-                      </label>
-                      <label>
-                        Incident ID
-                        <input value={approvalForm.incident_id} onChange={(e) => setApprovalForm({ ...approvalForm, incident_id: e.target.value })} />
-                      </label>
-                      <label>
-                        Recommendation ID
-                        <input value={approvalForm.recommendation_id} onChange={(e) => setApprovalForm({ ...approvalForm, recommendation_id: e.target.value })} />
-                      </label>
-                      <label>
-                        Approver
-                        <input value={approvalForm.approver} onChange={(e) => setApprovalForm({ ...approvalForm, approver: e.target.value })} />
-                      </label>
-                      <label>
-                        Channel
-                        <select value={approvalForm.channel} onChange={(e) => setApprovalForm({ ...approvalForm, channel: e.target.value })}>
-                          <option value="web">web</option>
-                          <option value="slack">slack</option>
-                          <option value="teams">teams</option>
-                          <option value="email">email</option>
-                        </select>
-                      </label>
-                      {approvalForm.action === "modify" ? (
-                        <label>
-                          Modified Action
-                          <textarea rows={3} value={approvalForm.modified_action} onChange={(e) => setApprovalForm({ ...approvalForm, modified_action: e.target.value })} />
-                        </label>
-                      ) : null}
-                      <label>
-                        Comment
-                        <textarea rows={3} value={approvalForm.comment} onChange={(e) => setApprovalForm({ ...approvalForm, comment: e.target.value })} />
-                      </label>
-                      <button className="button-primary" type="submit" disabled={!approvalReady || approvalState.loading}>
-                        {approvalState.loading ? "Submitting..." : "Submit Approval Action"}
-                      </button>
-                    </form>
-                    {!String(approvalForm.recommendation_id || "").trim() ? (
-                      <p className="subtitle">Recommendation will be resolved automatically from the selected incident during submission.</p>
-                    ) : null}
-                  </>
-                ) : (
-                  <p className="subtitle">Use inline Approve or Reject for common actions. Open the advanced form for modify or manual approval payload editing.</p>
-                )}
-                {approvalState.error ? <p className="error">{approvalState.error}</p> : null}
-                {approvalState.result ? <pre className="result">{JSON.stringify(approvalState.result, null, 2)}</pre> : null}
-              </article>
-            </section>
-          ) : null}
-
-          {activeTab === "trace" ? (
-            <section className="grid single-col">
-              <article className="panel">
-                <div className="panel-head">
-                  <h2>Agent Flow</h2>
-                  <p>Agent flow with decisions, outputs, and communication handoffs.</p>
-                </div>
-                <h3>Workflow Event Timeline</h3>
-                <div className="table-wrap">
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>Step</th>
-                        <th>Agent</th>
-                        <th>Action</th>
-                        <th>Decision</th>
-                        <th>Output</th>
-                        <th>Handoff</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {workflowEventRows.map((row, index) => (
-                        <tr key={`${row.sequence}-${index}`}>
-                          <td>{row.sequence}</td>
-                          <td>{row.agent}</td>
-                          <td>{row.action}</td>
-                          <td>{row.decision}</td>
-                          <td>{row.output}</td>
-                          <td>{row.communicates_to}</td>
-                        </tr>
-                      ))}
-                      {!workflowEventRows.length ? (
-                        <tr>
-                          <td colSpan={6}>Run a workflow to populate detailed agent timeline.</td>
-                        </tr>
-                      ) : null}
-                    </tbody>
-                  </table>
-                </div>
-
-                <h3>Gateway Audit Events</h3>
-                {gatewayRecent.error ? <p className="error">{gatewayRecent.error}</p> : null}
-                <div className="table-wrap">
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>Time</th>
-                        <th>Path</th>
-                        <th>Status</th>
-                        <th>Decision</th>
-                        <th>Trace ID</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {gatewayRecent.rows.slice(0, 30).map((row, index) => (
-                        <tr key={row.id || index}>
-                          <td>{formatIstTimestamp(row.created_at)}</td>
-                          <td>{row.path || "-"}</td>
-                          <td>{row.status_code || "-"}</td>
-                          <td>{row?.safety?.decision || "-"}</td>
-                          <td>{row.trace_id || "-"}</td>
-                        </tr>
-                      ))}
-                      {!gatewayRecent.rows.length && !gatewayRecent.loading ? (
-                        <tr>
-                          <td colSpan={5}>No recent gateway trace entries.</td>
-                        </tr>
-                      ) : null}
-                    </tbody>
-                  </table>
-                </div>
-                {workflowState.result ? <pre className="result">{JSON.stringify(workflowState.result, null, 2)}</pre> : null}
-              </article>
-            </section>
-          ) : null}
-
-          {activeTab === "finops" ? (
-            <section className="grid single-col">
-              <article className="panel">
-                <div className="panel-head">
-                  <h2>FinOps</h2>
-                  <p>LLM FinOps with provider cost breakdown and per-call model usage.</p>
-                </div>
-                <h3>Provider Cost Breakdown</h3>
-                <div className="table-wrap">
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>Provider</th>
-                        <th>Calls</th>
-                        <th>Tokens</th>
-                        <th>Cost USD</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {finopsByProvider.map((row, index) => (
-                        <tr key={`${row.provider}-${index}`}>
-                          <td>{row.provider}</td>
-                          <td>{row.calls}</td>
-                          <td>{row.total_tokens}</td>
-                          <td>{Number(row.total_cost_usd || 0).toFixed(6)}</td>
-                        </tr>
-                      ))}
-                      {!finopsByProvider.length ? (
-                        <tr>
-                          <td colSpan={4}>No successful model calls recorded yet.</td>
-                        </tr>
-                      ) : null}
-                    </tbody>
-                  </table>
-                </div>
-
-                <h3>Per-call Model Usage</h3>
-                <div className="table-wrap">
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>Task</th>
-                        <th>Provider</th>
-                        <th>Model</th>
-                        <th>Input Tokens</th>
-                        <th>Output Tokens</th>
-                        <th>Total Cost (USD)</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {allUsageRows.map((row, index) => (
-                        <tr key={`${row.task || "task"}-${index}`}>
-                          <td>{row.task || "-"}</td>
-                          <td>{row.provider || "-"}</td>
-                          <td>{row.model || "-"}</td>
-                          <td>{row.input_tokens || "-"}</td>
-                          <td>{row.output_tokens || "-"}</td>
-                          <td>{row.total_cost_usd || "-"}</td>
-                        </tr>
-                      ))}
-                      {!allUsageRows.length ? (
-                        <tr>
-                          <td colSpan={6}>No usage yet. Run a sample workflow from Home or open a processed alert to populate FinOps data.</td>
-                        </tr>
-                      ) : null}
-                    </tbody>
-                  </table>
-                </div>
-              </article>
-            </section>
-          ) : null}
-
-          {activeTab === "rag" ? (
-            <section className="grid single-col">
-              <article className="panel">
-                <div className="panel-head">
-                  <h2>Message Bus</h2>
-                  <button className="button-secondary" onClick={() => runWorkflow(selectedFlow)}>Refresh Activity</button>
-                </div>
-
-                <MessageBusTopology
-                  actual={messageBusActual}
-                  configuredRows={messageBusTopicRows}
-                  routing={observedRouting}
-                  primaryTopic={onboardingForm.azure_service_bus_topic}
-                />
-
-                <h3>Latest Workflow Topic Activity</h3>
-                <div className="table-wrap">
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>Service</th>
-                        <th>Consumed</th>
-                        <th>Published</th>
-                        <th>Provider</th>
-                        <th>Status</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {messageBusActual.rows.map((row, index) => (
-                        <tr key={`${row.service}-${index}`}>
-                          <td>{row.service}</td>
-                          <td>{row.consumed}</td>
-                          <td>{row.published}</td>
-                          <td>{row.provider}</td>
-                          <td>{row.status}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-
-                <div className="dual-col">
-                  <article className="panel">
-                    <h3>Actual Topics Published</h3>
-                    <ul className="flow-list">
-                      {messageBusActual.published.map((topic) => <li key={`pub-${topic}`}>{topic}</li>)}
-                      {!messageBusActual.published.length ? <li>No published topics observed yet.</li> : null}
-                    </ul>
-                  </article>
-                  <article className="panel">
-                    <h3>Actual Topics Consumed</h3>
-                    <ul className="flow-list">
-                      {messageBusActual.consumed.map((topic) => <li key={`con-${topic}`}>{topic}</li>)}
-                      {!messageBusActual.consumed.length ? <li>No consumed topics observed yet.</li> : null}
-                    </ul>
-                  </article>
-                </div>
-
-                <h3>Configured Topic Topology</h3>
-                <div className="table-wrap">
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>Service</th>
-                        <th>Consumes</th>
-                        <th>Publishes</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {messageBusTopicRows.map((row, index) => (
-                        <tr key={`${row.service}-${index}`}>
-                          <td>{row.service}</td>
-                          <td>{row.consumes}</td>
-                          <td>{row.publishes}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-
-                <h3>Routing Rule</h3>
-                <p className="subtitle">When dynamic routing is enabled: if stream_count exceeds threshold, provider is kafka; otherwise rabbitmq.</p>
-                <p className="subtitle">Observed workflow: {observedRouting?.workflow || "N/A"} | next action: {observedRouting?.next_action || "N/A"}</p>
-              </article>
-            </section>
-          ) : null}
-
-          {activeTab === "safety" ? (
-            <section className="grid single-col">
-              <article className="panel">
-                <div className="panel-head">
-                  <h2>Gateway Safety</h2>
-                  <p>Review gateway decision, policy reasons, and safety metrics before closure.</p>
-                  <button className="button-secondary" onClick={() => { loadGatewaySummary(); loadGatewayRecent(); loadLandingPadRecent(); }}>
-                    Refresh
-                  </button>
-                </div>
-                {gatewaySummary.error ? <p className="error">{gatewaySummary.error}</p> : null}
-                <div className="stat-grid">
-                  <div className="stat-card"><strong>Total</strong><span>{gatewaySummary.data.total_events || 0}</span></div>
-                  <div className="stat-card"><strong>Allowed</strong><span>{gatewaySummary.data.allowed || 0}</span></div>
-                  <div className="stat-card"><strong>Review</strong><span>{gatewaySummary.data.review || 0}</span></div>
-                  <div className="stat-card"><strong>Blocked</strong><span>{gatewaySummary.data.blocked || 0}</span></div>
-                </div>
-                <p className="subtitle">Latest trace: {gatewaySummary.data.latest_trace_id || "-"}</p>
-                <h3>Recent Gateway Events</h3>
-                <div className="table-wrap">
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>Path</th>
-                        <th>Status</th>
-                        <th>Decision</th>
-                        <th>Score</th>
-                        <th>Latency ms</th>
-                        <th>Reasons</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {gatewayRecent.rows.map((row, index) => (
-                        <tr key={`${row.trace_id || "gw"}-${index}`}>
-                          <td>{row.path || "-"}</td>
-                          <td>{row.status_code || "-"}</td>
-                          <td>{row?.safety?.decision || "-"}</td>
-                          <td>{row?.safety?.score ?? "-"}</td>
-                          <td>{row.latency_ms || "-"}</td>
-                          <td>{Array.isArray(row?.safety?.reasons) ? row.safety.reasons.join("; ") : "-"}</td>
-                        </tr>
-                      ))}
-                      {!gatewayRecent.rows.length ? (
-                        <tr>
-                          <td colSpan={6}>No gateway events yet.</td>
-                        </tr>
-                      ) : null}
-                    </tbody>
-                  </table>
-                </div>
-
-                <h3>Landing Pad Realtime Ingestion</h3>
-                {landingPadRecent.error ? <p className="error">{landingPadRecent.error}</p> : null}
-                <div className="table-wrap">
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>Received At (IST)</th>
-                        <th>Alert</th>
-                        <th>Service</th>
-                        <th>Severity</th>
-                        <th>Status</th>
-                        <th>File</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {landingPadRecent.rows.map((row, index) => (
-                        <tr key={`${row.file || "landing-pad"}-${index}`}>
-                          <td>{formatIstTimestamp(row.received_at || row.modified_at)}</td>
-                          <td>{row.name || row.alertname || "-"}</td>
-                          <td>{row.service || "-"}</td>
-                          <td>{String(row.severity || "-").toUpperCase()}</td>
-                          <td>{row.alert_status || "-"}</td>
-                          <td>{row.file || "-"}</td>
-                        </tr>
-                      ))}
-                      {!landingPadRecent.rows.length ? (
-                        <tr>
-                          <td colSpan={6}>No realtime landing-pad ingestion records yet.</td>
-                        </tr>
-                      ) : null}
-                    </tbody>
-                  </table>
-                </div>
-              </article>
-            </section>
-          ) : null}
-
-          {activeTab === "closed" ? (
-            <section className="grid single-col">
-              <article className="panel">
-                <div className="panel-head">
-                  <h2>Closed Tickets</h2>
-                  <p>Closed tickets and current closure report summary.</p>
-                  <button className="button-secondary" onClick={loadClosedIncidents}>Refresh</button>
-                </div>
-                <div className="filter-grid sticky-controls">
-                  <label>
-                    Filter by Risk Tier
-                    <select
-                      value={closedFilters.risk}
-                      onChange={(e) => setClosedFilters((curr) => ({ ...curr, risk: e.target.value }))}
-                    >
-                      <option value="all">all</option>
-                      {closedRiskOptions.map((option) => (
-                        <option key={`risk-${option}`} value={option}>{option}</option>
-                      ))}
-                    </select>
-                  </label>
-                  <label>
-                    Filter by Execution Mode
-                    <select
-                      value={closedFilters.mode}
-                      onChange={(e) => setClosedFilters((curr) => ({ ...curr, mode: e.target.value }))}
-                    >
-                      <option value="all">all</option>
-                      {closedModeOptions.map((option) => (
-                        <option key={`mode-${option}`} value={option}>{option}</option>
-                      ))}
-                    </select>
-                  </label>
-                </div>
-                <p className="subtitle">Showing {filteredClosedRows.length} filtered records</p>
-                {closedIncidents.error ? <p className="error">{closedIncidents.error}</p> : null}
-                <div className="table-wrap">
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>Incident</th>
-                        <th>Service</th>
-                        <th>Severity</th>
-                        <th>Status</th>
-                        <th>Closed At</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {filteredClosedRows.map((row, index) => (
-                        <tr key={row.incident_id || index}>
-                          <td>{row.incident_id || "-"}</td>
-                          <td>{row.service || "-"}</td>
-                          <td>{row.severity || "-"}</td>
-                          <td><span className={`pill ${statusPillClass(row.status || "closed")}`}>{row.status || "closed"}</span></td>
-                          <td>{formatIstTimestamp(row.closed_at || row.updated_at)}</td>
-                        </tr>
-                      ))}
-                      {!filteredClosedRows.length && !closedIncidents.loading ? (
-                        <tr>
-                          <td colSpan={5}>No closed incidents available.</td>
-                        </tr>
-                      ) : null}
-                    </tbody>
-                  </table>
-                </div>
-              </article>
-            </section>
-          ) : null}
         </section>
       </div>
-    </main>
+      </KaiOperationsShell>
+    </div>
   );
 }

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import re
+import struct
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -26,6 +28,36 @@ _VOLATILE_TOKEN = re.compile(
     r"(?i)(?:\b\d{4}-\d{2}-\d{2}[T ][0-9:.+\-Z]+\b|\b0x[0-9a-f]+\b|\b[0-9a-f]{16,}\b|\b\d+\b)"
 )
 _QUOTED_LOG_FIELD = re.compile(r'\b(?P<key>msg|message|err|error)="(?P<value>(?:\\.|[^"])*)"')
+
+# Platform control-plane failures belong in KaiOps operational telemetry, not
+# in the customer incident pipeline. Ingesting these containers recursively
+# turns a single broker/agent error into another alert, Jira and RCA request.
+_KAIOPS_CONTROL_PLANE_SERVICES = {
+    "alert-intelligence",
+    "api-gateway",
+    "application-onboarding",
+    "approval-service",
+    "audit-service",
+    "closure-service",
+    "context-agent",
+    "dashboard-generator",
+    "discovery-mcp",
+    "metrics-validation-agent",
+    "model-router",
+    "monitoring-adapter",
+    "notification-service",
+    "orchestrator",
+    "prometheus-config-service",
+    "remediation-engine",
+    "resolution-agent",
+    "rule-generation-agent",
+    "temporal-pilot-worker",
+    "validation-agent",
+}
+
+
+def _is_kaiops_control_plane_service(service: str) -> bool:
+    return str(service or "").strip().lower() in _KAIOPS_CONTROL_PLANE_SERVICES
 
 
 @dataclass
@@ -170,6 +202,76 @@ async def _docker_container_metadata(client: httpx.AsyncClient, endpoint: str, c
         return {}
 
 
+def _decode_docker_log_stream(payload: bytes) -> str:
+    """Decode Docker's multiplexed stdout/stderr framing, or plain text."""
+    chunks: list[bytes] = []
+    offset = 0
+    while offset + 8 <= len(payload):
+        stream_type = payload[offset]
+        size = struct.unpack(">I", payload[offset + 4:offset + 8])[0]
+        end = offset + 8 + size
+        if stream_type not in {0, 1, 2} or end > len(payload):
+            return payload.decode("utf-8", errors="replace")
+        chunks.append(payload[offset + 8:end])
+        offset = end
+    if chunks and offset == len(payload):
+        return b"".join(chunks).decode("utf-8", errors="replace")
+    return payload.decode("utf-8", errors="replace")
+
+
+async def fetch_docker_error_logs(
+    *, endpoint: str, state: OpenSearchLogState, lookback_seconds: int, batch_size: int, timeout_seconds: float
+) -> list[dict[str, Any]]:
+    """Fallback source when the optional OpenSearch log store is unavailable."""
+    if not endpoint:
+        return []
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=max(30, lookback_seconds))
+    seen = state.load()
+    records: list[dict[str, Any]] = []
+    excluded_services = {"monitoring-ingestion-worker", "otel-collector", "opensearch"} | _KAIOPS_CONTROL_PLANE_SERVICES
+    async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+        response = await client.get(f"{endpoint.rstrip('/')}/containers/json", params={"all": "0"})
+        response.raise_for_status()
+        containers = response.json()
+        for container in containers if isinstance(containers, list) else []:
+            labels = container.get("Labels") if isinstance(container.get("Labels"), dict) else {}
+            service = str(labels.get("com.docker.compose.service") or "").strip()
+            if service in excluded_services:
+                continue
+            container_id = str(container.get("Id") or "")
+            if not container_id:
+                continue
+            names = container.get("Names") if isinstance(container.get("Names"), list) else []
+            container_name = str(names[0] if names else service).lstrip("/")
+            logs = await client.get(
+                f"{endpoint.rstrip('/')}/containers/{container_id}/logs",
+                params={"stdout": "1", "stderr": "1", "timestamps": "1", "since": str(int(cutoff.timestamp())), "tail": str(max(20, batch_size))},
+            )
+            logs.raise_for_status()
+            for raw_line in _decode_docker_log_stream(logs.content).splitlines():
+                timestamp, _, line = raw_line.partition(" ")
+                if not line:
+                    line, timestamp = timestamp, datetime.now(timezone.utc).isoformat()
+                if not _is_failure_line(line):
+                    continue
+                document_id = hashlib.sha256(f"{container_id}:{timestamp}:{line}".encode("utf-8")).hexdigest()
+                if document_id in seen:
+                    continue
+                records.append({
+                    "document_id": document_id,
+                    "source_path": f"docker://{container_name}/{document_id}",
+                    "line": line,
+                    "service": service or container_name,
+                    "project_name": str(labels.get("com.docker.compose.project") or "KaiOps"),
+                    "container_name": container_name,
+                    "container_id": container_id,
+                    "timestamp": timestamp,
+                    "trace_id": "",
+                })
+    records.sort(key=lambda item: str(item.get("timestamp") or ""), reverse=True)
+    return records[:batch_size]
+
+
 async def fetch_opensearch_error_logs(
     *,
     endpoint: str,
@@ -180,12 +282,17 @@ async def fetch_opensearch_error_logs(
     timeout_seconds: float = 15.0,
     docker_api_endpoint: str = "",
 ) -> list[dict[str, Any]]:
-    """Fetch fresh error documents with an overlapping window and ID checkpoint."""
+    """Fetch the newest error documents with an overlapping ID checkpoint.
+
+    Newest-first ordering is intentional: a noisy source can produce more than
+    ``batch_size`` matches per poll. Oldest-first ordering would then keep the
+    alert stream permanently behind the live edge.
+    """
 
     cutoff = datetime.now(timezone.utc) - timedelta(seconds=max(30, lookback_seconds))
     body = {
         "size": max(1, min(batch_size, 500)),
-        "sort": [{"@timestamp": {"order": "asc", "unmapped_type": "date"}}],
+        "sort": [{"@timestamp": {"order": "desc", "unmapped_type": "date"}}],
         "query": {
             "bool": {
                 "filter": [{"range": {"@timestamp": {"gte": cutoff.isoformat()}}}],
@@ -203,8 +310,18 @@ async def fetch_opensearch_error_logs(
     }
     url = f"{endpoint.rstrip('/')}/{index_pattern.strip() or 'otel-*'}/_search"
     async with httpx.AsyncClient(timeout=timeout_seconds) as client:
-        response = await client.post(url, json=body)
-        response.raise_for_status()
+        try:
+            response = await client.post(url, json=body)
+            response.raise_for_status()
+        except httpx.HTTPError:
+            logger.warning("OpenSearch log source unavailable; falling back to Docker logs", exc_info=True)
+            return await fetch_docker_error_logs(
+                endpoint=docker_api_endpoint,
+                state=state,
+                lookback_seconds=lookback_seconds,
+                batch_size=max(batch_size, 100),
+                timeout_seconds=timeout_seconds,
+            )
         hits = response.json().get("hits", {}).get("hits", [])
         container_ids = {
             str(_resource_attributes(hit.get("_source") or {}).get("container.id") or "")
@@ -229,6 +346,8 @@ async def fetch_opensearch_error_logs(
         resource_attributes = _resource_attributes(source)
         container_id = str(resource_attributes.get("container.id") or "")
         container_metadata = docker_metadata.get(container_id, {})
+        if _is_kaiops_control_plane_service(str(container_metadata.get("service") or "")):
+            continue
         line = _source_value(source, "body", "message")
         if not line or not _is_failure_line(line):
             continue
@@ -258,8 +377,6 @@ async def fetch_opensearch_error_logs(
                 "raw_source": source,
             }
         )
-        seen[document_id] = timestamp
-    state.save(seen)
     return records
 
 
@@ -316,6 +433,11 @@ def log_line_to_alert_payload(record: dict[str, Any], *, default_service: str) -
     line = str(record.get("line") or "")
     source_path = str(record.get("source_path") or "")
 
+    # Defense in depth for records supplied by OpenSearch or tests/direct
+    # callers rather than the Docker fallback collector.
+    if _is_kaiops_control_plane_service(str(record.get("service") or "")):
+        return None
+
     parsed: dict[str, Any] = {}
     try:
         candidate = json.loads(line)
@@ -325,10 +447,13 @@ def log_line_to_alert_payload(record: dict[str, Any], *, default_service: str) -
         parsed = {}
 
     if parsed:
-        level = str(parsed.get("level") or parsed.get("severity") or "").strip()
+        # Python's standard JSON formatter emits ``levelname`` while several
+        # application loggers emit ``level``/``severity``. Treating an
+        # unrecognised WARNING as an ERROR created false log-ingestion alerts.
+        level = str(parsed.get("level") or parsed.get("levelname") or parsed.get("severity") or "").strip()
         if level and level.lower() not in {"error", "critical", "fatal"}:
             return None
-        service = str(parsed.get("service") or default_service)
+        service = str(parsed.get("service") or record.get("service") or default_service)
         message = str(parsed.get("message") or parsed.get("event") or "log alert")
         exception_text = str(parsed.get("exception") or "")
         alert_name = str(parsed.get("alert_name") or message)

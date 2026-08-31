@@ -50,7 +50,7 @@ $lines = @(
     "AZURE_AI_EVALUATION_ENABLED=true",
     "OBSERVABILITY_AZURE_MONITOR_ENABLED=true",
     "KAFKA_ENABLED=false",
-    "EVENT_BUS_PROVIDER=azure-servicebus"
+    "EVENT_BUS_PROVIDER=azure-service-bus"
 )
 
 Set-Content -Path $OutputFile -Value ($lines -join [Environment]::NewLine) -Encoding utf8

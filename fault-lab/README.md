@@ -67,6 +67,39 @@ curl -X POST http://localhost:8080/api/faults/kaiops-scenario-01/stop
 
 The fault automatically recovers when its duration expires.
 
+## Run the non-fatal telemetry investigation demo
+
+Start three bounded issues together:
+
+```bash
+curl -X POST "http://localhost:8080/api/demos/telemetry/start?duration=120"
+```
+
+The demo activates:
+
+- `kaiops-scenario-42`: partial Prometheus scrape-target loss
+- `kaiops-scenario-43`: telemetry export gap
+- `kaiops-scenario-22`: queue backlog with requests still accepted
+
+These scenarios keep the application running. Telemetry workloads return HTTP
+200 with a degradation warning and backlog workloads return HTTP 202. Prometheus
+and JSON logs still breach their thresholds, so Alertmanager sends the events
+through monitoring-adapter, alert-intelligence, orchestrator, context-agent,
+resolution-agent, approval/remediation, and closure validation.
+
+Every emitted event includes the trace ID, representative ticket, root cause,
+resolution steps, validation criteria, and runbook ID. This gives the context
+agent grounded evidence while leaving the resolution agent responsible for the
+RCA and corrective recommendation.
+
+Stop all three immediately:
+
+```bash
+curl -X POST http://localhost:8080/api/demos/telemetry/stop
+```
+
+They also recover automatically when the requested duration expires.
+
 ## Generate workload traffic
 
 In a second terminal:

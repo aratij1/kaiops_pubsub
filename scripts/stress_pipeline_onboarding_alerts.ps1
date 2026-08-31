@@ -6,6 +6,9 @@ param(
     [int]$DetailWrites = 200,
     [ValidateRange(0, 300)]
     [int]$PostIngestSettleSeconds = 15,
+    [ValidateRange(0, 900)]
+    [int]$MaxPersistenceWaitSeconds = 180,
+    [switch]$RequireEndToEndTarget,
     [string]$MysqlContainer = ""
 )
 
@@ -174,6 +177,7 @@ for ($i = 1; $i -le $DetailWrites; $i++) {
 }
 
 Write-Host "[4/6] Ingesting $TotalAlerts alerts in batches of $BatchSize via Alertmanager webhook..."
+$ingestionStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 $batchCount = [int]($TotalAlerts / $BatchSize)
 $totalReceived = 0
 $totalIngested = 0
@@ -192,7 +196,7 @@ for ($batch = 1; $batch -le $batchCount; $batch++) {
             status = "firing"
             labels = @{
                 alertname = "StressPipelineAlert-$batchPrefix-$j"
-                application = "stress-lab"
+                application = $newProjectName
                 service = "payments"
                 environment = "prod"
                 severity = $severity
@@ -214,7 +218,7 @@ for ($batch = 1; $batch -le $batchCount; $batch++) {
         receiver = "kaiops-stress"
         status = "firing"
         commonLabels = @{
-            application = "stress-lab"
+            application = $newProjectName
             service = "payments"
             environment = "prod"
             source = "stress-harness"
@@ -238,11 +242,26 @@ for ($batch = 1; $batch -le $batchCount; $batch++) {
         Write-Host "  ingest batches complete: $batch / $batchCount"
     }
 }
+$ingestionStopwatch.Stop()
+$ingestionSeconds = [math]::Round($ingestionStopwatch.Elapsed.TotalSeconds, 3)
+$ingestionAlertsPerMinute = if ($ingestionSeconds -gt 0) { [math]::Round(($totalIngested * 60.0) / $ingestionSeconds, 2) } else { 0 }
 
 if ($PostIngestSettleSeconds -gt 0) {
-    Write-Host "  waiting $PostIngestSettleSeconds seconds for async DB projection workers..."
+    Write-Host "  waiting $PostIngestSettleSeconds seconds before checking asynchronous persistence..."
     Start-Sleep -Seconds $PostIngestSettleSeconds
 }
+
+$persistenceWaitStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+do {
+    $progress = Get-DbCounts
+    $persistedSoFar = [int]$progress.alerts - [int]$baseline.alerts
+    if ($persistedSoFar -ge $totalIngested -or $persistenceWaitStopwatch.Elapsed.TotalSeconds -ge $MaxPersistenceWaitSeconds) {
+        break
+    }
+    Start-Sleep -Seconds 5
+} while ($true)
+$persistenceWaitStopwatch.Stop()
+$persistenceWaitSeconds = [math]::Round($persistenceWaitStopwatch.Elapsed.TotalSeconds, 3)
 
 Write-Host "[5/6] Capturing post-run DB counts and status distributions..."
 $after = Get-DbCounts
@@ -259,6 +278,7 @@ $alertAcceptancePct = if ($TotalAlerts -gt 0) { [math]::Round(($totalIngested * 
 $alertsPersistPct = if ($totalIngested -gt 0) { [math]::Round(($alertsDelta * 100.0) / $totalIngested, 2) } else { 0 }
 $projectionCoveragePct = if ($alertsDelta -gt 0) { [math]::Round(($projectionsDelta * 100.0) / $alertsDelta, 2) } else { 0 }
 $eventsPerAlert = if ($alertsDelta -gt 0) { [math]::Round(($eventsDelta * 1.0) / $alertsDelta, 3) } else { 0 }
+$endToEndTargetMet = $ingestionAlertsPerMinute -ge 1000 -and $ingestFailures -eq 0 -and $alertsPersistPct -ge 99 -and $projectionCoveragePct -ge 99
 
 $pipelineSummary = [ordered]@{
     run_id = $runId
@@ -274,6 +294,12 @@ $pipelineSummary = [ordered]@{
     ingestion_received = $totalReceived
     ingestion_ingested = $totalIngested
     ingestion_skipped = $totalSkipped
+    ingestion_seconds = $ingestionSeconds
+    ingestion_alerts_per_minute = $ingestionAlertsPerMinute
+    target_alerts_per_minute = 1000
+    persistence_wait_seconds = $persistenceWaitSeconds
+    ingress_target_met = ($ingestionAlertsPerMinute -ge 1000 -and $ingestFailures -eq 0)
+    end_to_end_target_met = $endToEndTargetMet
     acceptance_pct = $alertAcceptancePct
     baseline = $baseline
     after = $after
@@ -295,3 +321,6 @@ $pipelineSummary = [ordered]@{
 
 Write-Host "[6/6] Stress test summary:"
 $pipelineSummary | ConvertTo-Json -Depth 8
+if ($RequireEndToEndTarget -and -not $endToEndTargetMet) {
+    throw "End-to-end capacity target failed: ingress=$ingestionAlertsPerMinute/min, persisted=$alertsPersistPct%, projected=$projectionCoveragePct%."
+}

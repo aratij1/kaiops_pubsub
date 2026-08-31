@@ -207,7 +207,7 @@ if (-not $DisableAzureFeaturePatch) {
                 AZURE_AI_EVALUATION_ENABLED = "true"
                 OBSERVABILITY_AZURE_MONITOR_ENABLED = "true"
                 KAFKA_ENABLED = "false"
-                EVENT_BUS_PROVIDER = "azure-servicebus"
+                EVENT_BUS_PROVIDER = "azure-service-bus"
             }
         }
         $patchJson = $patchData | ConvertTo-Json -Depth 8 -Compress

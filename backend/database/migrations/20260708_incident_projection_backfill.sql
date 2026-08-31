@@ -1,6 +1,15 @@
 -- Backfill incident_projections from existing incidents rows.
 -- Idempotent: safe to re-run.
+-- NOTE: incident_projections has no created_at column; the historical comment
+-- below explains an older ORM assumption and is superseded by this schema fact.
 
+-- created_at is set explicitly even though it's not otherwise used by this
+-- projection (first_seen_at/updated_at carry the meaningful timestamps):
+-- IncidentProjectionRecord(Base, TimestampMixin) in common/database.py
+-- inherits a `created_at` column from TimestampMixin whose `default=utc_now`
+-- is a Python-side (ORM-only) default, not a database-level DEFAULT — so the
+-- live table's created_at is NOT NULL with no DB default, and a raw INSERT
+-- that omits it fails with "doesn't have a default value".
 INSERT INTO incident_projections (
     incident_id,
     alert_id,

@@ -2,8 +2,15 @@
 .github
 .pytest_cache
 .ruff_cache
+.uv-cache
 .venv
+**/node_modules
+**/dist
+**/storybook-static
 .tmp
+**/test-results
+**/playwright-report
+**/artifacts
 __pycache__
 *.pyc
 data
@@ -14,3 +21,4 @@ frontend/react/test-results
 frontend/react/playwright-report
 backend/ingested_alerts
 backend/rag/changes
+backend/rag/_review

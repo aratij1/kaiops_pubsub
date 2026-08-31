@@ -1,0 +1,9 @@
+.audit-workspace { display: grid; gap: 16px; }
+.audit-hero { display: flex; align-items: center; gap: 14px; padding: 20px; border: 1px solid var(--border-color); border-radius: 16px; background: var(--surface-primary); }
+.audit-hero > svg { width: 36px; height: 36px; color: var(--color-primary); }
+.audit-hero div { flex: 1; }
+.audit-hero h2, .audit-hero p { margin: 2px 0; }
+.audit-controls, .audit-pagination { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.audit-controls label, .audit-controls span { display: flex; align-items: center; gap: 8px; }
+.audit-controls input { min-width: 280px; }
+.audit-pagination div { display: flex; align-items: center; gap: 10px; }
