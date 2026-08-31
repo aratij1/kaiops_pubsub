@@ -1,5 +1,5 @@
-from datetime import UTC, datetime
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
@@ -9,7 +9,6 @@ from common.context_enrichment_contract import (
 )
 from common.models import Incident
 
-
 FIXTURES = Path(__file__).parent / "fixtures" / "connectors"
 
 
@@ -17,11 +16,11 @@ def _fixture(name: str) -> dict:
     return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
 
 
-def _requirement(incident: Incident) -> EvidenceRequirement:
+def _requirement(incident: Incident, category: str = "metrics") -> EvidenceRequirement:
     now = datetime(2024, 8, 26, 13, 32, tzinfo=UTC)
     return EvidenceRequirement(
         requirement_id=uuid4(), tenant_id=incident.tenant_id, incident_id=incident.id,
-        rca_version=1, category="metrics", question="What was gateway latency?",
+        rca_version=1, category=category, question="What factual evidence was observed?",
         reason="Confirm the observed latency signal", priority="high", collection_mode="automatic",
         candidate_connectors=["prometheus"], created_at=now, updated_at=now,
     )
@@ -75,3 +74,43 @@ def test_normalization_rejects_cross_tenant_binding() -> None:
 
     assert result.records == []
     assert result.rejected == [{"code": "EVIDENCE_BINDING_MISMATCH"}]
+
+
+def test_sanitized_connector_fixtures_normalize_to_governed_evidence() -> None:
+    incident = Incident(tenant_id="tenant-a", service="api-gateway", title="availability")
+    cases = [
+        ("logs_response.json", "logs", "opensearch", "logs"),
+        ("otel_trace.json", "traces", "otel", "traces"),
+        ("deployment_change.json", "deployment", "jenkins", "changes"),
+        ("source_repository.json", "source_code", "github", "source_code"),
+        ("approved_rag_document.json", "runbook", "vector-db", "knowledge"),
+        ("jira_issue_comment.json", "ticket", "jira", "tickets"),
+    ]
+    for filename, requirement_category, connector, canonical_category in cases:
+        result = normalize_connector_response(
+            raw_response=_fixture(filename),
+            requirement=_requirement(incident, requirement_category),
+            incident=incident,
+            connector=connector,
+            collected_at=datetime(2024, 8, 26, 13, 32, tzinfo=UTC),
+        )
+        assert result.rejected == [], filename
+        assert len(result.records) == 1, filename
+        record = result.records[0]
+        assert record.category == canonical_category
+        assert record.source_reference
+        assert record.evidence_id.startswith("EVD-")
+        assert record.tenant_id == incident.tenant_id
+        assert record.incident_id == str(incident.id)
+
+
+def test_unapproved_rag_document_is_rejected_with_reason() -> None:
+    incident = Incident(tenant_id="tenant-a", service="api-gateway", title="availability")
+    payload = _fixture("approved_rag_document.json")
+    payload["records"][0]["approved"] = False
+    result = normalize_connector_response(
+        raw_response=payload, requirement=_requirement(incident, "runbook"), incident=incident,
+        connector="vector-db", collected_at=datetime(2024, 8, 26, 13, 32, tzinfo=UTC),
+    )
+    assert result.records == []
+    assert result.rejected == [{"code": "KNOWLEDGE_NOT_APPROVED", "record_index": 0}]

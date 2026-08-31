@@ -1,0 +1,1 @@
+{"endpoint":"logs.internal","query":"service=api-gateway","records":[{"timestamp":"2024-08-26T13:31:00Z","message":"upstream request timed out","service":"api-gateway","source_reference":"opensearch://logs/api-gateway/evt-17"}]}

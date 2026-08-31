@@ -191,7 +191,70 @@ def normalize_connector_response(
                 current_observation=True, contradiction_status=None,
             ))
     else:
-        rejected.append({"code": "NORMALIZER_NOT_IMPLEMENTED", "category": category})
+        required_fields = {
+            "logs": ("message", "log"),
+            "traces": ("trace_id", "span_id", "spans"),
+            "changes": ("change_id", "deployment_id", "commit_sha"),
+            "source_code": ("commit_sha", "path", "repository"),
+            "knowledge": ("document_id", "version"),
+            "tickets": ("issue_key", "comment_id"),
+        }
+        for index, raw in enumerate(raw_records):
+            if not isinstance(raw, dict):
+                rejected.append({"code": "INVALID_RECORD_TYPE", "record_index": index})
+                continue
+            if not any(raw.get(field) not in (None, "", [], {}) for field in required_fields[category]):
+                rejected.append({"code": "EVIDENCE_REQUIRED_FIELD_MISSING", "record_index": index,
+                                 "category": category})
+                continue
+            if category == "knowledge" and raw.get("approved") is not True:
+                rejected.append({"code": "KNOWLEDGE_NOT_APPROVED", "record_index": index})
+                continue
+            source_reference = str(
+                raw.get("source_reference") or raw.get("url") or raw.get("uri")
+                or raw.get("repository_url") or ""
+            ).strip()
+            if not source_reference:
+                rejected.append({"code": "EVIDENCE_SOURCE_REFERENCE_MISSING", "record_index": index})
+                continue
+            observed_raw = (
+                raw.get("observed_at") or raw.get("timestamp") or raw.get("updated_at")
+                or raw.get("created_at") or window_end_raw or now
+            )
+            try:
+                observed_at = _parse_timestamp(observed_raw)
+            except (TypeError, ValueError, OSError):
+                rejected.append({"code": "INVALID_OBSERVATION_TIMESTAMP", "record_index": index})
+                continue
+            content = {
+                key: value for key, value in raw.items()
+                if key not in {"source_reference", "url", "uri", "repository_url", "provenance"}
+            }
+            identity = {
+                key: raw.get(key) for key in (
+                    "trace_id", "span_id", "change_id", "deployment_id", "commit_sha",
+                    "document_id", "version", "issue_key", "comment_id", "timestamp",
+                ) if raw.get(key) not in (None, "")
+            } or {"source_reference": source_reference, "index": index}
+            evidence_id = _stable_evidence_id(
+                requirement=requirement, connector=connector, source_reference=source_reference,
+                observation_identity=identity, content=content,
+            )
+            normalized.append(EvidenceRecord(
+                evidence_id=evidence_id, requirement_id=str(requirement.requirement_id),
+                tenant_id=requirement.tenant_id, incident_id=str(incident.id), category=category,
+                source_id=endpoint, connector=connector, source_reference=source_reference,
+                service=str(raw.get("service") or incident.service or "") or None,
+                resource=str(raw.get("resource") or "") or None,
+                project_id=str(raw.get("project_id") or "") or None,
+                observed_at=observed_at, collected_at=now,
+                observation_window_start=window_start, observation_window_end=window_end,
+                freshness="fresh" if abs((now - observed_at).total_seconds()) <= 900 else "stale",
+                content=content, provenance={**provenance, **dict(raw.get("provenance") or {}),
+                                             "endpoint": endpoint},
+                current_observation=bool(raw.get("current_observation", True)),
+                contradiction_status=raw.get("contradiction_status"),
+            ))
     return ConnectorNormalization(
         records=normalized,
         metadata={"connector": connector, "endpoint": endpoint, "query": query,

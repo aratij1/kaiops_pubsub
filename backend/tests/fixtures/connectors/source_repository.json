@@ -1,0 +1,1 @@
+{"endpoint":"github.internal","records":[{"observed_at":"2024-08-26T13:29:00Z","repository":"kaiops/api-gateway","path":"backend/src/api-gateway/app.py","commit_sha":"e30250c3d802cbc2f9152bc1f9d2871f19c105f3","service":"api-gateway","source_reference":"https://github.example/kaiops/api-gateway/commit/e30250c"}]}
