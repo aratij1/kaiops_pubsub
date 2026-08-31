@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 from uuid import NAMESPACE_URL, UUID, uuid5
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from common.models import Alert, Incident
 
@@ -25,6 +25,179 @@ EvidenceCategory = Literal[
     "business_impact",
     "validation",
 ]
+CanonicalEvidenceCategory = Literal[
+    "metrics", "logs", "traces", "changes", "source_code", "knowledge", "tickets",
+]
+
+
+class EvidenceRecord(BaseModel):
+    """Canonical governed evidence shared by collection, context, RCA, and APIs."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    evidence_id: str = Field(min_length=1)
+    requirement_id: str = Field(min_length=1)
+    tenant_id: str = Field(min_length=1)
+    incident_id: str = Field(min_length=1)
+    category: CanonicalEvidenceCategory
+    source_id: str = Field(min_length=1)
+    connector: str = Field(min_length=1)
+    source_reference: str = Field(min_length=1)
+    service: str | None = None
+    resource: str | None = None
+    project_id: str | None = None
+    observed_at: datetime
+    collected_at: datetime
+    observation_window_start: datetime | None = None
+    observation_window_end: datetime | None = None
+    freshness: Literal["fresh", "cached", "stale"]
+    content: dict[str, Any]
+    provenance: dict[str, Any]
+    current_observation: bool
+    contradiction_status: str | None = None
+
+    @model_validator(mode="after")
+    def validate_binding(self) -> EvidenceRecord:
+        UUID(self.incident_id)
+        UUID(self.requirement_id)
+        if self.observation_window_start and self.observation_window_end:
+            if self.observation_window_end < self.observation_window_start:
+                raise ValueError("observation window end precedes start")
+        return self
+
+
+class ConnectorNormalization(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    records: list[EvidenceRecord]
+    metadata: dict[str, Any]
+    rejected: list[dict[str, Any]] = Field(default_factory=list)
+
+
+_CANONICAL_CATEGORY = {
+    "metrics": "metrics", "logs": "logs", "traces": "traces",
+    "deployment": "changes", "change": "changes", "source_code": "source_code",
+    "runbook": "knowledge", "ticket": "tickets",
+}
+
+
+def _parse_timestamp(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(float(value), tz=UTC)
+    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _stable_evidence_id(
+    *, requirement: EvidenceRequirement, connector: str, source_reference: str,
+    observation_identity: Any, content: dict[str, Any],
+) -> str:
+    material = json.dumps({
+        "tenant_id": requirement.tenant_id,
+        "incident_id": str(requirement.incident_id),
+        "requirement_id": str(requirement.requirement_id),
+        "connector": connector,
+        "source_reference": source_reference,
+        "observation_identity": observation_identity,
+        "content_digest": hashlib.sha256(
+            json.dumps(content, sort_keys=True, separators=(",", ":"), default=str).encode()
+        ).hexdigest(),
+    }, sort_keys=True, separators=(",", ":"), default=str)
+    return f"EVD-{hashlib.sha256(material.encode()).hexdigest()}"
+
+
+def normalize_connector_response(
+    *, raw_response: dict[str, Any], requirement: EvidenceRequirement,
+    incident: Incident, connector: str, collected_at: datetime,
+) -> ConnectorNormalization:
+    """Normalize a raw connector wrapper without discarding wrapper provenance."""
+    now = collected_at if collected_at.tzinfo else collected_at.replace(tzinfo=UTC)
+    wrapper = _redact_secrets(dict(raw_response))
+    provenance = dict(wrapper.get("provenance") or {})
+    query = str(wrapper.get("query") or provenance.get("query") or "").strip()
+    endpoint = str(
+        wrapper.get("endpoint") or wrapper.get("endpoint_identity")
+        or provenance.get("endpoint") or connector
+    ).strip()
+    window_start_raw = wrapper.get("observation_window_start") or provenance.get("observation_window_start")
+    window_end_raw = wrapper.get("observation_window_end") or provenance.get("observation_window_end")
+    window_start = _parse_timestamp(window_start_raw) if window_start_raw is not None else None
+    window_end = _parse_timestamp(window_end_raw) if window_end_raw is not None else None
+    category = _CANONICAL_CATEGORY.get(requirement.category)
+    if category is None:
+        return ConnectorNormalization(
+            records=[], metadata={"connector": connector, "endpoint": endpoint, "query": query},
+            rejected=[{"code": "UNSUPPORTED_EVIDENCE_CATEGORY", "category": requirement.category}],
+        )
+    if requirement.tenant_id != incident.tenant_id or requirement.incident_id != incident.id:
+        return ConnectorNormalization(
+            records=[], metadata={"connector": connector, "endpoint": endpoint, "query": query},
+            rejected=[{"code": "EVIDENCE_BINDING_MISMATCH"}],
+        )
+    raw_records = wrapper.get("series") or wrapper.get("records") or wrapper.get("evidence") or []
+    if not isinstance(raw_records, list):
+        raw_records = []
+    normalized: list[EvidenceRecord] = []
+    rejected: list[dict[str, Any]] = []
+    if category == "metrics":
+        source_reference = f"prometheus://{endpoint}/query?expr={query}"
+        for index, raw in enumerate(raw_records):
+            if not isinstance(raw, dict):
+                rejected.append({"code": "INVALID_RECORD_TYPE", "record_index": index})
+                continue
+            labels = raw.get("metric") if isinstance(raw.get("metric"), dict) else {}
+            metric_name = str(labels.get("__name__") or "").strip()
+            samples_raw = raw.get("values") if isinstance(raw.get("values"), list) else []
+            if not samples_raw and isinstance(raw.get("value"), list):
+                samples_raw = [raw["value"]]
+            samples: list[dict[str, Any]] = []
+            for sample_index, sample in enumerate(samples_raw):
+                if not isinstance(sample, (list, tuple)) or len(sample) != 2:
+                    rejected.append({"code": "INVALID_PROMETHEUS_SAMPLE", "record_index": index,
+                                     "sample_index": sample_index})
+                    continue
+                try:
+                    observed = _parse_timestamp(sample[0])
+                except (TypeError, ValueError, OSError):
+                    rejected.append({"code": "INVALID_OBSERVATION_TIMESTAMP", "record_index": index,
+                                     "sample_index": sample_index})
+                    continue
+                samples.append({"timestamp": observed.isoformat(), "value": str(sample[1])})
+            if not metric_name or not samples:
+                rejected.append({"code": "PROMETHEUS_SERIES_INCOMPLETE", "record_index": index})
+                continue
+            content = {"metric_name": metric_name, "labels": dict(labels), "samples": samples,
+                       "result_type": "matrix" if "values" in raw else "vector"}
+            observed_at = max(_parse_timestamp(sample["timestamp"]) for sample in samples)
+            evidence_id = _stable_evidence_id(
+                requirement=requirement, connector=connector, source_reference=source_reference,
+                observation_identity={"labels": labels, "samples": samples}, content=content,
+            )
+            normalized.append(EvidenceRecord(
+                evidence_id=evidence_id, requirement_id=str(requirement.requirement_id),
+                tenant_id=requirement.tenant_id, incident_id=str(incident.id), category="metrics",
+                source_id=endpoint, connector=connector, source_reference=source_reference,
+                service=str(labels.get("service") or incident.service or "") or None,
+                resource=str(labels.get("instance") or "") or None,
+                project_id=str(labels.get("project_id") or "") or None,
+                observed_at=observed_at, collected_at=now,
+                observation_window_start=window_start, observation_window_end=window_end,
+                freshness="fresh" if abs((now - observed_at).total_seconds()) <= 900 else "stale",
+                content=content,
+                provenance={**provenance, "query": query, "endpoint": endpoint,
+                            "raw_result_type": "matrix" if "values" in raw else "vector"},
+                current_observation=True, contradiction_status=None,
+            ))
+    else:
+        rejected.append({"code": "NORMALIZER_NOT_IMPLEMENTED", "category": category})
+    return ConnectorNormalization(
+        records=normalized,
+        metadata={"connector": connector, "endpoint": endpoint, "query": query,
+                  "observation_window_start": window_start, "observation_window_end": window_end},
+        rejected=rejected,
+    )
 RequirementStatus = Literal[
     "identified",
     "scheduled",

@@ -1,0 +1,19 @@
+{
+  "connector": "prometheus",
+  "endpoint_identity": "prometheus:9090",
+  "query": "up{service=\"api-gateway\"}",
+  "provenance": {
+    "transport": "http",
+    "api_path": "/api/v1/query"
+  },
+  "series": [
+    {
+      "metric": {
+        "__name__": "up",
+        "service": "api-gateway",
+        "instance": "api-gateway:8010"
+      },
+      "value": [1724679030, "1"]
+    }
+  ]
+}

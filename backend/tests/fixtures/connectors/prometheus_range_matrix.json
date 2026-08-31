@@ -1,0 +1,24 @@
+{
+  "connector": "prometheus",
+  "endpoint_identity": "prometheus:9090",
+  "query": "http_request_duration_seconds{service=\"api-gateway\"}",
+  "observation_window_start": "2024-08-26T13:29:00Z",
+  "observation_window_end": "2024-08-26T13:31:00Z",
+  "provenance": {
+    "transport": "http",
+    "api_path": "/api/v1/query_range"
+  },
+  "series": [
+    {
+      "metric": {
+        "__name__": "http_request_duration_seconds",
+        "service": "api-gateway",
+        "instance": "api-gateway:8010"
+      },
+      "values": [
+        [1724679000, "3.2"],
+        [1724679030, "3.4"]
+      ]
+    }
+  ]
+}
