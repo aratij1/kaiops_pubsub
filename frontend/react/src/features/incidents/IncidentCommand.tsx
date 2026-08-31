@@ -350,6 +350,7 @@ export default function IncidentCommand() {
           alertId={canonicalAlertId || undefined}
           accessToken={session.accessToken || ""}
           declaredGaps={declaredGaps}
+          proposedRcaDraft={rootCause}
           onIncidentRefresh={refreshIncident}
         />
 

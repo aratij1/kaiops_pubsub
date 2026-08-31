@@ -37,9 +37,9 @@ function actionableFailure(item: Requirement) {
   return "";
 }
 
-export type ContextEnrichmentPanelProps = { incidentId: string; alertId?: string; accessToken: string; declaredGaps: EvidenceGap[]; onIncidentRefresh: () => Promise<void> };
+export type ContextEnrichmentPanelProps = { incidentId: string; alertId?: string; accessToken: string; declaredGaps: EvidenceGap[]; proposedRcaDraft?: string; onIncidentRefresh: () => Promise<void> };
 
-export default function ContextEnrichmentPanel({ incidentId, alertId, accessToken, declaredGaps, onIncidentRefresh }: ContextEnrichmentPanelProps) {
+export default function ContextEnrichmentPanel({ incidentId, alertId, accessToken, declaredGaps, proposedRcaDraft = "", onIncidentRefresh }: ContextEnrichmentPanelProps) {
   const [state, setState] = useState<OperationsState | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -101,6 +101,14 @@ export default function ContextEnrichmentPanel({ incidentId, alertId, accessToke
   const rcaVersion = state?.investigation?.rca_version || 0;
   const evidenceIds = state?.context?.evidence_ids || [];
 
+  const startFromAiDraft = (requirementId: string, category: string) => {
+    const draft = proposedRcaDraft
+      ? `AI hypothesis to verify: ${proposedRcaDraft}\n\nVerified ${category.replaceAll("_", " ")} observation: `
+      : `Verified ${category.replaceAll("_", " ")} observation: `;
+    setAnswers((current) => ({ ...current, [requirementId]: draft }));
+    setAnnouncement("AI draft inserted. Replace the hypothesis with your verified observation and provide its source before submitting.");
+  };
+
   const card = (item: Requirement, historical = false) => {
     const request = item.active_human_request; const job = item.latest_job;
     const complete = ["collected", "answered", "satisfied"].includes(item.status.toLowerCase());
@@ -117,9 +125,10 @@ export default function ContextEnrichmentPanel({ incidentId, alertId, accessToke
       {failure ? <p className="context-enrichment-action" role="status">{failure}</p> : null}
       {!historical && request?.status === "pending" ? <div className="context-enrichment-response">
         <small>Assigned to {request.expected_responder || "an authorized responder"}{request.due_at ? ` · due ${formatUtcTimestamp(request.due_at)}` : ""}</small>
-        <textarea aria-label={`Response for ${item.category}`} value={answers[item.requirement_id] || ""} onChange={(event) => setAnswers((value) => ({ ...value, [item.requirement_id]: event.target.value }))} placeholder="Provide the factual observation." />
+        <div className="context-enrichment-ai-draft"><div><strong>Kai can prepare a draft</strong><p>The draft is an unverified hypothesis, not grounded evidence. Modify it to state only what you verified.</p></div><button type="button" className="button-secondary" onClick={() => startFromAiDraft(item.requirement_id, item.category)}>Insert editable AI draft</button></div>
+        <textarea aria-label={`Response for ${item.category}`} value={answers[item.requirement_id] || ""} onChange={(event) => setAnswers((value) => ({ ...value, [item.requirement_id]: event.target.value }))} placeholder="State the verified factual observation. Remove any AI claim you could not confirm." />
         <input aria-label={`Source reference for ${item.category}`} value={references[item.requirement_id] || ""} onChange={(event) => setReferences((value) => ({ ...value, [item.requirement_id]: event.target.value }))} placeholder="Source reference (ticket, dashboard, or catalog URL)" />
-        <button type="button" className="button-primary" disabled={loading || !String(answers[item.requirement_id] || "").trim() || !String(references[item.requirement_id] || "").trim()} onClick={() => void submit(item.requirement_id)}>Submit evidence</button>
+        <button type="button" className="button-primary" disabled={loading || !String(answers[item.requirement_id] || "").trim() || !String(references[item.requirement_id] || "").trim()} onClick={() => void submit(item.requirement_id)}>Submit reviewed evidence and rerun RCA</button>
       </div> : null}
     </article>;
   };

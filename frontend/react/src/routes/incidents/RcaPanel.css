@@ -979,3 +979,8 @@
 .context-enrichment-response textarea { min-height: 5rem; padding: .65rem; border: 1px solid #cbd5e1; border-radius: 8px; }
 .context-enrichment-response input { padding: .65rem; border: 1px solid #cbd5e1; border-radius: 8px; }
 .context-enrichment-response button { justify-self: start; }
+.context-enrichment-ai-draft { display: flex; align-items: center; justify-content: space-between; gap: .8rem; padding: .7rem; border: 1px solid #bfdbfe; border-radius: 9px; background: #eff6ff; }
+.context-enrichment-ai-draft strong { color: #1d4ed8; font-size: .78rem; }
+.context-enrichment-ai-draft p { color: #475569; font-size: .72rem; line-height: 1.45; }
+.context-enrichment-ai-draft button { flex: none; }
+@media(max-width:700px) { .context-enrichment-ai-draft { align-items: stretch; flex-direction: column; } }
