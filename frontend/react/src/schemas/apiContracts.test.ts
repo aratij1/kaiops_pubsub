@@ -19,6 +19,16 @@ describe("internal API contract registry", () => {
       unacknowledged: 0,
     })).toMatchObject({ status: "healthy", healthy: true, queues: 4 });
     expect(parseInternalApiResponse("/api-gateway/incidents/metadata?limit=10", "GET", { rows: [] })).toMatchObject({ rows: [] });
+    expect(parseInternalApiResponse(
+      "/api-gateway/incidents/1f11cbe9-274a-490a-ae4c-aebb3d70e58a/context-gaps",
+      "GET",
+      { data: { schema_version: "kaiops.context-enrichment.v1", requirements: [{ requirement_id: "r1" }], jobs: [], human_requests: [] } },
+    )).toEqual({
+      schema_version: "kaiops.context-enrichment.v1",
+      requirements: [{ requirement_id: "r1" }],
+      jobs: [],
+      human_requests: [],
+    });
     expect(parseInternalApiResponse("/api-gateway/evaluations/by-recommendation/1f11cbe9-274a-490a-ae4c-aebb3d70e58a/feedback", "POST", { updated: true })).toEqual({ updated: true });
     expect(parseInternalApiResponse("/context-agent/collect?publish_events=false", "POST", {
       incident_id: "1f11cbe9-274a-490a-ae4c-aebb3d70e58a",
