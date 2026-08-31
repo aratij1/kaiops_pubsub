@@ -845,6 +845,7 @@ services:
     environment:
       <<: *service-env
       SERVICE_NAME: context-agent
+      SERVICE_INTERNAL_TOKEN: ${SERVICE_INTERNAL_TOKEN:-kaiops-local-service-token-change-me}
       # Auto reuses complete cached context. Per event, realtime forces fresh
       # discovery and historical uses periodic snapshots without live calls.
       CONTEXT_STRATEGY: ${CONTEXT_STRATEGY:-auto}

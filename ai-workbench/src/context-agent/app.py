@@ -2158,8 +2158,55 @@ async def reconcile_context_enrichment(
                 existing_ids = {row["requirement_id"] for row in existing}
                 missing = [row for row in requirements if str(row.requirement_id) not in existing_ids]
                 summary["requirements_created"] += len(missing)
+                context_payload = candidate["context"] if isinstance(candidate["context"], dict) else {}
+                alert_payload = context_payload.get("alert") if isinstance(context_payload.get("alert"), dict) else {}
+                incident_payload = candidate["incident"] if isinstance(candidate["incident"], dict) else {}
+                alert = Alert.model_validate(alert_payload)
+                incident = _incident_from_workflow_payload({
+                    **incident_payload, "id": candidate["incident_id"],
+                    "tenant_id": request.tenant_id, "alert_ids": [candidate["alert_id"]],
+                })
+                resolved = alert.metadata.get("resolved_context_connectors", [])
+                authorized = {
+                    str(item.get("provider") or "").strip().lower()
+                    for item in resolved if isinstance(item, dict)
+                }
+                authorized.update({"local-evidence", "vector-db"})
+                planned: list[tuple[EvidenceRequirement, str | None]] = [
+                    (requirement, next((name for name in requirement.candidate_connectors if name in authorized), None))
+                    for requirement in missing
+                ]
+                summary["jobs_scheduled"] += sum(1 for _, connector in planned if connector)
+                summary["human_requests_created"] += sum(1 for _, connector in planned if not connector)
                 if not request.dry_run and missing:
                     await repository.upsert_context_evidence_requirements(missing)
+                    window_end = datetime.now(UTC).replace(microsecond=0)
+                    for requirement, connector in planned:
+                        if connector:
+                            await repository.schedule_context_enrichment_job(
+                                tenant_id=request.tenant_id, incident_id=incident.id,
+                                requirement_id=requirement.requirement_id, connector_id=connector,
+                                query_payload={
+                                    "schema_version": "kaiops.context-enrichment-query.v1",
+                                    "category": requirement.category, "question": requirement.question,
+                                    "alert": alert.model_dump(mode="json"),
+                                    "incident": incident.model_dump(mode="json"),
+                                    "decision": {"reconciled": True},
+                                },
+                                observation_start=window_end - timedelta(minutes=30),
+                                observation_end=window_end,
+                            )
+                        else:
+                            await repository.create_human_evidence_request(
+                                tenant_id=request.tenant_id, incident_id=incident.id,
+                                requirement_id=requirement.requirement_id,
+                                expected_responder="incident-owner",
+                                due_at=datetime.now(UTC) + timedelta(hours=1),
+                                acceptable_format="A source reference and a concise factual observation.",
+                                evidence_already_checked=requirement.candidate_connectors,
+                                hypothesis_impact=requirement.reason,
+                                investigation_can_continue=True,
+                            )
             except Exception as exc:
                 summary["errors"].append({"incident_id": candidate["incident_id"], "error": str(exc)[:500]})
         if request.dry_run:
