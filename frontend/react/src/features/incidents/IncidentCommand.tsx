@@ -20,8 +20,6 @@ import {
   SearchCheck,
   ShieldCheck,
   Sparkles,
-  Target,
-  Wrench,
   X,
 } from "lucide-react";
 
@@ -236,6 +234,21 @@ export default function IncidentCommand() {
     ...arrayOfText(analysis.evidence),
     ...arrayOfText(recommendationMetadata.supporting_evidence),
   ].slice(0, 6);
+  const acceptedEvidenceIds = arrayOfText(
+    analysis.accepted_evidence_ids || recommendationMetadata.accepted_evidence_ids || contextSnapshot.evidence_ids,
+  );
+  const publishedCitationCount = Number(
+    analysis.validated_citation_count
+      ?? analysis.citation_count
+      ?? recommendationMetadata.validated_citation_count
+      ?? recommendationMetadata.citation_count
+      ?? 0,
+  );
+  const validatedCitationCount = Math.max(
+    Number.isFinite(publishedCitationCount) ? publishedCitationCount : 0,
+    arrayOfText(analysis.validated_citations).length,
+    arrayOfText(recommendationMetadata.validated_citations).length,
+  );
   const contradictions = arrayOfText(analysis.contradictions || analysis.ruled_out || analysis.alternative_causes);
   const declaredGaps: EvidenceGap[] = (Array.isArray(analysis.missing_evidence) ? analysis.missing_evidence : [])
     .map((gap) => typeof gap === "string"
@@ -245,12 +258,20 @@ export default function IncidentCommand() {
   const status = normalizedStatus(row);
   const inFailure = FAILED.some((value) => status.includes(value));
   const isTerminal = TERMINAL.some((value) => status.includes(value));
-  const currentJourneyIndex = isTerminal ? 6 : status.includes("validat") || status.includes("verif") ? 5 : status.includes("execut") || status.includes("remediat") || status.includes("rollback") ? 4 : status.includes("approval") || recommendation.action || recommendation.title ? 3 : rootCause ? 2 : status.includes("investigat") || status.includes("analy") ? 1 : 0;
+  const analysisStatus = text(analysis.status, analysis.conclusion_status, recommendationMetadata.rca_status).toLowerCase();
+  const rcaConfirmed = Boolean(rootCause)
+    && (confidenceKind === "confirmed_rca" || ["confirmed", "grounded", "conclusive"].includes(analysisStatus))
+    && validatedCitationCount > 0;
+  const currentJourneyIndex = isTerminal ? 6 : status.includes("validat") || status.includes("verif") ? 5 : status.includes("execut") || status.includes("remediat") || status.includes("rollback") ? 4 : status.includes("approval") ? 3 : rootCause ? 2 : status.includes("investigat") || status.includes("analy") ? 1 : 0;
   const action = text(recommendation.title, recommendation.action, recommendation.recommended_action, eventPayload.recommended_action, projection.recommended_action);
   const approvalCandidatePending = Boolean(approval) && !["approved", "rejected", "completed"].includes(text(approval?.approval_status, approval?.status).toLowerCase());
   const sourceTimestamp = text(source.received_at, source.created_at, row.created_at);
   const updatedTimestamp = text(row.latest_event_at, row.updated_at, row.created_at);
-  const impact = text(row.customer_impact, row.business_impact, projection.customer_impact, projection.business_impact, projection.impact, eventPayload.impact, recommendation.impact, sourceAnnotations.business_impact, sourceAnnotations.summary, source.summary, source.description, row.summary);
+  const impact = text(row.customer_impact, row.business_impact, projection.customer_impact, projection.business_impact, projection.impact, eventPayload.impact, recommendation.impact, sourceAnnotations.business_impact);
+  const impactNormalized = impact.toLowerCase();
+  const impactEstablished = Boolean(impact) && ![
+    "unknown", "not established", "no direct customer", "no confirmed customer", "insufficient evidence", "lack of direct evidence",
+  ].some((marker) => impactNormalized.includes(marker));
   const sourceName = text(row.origin_system, row.source, source.origin_system, source.source, sourceLabels.origin_system, sourceLabels.transport);
   const signalCount = text(row.deduplicated_count, source.deduplicated_count, source.occurrence_count, contextAlert.deduplicated_count, contextAlert.occurrence_count);
   const correlationDetail = text(row.deduplication_reason, deduplication.reason, deduplication.disposition, deduplication.match_type) || "Correlation detail unavailable";
@@ -260,8 +281,9 @@ export default function IncidentCommand() {
   }, 0);
   const contextCollectedAt = text(contextSnapshot.collected_at, contextMetadata.context_collected_at);
   const contextQuality = confidenceValue(contextSnapshot.quality_score);
-  const resolutionAvailable = Boolean(action || Object.keys(executionPlan).length);
   const executionReady = executionPlan.execution_ready === true;
+  const resolutionAvailable = Boolean(action) && executionReady && rcaConfirmed;
+  const diagnosticSuggestion = Boolean(action) && !resolutionAvailable ? action : "";
   const executionUnavailableReason = text(
     executionPlan.readiness_reason,
     executionPlan.blocking_reason,
@@ -286,7 +308,7 @@ export default function IncidentCommand() {
     <header className="ic-command-header">
       <button type="button" className="ic-back" onClick={() => navigate("/incidents")}><ArrowLeft aria-hidden="true" /> Incident inbox</button>
       <div className="ic-title-row">
-        <div><span className="ic-id">{incidentId(row)}</span><h2>{titleFor(row)}</h2><p>{impact || "Customer and business impact have not been published to this incident."}</p></div>
+        <div><span className="ic-id">{incidentId(row)}</span><h2>{titleFor(row)}</h2><p>{impactEstablished ? impact : "Customer or business impact is not established by accepted evidence."}</p></div>
         <div className="ic-header-state"><StateBadge status={status} /><span><Bot aria-hidden="true" /> Kai {isTerminal ? "completed" : inFailure ? "needs intervention" : status.includes("approval") ? "needs your decision" : "is working"}</span></div>
       </div>
       <dl className="ic-critical-context">
@@ -309,15 +331,17 @@ export default function IncidentCommand() {
     <div className="ic-command-grid">
       <main className="ic-primary">
         <section className="ic-section ic-impact">
-          <header><div><span>What happened</span><h3>Impact and service context</h3></div><Target aria-hidden="true" /></header>
-          <div className="ic-impact-grid"><Metric label="Customer impact" value={impact || "Unavailable"} /><Metric label="Affected service" value={valueOrUnavailable(row.service)} /><Metric label="Source" value={valueOrUnavailable(sourceName)} /><Metric label="Signal count" value={valueOrUnavailable(signalCount)} detail={correlationDetail} /></div>
+          <header><div><span>Observed state</span><h3>{impactEstablished ? "Verified impact" : "Impact has not been established"}</h3></div><StatusBadge tone={impactEstablished ? "success" : "warning"}>{impactEstablished ? "Evidence-backed" : "Unknown"}</StatusBadge></header>
+          <p className="ic-decision-summary">{impactEstablished ? impact : "The alert proves that a signal fired. It does not, by itself, prove customer or business impact."}</p>
+          <div className="ic-impact-grid"><Metric label="Impact" value={impactEstablished ? impact : "Not established"} /><Metric label="Monitored service" value={valueOrUnavailable(row.service)} /><Metric label="Signal source" value={valueOrUnavailable(sourceName)} /><Metric label="Correlated signals" value={valueOrUnavailable(signalCount)} detail={correlationDetail} /></div>
         </section>
 
         <section className="ic-section ic-rca">
-          <header><div><span>Root cause story</span><h3>{rootCause || "Kai has not published a root-cause hypothesis"}</h3></div>{confidence !== null ? <div className="ic-confidence"><small>{confidenceLabel}</small><strong>{confidence}%</strong></div> : <StatusBadge tone="inactive">Confidence unavailable</StatusBadge>}</header>
+          <header><div><span>{rcaConfirmed ? "Confirmed root cause" : "Working hypothesis"}</span><h3>{rootCause || "No causal hypothesis has been published"}</h3></div><StatusBadge tone={rcaConfirmed ? "success" : rootCause ? "warning" : "inactive"}>{rcaConfirmed ? "Grounded" : rootCause ? "Unconfirmed" : "Unavailable"}</StatusBadge></header>
           {rootCause ? <>
+            <div className="ic-decision-evidence"><span><strong>{validatedCitationCount}</strong> validated citation{validatedCitationCount === 1 ? "" : "s"}</span><span><strong>{acceptedEvidenceIds.length}</strong> RCA-bound evidence record{acceptedEvidenceIds.length === 1 ? "" : "s"}</span><span><strong>{confidence === null ? "—" : `${confidence}%`}</strong> {confidenceLabel.toLowerCase()}</span></div>
             <div className="ic-reasoning"><article><h4>Why Kai thinks this</h4>{supportingReasons.length ? <ul>{supportingReasons.map((reason) => <li key={reason}><CheckCircle2 aria-hidden="true" />{reason}</li>)}</ul> : <p>Supporting reasons were not included in the backend analysis.</p>}</article><article><h4>What Kai ruled out</h4>{contradictions.length ? <ul>{contradictions.map((reason) => <li key={reason}><X aria-hidden="true" />{reason}</li>)}</ul> : <p>No ruled-out hypotheses were included.</p>}</article></div>
-            <TechnicalDetails summary="Why this confidence?"><p>{confidence === null ? "The backend did not publish a confidence score." : `${confidence}% is the normalized ${confidenceLabel.toLowerCase()} published with this incident analysis.`}</p><p>{confidenceKind === "confirmed_rca" ? "The RCA is confirmed but remains governed by policy gates." : "The investigation is not conclusive; this score cannot authorize remediation."}</p><p>{supportingReasons.length} supporting reason(s) and {contradictions.length} contradiction or ruled-out item(s) are available.</p></TechnicalDetails>
+            <TechnicalDetails summary="Why is this gated?"><p>{rcaConfirmed ? "The backend marked this analysis as grounded and supplied validated citations." : "This remains a diagnostic hypothesis. Confidence alone cannot confirm causality or authorize remediation."}</p><p>{validatedCitationCount} validated citation(s), {supportingReasons.length} supporting reason(s), and {contradictions.length} ruled-out item(s) are bound to this view.</p></TechnicalDetails>
           </> : <EmptyState title="Investigation is still forming a hypothesis" description="Kai will show a falsifiable root-cause story when the backend publishes one." />}
         </section>
 
@@ -330,15 +354,18 @@ export default function IncidentCommand() {
         />
 
         <section className="ic-section ic-causal">
-          <header><div><span>Relevant causal path</span><h3>How the signal connects to impact</h3></div><GitBranch aria-hidden="true" /></header>
+          <header><div><span>Causal chain</span><h3>{rcaConfirmed && impactEstablished ? "Evidence-supported path to impact" : "Causal path is incomplete"}</h3></div><GitBranch aria-hidden="true" /></header>
           <div className="ic-causal-path">
-            {[text(rootCause), text(row.service), titleFor(row), impact].filter((value, index, values) => value && values.indexOf(value) === index).map((value, index, values) => <div key={value}><button type="button"><span>{index === 0 && rootCause ? "Hypothesis" : index === values.length - 1 ? "Observed impact" : "Affected component"}</span><strong>{value}</strong></button>{index < values.length - 1 ? <ArrowDown aria-hidden="true" /> : null}</div>)}
+            <div><button type="button"><span>Observed signal</span><strong>{titleFor(row)}</strong></button><ArrowDown aria-hidden="true" /></div>
+            <div><button type="button"><span>Monitored service</span><strong>{valueOrUnavailable(row.service)}</strong></button><ArrowDown aria-hidden="true" /></div>
+            <div><button type="button"><span>{rcaConfirmed ? "Confirmed cause" : "Unconfirmed hypothesis"}</span><strong>{rootCause || "Not available"}</strong></button><ArrowDown aria-hidden="true" /></div>
+            <div><button type="button"><span>{impactEstablished ? "Verified impact" : "Impact"}</span><strong>{impactEstablished ? impact : "Not established"}</strong></button></div>
           </div>
-          {!rootCause && !impact ? <p className="ic-unavailable">The backend has not supplied enough evidence to construct a causal path.</p> : null}
+          {!rcaConfirmed || !impactEstablished ? <p className="ic-gate-note"><ShieldCheck aria-hidden="true" /> KaiMS will not claim an end-to-end causal path until both causality and impact are supported by accepted evidence.</p> : null}
         </section>
 
         <section className="ic-section ic-resolution">
-          <header><div><span>Recommended resolution</span><h3>{action || "No resolution recommendation available"}</h3></div><Wrench aria-hidden="true" /></header>
+          <header><div><span>{resolutionAvailable ? "Governed resolution" : "Resolution gate"}</span><h3>{resolutionAvailable ? action : "No executable resolution is available"}</h3></div><StatusBadge tone={resolutionAvailable ? "success" : "warning"}>{resolutionAvailable ? "Ready for review" : "Blocked"}</StatusBadge></header>
           {resolutionAvailable ? <>
             <p className="ic-resolution-why">{text(recommendation.why, recommendation.rationale, recommendation.reason, projection.recommendation_reason) || "The backend did not include a human-readable rationale."}</p>
             <div className="ic-resolution-facts">
@@ -357,7 +384,7 @@ export default function IncidentCommand() {
               ["Approval", safety.approval || row.approval_status || (approvalPending ? "Required" : "Not recorded")],
             ].map(([label, value]) => <div key={String(label)}><dt>{String(label)}</dt><dd>{valueOrUnavailable(Array.isArray(value) ? value.join("; ") : value)}</dd></div>)}</dl></section>
             {approvalPending && approval ? <section className="ic-inline-approval"><header><FileCheck2 aria-hidden="true" /><div><span>Kai needs your decision</span><strong>{action || "Review this production action"}</strong></div></header><p>{text(row.environment).toLowerCase().includes("prod") ? "This action may change Production. Review its scope and stop conditions before approving." : "Policy requires a human decision before Kai can continue."}</p>{approvalExpanded ? <div className="ic-approval-preview"><article><span>What will change</span><p>{action || "Action detail unavailable"}</p></article><article><span>What Kai will watch</span><p>{valueOrUnavailable(safety.stop_conditions || validation.watch_conditions)}</p></article><article><span>When Kai will rollback</span><p>{valueOrUnavailable(safety.rollback_conditions || executionPlan.rollback_conditions)}</p></article></div> : null}<div className="ic-decision-actions"><button type="button" className="button-secondary" onClick={() => setApprovalExpanded((open) => !open)}>{approvalExpanded ? "Hide preview" : "Review safety preview"}</button><button type="button" className="button-secondary" onClick={() => approvals.toggleReject(incidentId(approval))}>Reject</button><button type="button" className="button-primary" disabled={!approvals.ready || approvals.actionLoading} onClick={() => approvals.approve(approval as ApprovalRow)}>{approvals.actionLoading ? "Submitting decision..." : "Approve & let Kai resolve"}</button></div>{approvals.actionError ? <p className="ic-action-error">{approvals.actionError}</p> : null}</section> : <div className="ic-resolution-actions"><button type="button" className="button-secondary" disabled={!executionReady} title={!executionReady ? executionUnavailableReason : undefined} onClick={() => incidents.openTechnical(row, "resolution")}>{executionReady ? "Open technical execution workspace" : "Execution unavailable — collect evidence"}</button>{row.jira_url ? <a className="button-secondary" href={row.jira_url} target="_blank" rel="noreferrer">Open ticket <ExternalLink aria-hidden="true" /></a> : null}</div>}
-          </> : <EmptyState title="No safe action is ready" description="Kai will keep investigating until the backend publishes a governed resolution plan." />}
+          </> : <div className="ic-resolution-blocked"><ShieldCheck aria-hidden="true" /><div><strong>Investigation must establish a grounded RCA first</strong><p>{diagnosticSuggestion ? `The backend proposed “${diagnosticSuggestion}”, but it is shown only as a diagnostic suggestion because it is not bound to a grounded, execution-ready plan.` : "Kai will keep collecting evidence until the backend publishes a grounded RCA and a governed execution plan."}</p><dl><div><dt>Grounded RCA</dt><dd>{rcaConfirmed ? "Passed" : "Required"}</dd></div><div><dt>Validated citations</dt><dd>{validatedCitationCount}</dd></div><div><dt>Execution-ready plan</dt><dd>{executionReady ? "Published" : "Required"}</dd></div></dl></div></div>}
         </section>
 
         <section className="ic-section ic-validation">

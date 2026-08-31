@@ -23,7 +23,8 @@ function friendlyFailure(error: unknown) {
   return "Incident operations could not be loaded. Retry or contact the platform owner if the problem continues.";
 }
 
-function lifecycleLabel(state: string) {
+function lifecycleLabel(state: string, evidenceCount = 0) {
+  if (state === "DETECTED" && evidenceCount > 0) return "Evidence recorded";
   const labels: Record<string, string> = { DETECTED: "No evidence yet", REQUIREMENTS_IDENTIFIED: "Evidence required", COLLECTING: "Collecting", WAITING_FOR_HUMAN: "Waiting for human", COLLECTION_BLOCKED: "Blocked", INVESTIGATION_FAILED: "Failed", CONTEXT_READY: "Context ready", INVESTIGATING: "Investigating", RCA_READY: "RCA ready", CLOSED: "Closed" };
   return labels[state] || state.replaceAll("_", " ").toLowerCase();
 }
@@ -58,7 +59,7 @@ export default function ContextEnrichmentPanel({ incidentId, alertId, accessToke
       const result = await fetchJson(`/api-gateway/incidents/${encodeURIComponent(incidentId)}/operations-state`, { headers, maxAttempts: 1, staleTimeMs: 0 }) as OperationsState;
       setState(result); setError(""); failureCount.current = 0;
       if (previousState.current && previousState.current !== result.lifecycle_state) {
-        setAnnouncement(`Evidence lifecycle changed to ${lifecycleLabel(result.lifecycle_state)}.`);
+        setAnnouncement(`Evidence lifecycle changed to ${lifecycleLabel(result.lifecycle_state, result.context?.evidence_ids?.length || 0)}.`);
         void onIncidentRefresh();
       }
       previousState.current = result.lifecycle_state;
@@ -126,7 +127,7 @@ export default function ContextEnrichmentPanel({ incidentId, alertId, accessToke
   return <section className="context-enrichment-panel" aria-labelledby="context-enrichment-title">
     <div className="sr-only" aria-live="polite">{announcement}</div>
     <header><div><span className="discovery-eyebrow">Autonomous context enrichment</span><h3 id="context-enrichment-title">Evidence gaps and human requests</h3><p>KaiMS keeps collecting governed evidence while this investigation remains open.</p></div><button type="button" className="button-secondary" onClick={() => void load(true)} disabled={loading}><RefreshCw size={15} className={loading ? "is-spinning" : ""} /> Refresh</button></header>
-    {state ? <div className="context-enrichment-summary" role="status"><strong>{lifecycleLabel(state.lifecycle_state)}</strong><span>Last updated {state.updated_at ? formatUtcTimestamp(state.updated_at) : "unavailable"}</span><span>Snapshot {state.context?.snapshot_id ? `v${state.context.version} · ${state.context.snapshot_id}` : "not published"}</span><span>RCA {rcaVersion ? `v${rcaVersion}` : "not published"} · {evidenceIds.length} accepted evidence record{evidenceIds.length === 1 ? "" : "s"}</span></div> : null}
+    {state ? <div className="context-enrichment-summary" role="status"><strong>{lifecycleLabel(state.lifecycle_state, evidenceIds.length)}</strong><span>Last updated {state.updated_at ? formatUtcTimestamp(state.updated_at) : "unavailable"}</span><span>Snapshot {state.context?.snapshot_id ? `v${state.context.version} · ${state.context.snapshot_id}` : "not published"}</span><span>RCA {rcaVersion ? `v${rcaVersion}` : "not published"} · {evidenceIds.length} accepted evidence record{evidenceIds.length === 1 ? "" : "s"}</span></div> : null}
     {error ? <p className="context-enrichment-error" role="alert"><CircleAlert size={17} />{error}</p> : null}
     {!alertId && declaredGaps.length ? <p className="context-enrichment-error" role="status"><CircleAlert size={17} />Canonical alert binding is missing. Backend orchestration will regenerate analysis after a governed snapshot is committed.</p> : null}
     {!error && state && !current.length ? <p className="context-enrichment-empty">{declaredGaps.length ? "Evidence requirements have not been projected yet. KaiMS will continue monitoring this incident." : "No unresolved evidence gaps are declared."}</p> : null}
