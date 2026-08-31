@@ -121,6 +121,8 @@ export default function IncidentCommand() {
   const approvals = useRouteRuntimeSlice("approvals");
   const session = useRouteRuntimeSlice("session");
   const [approvalExpanded, setApprovalExpanded] = useState(false);
+  const [analysisRefreshing, setAnalysisRefreshing] = useState(false);
+  const [analysisRefreshError, setAnalysisRefreshError] = useState("");
   const [directRequestVersion, setDirectRequestVersion] = useState(0);
   const [directIncident, setDirectIncident] = useState<{
     loading: boolean;
@@ -327,6 +329,17 @@ export default function IncidentCommand() {
     }
     await refreshIncident();
   };
+  const regenerateFromCard = async () => {
+    setAnalysisRefreshing(true);
+    setAnalysisRefreshError("");
+    try {
+      await requestFreshAnalysis();
+    } catch (error) {
+      setAnalysisRefreshError(String((error as Error).message || error));
+    } finally {
+      setAnalysisRefreshing(false);
+    }
+  };
 
   return <article className="incident-command">
     <header className="ic-command-header">
@@ -362,6 +375,8 @@ export default function IncidentCommand() {
         <section className="ic-section ic-rca">
           <header><div><span>Root cause story</span><h3>{rootCause || "Kai has not published a root-cause hypothesis"}</h3></div>{confidence !== null ? <div className="ic-confidence"><small>{confidenceLabel}</small><strong>{confidence}%</strong></div> : <StatusBadge tone="inactive">Confidence unavailable</StatusBadge>}</header>
           {text(analysisGeneration.rca) === "model" ? <p className="ic-resolution-why">Agent synthesis: {text(analysisGeneration.provider, "configured provider")} / {text(analysisGeneration.model, "configured model")}. Evidence policy remains authoritative.</p> : null}
+          <div className="ic-resolution-actions"><button type="button" className="button-secondary" disabled={analysisRefreshing || !canonicalAlertId} onClick={() => void regenerateFromCard()}><RefreshCw aria-hidden="true" />{analysisRefreshing ? "Agents are analyzing…" : "Regenerate with AI agents"}</button></div>
+          {analysisRefreshError ? <p className="ic-action-error" role="alert">{analysisRefreshError}</p> : null}
           {rootCause ? <>
             <div className="ic-reasoning"><article><h4>Why Kai thinks this</h4>{supportingReasons.length ? <ul>{supportingReasons.map((reason) => <li key={reason}><CheckCircle2 aria-hidden="true" />{reason}</li>)}</ul> : <p>Supporting reasons were not included in the backend analysis.</p>}</article><article><h4>What Kai ruled out</h4>{contradictions.length ? <ul>{contradictions.map((reason) => <li key={reason}><X aria-hidden="true" />{reason}</li>)}</ul> : <p>No ruled-out hypotheses were included.</p>}</article></div>
             <TechnicalDetails summary="Why this confidence?"><p>{confidence === null ? "The backend did not publish a confidence score." : `${confidence}% is the normalized ${confidenceLabel.toLowerCase()} published with this incident analysis.`}</p><p>{confidenceKind === "confirmed_rca" ? "The RCA is confirmed but remains governed by policy gates." : "The investigation is not conclusive; this score cannot authorize remediation."}</p><p>{supportingReasons.length} supporting reason(s) and {contradictions.length} contradiction or ruled-out item(s) are available.</p></TechnicalDetails>
