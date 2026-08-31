@@ -8460,9 +8460,18 @@ class ContextEnrichmentRepository(EvaluationRepository):
             row.status = "blocked"
             row.last_error = str(error or "maximum collection attempts reached")[:4000]
             if requirement is not None:
-                requirement.status = "blocked"
                 requirement.retry_count = int(requirement.retry_count or 0) + 1
-                requirement.version += 1
+                await self.create_human_evidence_request(
+                    tenant_id=row.tenant_id,
+                    incident_id=row.incident_id,
+                    requirement_id=row.requirement_id,
+                    expected_responder="incident-owner",
+                    due_at=datetime.now(UTC) + timedelta(hours=1),
+                    acceptable_format="A source reference and a concise factual observation.",
+                    evidence_already_checked=[row.connector_id, row.last_error],
+                    hypothesis_impact=requirement.reason,
+                    investigation_can_continue=True,
+                )
         row.version += 1
         row.lease_owner = None
         row.lease_expires_at = None

@@ -130,7 +130,6 @@ def _has_code_evidence(context: Context) -> bool:
 
 
 def _context_identity(alert: Alert) -> tuple[str, str, str, str]:
-    metadata = alert.metadata if isinstance(alert.metadata, dict) else {}
     labels = alert.labels if isinstance(alert.labels, dict) else {}
     tenant_id = require_tenant_id(alert.tenant_id, source="context alert identity")
     service = str(alert.service or "unknown").strip().lower() or "unknown"
@@ -2159,9 +2158,21 @@ async def reconcile_context_enrichment(
                     (int(row["rca_version"]), str(row["category"]), str(row["question"]))
                     for row in existing
                 }
+                activity = await repository.list_context_enrichment_activity(
+                    tenant_id=request.tenant_id, incident_id=candidate["incident_id"],
+                )
+                requested_requirement_ids = {
+                    str(row["requirement_id"]) for row in activity["human_requests"]
+                }
                 missing = [
                     row for row in requirements
                     if (row.rca_version, row.category, row.question) not in existing_keys
+                ]
+                stalled = [
+                    EvidenceRequirement.model_validate(row) for row in existing
+                    if int(row["rca_version"]) == int(candidate["rca_version"])
+                    and row["status"] == "blocked"
+                    and str(row["requirement_id"]) not in requested_requirement_ids
                 ]
                 summary["requirements_created"] += len(missing)
                 context_payload = candidate["context"] if isinstance(candidate["context"], dict) else {}
@@ -2182,9 +2193,12 @@ async def reconcile_context_enrichment(
                     (requirement, next((name for name in requirement.candidate_connectors if name in authorized), None))
                     for requirement in missing
                 ]
+                # A terminal connector failure must become actionable human work;
+                # never reschedule the same exhausted requirement indefinitely.
+                planned.extend((requirement, None) for requirement in stalled)
                 summary["jobs_scheduled"] += sum(1 for _, connector in planned if connector)
                 summary["human_requests_created"] += sum(1 for _, connector in planned if not connector)
-                if not request.dry_run and missing:
+                if not request.dry_run and planned:
                     await repository.upsert_context_evidence_requirements(missing)
                     window_end = datetime.now(UTC).replace(microsecond=0)
                     for requirement, connector in planned:

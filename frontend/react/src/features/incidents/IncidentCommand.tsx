@@ -317,11 +317,12 @@ export default function IncidentCommand() {
     if (!response.ok) throw new Error(`Fresh analysis request returned HTTP ${response.status}`);
     const accepted = record(await response.json() as unknown);
     const requestId = text(accepted.request_id, record(accepted.data).request_id);
+    const acceptedIncidentId = text(accepted.incident_id, record(accepted.data).incident_id, canonicalIncidentId);
     if (requestId) {
       for (let attempt = 0; attempt < 20; attempt += 1) {
         await new Promise((resolve) => window.setTimeout(resolve, 1_500));
-        const statusResponse = await fetch(`/api-gateway/analysis/requests/${encodeURIComponent(requestId)}/status`, { headers: { Authorization: `Bearer ${session.accessToken}`, Accept: "application/json" } });
-        if (!statusResponse.ok) break;
+        const statusResponse = await fetch(`/api-gateway/analysis/requests/${encodeURIComponent(requestId)}/status?incident_id=${encodeURIComponent(acceptedIncidentId)}`, { headers: { Authorization: `Bearer ${session.accessToken}`, Accept: "application/json" } });
+        if (!statusResponse.ok) throw new Error(`Analysis status returned HTTP ${statusResponse.status}`);
         const statusPayload = record(await statusResponse.json() as unknown);
         const requestStatus = text(statusPayload.status, record(statusPayload.data).status).toLowerCase();
         if (["complete", "completed", "failed", "blocked", "cancelled"].includes(requestStatus)) break;

@@ -173,6 +173,48 @@ async def test_connector_unavailable_becomes_human_request_without_stopping_othe
 
 
 @pytest.mark.asyncio
+async def test_exhausted_automatic_collection_escalates_to_human_request(
+    sqlite_session_factory,
+):
+    incident_id = uuid4()
+    requirement = EvidenceRequirement(
+        requirement_id=uuid4(), tenant_id="tenant-a", incident_id=incident_id,
+        rca_version=4, category="traces", question="Which span failed?",
+        reason="A trace is required to confirm the causal path", priority="high",
+        collection_mode="automatic", candidate_connectors=["jaeger"],
+        created_at=datetime.now(UTC), updated_at=datetime.now(UTC),
+    )
+    async with sqlite_session_factory() as session:
+        repo = ContextEnrichmentRepository(session)
+        await repo.upsert_context_evidence_requirements([requirement])
+        job = await repo.schedule_context_enrichment_job(
+            tenant_id="tenant-a", incident_id=incident_id,
+            requirement_id=requirement.requirement_id, connector_id="jaeger",
+            query_payload={"service": "checkout-api"},
+            observation_start=datetime.now(UTC) - timedelta(minutes=10),
+            observation_end=datetime.now(UTC),
+        )
+        claimed = await repo.claim_context_enrichment_jobs(worker_id="worker-a", limit=1)
+        assert claimed[0]["job_id"] == str(job.job_id)
+        await repo.finish_context_enrichment_job(
+            job_id=job.job_id, worker_id="worker-a", collected=False,
+            error="connector unavailable", maximum_attempts=1,
+        )
+        activity = await repo.list_context_enrichment_activity(
+            tenant_id="tenant-a", incident_id=incident_id,
+        )
+        gaps = await repo.list_context_evidence_requirements(
+            tenant_id="tenant-a", incident_id=incident_id,
+        )
+
+        assert activity["jobs"][0]["status"] == "blocked"
+        assert len(activity["human_requests"]) == 1
+        assert activity["human_requests"][0]["status"] == "pending"
+        assert activity["human_requests"][0]["expected_responder"] == "incident-owner"
+        assert gaps[0]["status"] == "human_requested"
+
+
+@pytest.mark.asyncio
 async def test_human_response_is_tenant_scoped_and_recorded_as_assertion(sqlite_session_factory):
     incident_id = uuid4()
     requirement = EvidenceRequirement(
