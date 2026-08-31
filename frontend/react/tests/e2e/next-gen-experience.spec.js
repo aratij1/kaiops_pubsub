@@ -183,6 +183,7 @@ async function installScenario(page, options = {}) {
         readiness: { approval_ready: true, blocking_reasons: [] },
         readiness_blocks: [],
       },
+      investigation_integrity: { status: "verified", verified: true, blocking_reasons: [] },
       recommendation: {
         id: RECOMMENDATION_ID,
         metadata: governedPlanReady ? {
@@ -495,7 +496,7 @@ test("failed remediation presents failure evidence and rollback truth", async ({
   });
   await installScenario(page, { incident: failed });
   await signIn(page, `/incidents/${INCIDENT_ID}`);
-  await expect(page.getByRole("alert")).toContainText("automatic stop threshold");
+  await expect(page.locator(".ic-failure")).toContainText("automatic stop threshold");
   await expect(page.locator(".ic-journey li.is-failed")).toContainText("Executing");
   await expect(page.getByRole("button", { name: "Rollback unavailable" })).toBeDisabled();
 });
