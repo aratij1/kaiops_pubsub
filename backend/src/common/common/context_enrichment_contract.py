@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Literal
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -121,6 +121,67 @@ class HumanEvidenceResponse(BaseModel):
     responder_id: str = Field(min_length=1, max_length=255)
     source_reference: str | None = Field(default=None, max_length=1536)
     responded_at: datetime
+
+
+_REQUIREMENT_CONNECTORS: dict[str, list[str]] = {
+    "metrics": ["prometheus"],
+    "logs": ["opensearch", "discovery-mcp"],
+    "traces": ["jaeger", "discovery-mcp"],
+    "topology": ["discovery-mcp", "cmdb"],
+    "deployment": ["jenkins", "kubernetes"],
+    "change": ["jira", "github"],
+    "source_code": ["github"],
+    "database": ["discovery-mcp"],
+    "ticket": ["jira"],
+    "runbook": ["vector-db"],
+    "validation": ["prometheus"],
+}
+_HUMAN_CATEGORIES = {"ownership", "business_impact"}
+_CATEGORY_ALIASES = {
+    "metric": "metrics", "telemetry": "metrics", "prometheus": "metrics",
+    "log": "logs", "opensearch": "logs", "trace": "traces", "jaeger": "traces",
+    "deployments": "deployment", "changes": "change", "code": "source_code",
+    "tickets": "ticket", "jira": "ticket", "rag": "runbook", "knowledge": "runbook",
+}
+
+
+def build_evidence_requirements(
+    *, tenant_id: str, incident_id: UUID | str, rca_version: int,
+    missing_evidence: list[object], now: datetime,
+) -> list[EvidenceRequirement]:
+    """Create deterministic work items from an RCA's declared evidence gaps.
+
+    This lives in the shared contract package so the resolution service that
+    discovers a gap and the context service that fulfils it cannot drift.
+    """
+    tenant = str(tenant_id or "").strip()
+    if not tenant:
+        raise ValueError("tenant_id is required to plan evidence")
+    incident = UUID(str(incident_id))
+    version = max(1, int(rca_version or 1))
+    requirements: list[EvidenceRequirement] = []
+    valid_categories = set(EvidenceCategory.__args__)
+    for raw in missing_evidence or []:
+        gap = raw if isinstance(raw, dict) else {}
+        token = str(gap.get("category") if gap else raw).strip().lower()
+        category = _CATEGORY_ALIASES.get(token, token)
+        if category not in valid_categories:
+            continue
+        connectors = list(gap.get("candidate_connectors") or _REQUIREMENT_CONNECTORS.get(category, []))
+        mode = "human_required" if category in _HUMAN_CATEGORIES else (
+            "automatic" if connectors else "connector_required"
+        )
+        question = str(gap.get("question") or f"Collect {category} evidence for this incident.")
+        identity = f"{tenant}:{incident}:{version}:{category}:{question}"
+        requirements.append(EvidenceRequirement(
+            requirement_id=uuid5(NAMESPACE_URL, identity), tenant_id=tenant,
+            incident_id=incident, rca_version=version, category=category,
+            question=question,
+            reason=str(gap.get("reason") or "Required to test the current RCA hypothesis."),
+            priority=str(gap.get("priority") or "high"), collection_mode=mode,
+            candidate_connectors=connectors, status="identified", created_at=now, updated_at=now,
+        ))
+    return requirements
 
 
 class HitlJiraRequest(BaseModel):

@@ -51,6 +51,19 @@ async def test_missing_automatic_evidence_creates_idempotent_enrichment_jobs(
             observation_start=now - timedelta(minutes=10), observation_end=now,
         )
         assert first.job_id == second.job_id
+        job_id = first.job_id
+        await session.commit()
+
+    async with sqlite_session_factory() as session:
+        repo = ContextEnrichmentRepository(session)
+        claimed = await repo.claim_context_enrichment_jobs(limit=1)
+        assert claimed[0]["job_id"] == str(job_id)
+        assert claimed[0]["attempt_count"] == 1
+        await repo.finish_context_enrichment_job(job_id=job_id, collected=True)
+        activity = await repo.list_context_enrichment_activity(
+            tenant_id="tenant-a", incident_id=incident_id,
+        )
+        assert activity["jobs"][0]["status"] == "collected"
 
 
 @pytest.mark.asyncio

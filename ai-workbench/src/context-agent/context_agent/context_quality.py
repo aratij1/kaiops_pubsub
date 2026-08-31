@@ -6,11 +6,10 @@ import re
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlencode
-from uuid import NAMESPACE_URL, UUID, uuid5
 
 from ai_workbench_common.models import Context
+from common.context_enrichment_contract import EvidenceRequirement, build_evidence_requirements
 from common.incident_contracts import ContextPackage
-from common.context_enrichment_contract import EvidenceRequirement
 from common.models import EvidenceReference
 
 CONTEXT_CONTRACT_VERSION = "kaiops.context.v2"
@@ -72,16 +71,6 @@ def utc_now() -> datetime:
     return datetime.now(UTC)
 
 
-_REQUIREMENT_CONNECTORS: dict[str, list[str]] = {
-    "metrics": ["prometheus"], "logs": ["opensearch"], "traces": ["jaeger"],
-    "topology": ["discovery-mcp", "cmdb"], "deployment": ["deployment-history"],
-    "change": ["jira", "source-control"], "source_code": ["source-control"],
-    "database": ["database-observer"], "ticket": ["jira"], "runbook": ["vector-db"],
-    "validation": ["prometheus"],
-}
-_HUMAN_CATEGORIES = {"ownership", "business_impact"}
-
-
 async def plan_missing_evidence(
     context: Context,
     investigation: Any,
@@ -101,41 +90,12 @@ async def plan_missing_evidence(
     ).strip()
     if not tenant_id or not incident_raw:
         raise ValueError("tenant_id and incident_id are required to plan evidence")
-    incident_id = UUID(incident_raw)
-    rca_version = max(1, int(investigation_payload.get("rca_version") or 1))
     raw_gaps = investigation_payload.get("missing_evidence") or metadata.get("missing_evidence") or []
-    now = utc_now()
-    requirements: list[EvidenceRequirement] = []
-    for raw_gap in raw_gaps:
-        raw_category = str(
-            raw_gap.get("category") if isinstance(raw_gap, dict) else raw_gap
-        ).strip().lower()
-        category = raw_category if raw_category in {"traces", "ownership", "business_impact", "validation"} else canonical_source(raw_category)
-        category = {
-            "telemetry": "metrics", "deployments": "deployment", "changes": "change",
-            "code": "source_code", "tickets": "ticket", "rag": "runbook",
-        }.get(category, category)
-        if category not in {
-            "metrics", "logs", "traces", "topology", "deployment", "change",
-            "source_code", "database", "ticket", "runbook", "ownership",
-            "business_impact", "validation",
-        }:
-            continue
-        gap = raw_gap if isinstance(raw_gap, dict) else {}
-        connectors = list(gap.get("candidate_connectors") or _REQUIREMENT_CONNECTORS.get(category, []))
-        mode = "human_required" if category in _HUMAN_CATEGORIES else (
-            "automatic" if connectors else "connector_required"
-        )
-        identity = f"{tenant_id}:{incident_id}:{rca_version}:{category}:{gap.get('question', '')}"
-        requirements.append(EvidenceRequirement(
-            requirement_id=uuid5(NAMESPACE_URL, identity), tenant_id=tenant_id,
-            incident_id=incident_id, rca_version=rca_version, category=category,
-            question=str(gap.get("question") or f"Collect {category} evidence for this incident."),
-            reason=str(gap.get("reason") or "Required to test the current RCA hypothesis."),
-            priority=str(gap.get("priority") or "high"), collection_mode=mode,
-            candidate_connectors=connectors, status="identified", created_at=now, updated_at=now,
-        ))
-    return requirements
+    return build_evidence_requirements(
+        tenant_id=tenant_id, incident_id=incident_raw,
+        rca_version=max(1, int(investigation_payload.get("rca_version") or 1)),
+        missing_evidence=raw_gaps, now=utc_now(),
+    )
 
 
 def canonical_source(value: Any) -> str:

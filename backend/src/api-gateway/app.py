@@ -3837,10 +3837,20 @@ async def post_incident_context_gap_response(
     x_trace_id: str | None = Header(default=None),
     tenant_id: str = Depends(current_tenant_id),
 ) -> dict[str, Any]:
+    auth = getattr(request.state, "auth", None)
+    if auth is None:
+        raise HTTPException(status_code=401, detail="Authentication is required")
+    responder_id = str(auth.email or auth.username or auth.user_id)
+    governed_payload = {
+        **payload,
+        # These fields are audit evidence and may never be asserted by the browser.
+        "responder_id": responder_id,
+        "responded_at": datetime.now(UTC).isoformat(),
+    }
     return await guarded_proxy(
         request=request, method="POST",
         path=f"/incidents/{incident_id}/context-gaps/{requirement_id}/responses",
-        target_base=settings.context_agent_url, payload=payload, params={"tenant_id": tenant_id},
+        target_base=settings.context_agent_url, payload=governed_payload, params={"tenant_id": tenant_id},
         trace_id=trace_id_from_header(x_trace_id), timeout_seconds=30.0,
     )
 

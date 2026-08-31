@@ -943,3 +943,23 @@
   .rca-code-changes article > div { display: grid; }
   .rca-code-changes code { max-width: 100%; }
 }
+.context-enrichment-panel {
+  margin: 1.5rem 0;
+  padding: 1.25rem;
+  border: 1px solid #bfdbfe;
+  border-left: 4px solid #1677d2;
+  border-radius: 14px;
+  background: #fff;
+}
+.context-enrichment-panel > header { display: flex; justify-content: space-between; gap: 1rem; align-items: flex-start; }
+.context-enrichment-panel h3 { margin: .2rem 0; }
+.context-enrichment-panel p { margin: .25rem 0; }
+.context-enrichment-error { display: flex; gap: .5rem; padding: .85rem; color: #991b1b; background: #fef2f2; border: 1px solid #fecaca; border-radius: 10px; }
+.context-enrichment-empty { padding: .85rem; color: #475569; background: #f8fafc; border-radius: 10px; }
+.context-enrichment-list { display: grid; gap: .75rem; margin-top: 1rem; }
+.context-enrichment-list article { padding: .85rem; border: 1px solid #dbe5ef; border-radius: 10px; }
+.context-enrichment-item-heading { display: grid; grid-template-columns: auto 1fr auto; gap: .65rem; align-items: start; }
+.context-enrichment-item-heading > span { padding: .2rem .5rem; border-radius: 999px; background: #e0f2fe; font-size: .75rem; text-transform: capitalize; }
+.context-enrichment-response { display: grid; gap: .5rem; margin-top: .75rem; }
+.context-enrichment-response textarea { min-height: 5rem; padding: .65rem; border: 1px solid #cbd5e1; border-radius: 8px; }
+.context-enrichment-response button { justify-self: start; }

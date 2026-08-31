@@ -8236,6 +8236,40 @@ class ContextEnrichmentRepository(EvaluationRepository):
             "created_at": row.created_at, "updated_at": row.updated_at,
         } for row in result.scalars().all()]
 
+    async def list_context_enrichment_activity(
+        self, *, tenant_id: str, incident_id: UUID | str,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Return the durable machine and human work associated with a gap."""
+        tenant = require_tenant_id(tenant_id, source="context enrichment activity")
+        incident_uuid = self._to_uuid(incident_id)
+        jobs = (await self.session.execute(
+            select(ContextEnrichmentJobRecord).where(
+                ContextEnrichmentJobRecord.tenant_id == tenant,
+                ContextEnrichmentJobRecord.incident_id == incident_uuid,
+            ).order_by(ContextEnrichmentJobRecord.created_at.asc())
+        )).scalars().all()
+        requests = (await self.session.execute(
+            select(HumanEvidenceRequestRecord).where(
+                HumanEvidenceRequestRecord.tenant_id == tenant,
+                HumanEvidenceRequestRecord.incident_id == incident_uuid,
+            ).order_by(HumanEvidenceRequestRecord.created_at.asc())
+        )).scalars().all()
+        return {
+            "jobs": [{
+                "job_id": str(row.job_id), "requirement_id": str(row.requirement_id),
+                "connector_id": row.connector_id, "status": row.status,
+                "attempt_count": row.attempt_count, "available_at": row.available_at,
+                "last_error": row.last_error, "updated_at": row.updated_at,
+            } for row in jobs],
+            "human_requests": [{
+                "request_id": str(row.request_id), "requirement_id": str(row.requirement_id),
+                "expected_responder": row.expected_responder, "due_at": row.due_at,
+                "acceptable_format": row.acceptable_format, "status": row.status,
+                "investigation_can_continue": row.investigation_can_continue,
+                "updated_at": row.updated_at,
+            } for row in requests],
+        }
+
     async def schedule_context_enrichment_job(
         self, *, tenant_id: str, incident_id: UUID | str, requirement_id: UUID | str,
         connector_id: str, query_payload: dict[str, Any], observation_start: datetime,
@@ -8263,6 +8297,64 @@ class ContextEnrichmentRepository(EvaluationRepository):
         self.session.add(row)
         await self.session.flush()
         return row
+
+    async def claim_context_enrichment_jobs(self, *, limit: int = 10) -> list[dict[str, Any]]:
+        """Lease due jobs for one worker using row locks across replicas."""
+        now = datetime.now(UTC)
+        statement = select(ContextEnrichmentJobRecord).where(
+            ContextEnrichmentJobRecord.status.in_(["scheduled", "retry"]),
+            ContextEnrichmentJobRecord.available_at <= now,
+        ).order_by(ContextEnrichmentJobRecord.available_at.asc()).limit(max(1, min(limit, 50)))
+        if self.session.bind and self.session.bind.dialect.name != "sqlite":
+            statement = statement.with_for_update(skip_locked=True)
+        rows = (await self.session.execute(statement)).scalars().all()
+        result = []
+        for row in rows:
+            row.status = "collecting"
+            row.attempt_count = int(row.attempt_count or 0) + 1
+            row.version += 1
+            result.append({
+                "job_id": str(row.job_id), "tenant_id": row.tenant_id,
+                "incident_id": str(row.incident_id),
+                "requirement_id": str(row.requirement_id),
+                "connector_id": row.connector_id, "attempt_count": row.attempt_count,
+                "query_payload": dict(row.query_payload or {}),
+            })
+        await self.session.flush()
+        return result
+
+    async def finish_context_enrichment_job(
+        self, *, job_id: UUID | str, collected: bool, error: str | None = None,
+        retry_after_seconds: int = 60, maximum_attempts: int = 4,
+    ) -> None:
+        row = await self.session.get(ContextEnrichmentJobRecord, self._to_uuid(job_id))
+        if row is None:
+            raise LookupError("context enrichment job not found")
+        requirement = await self.session.get(ContextEvidenceRequirementRecord, row.requirement_id)
+        if collected:
+            row.status = "collected"
+            row.last_error = None
+            if requirement is not None:
+                requirement.status = "collected"
+                requirement.version += 1
+        elif int(row.attempt_count or 0) < maximum_attempts:
+            row.status = "retry"
+            row.available_at = datetime.now(UTC) + timedelta(seconds=max(1, retry_after_seconds))
+            row.last_error = str(error or "evidence was not returned")[:4000]
+            if requirement is not None:
+                requirement.status = "scheduled"
+                requirement.retry_count = int(requirement.retry_count or 0) + 1
+                requirement.retry_after = row.available_at
+                requirement.version += 1
+        else:
+            row.status = "blocked"
+            row.last_error = str(error or "maximum collection attempts reached")[:4000]
+            if requirement is not None:
+                requirement.status = "blocked"
+                requirement.retry_count = int(requirement.retry_count or 0) + 1
+                requirement.version += 1
+        row.version += 1
+        await self.session.flush()
 
     async def create_human_evidence_request(
         self, *, tenant_id: str, incident_id: UUID | str, requirement_id: UUID | str,

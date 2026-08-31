@@ -4,25 +4,20 @@ import asyncio
 import logging
 import os
 from collections.abc import Awaitable, Callable, Coroutine
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from time import monotonic
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import httpx
 from ai_workbench_common.models import Context
+from common.capability_registry import default_capability_registry
 from common.config import get_settings
+from common.context_enrichment_contract import build_evidence_requirements
 from common.event_publishers import build_agent_event_contract, build_event_envelope
-from common.resolution_lifecycle import ResolutionState, create_lifecycle, decide_resolution_control
 from common.kafka import KafkaConsumer
 from common.kafka import consume_forever as consume_kafka_forever
 from common.models import Alert, Incident, Recommendation
-from common.capability_registry import default_capability_registry
-from common.remediation_plan import (
-    AutonomyRecommendation,
-    RemediationPlan,
-    assess_remediation_plan,
-)
 from common.orchestration.execution_plan import resolve_execution_plan
 from common.orchestration.execution_plan_contract import (
     ExecutionPlanV2,
@@ -30,7 +25,13 @@ from common.orchestration.execution_plan_contract import (
 )
 from common.rabbitmq import RabbitMQConsumer
 from common.rabbitmq import consume_forever as consume_rabbitmq_forever
-from common.repository import IncidentRepository
+from common.remediation_plan import (
+    AutonomyRecommendation,
+    RemediationPlan,
+    assess_remediation_plan,
+)
+from common.repository import ContextEnrichmentRepository, IncidentRepository
+from common.resolution_lifecycle import ResolutionState, create_lifecycle, decide_resolution_control
 from common.service import create_app
 from common.telemetry import CONTEXT_KNOWLEDGE_OPERATIONS, EVENTS_PROCESSED
 from common.tenant_identity import require_tenant_id
@@ -38,17 +39,17 @@ from common.topics import CONTEXT_EVENTS, RESOLUTION_EVENTS
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from resolution_agent import ResolutionIntelligenceAgent
-from resolution_agent.investigation import IterativeInvestigator
-from resolution_agent.contracts import ResolutionOption
-from resolution_agent.policy import ResolutionPolicyInput, evaluate_resolution_policy
-from resolution_agent.metrics import HITL_TOTAL, HOTL_TOTAL, PLAN_BLOCKED_TOTAL
-from resolution_agent.workflow import ResolutionWorkflowState, transition_idempotency_key
 from resolution_agent.catalog import (
     RESOLUTION_CATALOG,
     prepare_resolution_plan,
     register_global_knowledge,
     relevant_resolutions,
 )
+from resolution_agent.contracts import ResolutionOption
+from resolution_agent.investigation import IterativeInvestigator
+from resolution_agent.metrics import HITL_TOTAL, HOTL_TOTAL, PLAN_BLOCKED_TOTAL
+from resolution_agent.policy import ResolutionPolicyInput, evaluate_resolution_policy
+from resolution_agent.workflow import ResolutionWorkflowState, transition_idempotency_key
 
 settings = get_settings()
 settings.service_name = "resolution-agent"
@@ -1135,6 +1136,62 @@ async def _persist_resolution_event(
                 "policy_decision": policy_decision,
             }
             await repo.record_resolution_transition(transition_payload)
+        missing = list((metadata.get("rca_analysis") or {}).get("missing_evidence") or [])
+        if missing:
+            rca_version = max(1, int(metadata.get("rca_version") or 1))
+            requirements = build_evidence_requirements(
+                tenant_id=context.tenant_id, incident_id=incident.id,
+                rca_version=rca_version, missing_evidence=missing, now=datetime.now(UTC),
+            )
+            enrichment_repo = ContextEnrichmentRepository(session)
+            await enrichment_repo.upsert_context_evidence_requirements(requirements)
+            resolved = context.alert.metadata.get("resolved_context_connectors", [])
+            authorized = {
+                str(item.get("provider") or "").strip().lower()
+                for item in resolved if isinstance(item, dict)
+            }
+            # Built-in governed read-only sources are available without a
+            # tenant secret; all other connectors must be explicitly onboarded.
+            authorized.update({"local-evidence", "vector-db"})
+            window_end = datetime.now(UTC)
+            for requirement in requirements:
+                connector = next(
+                    (candidate for candidate in requirement.candidate_connectors if candidate in authorized),
+                    None,
+                )
+                if connector:
+                    await enrichment_repo.schedule_context_enrichment_job(
+                        tenant_id=context.tenant_id, incident_id=incident.id,
+                        requirement_id=requirement.requirement_id, connector_id=connector,
+                        query_payload={
+                            "schema_version": "kaiops.context-enrichment-query.v1",
+                            "category": requirement.category,
+                            "question": requirement.question,
+                            "alert_id": str(context.alert.id),
+                            "context_snapshot_id": str(metadata.get("context_snapshot_id") or ""),
+                            "analysis_request_id": str(metadata.get("analysis_request_id") or ""),
+                            "alert": context.alert.model_dump(mode="json"),
+                            "incident": incident.model_dump(mode="json"),
+                            "decision": dict(decision_payload),
+                        },
+                        observation_start=window_end.replace(microsecond=0) - timedelta(minutes=30),
+                        observation_end=window_end.replace(microsecond=0),
+                    )
+                else:
+                    await enrichment_repo.create_human_evidence_request(
+                        tenant_id=context.tenant_id, incident_id=incident.id,
+                        requirement_id=requirement.requirement_id,
+                        expected_responder=str(
+                            context.alert.metadata.get("owner_team")
+                            or context.alert.metadata.get("assigned_to")
+                            or "incident-owner"
+                        ),
+                        due_at=window_end + timedelta(hours=1),
+                        acceptable_format="A source reference and a concise factual observation.",
+                        evidence_already_checked=list((metadata.get("rca_analysis") or {}).get("evidence_used") or []),
+                        hypothesis_impact=requirement.reason,
+                        investigation_can_continue=True,
+                    )
         await session.commit()
     knowledge_id = str(context.metadata.get("context_knowledge_id") or "").strip()
     if not knowledge_id:

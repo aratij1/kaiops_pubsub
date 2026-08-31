@@ -13,6 +13,7 @@ import {
 import { useRouteRuntimeSlice } from "../../app/routeRuntime";
 import EvidenceDraftReview from "./EvidenceDraftReview";
 import DecisionReadinessPanel from "./DecisionReadinessPanel";
+import ContextEnrichmentPanel from "./ContextEnrichmentPanel";
 import "./RcaPanel.css";
 import "./RcaReuseBanner.css";
 import "./EvidenceReview.css";
@@ -314,6 +315,13 @@ export default function RcaPanel({
       {analysisReused ? <aside className="rca-reuse-banner" role="status"><CheckCircle2 size={18} /><div><strong>Verified analysis reused</strong><span>Scope and freshness checks passed at {formatQualityPercent(analysisReuseScore)} similarity. Refresh if the deployment or symptoms changed.</span></div></aside> : null}
 
       <DecisionReadinessPanel title="Investigation readiness" checks={investigationChecks} eligibleLabel="Evidence ready for operator review" onReviewEvidence={() => onSetRcaDetailView("evidence")} />
+
+      {resolutionBinding.incident_id ? <ContextEnrichmentPanel
+        incidentId={resolutionBinding.incident_id}
+        accessToken={accessToken}
+        declaredGaps={missingEvidence.map((gap: any) => String(gap?.category || gap))}
+        onEvidenceChanged={() => onRerunRca("fresh")}
+      /> : null}
 
       <div className="context-workspace-toolbar">
         <nav className="rca-view-tabs" aria-label="Context workspace views" role="tablist">

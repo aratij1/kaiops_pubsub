@@ -690,6 +690,83 @@ async def _persist_context_event(
         return enqueued
 
 
+async def _context_enrichment_worker(app: FastAPI) -> None:
+    """Execute durable read-only gap jobs and hand fresh context back to RCA."""
+    connector_aliases = {"opensearch": "discovery-mcp", "jaeger": "discovery-mcp", "jira": "discovery-mcp"}
+    while True:
+        try:
+            if not settings.database_enabled or getattr(app.state, "session_factory", None) is None:
+                await asyncio.sleep(5)
+                continue
+            async with app.state.session_factory() as session:
+                jobs = await ContextEnrichmentRepository(session).claim_context_enrichment_jobs(limit=5)
+                await session.commit()
+            if not jobs:
+                await asyncio.sleep(3)
+                continue
+            for job in jobs:
+                collected = False
+                failure = "connector returned no attributable evidence"
+                try:
+                    query = job.get("query_payload") if isinstance(job.get("query_payload"), dict) else {}
+                    alert = Alert.model_validate(query.get("alert"))
+                    incident = Incident.model_validate(query.get("incident"))
+                    connector_name = connector_aliases.get(job["connector_id"], job["connector_id"])
+                    connector = next((item for item in agent.connectors if item.name == connector_name), None)
+                    if connector is None:
+                        raise RuntimeError(f"connector {job['connector_id']} is not installed")
+                    observation = await connector.fetch(alert, incident)
+                    collected = bool(observation) and str(observation.get("_source_status") or "") not in {
+                        "unavailable", "unauthorized", "misconfigured", "timed_out",
+                    }
+                    if collected:
+                        decision = dict(query.get("decision") or {})
+                        analysis_request_id = str(uuid5(NAMESPACE_URL, f"kaims:enrichment:{job['job_id']}"))
+                        decision.update({
+                            "analysis_request_id": analysis_request_id,
+                            "analysis_mode": "fresh",
+                            "context_strategy": "realtime",
+                            "enrichment_job_id": job["job_id"],
+                        })
+                        context = await _collect_context_with_strategy(app, alert, incident, "realtime", None)
+                        context = _attach_analysis_request_metadata(
+                            context, decision=decision,
+                            analysis_request={"id": analysis_request_id, "mode": "fresh"},
+                        )
+                        provider = str(getattr(settings, "event_bus_provider", "rabbitmq") or "rabbitmq")
+                        publishers = getattr(app.state, "message_bus_publishers", {})
+                        provider_used = provider if publishers.get(provider) is not None else "rabbitmq"
+                        outgoing = _build_context_event_payload(
+                            alert=alert, incident=incident, context=context,
+                            decision=decision, provider_used=provider_used,
+                        )
+                        enqueued = await _persist_context_event(
+                            app=app, alert=alert, incident=incident, context=context,
+                            decision=decision, provider_used=provider_used, outgoing_payload=outgoing,
+                        )
+                        if enqueued:
+                            await _publish_context_event(
+                                app=app, provider=provider_used, alert=alert, incident=incident,
+                                context=context, decision=decision, payload=outgoing,
+                            )
+                except Exception as exc:
+                    collected = False
+                    failure = str(exc)[:1000]
+                    logger.exception("context enrichment job failed job_id=%s", job.get("job_id"))
+                finally:
+                    async with app.state.session_factory() as session:
+                        await ContextEnrichmentRepository(session).finish_context_enrichment_job(
+                            job_id=job["job_id"], collected=collected, error=failure,
+                            retry_after_seconds=min(300, 15 * (2 ** max(0, int(job["attempt_count"]) - 1))),
+                        )
+                        await session.commit()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("context enrichment worker loop failed")
+            await asyncio.sleep(5)
+
+
 def _build_context_event_payload(
     *,
     alert: Alert,
@@ -956,6 +1033,7 @@ async def startup(app: FastAPI) -> None:
         app.state.rabbitmq_publisher = None
 
     tasks.append(asyncio.create_task(_context_outbox_dispatch_loop(app), name="context-agent-event-outbox"))
+    tasks.append(asyncio.create_task(_context_enrichment_worker(app), name="context-agent-enrichment-worker"))
 
     index_consumer = RabbitMQConsumer(settings, GOVERNED_RAG_APPROVED_TOPIC)
     tasks.append(asyncio.create_task(
@@ -1980,10 +2058,18 @@ async def list_context_gaps(incident_id: str, tenant_id: str) -> dict[str, Any]:
     if not settings.database_enabled or getattr(app.state, "session_factory", None) is None:
         raise HTTPException(status_code=503, detail="context enrichment database is unavailable")
     async with app.state.session_factory() as session:
-        rows = await ContextEnrichmentRepository(session).list_context_evidence_requirements(
+        repository = ContextEnrichmentRepository(session)
+        rows = await repository.list_context_evidence_requirements(
             tenant_id=tenant, incident_id=incident_id,
         )
-    return {"incident_id": incident_id, "tenant_id": tenant, "requirements": rows, "count": len(rows)}
+        activity = await repository.list_context_enrichment_activity(
+            tenant_id=tenant, incident_id=incident_id,
+        )
+    return {
+        "schema_version": "kaiops.context-enrichment.v1",
+        "incident_id": incident_id, "tenant_id": tenant,
+        "requirements": rows, "count": len(rows), **activity,
+    }
 
 
 @app.post("/incidents/{incident_id}/context-gaps/{requirement_id}/responses")
