@@ -8277,6 +8277,44 @@ class ContextEnrichmentRepository(EvaluationRepository):
             "updated_at": row.updated_at,
         }
 
+    async def active_incident_gap_candidates(
+        self, *, tenant_id: str, limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Return the latest governed RCA with gaps for active tenant incidents."""
+        tenant = require_tenant_id(tenant_id, source="context enrichment reconciliation")
+        rows = (await self.session.execute(
+            select(IncidentInvestigationBindingRecord).join(
+                IncidentRecord, IncidentRecord.id == IncidentInvestigationBindingRecord.incident_id,
+            ).where(
+                IncidentInvestigationBindingRecord.tenant_id == tenant,
+                IncidentRecord.status.notin_(["closed", "resolved", "cancelled", "canceled"]),
+            ).order_by(
+                IncidentInvestigationBindingRecord.incident_id,
+                IncidentInvestigationBindingRecord.rca_version.desc(),
+            ).limit(max(1, min(int(limit), 500)))
+        )).scalars().all()
+        latest: dict[UUID, IncidentInvestigationBindingRecord] = {}
+        for row in rows:
+            latest.setdefault(row.incident_id, row)
+        candidates: list[dict[str, Any]] = []
+        for binding in latest.values():
+            incident = await self.session.get(IncidentRecord, binding.incident_id)
+            audit = await self.session.get(AuditLogRecord, binding.recommendation_id)
+            snapshot = await self.session.get(ContextSnapshotRecord, binding.context_snapshot_id)
+            recommendation = dict(audit.payload or {}) if audit and isinstance(audit.payload, dict) else {}
+            metadata = recommendation.get("metadata") if isinstance(recommendation.get("metadata"), dict) else {}
+            analysis = metadata.get("rca_analysis") if isinstance(metadata.get("rca_analysis"), dict) else {}
+            gaps = list(analysis.get("missing_evidence") or [])
+            if not gaps:
+                continue
+            context = dict(snapshot.payload or {}) if snapshot and isinstance(snapshot.payload, dict) else {}
+            candidates.append({
+                "incident_id": str(binding.incident_id), "rca_version": binding.rca_version,
+                "alert_id": str(binding.alert_id), "gaps": gaps, "context": context,
+                "incident": dict(incident.payload or {}) if incident and isinstance(incident.payload, dict) else {},
+            })
+        return candidates
+
     async def list_context_enrichment_activity(
         self, *, tenant_id: str, incident_id: UUID | str,
     ) -> dict[str, list[dict[str, Any]]]:

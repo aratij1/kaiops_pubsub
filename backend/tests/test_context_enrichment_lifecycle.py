@@ -8,7 +8,12 @@ from common.context_enrichment_contract import (
     HitlRoutingConfiguration,
     validate_enrichment_observation,
 )
-from common.database import ContextSnapshotRecord, IncidentInvestigationBindingRecord
+from common.database import (
+    AuditLogRecord,
+    ContextSnapshotRecord,
+    IncidentInvestigationBindingRecord,
+    IncidentRecord,
+)
 from common.models import Alert, AlertSeverity, Incident
 from common.repository import ContextEnrichmentRepository
 from context_agent.connectors import execute_enrichment_plan
@@ -210,6 +215,52 @@ async def test_human_response_is_tenant_scoped_and_recorded_as_assertion(sqlite_
         )).scalars().first()
         assert latest.snapshot_version == 2
         assert latest.parent_snapshot_id == snapshot_id
+
+
+@pytest.mark.asyncio
+async def test_active_gap_reconciliation_is_idempotent(sqlite_session_factory) -> None:
+    incident_id, alert_id, snapshot_id, recommendation_id = uuid4(), uuid4(), uuid4(), uuid4()
+    analysis_id = uuid4()
+    now = datetime.now(UTC)
+    async with sqlite_session_factory() as session:
+        session.add(IncidentRecord(
+            id=incident_id, tenant_id="tenant-a", service="checkout-api", environment="prod",
+            severity="critical", status="investigating", title="checkout latency", payload={},
+        ))
+        session.add(ContextSnapshotRecord(
+            snapshot_id=snapshot_id, tenant_id="tenant-a", incident_id=str(incident_id),
+            alert_signature="signature", subject_fingerprint="s" * 64,
+            context_fingerprint="c" * 64, contract_version="kaiops.context.v2",
+            quality_score=0.4, reusable=False, source_manifest={}, payload={},
+            collected_at=now, expires_at=now + timedelta(hours=1),
+        ))
+        session.add(IncidentInvestigationBindingRecord(
+            tenant_id="tenant-a", project_id="project-a", incident_id=incident_id,
+            alert_id=alert_id, analysis_request_id=analysis_id, context_snapshot_id=snapshot_id,
+            context_fingerprint="c" * 64, recommendation_id=recommendation_id,
+            rca_version=3, status="insufficient_evidence", created_at=now,
+            expires_at=now + timedelta(hours=1),
+        ))
+        session.add(AuditLogRecord(
+            id=recommendation_id, tenant_id="tenant-a", actor="resolution-agent",
+            action="recommendation.generated", resource_type="incident",
+            resource_id=str(incident_id), payload={"metadata": {"rca_analysis": {
+                "missing_evidence": [{"category": "logs", "question": "Which errors occurred?"}],
+            }}},
+        ))
+        await session.flush()
+        repo = ContextEnrichmentRepository(session)
+        candidates = await repo.active_incident_gap_candidates(tenant_id="tenant-a")
+        requirements = await plan_missing_evidence(
+            context_for(incident_id), {
+                "tenant_id": "tenant-a", "incident_id": str(incident_id), "rca_version": 3,
+                "missing_evidence": candidates[0]["gaps"],
+            },
+        )
+        first = await repo.upsert_context_evidence_requirements(requirements)
+        second = await repo.upsert_context_evidence_requirements(requirements)
+        assert len(candidates) == 1
+        assert first[0].requirement_id == second[0].requirement_id
 
 
 def test_hitl_routing_configuration_rejects_placeholder_identity():

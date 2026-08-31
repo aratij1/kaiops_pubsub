@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -19,8 +20,10 @@ from common.config import get_settings
 from common.context_enrichment_contract import (
     EvidenceRequirement,
     HumanEvidenceResponse,
+    build_evidence_requirements,
     validate_enrichment_observation,
 )
+from common.database import AuditLogRecord
 from common.event_publishers import EventPublisher, RabbitMQPublisher, build_agent_event_contract, build_event_envelope
 from common.kafka import KafkaConsumer
 from common.kafka import consume_forever as consume_kafka_forever
@@ -51,7 +54,7 @@ from context_agent.context_quality import (
     govern_context,
 )
 from context_agent.knowledge_graph import KnowledgeGraph
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 
@@ -1048,6 +1051,16 @@ async def _governed_rag_retry_loop(app: FastAPI) -> None:
 
 
 async def startup(app: FastAPI) -> None:
+    if settings.database_enabled:
+        try:
+            async with app.state.session_factory() as session:
+                await session.execute(text(
+                    "SELECT lease_owner, lease_expires_at FROM context_enrichment_jobs LIMIT 0"
+                ))
+        except Exception as exc:
+            raise RuntimeError(
+                "context enrichment schema is incompatible; run pending migrations before startup"
+            ) from exc
     provider = str(getattr(settings, "event_bus_provider", "rabbitmq") or "rabbitmq").strip().lower()
     app.state.message_bus_publishers = {provider: app.state.producer, "rabbitmq": app.state.producer}
 
@@ -2104,6 +2117,61 @@ async def list_context_gaps(incident_id: str, tenant_id: str) -> dict[str, Any]:
         "incident_id": incident_id, "tenant_id": tenant,
         "requirements": rows, "count": len(rows), **activity,
     }
+
+
+class ContextEnrichmentReconcileRequest(BaseModel):
+    tenant_id: str = Field(min_length=1, max_length=128)
+    limit: int = Field(default=100, ge=1, le=500)
+    dry_run: bool = True
+
+
+@app.post("/internal/context-enrichment/reconcile")
+async def reconcile_context_enrichment(
+    request: ContextEnrichmentReconcileRequest,
+    x_kaiops_internal_token: str = Header(default=""),
+) -> dict[str, Any]:
+    expected = str(settings.service_internal_token or "")
+    if not expected or not hmac.compare_digest(x_kaiops_internal_token, expected):
+        raise HTTPException(status_code=403, detail="service authentication is required")
+    summary: dict[str, Any] = {
+        "incidents_scanned": 0, "gaps_found": 0, "requirements_created": 0,
+        "jobs_scheduled": 0, "human_requests_created": 0, "skipped_incidents": 0,
+        "errors": [], "dry_run": request.dry_run,
+    }
+    async with app.state.session_factory() as session:
+        repository = ContextEnrichmentRepository(session)
+        candidates = await repository.active_incident_gap_candidates(
+            tenant_id=request.tenant_id, limit=request.limit,
+        )
+        summary["incidents_scanned"] = len(candidates)
+        for candidate in candidates:
+            try:
+                requirements = build_evidence_requirements(
+                    tenant_id=request.tenant_id, incident_id=candidate["incident_id"],
+                    rca_version=candidate["rca_version"], missing_evidence=candidate["gaps"],
+                    now=datetime.now(UTC),
+                )
+                summary["gaps_found"] += len(requirements)
+                existing = await repository.list_context_evidence_requirements(
+                    tenant_id=request.tenant_id, incident_id=candidate["incident_id"],
+                )
+                existing_ids = {row["requirement_id"] for row in existing}
+                missing = [row for row in requirements if str(row.requirement_id) not in existing_ids]
+                summary["requirements_created"] += len(missing)
+                if not request.dry_run and missing:
+                    await repository.upsert_context_evidence_requirements(missing)
+            except Exception as exc:
+                summary["errors"].append({"incident_id": candidate["incident_id"], "error": str(exc)[:500]})
+        if request.dry_run:
+            await session.rollback()
+        else:
+            session.add(AuditLogRecord(
+                tenant_id=request.tenant_id, actor="context-enrichment-reconciler",
+                action="context.enrichment.reconciled", resource_type="tenant",
+                resource_id=request.tenant_id, payload=summary,
+            ))
+            await session.commit()
+    return summary
 
 
 @app.post("/incidents/{incident_id}/context-gaps/{requirement_id}/responses")
