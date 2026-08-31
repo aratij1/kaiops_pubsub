@@ -1,11 +1,10 @@
 from __future__ import annotations
 
+from common.config import get_settings
+from common.service import create_app
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from pydantic import BaseModel, Field
-
-from common.config import get_settings
-from common.service import create_app
 
 
 class ValidatedPayload(BaseModel):
@@ -81,3 +80,18 @@ def test_structured_conflict_can_be_declared_retryable() -> None:
     assert response.json()["error"]["code"] == "target_execution_busy"
     assert response.json()["error"]["message"] == "Target is busy."
     assert response.json()["error"]["retryable"] is True
+
+
+def test_build_info_exposes_safe_release_contract(monkeypatch) -> None:
+    monkeypatch.setenv("KAIMS_RELEASE_SHA", "abc123")
+    monkeypatch.setenv("KAIMS_BUILD_TIME", "2026-08-31T11:00:00Z")
+
+    response = TestClient(error_contract_app()).get("/build-info")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "service": "error-contract-test",
+        "release_sha": "abc123",
+        "build_time": "2026-08-31T11:00:00Z",
+        "contract_versions": {"context_enrichment": "kaiops.context-enrichment.v1"},
+    }

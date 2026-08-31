@@ -4,7 +4,6 @@ import asyncio
 import hashlib
 import json
 import logging
-import os
 from collections import deque
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
@@ -349,15 +348,6 @@ async def shutdown(app: FastAPI) -> None:
 app = create_app(title="KaiMS API Gateway", settings=settings, startup=startup, shutdown=shutdown)
 
 
-@app.get("/build-info")
-async def build_info() -> dict[str, Any]:
-    """Expose only safe release identity and public contract compatibility."""
-    return {
-        "service": "api-gateway",
-        "release_sha": os.getenv("KAIMS_RELEASE_SHA", "dev"),
-        "build_time": os.getenv("KAIMS_BUILD_TIME", "unknown"),
-        "contract_versions": {"context_enrichment": "kaiops.context-enrichment.v1"},
-    }
 app.include_router(user_management_router)
 app.include_router(triage_router)
 

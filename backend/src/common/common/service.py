@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from time import perf_counter
@@ -18,7 +19,7 @@ from common.logging import configure_logging
 from common.telemetry import metrics_response, setup_tracing
 
 _MAX_HTTP_BODY_LOG_BYTES = 4096
-_SKIP_HTTP_LOG_PATHS = {"/healthz", "/readyz", "/metrics"}
+_SKIP_HTTP_LOG_PATHS = {"/build-info", "/healthz", "/readyz", "/metrics"}
 _OMIT_HTTP_REQUEST_BODY_PATHS = {
     "/alerts/alertmanager",
     "/api/v1/alerts/generic",
@@ -176,6 +177,16 @@ def create_app(
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
         return {"status": "ok", "service": settings.service_name}
+
+    @app.get("/build-info")
+    async def build_info() -> dict[str, Any]:
+        """Expose safe release provenance and public contract compatibility."""
+        return {
+            "service": settings.service_name,
+            "release_sha": os.getenv("KAIMS_RELEASE_SHA", "dev"),
+            "build_time": os.getenv("KAIMS_BUILD_TIME", "unknown"),
+            "contract_versions": {"context_enrichment": "kaiops.context-enrichment.v1"},
+        }
 
     @app.get("/readyz")
     async def readyz() -> dict[str, str]:
