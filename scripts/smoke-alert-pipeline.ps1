@@ -7,6 +7,8 @@ param(
     [string]$AlertmanagerUrl = "http://localhost:9093",
     [string]$GatewayUrl = "http://localhost:8010",
     [int]$GatewayLimit = 500,
+    [ValidateSet("strict", "sanity")]
+    [string]$Mode = "sanity",
     [double]$TimeoutSeconds = 60,
     [double]$PollIntervalSeconds = 5,
     [double]$RequestTimeoutSeconds = 8,
@@ -87,6 +89,7 @@ try {
         --alertmanager-url $AlertmanagerUrl `
         --gateway-url $GatewayUrl `
         --gateway-limit $GatewayLimit `
+        --mode $Mode `
         --timeout-seconds $TimeoutSeconds `
         --poll-interval-seconds $PollIntervalSeconds `
         --request-timeout-seconds $RequestTimeoutSeconds

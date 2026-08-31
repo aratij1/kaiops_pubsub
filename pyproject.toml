@@ -7,7 +7,6 @@ dependencies = [
     "aio-pika>=9.4.0",
     "aiokafka>=0.12.0",
     "aiomysql>=0.2.0",
-    "asyncpg>=0.30.0",
     "fastapi>=0.115.0",
     "httpx>=0.28.0",
     "langchain>=0.3.0",
@@ -15,7 +14,9 @@ dependencies = [
     "numpy>=2.0.0",
     "opentelemetry-api>=1.29.0",
     "opentelemetry-exporter-otlp>=1.29.0",
-    "opentelemetry-instrumentation-fastapi>=0.50b0",
+  "opentelemetry-instrumentation-fastapi>=0.50b0",
+  "opentelemetry-instrumentation-httpx>=0.50b0",
+  "opentelemetry-instrumentation-sqlalchemy>=0.50b0",
     "opentelemetry-sdk>=1.29.0",
     "prometheus-client>=0.21.0",
     "pydantic>=2.10.0",
@@ -25,9 +26,12 @@ dependencies = [
     "bcrypt>=4.2.0",
     "email-validator>=2.2.0",
     "redis>=5.2.0",
-    "google-cloud-pubsub>=2.23.0",
+    "azure-servicebus>=7.13.0",
+    "azure-monitor-opentelemetry-exporter>=1.0.0b35",
+    "azure-storage-blob>=12.25.0",
+    "boto3>=1.35.0",
     "sqlalchemy[asyncio]>=2.0.0",
-    "streamlit>=1.41.0",
+    "temporalio>=1.9.0,<2.0.0",
     "uvicorn[standard]>=0.34.0",
 ]
 
@@ -37,28 +41,52 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = [
-    "services/common",
-    "services/api-gateway",
-    "services/alert-intelligence",
-    "services/context-agent",
-    "services/model-router",
-    "services/resolution-agent",
-    "services/orchestrator",
-    "services/remediation-engine",
-    "services/closure-service",
-    "services/monitoring-adapter",
+    "backend/src/common",
+    "ai-workbench/src",
+    "backend/src/api-gateway",
+    "backend/src/application-onboarding",
+    "backend/src/alert-intelligence",
+    "ai-workbench/src/context-agent",
+    "backend/src/dashboard-generator",
+    "backend/src/discovery-service",
+    "ai-workbench/src/model-router",
+    "backend/src/metrics-validation-agent",
+    "ai-workbench/src/resolution-agent",
+    "ai-workbench/src/evaluation-service",
+    "backend/src/orchestrator",
+    "backend/src/prometheus-config-service",
+    "backend/src/rule-generation-agent",
+    "backend/src/remediation-engine",
+    "backend/src/closure-service",
+    "backend/src/validation-agent",
+    "backend/src/audit-service",
+    "backend/src/monitoring-adapter",
+    "backend/src/notification-service",
+    "backend/src/temporal-pilot",
 ]
 include = [
     "common*",
+    "ai_workbench_common*",
     "api_gateway*",
+    "application_onboarding*",
     "alert_intelligence*",
     "context_agent*",
+    "dashboard_generator*",
+    "discovery_service*",
     "model_router*",
+    "metrics_validation_agent*",
     "resolution_agent*",
     "orchestrator*",
+    "prometheus_config_service*",
+    "rule_generation_agent*",
     "remediation_engine*",
     "closure_service*",
+    "validation_agent*",
+    "audit_service*",
     "monitoring_adapter*",
+    "notification_service*",
+    "evaluation_service*",
+    "temporal_pilot*",
 ]
 
 [project.optional-dependencies]
@@ -66,24 +94,48 @@ dev = [
     "pytest>=8.3.0",
     "pytest-asyncio>=0.25.0",
     "ruff>=0.8.0",
+    "aiosqlite>=0.20.0",
 ]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 pythonpath = [
+    ".",
     "services/common",
     "services/api-gateway",
     "services/alert-intelligence",
+    "services/approval-service",
+    "services/closure-service",
     "services/context-agent",
     "services/model-router",
-    "services/resolution-agent",
-    "services/orchestrator",
-    "services/approval-service",
-    "services/remediation-engine",
-    "services/closure-service",
     "services/monitoring-adapter",
+    "services/orchestrator",
+    "services/remediation-engine",
+    "services/resolution-agent",
+    "backend/src/common",
+    "ai-workbench/src",
+    "backend/src/api-gateway",
+    "backend/src/application-onboarding",
+    "backend/src/alert-intelligence",
+    "ai-workbench/src/context-agent",
+    "backend/src/dashboard-generator",
+    "backend/src/discovery-service",
+    "ai-workbench/src/model-router",
+    "backend/src/metrics-validation-agent",
+    "ai-workbench/src/resolution-agent",
+    "ai-workbench/src/evaluation-service",
+    "backend/src/orchestrator",
+    "backend/src/approval-service",
+    "backend/src/prometheus-config-service",
+    "backend/src/remediation-engine",
+    "backend/src/rule-generation-agent",
+    "backend/src/closure-service",
+    "backend/src/validation-agent",
+    "backend/src/audit-service",
+    "backend/src/monitoring-adapter",
+    "backend/src/notification-service",
 ]
-testpaths = ["tests"]
+testpaths = ["backend/tests", "tests"]
 
 [tool.ruff]
 line-length = 120
@@ -92,6 +144,3 @@ target-version = "py312"
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ASYNC"]
 ignore = ["ASYNC110", "UP047"]
-
-[tool.ruff.lint.per-file-ignores]
-"services/ui/app.py" = ["E501"]

@@ -1,0 +1,202 @@
+{
+  "version": "actions-v2",
+  "last_reviewed": "2026-07-22",
+  "owners": ["platform-ops", "sre", "data-platform"],
+  "safety_contract": {
+    "default_live_execution": "disabled",
+    "requires_connector_executor": true,
+    "requires_secret_ref": true,
+    "requires_human_approval_for": ["write", "restart", "scale", "rollback", "archive", "failover"],
+    "dry_run_default": true
+  },
+  "commands": {
+    "check_api_gateway_health": {
+      "operation": "read_status",
+      "command": "curl -fsS ${api_gateway_url}/healthz || curl -fsS ${api_gateway_url}/health",
+      "safety": "read-only",
+      "expected_evidence": ["http_status", "response_body"]
+    },
+    "check_prometheus_alerts": {
+      "operation": "read_status",
+      "command": "curl -fsS ${prometheus_url}/api/v1/alerts",
+      "safety": "read-only",
+      "expected_evidence": ["active_alerts", "alert_state"]
+    },
+    "check_prometheus_targets": {
+      "operation": "read_status",
+      "command": "curl -fsS ${prometheus_url}/api/v1/targets",
+      "safety": "read-only",
+      "expected_evidence": ["target_health", "last_scrape"]
+    },
+    "query_service_latency_p95": {
+      "operation": "read_metrics",
+      "command": "promql: histogram_quantile(0.95, sum by (le, service, operation) (rate(kaiops_request_latency_seconds_bucket{service=\"${service}\"}[5m])))",
+      "safety": "read-only",
+      "expected_evidence": ["p95_latency_seconds"]
+    },
+    "query_service_error_rate": {
+      "operation": "read_metrics",
+      "command": "promql: avg_over_time(error_rate_percent{service=\"${service}\"}[5m])",
+      "safety": "read-only",
+      "expected_evidence": ["error_rate_percent"]
+    },
+    "query_service_availability": {
+      "operation": "read_metrics",
+      "command": "promql: up{job=\"${service}\"}",
+      "safety": "read-only",
+      "expected_evidence": ["up_metric"]
+    },
+    "query_request_throughput": {
+      "operation": "read_metrics",
+      "command": "promql: sum(rate(http_requests_total{service=\"${service}\"}[5m]))",
+      "safety": "read-only",
+      "expected_evidence": ["requests_per_second"]
+    },
+    "query_worker_queue_lag": {
+      "operation": "read_metrics",
+      "command": "promql: max(kaiops_worker_queue_lag{service=\"${service}\"})",
+      "safety": "read-only",
+      "expected_evidence": ["queue_lag"]
+    },
+    "query_message_bus_depth": {
+      "operation": "read_metrics",
+      "command": "promql: max(kaiops_message_bus_queue_depth{topic=~\"raw-alerts|enriched-alerts|orchestration-events|context-events|resolution-events|approval-events|remediation-events|closure-events\"})",
+      "safety": "read-only",
+      "expected_evidence": ["topic_depth", "consumer_lag"]
+    },
+    "check_kaiops_triage_script_dry_run": {
+      "operation": "script_execution",
+      "command": "sh scripts/remediation/kaiops_alert_health_triage.sh --service ${service} --environment ${environment} --api-gateway-url ${api_gateway_url} --prometheus-url ${prometheus_url} --mysql-host ${mysql_host} --mysql-database ${mysql_database} --mysql-user ${mysql_user} --dry-run true --alerts-table ${alerts_table}",
+      "safety": "read-only",
+      "expected_evidence": ["api_health", "prometheus_alerts", "mysql_row_count_if_available"]
+    },
+    "restart_service_runtime": {
+      "operation": "restart_service",
+      "command": "ansible-playbook playbooks/restart-service.yml -e service=${service} -e env=${environment}",
+      "safety": "restart",
+      "approval_required": true,
+      "rollback": "ansible-playbook playbooks/restart-service.yml -e service=${service} -e env=${environment}",
+      "expected_evidence": ["restart_job_id", "post_health_check"]
+    },
+    "scale_service_workers": {
+      "operation": "scale_service",
+      "command": "kubectl scale deployment/${service} --replicas=${replicas} -n ${namespace}",
+      "safety": "scale",
+      "approval_required": true,
+      "rollback": "kubectl scale deployment/${service} --replicas=${previous_replicas} -n ${namespace}",
+      "expected_evidence": ["deployment_rollout", "replica_count"]
+    },
+    "rollback_service_deployment": {
+      "operation": "rollback_deployment",
+      "command": "kubectl rollout undo deployment/${service} -n ${namespace}",
+      "safety": "rollback",
+      "approval_required": true,
+      "rollback": "kubectl rollout undo deployment/${service} --to-revision=${previous_revision} -n ${namespace}",
+      "expected_evidence": ["rollout_revision", "post_health_check"]
+    },
+    "validate_service_recovery": {
+      "operation": "verify_slo",
+      "command": "promql: up{job=\"${service}\"} == 1 and histogram_quantile(0.95, sum by (le) (rate(kaiops_request_latency_seconds_bucket{service=\"${service}\"}[5m]))) < ${latency_threshold_seconds}",
+      "safety": "read-only",
+      "expected_evidence": ["availability_ok", "latency_ok"]
+    },
+    "query_mysql_alert_rows": {
+      "operation": "read_database",
+      "command": "mysql -h ${mysql_host} -P ${mysql_port} -u ${mysql_user} ${mysql_database} -e \"SELECT COUNT(*) AS alert_rows FROM ${alerts_table};\"",
+      "safety": "read-only",
+      "expected_evidence": ["alert_rows"]
+    },
+    "query_mysql_table_size": {
+      "operation": "read_database",
+      "command": "mysql -h ${mysql_host} -P ${mysql_port} -u ${mysql_user} ${mysql_database} -e \"SELECT table_name, table_rows FROM information_schema.tables WHERE table_schema='${mysql_database}' AND table_name='${alerts_table}';\"",
+      "safety": "read-only",
+      "expected_evidence": ["table_rows", "table_size"]
+    },
+    "archive_old_alert_rows": {
+      "operation": "archive_database_rows",
+      "command": "mysql -h ${mysql_host} -P ${mysql_port} -u ${mysql_user} ${mysql_database} -e \"INSERT INTO alerts_archive SELECT * FROM ${alerts_table} WHERE created_at < NOW() - INTERVAL ${retention_days} DAY; DELETE FROM ${alerts_table} WHERE created_at < NOW() - INTERVAL ${retention_days} DAY;\"",
+      "safety": "write",
+      "approval_required": true,
+      "rollback": "restore ${alerts_table} from latest database backup or alerts_archive",
+      "expected_evidence": ["archived_rows", "remaining_rows"]
+    },
+    "validate_mysql_alert_rows": {
+      "operation": "verify_database_health",
+      "command": "mysql -h ${mysql_host} -P ${mysql_port} -u ${mysql_user} ${mysql_database} -e \"SELECT COUNT(*) AS alert_rows FROM ${alerts_table};\"",
+      "safety": "read-only",
+      "expected_evidence": ["alert_rows_below_threshold"]
+    },
+    "query_etl_rejected_rows": {
+      "operation": "read_database",
+      "command": "mysql -h ${mysql_host} -P ${mysql_port} -u ${mysql_user} ${mysql_database} -e \"SELECT COUNT(*) AS rejected_rows FROM ${etl_reject_table} WHERE batch_id='${batch_id}';\"",
+      "safety": "read-only",
+      "expected_evidence": ["rejected_rows", "batch_id"]
+    },
+    "query_etl_batch_status": {
+      "operation": "read_database",
+      "command": "mysql -h ${mysql_host} -P ${mysql_port} -u ${mysql_user} ${mysql_database} -e \"SELECT batch_id, status, source_file, started_at, completed_at FROM ${etl_batch_table} WHERE batch_id='${batch_id}';\"",
+      "safety": "read-only",
+      "expected_evidence": ["batch_status", "source_file"]
+    },
+    "replay_etl_batch": {
+      "operation": "replay_etl_batch",
+      "command": "python scripts/run_etl_load.py --input ${source_file} --batch-id ${batch_id} --mode replay --dry-run ${dry_run}",
+      "safety": "write",
+      "approval_required": true,
+      "rollback": "mark replay batch failed and restore target table from pre-replay backup",
+      "expected_evidence": ["replay_batch_id", "loaded_rows", "rejected_rows"]
+    },
+    "validate_etl_recovery": {
+      "operation": "verify_data_quality",
+      "command": "mysql -h ${mysql_host} -P ${mysql_port} -u ${mysql_user} ${mysql_database} -e \"SELECT COUNT(*) AS rejected_rows FROM ${etl_reject_table} WHERE batch_id='${batch_id}';\"",
+      "safety": "read-only",
+      "expected_evidence": ["rejected_rows_below_threshold"]
+    },
+    "check_policy_engine_health": {
+      "operation": "read_status",
+      "command": "curl -fsS ${policy_engine_url}/healthz",
+      "safety": "read-only",
+      "expected_evidence": ["policy_engine_health"]
+    },
+    "restart_policy_engine": {
+      "operation": "restart_service",
+      "command": "ansible-playbook playbooks/restart-service.yml -e service=policy-engine -e env=${environment}",
+      "safety": "restart",
+      "approval_required": true,
+      "rollback": "ansible-playbook playbooks/restart-service.yml -e service=policy-engine -e env=${environment}",
+      "expected_evidence": ["restart_job_id", "post_health_check"]
+    },
+    "validate_policy_engine_recovery": {
+      "operation": "verify_service_health",
+      "command": "curl -fsS ${policy_engine_url}/healthz && curl -fsS ${api_gateway_url}/api/v1/policies/status",
+      "safety": "read-only",
+      "expected_evidence": ["policy_engine_health", "policy_status"]
+    },
+    "check_workflow_execution_status": {
+      "operation": "read_status",
+      "command": "curl -fsS ${api_gateway_url}/api/v1/workflows/${workflow_id}",
+      "safety": "read-only",
+      "expected_evidence": ["workflow_status", "failed_stage"]
+    },
+    "retry_failed_workflow": {
+      "operation": "retry_workflow",
+      "command": "curl -fsS -X POST ${api_gateway_url}/api/v1/workflows/${workflow_id}/retry",
+      "safety": "write",
+      "approval_required": true,
+      "rollback": "cancel retried workflow ${workflow_id} and keep original incident open",
+      "expected_evidence": ["retry_workflow_id", "retry_status"]
+    },
+    "validate_workflow_recovery": {
+      "operation": "verify_workflow_health",
+      "command": "curl -fsS ${api_gateway_url}/api/v1/workflows/${workflow_id}",
+      "safety": "read-only",
+      "expected_evidence": ["workflow_completed"]
+    },
+    "validate_onboarding_smoke_flow": {
+      "operation": "verify_onboarding_flow",
+      "command": "curl -fsS ${api_gateway_url}/healthz && curl -fsS ${prometheus_url}/api/v1/rules && curl -fsS ${prometheus_url}/api/v1/alerts",
+      "safety": "read-only",
+      "expected_evidence": ["api_health", "prometheus_rules", "prometheus_alerts"]
+    }
+  }
+}

@@ -40,7 +40,7 @@ def _changed_rag_markdown(base_ref: str, rag_root: str) -> list[str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Validate metadata only for changed RAG markdown files")
-    parser.add_argument("--rag-root", default="rag", help="Path to rag root")
+    parser.add_argument("--rag-root", default="backend/rag", help="Path to rag root")
     parser.add_argument("--base-ref", default="origin/main", help="Git base ref for diff")
     parser.add_argument("--strict", action="store_true", help="Fail on warnings too")
     args = parser.parse_args()

@@ -1,0 +1,53 @@
+{
+  "received_at": "2026-07-24T08:40:04.805684+00:00",
+  "source": "prometheus-alertmanager",
+  "status": "processed",
+  "error": null,
+  "alert": {
+    "source": "prometheus-alertmanager",
+    "name": "DiskSpaceLow",
+    "service": "node-exporter",
+    "environment": "prod",
+    "severity": "critical",
+    "description": "Disk utilization is above 90% on node-exporter:9100 mount /run/desktop/mnt/host/c.",
+    "labels": {
+      "alertname": "DiskSpaceLow",
+      "fstype": "9p",
+      "instance": "node-exporter:9100",
+      "job": "node-exporter",
+      "severity": "critical",
+      "device": "C:\\134",
+      "mountpoint": "/run/desktop/mnt/host/c",
+      "alert_status": "firing",
+      "alert_fingerprint": "864d1e7211020843",
+      "support_tier": "L2/L3"
+    },
+    "annotations": {
+      "summary": "Disk space low",
+      "description": "Disk utilization is above 90% on node-exporter:9100 mount /run/desktop/mnt/host/c.",
+      "startsAt": "2026-07-24T07:06:50.276Z",
+      "endsAt": "0001-01-01T00:00:00Z",
+      "generatorURL": "http://c0b43bee68be:9090/graph?g0.expr=%28%281+-+%28node_filesystem_avail_bytes%7Bfstype%21~%22tmpfs%7Coverlay%22%7D+%2F+node_filesystem_size_bytes%7Bfstype%21~%22tmpfs%7Coverlay%22%7D%29%29+%2A+100%29+%3E+90&g0.tab=1"
+    }
+  },
+  "raw": {
+    "status": "firing",
+    "labels": {
+      "alertname": "DiskSpaceLow",
+      "device": "C:\\134",
+      "fstype": "9p",
+      "instance": "node-exporter:9100",
+      "job": "node-exporter",
+      "mountpoint": "/run/desktop/mnt/host/c",
+      "severity": "critical"
+    },
+    "annotations": {
+      "description": "Disk utilization is above 90% on node-exporter:9100 mount /run/desktop/mnt/host/c.",
+      "summary": "Disk space low"
+    },
+    "startsAt": "2026-07-24T07:06:50.276Z",
+    "endsAt": "0001-01-01T00:00:00Z",
+    "generatorURL": "http://c0b43bee68be:9090/graph?g0.expr=%28%281+-+%28node_filesystem_avail_bytes%7Bfstype%21~%22tmpfs%7Coverlay%22%7D+%2F+node_filesystem_size_bytes%7Bfstype%21~%22tmpfs%7Coverlay%22%7D%29%29+%2A+100%29+%3E+90&g0.tab=1",
+    "fingerprint": "864d1e7211020843"
+  }
+}

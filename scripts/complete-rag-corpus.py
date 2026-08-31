@@ -6,7 +6,7 @@ from typing import Any
 import re
 
 ROOT = Path(__file__).resolve().parents[1]
-RAG = ROOT / "rag"
+RAG = ROOT / "backend" / "rag"
 TODAY = date.today().isoformat()
 
 @dataclass
@@ -183,7 +183,7 @@ def write_coverage_docs(records: list[IncidentRecord]) -> None:
     )
     changes_body = (
         "# Incident Change Coverage Matrix\n\n"
-        "This document maintains change-context coverage for all incident/alert entries in rag/incidents.\n\n"
+        "This document maintains change-context coverage for all incident/alert entries in backend/rag/incidents.\n\n"
         "## Coverage\n"
         f"{changes_rows}\n"
     )
@@ -203,7 +203,7 @@ def write_coverage_docs(records: list[IncidentRecord]) -> None:
     )
     dep_body = (
         "# Incident Dependency Coverage Matrix\n\n"
-        "This document maintains dependency-context coverage for all incident/alert entries in rag/incidents.\n\n"
+        "This document maintains dependency-context coverage for all incident/alert entries in backend/rag/incidents.\n\n"
         "## Coverage\n"
         f"{dependencies_rows}\n"
     )
@@ -223,7 +223,7 @@ def write_coverage_docs(records: list[IncidentRecord]) -> None:
     )
     deply_body = (
         "# Incident Deployment Coverage Matrix\n\n"
-        "This document maintains deployment-context coverage for all incident/alert entries in rag/incidents.\n\n"
+        "This document maintains deployment-context coverage for all incident/alert entries in backend/rag/incidents.\n\n"
         "## Coverage\n"
         f"{deployment_rows}\n"
     )

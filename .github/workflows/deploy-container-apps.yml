@@ -1,0 +1,46 @@
+name: Deploy Azure Container Apps
+
+on:
+  workflow_dispatch:
+    inputs:
+      resource_group:
+        description: Existing Azure resource group
+        required: true
+      deployment_name:
+        description: Immutable release/deployment name
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  validate-and-deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate production parameters
+        run: python scripts/validate_aca_parameters.py
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Compile Bicep
+        run: az bicep build --file deploy/azure-container-apps/main.bicep
+      - name: Preview infrastructure changes
+        run: >-
+          az deployment group what-if
+          --resource-group "${{ inputs.resource_group }}"
+          --template-file deploy/azure-container-apps/main.bicep
+          --parameters deploy/azure-container-apps/production.parameters.json
+          --no-pretty-print
+      - name: Deploy revision
+        run: >-
+          az deployment group create
+          --name "${{ inputs.deployment_name }}"
+          --resource-group "${{ inputs.resource_group }}"
+          --template-file deploy/azure-container-apps/main.bicep
+          --parameters deploy/azure-container-apps/production.parameters.json
+          --mode Incremental

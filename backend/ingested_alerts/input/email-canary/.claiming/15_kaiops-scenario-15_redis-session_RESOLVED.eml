@@ -1,0 +1,82 @@
+From: database-monitoring@alerts.kaiops.example
+To: kaiops-landing-pad@operations.example
+Date: Thu, 23 Jul 2026 05:10:00 +0000
+Message-ID: <178480251644.5.1784527608799549157.kaiops-scenario-15.resolved@alerts.kaiops.example>
+In-Reply-To: =?utf-8?q?=3C178480251644=2E5=2E56496034289818756=2Ekaiops-scen?=
+ =?utf-8?q?ario-15=2Efiring=40alerts=2Ekaiops=2Eexample=3E?=
+References: =?utf-8?q?=3C178480251644=2E5=2E56496034289818756=2Ekaiops-scena?=
+ =?utf-8?q?rio-15=2Efiring=40alerts=2Ekaiops=2Eexample=3E?=
+Subject: Re: [P3][RESOLVED][PROD] Cache eviction storm | redis-session |
+ kaiops-scenario-15
+X-KaiOps-Schema-Version: 1.0
+X-KaiOps-Event-Type: alert
+X-KaiOps-Alert-Status: resolved
+X-KaiOps-Application-ID: kaiops-fault-lab
+X-KaiOps-Scenario-ID: kaiops-scenario-15
+X-KaiOps-Service: redis-session
+X-KaiOps-Severity: Medium
+X-KaiOps-Correlation-ID: INC-2025-10281
+X-KaiOps-Synthetic: true
+Auto-Submitted: auto-generated
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="===============7646396570804997340=="
+
+--===============7646396570804997340==
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: quoted-printable
+
+Hello KaiOps,
+
+RECOVERY UPDATE
+
+Alert: Cache eviction storm
+Status: RESOLVED
+Service: redis-session
+Scenario ID: kaiops-scenario-15
+Correlation ID: INC-2025-10281
+
+The monitored signal returned below its configured threshold.
+
+VALIDATION
+Hit rate above 95%, evictions near zero, and memory fragmentation below 1.5.
+
+HISTORICAL RESOLUTION STEPS
+1. Stop preload.
+2. remove oversized keys.
+3. raise memory temporarily.
+4. enforce key size and TTL policy.
+
+Please correlate this message with the original firing email and the active
+incident. The incident should close only after the configured validation poli=
+cy
+has passed.
+
+This is synthetic test data.
+
+Regards,
+KaiOps Monitoring
+
+--===============7646396570804997340==
+Content-Type: application/json
+Content-Transfer-Encoding: base64
+Content-Disposition: attachment;
+ filename="kaiops-scenario-15-recovery-payload.json"
+MIME-Version: 1.0
+
+ewogICJzY2hlbWFfdmVyc2lvbiI6ICIxLjAiLAogICJldmVudF90eXBlIjogImFsZXJ0IiwKICAi
+c3RhdHVzIjogInJlc29sdmVkIiwKICAic291cmNlX3Byb3ZpZGVyIjogImVtYWlsIiwKICAiYXBw
+bGljYXRpb25faWQiOiAia2Fpb3BzLWZhdWx0LWxhYiIsCiAgInNjZW5hcmlvX2lkIjogImthaW9w
+cy1zY2VuYXJpby0xNSIsCiAgInRpY2tldF9leGFtcGxlIjogIktBSS0wMjgxIiwKICAiYWxlcnRf
+bmFtZSI6ICJDYWNoZSBldmljdGlvbiBzdG9ybSIsCiAgInNlcnZpY2UiOiAicmVkaXMtc2Vzc2lv
+biIsCiAgImNvbXBvbmVudCI6ICJEYXRhYmFzZSIsCiAgImVudmlyb25tZW50IjogIlByZS1Qcm9k
+dWN0aW9uIiwKICAic2V2ZXJpdHkiOiAiTWVkaXVtIiwKICAidGhyZXNob2xkIjogIkV2aWN0aW9u
+cyBleGNlZWRlZCA1MCwwMDAgcGVyIG1pbnV0ZSBhbmQgaGl0IHJhdGUgZmVsbCBiZWxvdyA2MCUi
+LAogICJldmlkZW5jZSI6ICJFdmljdGlvbnMgZXhjZWVkZWQgNTAsMDAwIHBlciBtaW51dGUgYW5k
+IGhpdCByYXRlIGZlbGwgYmVsb3cgNjAlOyBvY2N1cnJlbmNlIDEvMjAuIEthaU9wcyBjb3JyZWxh
+dGlvbiBmb3VuZCAyIHJlbGF0ZWQgc2lnbmFscyBhY3Jvc3MgMyBtb25pdG9yZWQgcmVzb3VyY2Vz
+LiIsCiAgInJvb3RfY2F1c2VfaGludCI6ICJBIGJ1bGsgcHJlbG9hZCBpbnNlcnRlZCBvdmVyc2l6
+ZWQgbG93LXZhbHVlIHNlc3Npb24gYXR0cmlidXRlcy4iLAogICJydW5ib29rX2lkIjogIlJCLURB
+VEEtMDE1IiwKICAiaW5jaWRlbnRfY29ycmVsYXRpb25faWQiOiAiSU5DLTIwMjUtMTAyODEiLAog
+ICJzeW50aGV0aWMiOiB0cnVlCn0=
+
+--===============7646396570804997340==--

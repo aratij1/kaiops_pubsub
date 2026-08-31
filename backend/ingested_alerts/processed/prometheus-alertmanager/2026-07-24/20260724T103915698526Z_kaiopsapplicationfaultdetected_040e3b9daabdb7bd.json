@@ -1,0 +1,59 @@
+{
+  "received_at": "2026-07-24T10:39:15.698526+00:00",
+  "source": "prometheus-alertmanager",
+  "status": "processed",
+  "error": null,
+  "alert": {
+    "source": "prometheus-alertmanager",
+    "name": "KaiOpsApplicationFaultDetected",
+    "service": "payment-gateway",
+    "environment": "prod",
+    "severity": "high",
+    "description": "Scenario kaiops-scenario-02 breached its threshold. Example context ticket: KAI-0021.",
+    "labels": {
+      "alert_name": "Payment latency spike",
+      "alertname": "KaiOpsApplicationFaultDetected",
+      "component": "Application",
+      "instance": "fault-lab:8080",
+      "job": "kaiops-fault-lab",
+      "scenario_id": "kaiops-scenario-02",
+      "service": "payment-gateway",
+      "severity": "High",
+      "source": "kaiops-fault-lab",
+      "ticket_example": "KAI-0021",
+      "alert_status": "firing",
+      "alert_fingerprint": "040e3b9daabdb7bd",
+      "support_tier": "L2/L3"
+    },
+    "annotations": {
+      "description": "Scenario kaiops-scenario-02 breached its threshold. Example context ticket: KAI-0021.",
+      "summary": "Payment latency spike on payment-gateway",
+      "startsAt": "2026-07-24T10:39:10.625Z",
+      "endsAt": "0001-01-01T00:00:00Z",
+      "generatorURL": "http://22e6a3cda092:9090/graph?g0.expr=kaiops_fault_ratio+%3E+1&g0.tab=1"
+    }
+  },
+  "raw": {
+    "status": "firing",
+    "labels": {
+      "alert_name": "Payment latency spike",
+      "alertname": "KaiOpsApplicationFaultDetected",
+      "component": "Application",
+      "instance": "fault-lab:8080",
+      "job": "kaiops-fault-lab",
+      "scenario_id": "kaiops-scenario-02",
+      "service": "payment-gateway",
+      "severity": "High",
+      "source": "kaiops-fault-lab",
+      "ticket_example": "KAI-0021"
+    },
+    "annotations": {
+      "description": "Scenario kaiops-scenario-02 breached its threshold. Example context ticket: KAI-0021.",
+      "summary": "Payment latency spike on payment-gateway"
+    },
+    "startsAt": "2026-07-24T10:39:10.625Z",
+    "endsAt": "0001-01-01T00:00:00Z",
+    "generatorURL": "http://22e6a3cda092:9090/graph?g0.expr=kaiops_fault_ratio+%3E+1&g0.tab=1",
+    "fingerprint": "040e3b9daabdb7bd"
+  }
+}

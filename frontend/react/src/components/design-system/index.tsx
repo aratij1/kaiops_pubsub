@@ -172,7 +172,6 @@ export function VirtualizedList<Row>({ rows, rowKey, renderRow, height = 360, es
   const virtualizer = useVirtualizer({ count: rows.length, getScrollElement: () => parentRef.current, estimateSize: () => estimateSize, getItemKey: (index) => rowKey(rows[index]) });
   return <div ref={parentRef} className="k-virtual-list" style={{ height }} role="list" aria-label={label}><div style={{ height: virtualizer.getTotalSize(), position: "relative" }}>{virtualizer.getVirtualItems().map((item) => <div role="listitem" key={item.key} style={{ position: "absolute", insetInline: 0, transform: `translateY(${item.start}px)`, height: item.size }}>{renderRow(rows[item.index])}</div>)}</div></div>;
 }
-
 export type SemanticState = "critical" | "warning" | "success" | "info" | "inactive";
 
 export function KaiState({ state, detail }: { state: string; detail?: string }) {

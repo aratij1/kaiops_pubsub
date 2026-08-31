@@ -3,6 +3,7 @@
 .pytest_cache
 .ruff_cache
 .venv
+.tmp
 **/node_modules
 **/dist
 **/storybook-static
@@ -14,3 +15,9 @@ __pycache__
 *.pyc
 data
 postgres-data
+frontend/react/node_modules
+frontend/react/dist
+frontend/react/test-results
+frontend/react/playwright-report
+backend/ingested_alerts
+backend/rag/changes

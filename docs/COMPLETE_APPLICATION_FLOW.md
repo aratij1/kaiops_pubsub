@@ -39,7 +39,7 @@ sequenceDiagram
   participant AP as Approval Service
   participant REM as Remediation Engine
   participant CL as Closure Service
-  participant UI as Streamlit UI
+  participant UI as React UI
 
   M->>MA: Send alert payload
   MA->>GW: POST /alerts (or /sample/{flow}/workflow)
@@ -72,30 +72,35 @@ Connection resolution is explicit and catalog-driven.
 
 Primary sources:
 
-- [rag/execution/connectors.json](rag/execution/connectors.json)
-- [rag/onboarding/connectivity.json](rag/onboarding/connectivity.json)
+- [backend/config/kaiops-connections.json](backend/config/kaiops-connections.json)
+- [backend/rag/execution/connectors.json](backend/rag/execution/connectors.json)
+- [backend/rag/onboarding/connectivity.json](backend/rag/onboarding/connectivity.json)
 
 Resolution behavior:
 
 1. Use alert service (for example `orders-db`, `payments`) as connector key.
-2. Load connector profile:
+2. Load the central connection catalog from `CONNECTION_CONFIG_PATH`.
+3. Resolve connector profile:
    - connector_id
    - type (`api`, `kubernetes`, etc.)
    - endpoint or cluster/namespace
    - auth_method
    - secret_ref
+   - timeout_seconds
+   - retry
+   - health_check
    - allowed_operations
-3. If no exact connector exists, fall back to `default_connector` (`generic-api`).
+4. If no exact connector exists, fall back to `default_connector` (`generic-api`).
 
 This logic is implemented in:
 
-- [services/common/common/orchestration/execution_plan.py](services/common/common/orchestration/execution_plan.py)
+- [backend/src/common/common/orchestration/execution_plan.py](backend/src/common/common/orchestration/execution_plan.py)
 
 ## 4. How KaiMS Knows What Commands to Execute
 
 Command knowledge is explicit and governed by an action catalog:
 
-- [rag/execution/action_catalog.json](rag/execution/action_catalog.json)
+- [backend/rag/execution/action_catalog.json](backend/rag/execution/action_catalog.json)
 
 Each command entry defines:
 
@@ -110,7 +115,7 @@ Before execution planning, each command is checked against connector `allowed_op
 
 Step sequencing is playbook-driven:
 
-- [rag/execution/playbooks.json](rag/execution/playbooks.json)
+- [backend/rag/execution/playbooks.json](backend/rag/execution/playbooks.json)
 
 Playbook matching uses:
 
@@ -132,13 +137,13 @@ Policy and workflow routing determine risk and control mode before execution.
 
 Policy source:
 
-- [services/common/common/orchestration/orchestration_config.json](services/common/common/orchestration/orchestration_config.json)
+- [backend/src/common/common/orchestration/orchestration_config.json](backend/src/common/common/orchestration/orchestration_config.json)
 
 Runtime components:
 
-- [services/common/common/orchestration/policy_engine.py](services/common/common/orchestration/policy_engine.py)
-- [services/common/common/orchestration/workflow_engine.py](services/common/common/orchestration/workflow_engine.py)
-- [services/orchestrator/orchestrator/workflow.py](services/orchestrator/orchestrator/workflow.py)
+- [backend/src/common/common/orchestration/policy_engine.py](backend/src/common/common/orchestration/policy_engine.py)
+- [backend/src/common/common/orchestration/workflow_engine.py](backend/src/common/common/orchestration/workflow_engine.py)
+- [backend/src/orchestrator/orchestrator/workflow.py](backend/src/orchestrator/orchestrator/workflow.py)
 
 Decision includes:
 
@@ -160,7 +165,7 @@ Decision includes:
 
 Remediation plugin mapping is in:
 
-- [services/remediation-engine/remediation_engine/plugins.py](services/remediation-engine/remediation_engine/plugins.py)
+- [backend/src/remediation-engine/remediation_engine/plugins.py](backend/src/remediation-engine/remediation_engine/plugins.py)
 
 ## 8. Observability and UI Traceability
 
@@ -174,17 +179,17 @@ UI tabs expose operational transparency:
 
 Primary UI file:
 
-- [services/ui/app.py](services/ui/app.py)
+- [frontend/react/src/App.jsx](frontend/react/src/App.jsx)
 
 ## 9. What Must Exist for Production-Grade Automation
 
 To avoid missing pieces, each critical service should have:
 
-1. Connector profile in [rag/execution/connectors.json](rag/execution/connectors.json)
+1. Connector profile in [backend/config/kaiops-connections.json](backend/config/kaiops-connections.json)
 2. Allowed operations mapped for that connector
-3. Command entries in [rag/execution/action_catalog.json](rag/execution/action_catalog.json)
-4. Playbook entries in [rag/execution/playbooks.json](rag/execution/playbooks.json)
-5. Connectivity endpoints validated in [rag/onboarding/connectivity.json](rag/onboarding/connectivity.json)
+3. Command entries in [backend/rag/execution/action_catalog.json](backend/rag/execution/action_catalog.json)
+4. Playbook entries in [backend/rag/execution/playbooks.json](backend/rag/execution/playbooks.json)
+5. Connectivity endpoints validated in [backend/rag/onboarding/connectivity.json](backend/rag/onboarding/connectivity.json)
 
 ## 10. Quick Validation Checklist
 

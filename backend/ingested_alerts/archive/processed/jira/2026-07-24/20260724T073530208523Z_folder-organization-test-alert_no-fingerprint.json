@@ -1,0 +1,56 @@
+{
+  "received_at": "2026-07-24T07:35:30.208523+00:00",
+  "source": "jira",
+  "status": "processed",
+  "error": null,
+  "alert": {
+    "source": "jira",
+    "name": "folder-organization test alert",
+    "service": "OPS",
+    "environment": "prod",
+    "severity": "high",
+    "description": "Testing source/date folder layout",
+    "labels": {
+      "alert_status": "firing",
+      "ticket_id": "OPS-900",
+      "jira_issue_id": "10200",
+      "jira_status": "Open",
+      "jira_priority": "High",
+      "jira_reporter": "Rahul Mehta",
+      "jira_assignee": "Priya Nair",
+      "jira_webhook_event": "jira:issue_created",
+      "support_tier": "L2/L3"
+    },
+    "annotations": {
+      "summary": "folder-organization test alert",
+      "description": "Testing source/date folder layout"
+    }
+  },
+  "raw": {
+    "webhookEvent": "jira:issue_created",
+    "issue": {
+      "id": "10200",
+      "key": "OPS-900",
+      "fields": {
+        "summary": "folder-organization test alert",
+        "description": "Testing source/date folder layout",
+        "priority": {
+          "name": "High"
+        },
+        "status": {
+          "name": "Open"
+        },
+        "project": {
+          "key": "OPS",
+          "name": "Operations"
+        },
+        "assignee": {
+          "displayName": "Priya Nair"
+        },
+        "reporter": {
+          "displayName": "Rahul Mehta"
+        }
+      }
+    }
+  }
+}

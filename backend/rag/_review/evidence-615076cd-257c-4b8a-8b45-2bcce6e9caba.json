@@ -1,0 +1,39 @@
+{
+  "draft_id": "evidence-615076cd-257c-4b8a-8b45-2bcce6e9caba",
+  "status": "draft",
+  "alert_id": "615076cd-257c-4b8a-8b45-2bcce6e9caba",
+  "incident_id": "e58557ea-e425-4716-b2c2-7dd46c87f8be",
+  "alert_type": "TEST_KAIOPS_RUNTIME_20260817",
+  "severity": "high",
+  "title": "Evidence review: TEST_KAIOPS_RUNTIME_20260817",
+  "content": "## Alert\nTEST_KAIOPS_RUNTIME_20260817 on kaiops-runtime-check (test)\n\n## Evidence-backed summary\nEvidence was retrieved; model synthesis was unavailable.\n\n## Hypotheses\n- No grounded hypothesis was produced.\n\n## Collected evidence\n- [TICKET-370f4e54eb7a5299] ticket: KAN-1600 kaiops-runtime-check: TEST_KAIOPS_RUNTIME_20260817; type=Bug; status=To Do; priority=Medium; updated=2026-08-17T13:19:58.918+0530; labels=kaiops-candidate-3f4757a94db72799de36ef5836b0e795,kaiops-severity-high,kaiops_incident_e58557ea_e425_4716_b2c2_7dd46c87f8be,managed_by_kaiops; description=AI-discovered incident Service: kaiops-runtime-check Environment: test Category: latency Final severity: high Confidence: 0.8874 Initial hypothesis The kaiops-runtime-check signal is likely caused by a latency condition. Business impact A subset of requests or dependent workflows may fail or slow down. Evidence [{\"evidence_id\": \"alert:615076cd-257c-4b8a-8b45-2bcce6e9caba\", \"source\": \"runtime-ver (https://kaiops-test.atlassian.net/browse/KAN-1600)\n- [MYSQL-b78368f8ea0308b6] mysql: table=incidents {\"id\": \"e58557eae4254716b2c27dd46c87f8be\", \"tenant_id\": \"default\", \"service\": \"kaiops-runtime-check\", \"environment\": \"test\", \"severity\": \"high\", \"status\": \"investigating\", \"title\": \"kaiops-runtime-check: TEST_KAIOPS_RUNTIME_20260817\", \"ticket_id\": \"KAN-1600\", \"payload\": \"{\\\"id\\\": \\\"e58557ea-e425-4716-b2c2-7dd46c87f8be\\\", \\\"title\\\": \\\"kaiops-runtime-check: TEST_KAIOPS_RUNTIME_20260817\\\", \\\"status\\\": \\\"investigating\\\", \\\"service\\\": \\\"kaiops-runtime-check\\\", \\\"summary\\\": \\\"Controlled local runtime verification: service timeout and connection failed, deadline exceeded during health probe\\\", \\\"jira_key\\\": null, \\\"jira (mysql://kaiops/incidents#row=e58557eae4254716b2c27dd46c87f8be)\n- [MYSQL-886002b1b48774c5] mysql: table=incident_projections {\"incident_id\": \"e58557eae4254716b2c27dd46c87f8be\", \"alert_id\": \"615076cd257c4b8a8b452bcce6e9caba\", \"trace_id\": \"218dc8f56eb14e6fb721b8da3e48efad\", \"recommendation_id\": null, \"flow_id\": null, \"tenant_id\": \"default\", \"service\": \"kaiops-runtime-check\", \"environment\": \"test\", \"severity\": \"high\", \"status\": \"investigating\", \"owner\": null, \"risk_tier\": \"high\", \"execution_mode\": \"human-approval\", \"requires_approval\": 1, \"policy_version\": \"policy-v1\", \"policy_reason\": \"severity in mandatory approval set; planner=deterministic severity routing\", \"transport_provider\": \"rabbitmq\", \"latest_event_id\": \"fd53ceb9d47544eea05c98d (mysql://kaiops/incident_projections#row=615076cd257c4b8a8b452bcce6e9caba)",
+  "services": [
+    "kaiops-runtime-check"
+  ],
+  "evidence_ids": [
+    "TICKET-370f4e54eb7a5299",
+    "MYSQL-b78368f8ea0308b6",
+    "MYSQL-886002b1b48774c5"
+  ],
+  "source_uris": [
+    "https://kaiops-test.atlassian.net/browse/KAN-1600",
+    "mysql://kaiops/incidents#row=e58557eae4254716b2c27dd46c87f8be",
+    "mysql://kaiops/incident_projections#row=615076cd257c4b8a8b452bcce6e9caba"
+  ],
+  "created_at": "2026-08-17T07:53:42.449464+00:00",
+  "updated_at": "2026-08-17T07:53:42.449464+00:00",
+  "reviewed_by": null,
+  "review_notes": null,
+  "approved_by": null,
+  "approved_at": null,
+  "rag_document_path": null,
+  "evidence_relevance": {
+    "verified": true,
+    "identity_terms": [
+      "kaiops-runtime-check",
+      "test_kaiops_runtime_20260817"
+    ],
+    "relevant_count": 3,
+    "retrieved_count": 12
+  }
+}

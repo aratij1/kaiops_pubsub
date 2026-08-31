@@ -8,17 +8,71 @@ import time as _time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import StrEnum
+from pathlib import Path
 from typing import Any
 
 import httpx
 from common.config import Settings, get_settings
+from common.model_evaluation import VertexEvaluationClient
 from common.models import AlertSeverity
 from common.prompts import SYSTEM_PROMPT_SRE, render_task_payload_prompt
 from common.resilience import CircuitBreaker
+from common.telemetry import (
+    LLM_CACHE_REQUESTS,
+    LLM_COST_USD,
+    LLM_FALLBACKS,
+    LLM_GUARDRAIL_EVENTS,
+    LLM_LATENCY,
+    LLM_TOKENS,
+)
 
 logger = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT_HASH = hashlib.sha256(SYSTEM_PROMPT_SRE.encode("utf-8")).hexdigest()[:16]
+_SENSITIVE_KEY_PARTS = (
+    "api_key", "apikey", "authorization", "credential", "password", "private_key",
+    "secret", "session_cookie", "token",
+)
+
+
+def _sanitize_model_payload(value: Any) -> Any:
+    """Remove secret values before evidence is cached or sent to any model provider."""
+    if isinstance(value, dict):
+        sanitized: dict[str, Any] = {}
+        for raw_key, item in value.items():
+            key = str(raw_key)
+            normalized = key.lower().replace("-", "_")
+            sanitized[key] = (
+                "[REDACTED]"
+                if any(part in normalized for part in _SENSITIVE_KEY_PARTS)
+                else _sanitize_model_payload(item)
+            )
+        return sanitized
+    if isinstance(value, list):
+        return [_sanitize_model_payload(item) for item in value]
+    if isinstance(value, tuple):
+        return [_sanitize_model_payload(item) for item in value]
+    return value
+
+
+def _guard_model_request(*, prompt: str, payload: dict[str, Any], settings: Settings) -> dict[str, Any]:
+    if len(prompt) > settings.model_router_max_prompt_chars:
+        LLM_GUARDRAIL_EVENTS.labels("prompt_too_large").inc()
+        raise ValueError(f"prompt exceeds {settings.model_router_max_prompt_chars} characters")
+    sanitized = _sanitize_model_payload(payload)
+    payload_size = len(json.dumps(sanitized, sort_keys=True, default=str).encode("utf-8"))
+    if payload_size > settings.model_router_max_payload_bytes:
+        LLM_GUARDRAIL_EVENTS.labels("payload_too_large").inc()
+        raise ValueError(f"payload exceeds {settings.model_router_max_payload_bytes} bytes")
+    if sanitized != payload:
+        LLM_GUARDRAIL_EVENTS.labels("secret_redacted").inc()
+    return sanitized
+
+
+def _observe_model_usage(provider: str, usage: dict[str, Any]) -> None:
+    LLM_TOKENS.labels(provider, "input").inc(max(0, int(usage.get("input_tokens") or 0)))
+    LLM_TOKENS.labels(provider, "output").inc(max(0, int(usage.get("output_tokens") or 0)))
+    LLM_COST_USD.labels(provider).inc(max(0.0, float(usage.get("total_cost_usd") or 0.0)))
 
 
 def _normalize_prompt(prompt: str) -> str:
@@ -59,6 +113,19 @@ def _prompt_cache_set(
     cache.move_to_end(key)
     while len(cache) > max_entries:
         cache.popitem(last=False)
+
+
+def _configured_evaluation_metrics(settings: Settings) -> list[str]:
+    raw = str(getattr(settings, "azure_ai_evaluation_metrics", "") or "").strip()
+    if not raw:
+        return [str(getattr(settings, "azure_ai_evaluation_metric", "coherence") or "coherence").strip().lower()]
+    metrics = [item.strip().lower() for item in raw.split(",") if item.strip()]
+    return metrics or [str(getattr(settings, "azure_ai_evaluation_metric", "coherence") or "coherence").strip().lower()]
+
+
+def _configured_provider_name(value: str, fallback: str) -> str:
+    normalized = str(value or "").strip()
+    return normalized or fallback
 
 
 def _mark_usage_as_cached(result: dict[str, Any]) -> dict[str, Any]:
@@ -205,17 +272,11 @@ class OpenAIModelProvider(ModelProvider):
                 },
             ],
         }
-        base_url = self.base_url.rstrip("/")
-        is_azure_openai = ".openai.azure.com" in base_url.lower()
-        if is_azure_openai and not base_url.lower().endswith("/openai/v1"):
-            base_url = f"{base_url}/openai/v1"
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
-        if is_azure_openai:
-            headers["api-key"] = self.api_key
         try:
             async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
                 response = await client.post(
-                    f"{base_url}/responses",
+                    f"{self.base_url.rstrip('/')}/responses",
                     headers=headers,
                     json=request_payload,
                 )
@@ -251,6 +312,269 @@ class OpenAIModelProvider(ModelProvider):
                 if text:
                     return str(text)
         raise RuntimeError(f"{self.name} returned no text")
+
+
+@dataclass
+class GroqModelProvider(ModelProvider):
+    model: str = "llama-3.3-70b-versatile"
+    api_key: str | None = None
+    base_url: str = "https://api.groq.com/openai/v1"
+    timeout_seconds: float = 45.0
+    input_cost_per_million: float = 0.0
+    output_cost_per_million: float = 0.0
+
+    async def generate(self, prompt: str, payload: dict[str, Any]) -> ModelResponse:
+        self._ensure_available()
+        if not self.api_key:
+            self.breaker.record_failure()
+            raise RuntimeError(f"{self.name} unavailable: GROQ_API_KEY is not configured")
+
+        prompt_text = render_task_payload_prompt(prompt, payload)
+        request_payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT_SRE},
+                {"role": "user", "content": prompt_text},
+            ],
+            "temperature": 0.2,
+        }
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+                response = await client.post(
+                    f"{self.base_url.rstrip('/')}/chat/completions",
+                    headers=headers,
+                    json=request_payload,
+                )
+                response.raise_for_status()
+                data = response.json()
+        except httpx.HTTPStatusError as exc:
+            self.breaker.record_failure()
+            raise RuntimeError(provider_error_message(self.name, self.model, exc.response)) from exc
+        except Exception:
+            self.breaker.record_failure()
+            raise
+
+        self.breaker.record_success()
+        choices = data.get("choices") if isinstance(data.get("choices"), list) else []
+        content_text = ""
+        if choices:
+            message = choices[0].get("message") if isinstance(choices[0], dict) else {}
+            content_text = str(message.get("content") or "")
+        if not content_text:
+            raise RuntimeError(f"{self.name} returned no text")
+        usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+        model_usage = build_usage(
+            provider=self.name,
+            model=str(data.get("model") or self.model),
+            input_tokens=int(usage.get("prompt_tokens", estimate_tokens(prompt_text))),
+            output_tokens=int(usage.get("completion_tokens", estimate_tokens(content_text))),
+            input_cost_per_million=self.input_cost_per_million,
+            output_cost_per_million=self.output_cost_per_million,
+            estimated=not bool(usage),
+        )
+        return ModelResponse(content=content_text, usage=model_usage)
+
+
+@dataclass
+class AnthropicModelProvider(ModelProvider):
+    model: str = "claude-sonnet-4-6"
+    api_key: str | None = None
+    base_url: str = "https://api.anthropic.com/v1"
+    anthropic_version: str = "2023-06-01"
+    max_tokens: int = 1024
+    timeout_seconds: float = 45.0
+    input_cost_per_million: float = 0.0
+    output_cost_per_million: float = 0.0
+
+    async def generate(self, prompt: str, payload: dict[str, Any]) -> ModelResponse:
+        self._ensure_available()
+        if not self.api_key:
+            self.breaker.record_failure()
+            raise RuntimeError(f"{self.name} unavailable: ANTHROPIC_API_KEY is not configured")
+
+        prompt_text = render_task_payload_prompt(prompt, payload)
+        request_payload = {
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "system": SYSTEM_PROMPT_SRE,
+            "messages": [
+                {"role": "user", "content": prompt_text},
+            ],
+        }
+        headers = {
+            "x-api-key": self.api_key,
+            "anthropic-version": self.anthropic_version,
+            "content-type": "application/json",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+                response = await client.post(
+                    f"{self.base_url.rstrip('/')}/messages",
+                    headers=headers,
+                    json=request_payload,
+                )
+                response.raise_for_status()
+                data = response.json()
+        except httpx.HTTPStatusError as exc:
+            self.breaker.record_failure()
+            raise RuntimeError(provider_error_message(self.name, self.model, exc.response)) from exc
+        except Exception:
+            self.breaker.record_failure()
+            raise
+
+        self.breaker.record_success()
+        content_text = self._extract_text(data)
+        if not content_text:
+            raise RuntimeError(f"{self.name} returned no text")
+        usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+        model_usage = build_usage(
+            provider=self.name,
+            model=str(data.get("model") or self.model),
+            input_tokens=int(usage.get("input_tokens", estimate_tokens(prompt_text))),
+            output_tokens=int(usage.get("output_tokens", estimate_tokens(content_text))),
+            input_cost_per_million=self.input_cost_per_million,
+            output_cost_per_million=self.output_cost_per_million,
+            estimated=not bool(usage),
+        )
+        return ModelResponse(content=content_text, usage=model_usage)
+
+    def _extract_text(self, data: dict[str, Any]) -> str:
+        content = data.get("content") if isinstance(data.get("content"), list) else []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
+                return str(block.get("text"))
+        return ""
+
+
+@dataclass
+class GeminiModelProvider(ModelProvider):
+    model: str = "gemini-2.5-flash"
+    api_key: str | None = None
+    base_url: str = "https://generativelanguage.googleapis.com/v1beta"
+    timeout_seconds: float = 45.0
+    input_cost_per_million: float = 0.0
+    output_cost_per_million: float = 0.0
+
+    async def generate(self, prompt: str, payload: dict[str, Any]) -> ModelResponse:
+        self._ensure_available()
+        if not self.api_key:
+            self.breaker.record_failure()
+            raise RuntimeError(f"{self.name} unavailable: GEMINI_API_KEY is not configured")
+
+        prompt_text = render_task_payload_prompt(prompt, payload)
+        model_path = self.model if self.model.startswith("models/") else f"models/{self.model}"
+        request_payload = {
+            "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT_SRE}]},
+            "contents": [{"parts": [{"text": prompt_text}]}],
+        }
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+                response = await client.post(
+                    f"{self.base_url.rstrip('/')}/{model_path}:generateContent",
+                    headers={"x-goog-api-key": self.api_key, "Content-Type": "application/json"},
+                    json=request_payload,
+                )
+                response.raise_for_status()
+                data = response.json()
+        except httpx.HTTPStatusError as exc:
+            self.breaker.record_failure()
+            raise RuntimeError(provider_error_message(self.name, self.model, exc.response)) from exc
+        except Exception:
+            self.breaker.record_failure()
+            raise
+
+        self.breaker.record_success()
+        content_text = self._extract_text(data)
+        if not content_text:
+            raise RuntimeError(f"{self.name} returned no text")
+        usage_meta = data.get("usageMetadata") if isinstance(data.get("usageMetadata"), dict) else {}
+        model_usage = build_usage(
+            provider=self.name,
+            model=self.model,
+            input_tokens=int(usage_meta.get("promptTokenCount", estimate_tokens(prompt_text))),
+            output_tokens=int(usage_meta.get("candidatesTokenCount", estimate_tokens(content_text))),
+            input_cost_per_million=self.input_cost_per_million,
+            output_cost_per_million=self.output_cost_per_million,
+            estimated=not bool(usage_meta),
+        )
+        total_tokens = usage_meta.get("totalTokenCount")
+        if isinstance(total_tokens, int):
+            model_usage.total_tokens = total_tokens
+        return ModelResponse(content=content_text, usage=model_usage)
+
+    def _extract_text(self, data: dict[str, Any]) -> str:
+        candidates = data.get("candidates") if isinstance(data.get("candidates"), list) else []
+        for candidate in candidates:
+            content = candidate.get("content") if isinstance(candidate, dict) else {}
+            parts = content.get("parts") if isinstance(content, dict) else []
+            if not isinstance(parts, list):
+                continue
+            for part in parts:
+                if isinstance(part, dict) and part.get("text"):
+                    return str(part.get("text"))
+        return ""
+
+
+@dataclass
+class AzureOpenAIModelProvider(ModelProvider):
+    model: str = "gpt-4o"
+    api_key: str | None = None
+    base_url: str = ""
+    api_version: str = "2024-06-01"
+    timeout_seconds: float = 45.0
+    input_cost_per_million: float = 0.0
+    output_cost_per_million: float = 0.0
+
+    async def generate(self, prompt: str, payload: dict[str, Any]) -> ModelResponse:
+        self._ensure_available()
+        if not self.api_key or not self.base_url:
+            self.breaker.record_failure()
+            raise RuntimeError(f"{self.name} unavailable: AZURE_OPENAI_ENDPOINT/AZURE_OPENAI_API_KEY are not configured")
+
+        prompt_text = render_task_payload_prompt(prompt, payload)
+        request_payload = {
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT_SRE},
+                {"role": "user", "content": prompt_text},
+            ],
+            "temperature": 0.2,
+        }
+        url = f"{self.base_url.rstrip('/')}/openai/deployments/{self.model}/chat/completions"
+        headers = {"api-key": self.api_key, "Content-Type": "application/json"}
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+                response = await client.post(
+                    url, params={"api-version": self.api_version}, headers=headers, json=request_payload
+                )
+                response.raise_for_status()
+                data = response.json()
+        except httpx.HTTPStatusError as exc:
+            self.breaker.record_failure()
+            raise RuntimeError(provider_error_message(self.name, self.model, exc.response)) from exc
+        except Exception:
+            self.breaker.record_failure()
+            raise
+
+        self.breaker.record_success()
+        choices = data.get("choices") if isinstance(data.get("choices"), list) else []
+        content_text = ""
+        if choices:
+            message = choices[0].get("message") if isinstance(choices[0], dict) else {}
+            content_text = str(message.get("content") or "")
+        if not content_text:
+            raise RuntimeError(f"{self.name} returned no text")
+        usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+        model_usage = build_usage(
+            provider=self.name,
+            model=str(data.get("model") or self.model),
+            input_tokens=int(usage.get("prompt_tokens", estimate_tokens(prompt_text))),
+            output_tokens=int(usage.get("completion_tokens", estimate_tokens(content_text))),
+            input_cost_per_million=self.input_cost_per_million,
+            output_cost_per_million=self.output_cost_per_million,
+            estimated=not bool(usage),
+        )
+        return ModelResponse(content=content_text, usage=model_usage)
 
 
 @dataclass
@@ -301,19 +625,144 @@ class ModelRouter:
     settings: Settings = field(default_factory=get_settings)
     failover_chain: dict[str, list[str]] = field(
         default_factory=lambda: {
-            "gpt-5": ["gpt-4o", "local-llama"],
-            "local-llama": ["gpt-4o"],
-            "gpt-4o": ["gpt-5", "local-llama"],
+            "reasoning-critical": ["reasoning-standard", "gpt-5", "azure-openai", "gpt-4o", "gemini", "groq", "local-llama"],
+            "reasoning-standard": ["reasoning-critical", "gpt-5", "azure-openai", "gpt-4o", "gemini", "groq", "local-llama"],
+            "azure-openai": ["gpt-4o", "gpt-5", "gemini", "groq", "local-llama"],
+            "gpt-5": ["azure-openai", "gpt-4o", "gemini", "groq", "local-llama"],
+            "gpt-4o": ["azure-openai", "gpt-5", "gemini", "groq", "local-llama"],
+            "gemini": ["azure-openai", "gpt-4o", "gpt-5", "groq", "local-llama"],
+            "groq": ["azure-openai", "gpt-4o", "gemini", "local-llama"],
+            "local-llama": ["azure-openai", "gpt-4o", "gemini", "groq"],
         }
     )
     prompt_cache: OrderedDict[str, tuple[float, dict[str, Any]]] = field(default_factory=OrderedDict)
+    evaluation_client: VertexEvaluationClient = field(default_factory=lambda: VertexEvaluationClient(get_settings()))
+    _background_tasks: set[asyncio.Task[None]] = field(default_factory=set, repr=False, compare=False)
+    _policy_cache: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
+    _policy_cache_path: str = field(default="", repr=False, compare=False)
+    _policy_cache_mtime_ns: int = field(default=-1, repr=False, compare=False)
+
+    def provider_status(self) -> dict[str, Any]:
+        providers: dict[str, dict[str, Any]] = {}
+        for name, provider in self.providers.items():
+            breaker = provider.breaker
+            configured = not isinstance(provider, UnconfiguredModelProvider)
+            if hasattr(provider, "api_key"):
+                configured = configured and bool(str(getattr(provider, "api_key") or "").strip())
+            if hasattr(provider, "endpoint"):
+                configured = configured and bool(str(getattr(provider, "endpoint") or "").strip())
+            providers[name] = {
+                "configured": configured,
+                "healthy": bool(provider.healthy),
+                "model": str(getattr(provider, "model", name) or name),
+                "base_url": str(getattr(provider, "base_url", getattr(provider, "endpoint", "")) or ""),
+                "circuit_open": not breaker.allow(),
+                "failure_count": int(getattr(breaker, "_failures", 0) or 0),
+                "reason": str(getattr(provider, "reason", "") or "") or None,
+            }
+        return {
+            "providers": providers,
+            "selected": {
+                "critical": self.select_model(severity=AlertSeverity.CRITICAL, task=ModelTask.RCA),
+                "rca": self.select_model(severity=AlertSeverity.WARNING, task=ModelTask.RCA),
+                "default": self.select_model(severity=AlertSeverity.WARNING, task=ModelTask.GENERAL),
+            },
+            "prompt_cache": {
+                "enabled": bool(self.settings.model_router_prompt_cache_enabled),
+                "entries": len(self.prompt_cache),
+                "ttl_seconds": self.settings.model_router_prompt_cache_ttl_seconds,
+            },
+        }
+
+    async def _attach_evaluation(self, result: dict[str, Any], *, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        if not self.evaluation_client.enabled:
+            return result
+        content = str(result.get("content") or "")
+        if not content:
+            return result
+        metrics = _configured_evaluation_metrics(self.settings)
+        evaluation_results = await asyncio.to_thread(
+            self.evaluation_client.evaluate_many, content, metrics=metrics, context=None
+        )
+        if not evaluation_results:
+            return result
+        evaluations = [
+            {
+                "metric": item.metric,
+                "score": item.score,
+                "explanation": item.explanation,
+                "confidence": item.confidence,
+            }
+            for item in evaluation_results
+        ]
+        result["evaluation"] = evaluations[0]
+        result["evaluations"] = evaluations
+        self._publish_evaluation(result=result, payload=payload or {})
+        return result
+
+    async def _post_evaluation(self, body: dict[str, Any]) -> None:
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.post(f"{self.settings.evaluation_service_url.rstrip('/')}/evaluations", json=body)
+            response.raise_for_status()
+        except Exception as exc:
+            logger.warning("evaluation_service_publish_failed", extra={"error": str(exc)})
+
+    def _publish_evaluation(self, *, result: dict[str, Any], payload: dict[str, Any]) -> None:
+        usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
+        report = {
+            "contract_version": "kaiops.evaluation.judge.v1",
+            "provider": "llm-judge",
+            "metrics": result.get("evaluations", []),
+        }
+        body = {
+            "report": report,
+            "agent": "model-router",
+            "incident_id": str(payload.get("incident_id")) if payload.get("incident_id") else None,
+            "recommendation_id": str(payload.get("recommendation_id")) if payload.get("recommendation_id") else None,
+            "model_provider": str(result.get("model") or "") or None,
+            "model_name": str(usage.get("model") or "") or None,
+        }
+        task = asyncio.create_task(self._post_evaluation(body))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     def select_model(self, *, severity: AlertSeverity, task: ModelTask) -> str:
+        policy_provider = self._evaluation_policy_provider(severity=severity, task=task)
+        if policy_provider:
+            return policy_provider
         if severity == AlertSeverity.CRITICAL:
-            return "gpt-5"
+            return _configured_provider_name(self.settings.model_router_critical_provider, "reasoning-critical")
         if task == ModelTask.RCA:
-            return "gpt-4o"
-        return "gpt-4o"
+            return _configured_provider_name(self.settings.model_router_rca_provider, "reasoning-standard")
+        return _configured_provider_name(self.settings.model_router_default_provider, "gpt-4o")
+
+    def _evaluation_policy_provider(self, *, severity: AlertSeverity, task: ModelTask) -> str | None:
+        raw_path = str(self.settings.model_router_evaluation_policy_path or "").strip()
+        if not raw_path:
+            return None
+        try:
+            path = Path(raw_path)
+            mtime_ns = path.stat().st_mtime_ns
+            if raw_path != self._policy_cache_path or mtime_ns != self._policy_cache_mtime_ns:
+                self._policy_cache = json.loads(path.read_text(encoding="utf-8"))
+                self._policy_cache_path = raw_path
+                self._policy_cache_mtime_ns = mtime_ns
+            policy = self._policy_cache
+            if policy.get("contract_version") != "kaims.model-routing-policy.v1":
+                return None
+            routes = policy.get("routes") if isinstance(policy.get("routes"), dict) else {}
+            keys = (f"{severity.value}:{task.value}", f"*:{task.value}", "default")
+            route = next((routes[key] for key in keys if isinstance(routes.get(key), dict)), None)
+            if not route or not route.get("eligible"):
+                return None
+            if int(route.get("cases") or 0) < self.settings.model_router_evaluation_min_cases:
+                return None
+            provider = str(route.get("provider") or "").strip()
+            return provider if provider in self.providers else None
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            logger.warning("model_routing_policy_ignored", extra={"error_type": type(exc).__name__})
+            return None
 
     async def route(
         self,
@@ -323,6 +772,7 @@ class ModelRouter:
         prompt: str,
         payload: dict[str, Any],
     ) -> dict[str, Any]:
+        payload = _guard_model_request(prompt=prompt, payload=payload, settings=self.settings)
         primary = self.select_model(severity=severity, task=task)
         primary_provider = self.providers.get(primary)
         provider_identity = _provider_cache_identity(
@@ -339,8 +789,10 @@ class ModelRouter:
                 ttl_seconds=self.settings.model_router_prompt_cache_ttl_seconds,
             )
         if cached is not None:
+            LLM_CACHE_REQUESTS.labels("hit").inc()
             logger.debug("Prompt cache hit: %s", cache_key[:12])
             return _mark_usage_as_cached(cached)
+        LLM_CACHE_REQUESTS.labels("miss").inc()
         candidates = list(dict.fromkeys([primary, *self.failover_chain.get(primary, [])]))
         errors: list[str] = []
         for provider_name in candidates:
@@ -348,11 +800,18 @@ class ModelRouter:
             if provider is None:
                 errors.append(f"{provider_name}: provider is not registered")
                 continue
+            started = _time.monotonic()
             try:
                 response = await provider.generate(prompt, payload)
                 usage = response.usage.as_dict()
                 usage["task"] = task.value
+                usage["prompt_version"] = _SYSTEM_PROMPT_HASH
+                LLM_LATENCY.labels(provider_name, task.value, "ok").observe(_time.monotonic() - started)
+                _observe_model_usage(provider_name, usage)
+                if provider_name != primary:
+                    LLM_FALLBACKS.labels(primary, provider_name).inc()
                 result = {"model": provider_name, "content": response.content, "usage": usage}
+                result = await self._attach_evaluation(result, payload=payload)
                 if self.settings.model_router_prompt_cache_enabled:
                     _prompt_cache_set(
                         cache_key,
@@ -362,6 +821,7 @@ class ModelRouter:
                     )
                 return result
             except Exception as exc:
+                LLM_LATENCY.labels(provider_name, task.value, "error").observe(_time.monotonic() - started)
                 errors.append(f"{provider_name}: {exc}")
 
         raise RuntimeError("; ".join(errors))
@@ -374,6 +834,7 @@ class ModelRouter:
         prompt: str,
         payload: dict[str, Any],
     ) -> dict[str, Any]:
+        payload = _guard_model_request(prompt=prompt, payload=payload, settings=self.settings)
         provider = self.providers.get(provider_name)
         if provider is None:
             raise RuntimeError(f"{provider_name} provider is not registered")
@@ -391,12 +852,23 @@ class ModelRouter:
                 ttl_seconds=self.settings.model_router_prompt_cache_ttl_seconds,
             )
         if cached is not None:
+            LLM_CACHE_REQUESTS.labels("hit").inc()
             logger.debug("Prompt cache hit (provider): %s", cache_key[:12])
             return _mark_usage_as_cached(cached)
-        response = await provider.generate(prompt, payload)
+        LLM_CACHE_REQUESTS.labels("miss").inc()
+        started = _time.monotonic()
+        try:
+            response = await provider.generate(prompt, payload)
+        except Exception:
+            LLM_LATENCY.labels(provider_name, task.value, "error").observe(_time.monotonic() - started)
+            raise
         usage = response.usage.as_dict()
         usage["task"] = task.value
+        usage["prompt_version"] = _SYSTEM_PROMPT_HASH
+        LLM_LATENCY.labels(provider_name, task.value, "ok").observe(_time.monotonic() - started)
+        _observe_model_usage(provider_name, usage)
         result = {"model": provider_name, "content": response.content, "usage": usage}
+        result = await self._attach_evaluation(result, payload=payload)
         if self.settings.model_router_prompt_cache_enabled:
             _prompt_cache_set(
                 cache_key,
@@ -421,7 +893,44 @@ def build_default_providers(settings: Settings) -> dict[str, ModelProvider]:
             reason="set LOCAL_LLM_ENABLED=true and LOCAL_LLM_ENDPOINT to use Ollama",
         )
 
+    if settings.model_router_reasoning_backend.strip().lower() == "azure-openai":
+        standard_reasoning: ModelProvider = AzureOpenAIModelProvider(
+            name="reasoning-standard", model=settings.reasoning_standard_model,
+            api_key=settings.azure_openai_api_key, base_url=settings.azure_openai_endpoint,
+            api_version=settings.azure_openai_api_version, timeout_seconds=settings.llm_request_timeout_seconds,
+        )
+        critical_reasoning: ModelProvider = AzureOpenAIModelProvider(
+            name="reasoning-critical", model=settings.reasoning_critical_model,
+            api_key=settings.azure_openai_api_key, base_url=settings.azure_openai_endpoint,
+            api_version=settings.azure_openai_api_version, timeout_seconds=settings.llm_request_timeout_seconds,
+        )
+    else:
+        standard_reasoning = OpenAIModelProvider(
+            name="reasoning-standard", model=settings.reasoning_standard_model,
+            api_key=settings.openai_api_key, base_url=settings.openai_base_url,
+            timeout_seconds=settings.llm_request_timeout_seconds,
+            input_cost_per_million=settings.openai_gpt5_input_cost_per_million,
+            output_cost_per_million=settings.openai_gpt5_output_cost_per_million,
+        )
+        critical_reasoning = OpenAIModelProvider(
+            name="reasoning-critical", model=settings.reasoning_critical_model,
+            api_key=settings.openai_api_key, base_url=settings.openai_base_url,
+            timeout_seconds=settings.llm_request_timeout_seconds,
+            input_cost_per_million=settings.openai_gpt5_input_cost_per_million,
+            output_cost_per_million=settings.openai_gpt5_output_cost_per_million,
+        )
+
     return {
+        "reasoning-standard": standard_reasoning,
+        "reasoning-critical": critical_reasoning,
+        "azure-openai": AzureOpenAIModelProvider(
+            name="azure-openai",
+            model=settings.azure_openai_chat_deployment,
+            api_key=settings.azure_openai_api_key,
+            base_url=settings.azure_openai_endpoint,
+            api_version=settings.azure_openai_api_version,
+            timeout_seconds=settings.llm_request_timeout_seconds,
+        ),
         "gpt-5": OpenAIModelProvider(
             name="gpt-5",
             model=settings.openai_gpt5_model,
@@ -440,9 +949,33 @@ def build_default_providers(settings: Settings) -> dict[str, ModelProvider]:
             input_cost_per_million=settings.openai_gpt4o_input_cost_per_million,
             output_cost_per_million=settings.openai_gpt4o_output_cost_per_million,
         ),
-        "claude": UnconfiguredModelProvider(
+        "claude": AnthropicModelProvider(
             name="claude",
-            reason="set ANTHROPIC_API_KEY and add a Claude provider implementation",
+            model=settings.anthropic_model,
+            api_key=settings.anthropic_api_key,
+            base_url=settings.anthropic_base_url,
+            anthropic_version=settings.anthropic_version,
+            timeout_seconds=settings.llm_request_timeout_seconds,
+            input_cost_per_million=settings.anthropic_input_cost_per_million,
+            output_cost_per_million=settings.anthropic_output_cost_per_million,
+        ),
+        "gemini": GeminiModelProvider(
+            name="gemini",
+            model=settings.gemini_model,
+            api_key=settings.gemini_api_key,
+            base_url=settings.gemini_base_url,
+            timeout_seconds=settings.llm_request_timeout_seconds,
+            input_cost_per_million=settings.gemini_input_cost_per_million,
+            output_cost_per_million=settings.gemini_output_cost_per_million,
+        ),
+        "groq": GroqModelProvider(
+            name="groq",
+            model=settings.groq_model,
+            api_key=settings.groq_api_key,
+            base_url=settings.groq_base_url,
+            timeout_seconds=settings.llm_request_timeout_seconds,
+            input_cost_per_million=settings.groq_input_cost_per_million,
+            output_cost_per_million=settings.groq_output_cost_per_million,
         ),
         "local-llama": local_llama_provider,
     }

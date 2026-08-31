@@ -3,7 +3,11 @@ __pycache__/
 .ruff_cache/
 .mypy_cache/
 .venv/
+.venv_verify/
+.tmp/
 .env
+.env.azure
+.env.*.generated
 .env.azure-config.backup
 *.pyc
 *.pyo
@@ -16,6 +20,7 @@ build/
 data/
 logs/local/*.log
 node_modules/
+node_modules/
 .tmp/
 storybook-static/
 test-results/
@@ -24,10 +29,23 @@ artifacts/
 
 # Generated UI and runtime artifacts
 .tmp-ui-bundle.js
-ingested_alerts/input/*.json
+backend/ingested_alerts/input/*.json
+backend/ingested_alerts/input/*.csv
+backend/ingested_alerts/input/*.eml
+# processed/ and failed/ are date-partitioned (YYYY/MM/DD); tracked *.txt
+# sample fixtures stay tracked, only generated *.json audit records are ignored.
+backend/ingested_alerts/processed/**/*.json
+backend/ingested_alerts/failed/**/*.json
+# input_replayed/ and input_failed/ hold nothing but generated archive copies.
+backend/ingested_alerts/input_replayed/**
+backend/ingested_alerts/input_failed/**
+
+# Fault-lab generated runtime logs
+fault-lab/runtime/*.log
 
 # Generated onboarding outputs
-rag/changes/**
-rag/dependencies/*.md
-rag/incidents/*-rule-onboarding.md
-rag/runbooks/*-rule-runbook.md
+backend/rag/changes/**
+backend/rag/dependencies/*.md
+backend/rag/incidents/*-rule-onboarding.md
+backend/rag/runbooks/*-rule-runbook.md
+.env*

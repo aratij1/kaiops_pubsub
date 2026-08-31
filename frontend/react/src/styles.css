@@ -8803,7 +8803,6 @@ tbody tr:hover { background: #f5fafc; }
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-
 @media (max-width: 760px) {
   .ingestion-stream-page .ingestion-stream-list { height: 60vh; }
   .approval-workspace .approval-card-list { height: 54vh; }

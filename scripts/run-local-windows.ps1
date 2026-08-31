@@ -1,5 +1,6 @@
 param(
-    [switch]$NoUi
+    [switch]$NoUi,
+    [switch]$UseExternalInfrastructure
 )
 
 $ErrorActionPreference = "Stop"
@@ -85,33 +86,50 @@ if (-not (Test-Path $Python)) {
 }
 
 $ServicePaths = @(
-    "services\common",
-    "services\api-gateway",
-    "services\alert-intelligence",
-    "services\context-agent",
-    "services\model-router",
-    "services\resolution-agent",
-    "services\orchestrator",
-    "services\approval-service",
-    "services\remediation-engine",
-    "services\closure-service",
-    "services\monitoring-adapter"
+    "backend\src\common",
+    "ai-workbench\src",
+    "backend\src\api-gateway",
+    "backend\src\alert-intelligence",
+    "ai-workbench\src\context-agent",
+    "ai-workbench\src\model-router",
+    "ai-workbench\src\resolution-agent",
+    "backend\src\orchestrator",
+    "backend\src\approval-service",
+    "backend\src\remediation-engine",
+    "backend\src\closure-service",
+    "backend\src\monitoring-adapter"
 ) | ForEach-Object { Join-Path $RepoRoot $_ }
 
 $PythonPath = $ServicePaths -join ";"
 $DotEnv = Read-DotEnvFile -Path (Join-Path $RepoRoot ".env")
 
+$StandaloneDatabaseEnabled = if ($UseExternalInfrastructure) {
+    Resolve-ConfigValue -Name "DATABASE_ENABLED" -Default "true" -DotEnv $DotEnv
+} else {
+    "false"
+}
+$StandaloneEventBusProvider = if ($UseExternalInfrastructure) {
+    Resolve-ConfigValue -Name "EVENT_BUS_PROVIDER" -Default "rabbitmq" -DotEnv $DotEnv
+} else {
+    "noop"
+}
+$StandaloneMessageBusProvider = if ($UseExternalInfrastructure) {
+    Resolve-ConfigValue -Name "MESSAGE_BUS_DEFAULT_PROVIDER" -Default "rabbitmq" -DotEnv $DotEnv
+} else {
+    "noop"
+}
+
 $Config = @{
     KAFKA_ENABLED = Resolve-ConfigValue -Name "KAFKA_ENABLED" -Default "false" -DotEnv $DotEnv
-    EVENT_BUS_PROVIDER = Resolve-ConfigValue -Name "EVENT_BUS_PROVIDER" -Default "noop" -DotEnv $DotEnv
+    EVENT_BUS_PROVIDER = $StandaloneEventBusProvider
     MESSAGE_BUS_DYNAMIC_ROUTING = Resolve-ConfigValue -Name "MESSAGE_BUS_DYNAMIC_ROUTING" -Default "true" -DotEnv $DotEnv
     MESSAGE_BUS_STREAM_THRESHOLD = Resolve-ConfigValue -Name "MESSAGE_BUS_STREAM_THRESHOLD" -Default "500" -DotEnv $DotEnv
-    MESSAGE_BUS_DEFAULT_PROVIDER = Resolve-ConfigValue -Name "MESSAGE_BUS_DEFAULT_PROVIDER" -Default "rabbitmq" -DotEnv $DotEnv
+    MESSAGE_BUS_DEFAULT_PROVIDER = $StandaloneMessageBusProvider
     MESSAGE_BUS_WORKER_COUNT = Resolve-ConfigValue -Name "MESSAGE_BUS_WORKER_COUNT" -Default "1" -DotEnv $DotEnv
     RABBITMQ_URL = Resolve-ConfigValue -Name "RABBITMQ_URL" -Default "amqp://guest:guest@localhost:5672/" -DotEnv $DotEnv
     RABBITMQ_EXCHANGE = Resolve-ConfigValue -Name "RABBITMQ_EXCHANGE" -Default "kaiops.events" -DotEnv $DotEnv
     RABBITMQ_QUEUE_PREFIX = Resolve-ConfigValue -Name "RABBITMQ_QUEUE_PREFIX" -Default "kaiops" -DotEnv $DotEnv
-    DATABASE_ENABLED = Resolve-ConfigValue -Name "DATABASE_ENABLED" -Default "true" -DotEnv $DotEnv
+    DATABASE_ENABLED = $StandaloneDatabaseEnabled
     DB = Resolve-ConfigValue -Name "DB" -Default "mysql" -DotEnv $DotEnv
     DB_HOST = Resolve-ConfigValue -Name "DB_HOST" -Default "localhost" -DotEnv $DotEnv
     DB_PORT = Resolve-ConfigValue -Name "DB_PORT" -Default "3306" -DotEnv $DotEnv
@@ -241,22 +259,22 @@ function Test-UrlReady {
 
 Start-KaiMSWindow `
     -Title "KaiMS monitoring-adapter :8001" `
-    -Command "& '$Python' -m uvicorn app:app --host 127.0.0.1 --port 8001 --app-dir services/monitoring-adapter"
+    -Command "& '$Python' -m uvicorn app:app --host 127.0.0.1 --port 8001 --app-dir backend/src/monitoring-adapter"
 
 Start-KaiMSWindow `
     -Title "KaiMS approval-service :8007" `
-    -Command "& '$Python' -m uvicorn app:app --host 127.0.0.1 --port 8007 --app-dir services/approval-service"
+    -Command "& '$Python' -m uvicorn app:app --host 127.0.0.1 --port 8007 --app-dir backend/src/approval-service"
 
 Start-KaiMSWindow `
     -Title "KaiMS context-agent :8004" `
-    -Command "& '$Python' -m uvicorn app:app --host 127.0.0.1 --port 8004 --app-dir services/context-agent"
+    -Command "& '$Python' -m uvicorn app:app --host 127.0.0.1 --port 8004 --app-dir ai-workbench/src/context-agent"
 
 Start-KaiMSWindow `
     -Title "KaiMS api-gateway :8010" `
-    -Command "`$env:MONITORING_ADAPTER_URL = 'http://localhost:8001'; `$env:APPROVAL_SERVICE_URL = 'http://localhost:8007'; `$env:CONTEXT_AGENT_URL = 'http://localhost:8004'; & '$Python' -m uvicorn app:app --host 127.0.0.1 --port 8010 --app-dir services/api-gateway"
+    -Command "`$env:MONITORING_ADAPTER_URL = 'http://localhost:8001'; `$env:APPROVAL_SERVICE_URL = 'http://localhost:8007'; `$env:CONTEXT_AGENT_URL = 'http://localhost:8004'; & '$Python' -m uvicorn app:app --host 127.0.0.1 --port 8010 --app-dir backend/src/api-gateway"
 
 if (-not $NoUi) {
-    $UiFolder = (Join-Path $RepoRoot "services\ui\react").Replace("'", "''")
+    $UiFolder = (Join-Path $RepoRoot "frontend\react").Replace("'", "''")
     $UiCommand = @"
 Set-Location -LiteralPath '$UiFolder'
 npm install
@@ -267,6 +285,7 @@ npm run dev
 }
 
 Write-Host "Started KaiMS local services."
+Write-Host ("Runtime mode:         {0}" -f $(if ($UseExternalInfrastructure) { "external MySQL/message bus" } else { "standalone (database and message bus disabled)" }))
 Write-Host "Monitoring adapter: http://localhost:8001"
 Write-Host "Approval service:   http://localhost:8007"
 Write-Host "Context agent:      http://localhost:8004"

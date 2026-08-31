@@ -1,0 +1,32 @@
+{
+  "rules": [
+    {
+      "name": "servicedown",
+      "service": "kaiops-core1",
+      "environment": "prod",
+      "severity": "critical",
+      "requested_by": "admin",
+      "requested_role": "administrator",
+      "updated_at": "2026-07-16T15:37:03.515Z"
+    },
+    {
+      "name": "kaiopsmysqlalertstablerowshigh",
+      "service": "mysql",
+      "environment": "prod",
+      "severity": "high",
+      "requested_by": "admin",
+      "requested_role": "administrator",
+      "updated_at": "2026-07-17T13:45:47.280Z"
+    },
+    {
+      "name": "lowrequestthroughput",
+      "service": "kaiops-platform",
+      "environment": "prod",
+      "severity": "warning",
+      "requested_by": "admin",
+      "requested_role": "administrator",
+      "updated_at": "2026-07-21T04:29:03.575Z"
+    }
+  ],
+  "updated_at": "2026-07-21T04:29:03.610626+00:00"
+}

@@ -1,0 +1,21 @@
+{
+  "project": {
+    "name": "new_kaiops",
+    "owner_team": "data",
+    "environment": "prod",
+    "region": "us-east-1"
+  },
+  "deployment_mode": "on_prem",
+  "prometheus_url": "http://prometheus:9090",
+  "new_relic_url": "",
+  "datadog_url": "",
+  "azure_subscription_id": "",
+  "azure_resource_group": "",
+  "azure_service_bus_namespace": "",
+  "azure_service_bus_topic": "kaiops-orchestration-events",
+  "azure_service_bus_subscription": "kaiops-orchestration-sub",
+  "azure_content_safety_enabled": false,
+  "azure_content_safety_endpoint": "",
+  "user_assignments": {},
+  "updated_at": null
+}

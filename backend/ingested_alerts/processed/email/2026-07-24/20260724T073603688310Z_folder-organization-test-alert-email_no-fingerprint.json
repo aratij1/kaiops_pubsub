@@ -1,0 +1,33 @@
+{
+  "received_at": "2026-07-24T07:36:03.688310+00:00",
+  "source": "email",
+  "status": "processed",
+  "error": null,
+  "alert": {
+    "source": "email",
+    "name": "folder-organization test alert (email)",
+    "service": "email-inbox",
+    "environment": "prod",
+    "severity": "warning",
+    "description": "Testing folder-organization for the email channel.",
+    "labels": {
+      "alert_status": "firing",
+      "email_from": "testtrubot@gmail.com",
+      "email_message_id": "<6a63151b.1905e68e.25404.f73f@mx.google.com>",
+      "support_tier": "L1"
+    },
+    "annotations": {
+      "summary": "folder-organization test alert (email)",
+      "body": "Testing folder-organization for the email channel.",
+      "received_at": "2026-07-24T00:32:43-07:00"
+    }
+  },
+  "raw": {
+    "message_id": "<6a63151b.1905e68e.25404.f73f@mx.google.com>",
+    "subject": "folder-organization test alert (email)",
+    "from": "testtrubot@gmail.com",
+    "to": "pihu40381@gmail.com",
+    "received_at": "2026-07-24T00:32:43-07:00",
+    "body": "Testing folder-organization for the email channel."
+  }
+}

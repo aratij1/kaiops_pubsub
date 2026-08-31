@@ -1,0 +1,63 @@
+{
+  "draft_id": "evidence-c5eb6a02-c83f-41c1-8b3a-4e4c9e28dbf4",
+  "status": "draft",
+  "alert_id": "c5eb6a02-c83f-41c1-8b3a-4e4c9e28dbf4",
+  "incident_id": "61e6b6f5-0b13-4650-b53b-7ede4a52a8ab",
+  "alert_type": "ApprovalServiceCapacityError1786540588",
+  "severity": "critical",
+  "title": "Evidence review: ApprovalServiceCapacityError1786540588",
+  "content": "## Alert\nApprovalServiceCapacityError1786540588 on approval-service (prod)\n\n## Evidence-backed summary\nEvidence was retrieved; model synthesis was unavailable.\n\n## Hypotheses\n- No grounded hypothesis was produced.\n\n## Collected evidence\n- [LOG-d79cf48da6a12048] log: 2026-08-12T13:08:14.412108338Z INFO: Started server process [1] (docker://kaiops_pub-approval-service-1#L1)\n- [TICKET-643571a3928e6f4d] ticket: KAN-1480 approval-service: ApprovalServiceCapacityError1786540588; type=Bug; status=To Do; priority=Medium; updated=2026-08-12T18:43:24.384+0530; labels=kaiops-candidate-94c295faf243c0df00b4c52228286396,kaiops-severity-critical,kaiops_incident_61e6b6f5_0b13_4650_b53b_7ede4a52a8ab,managed_by_kaiops; description=AI-discovered incident Service: approval-service Environment: prod Category: dependency Final severity: critical Confidence: 0.8 Initial hypothesis The approval-service signal is likely caused by a dependency condition. Business impact A subset of requests or dependent workflows may fail or slow down. Evidence [{\"evidence_id\": \"alert:c5eb6a02-c83f-41c1-8b3a-4e4c9e28dbf4\", \"source\": \"lo (https://kaiops-test.atlassian.net/browse/KAN-1480)\n- [CODE-eb032afdb155ca03] code: 1: from __future__ import annotations 2: 3: import asyncio 4: from collections.abc import Awaitable, Callable, Coroutine (code:///workspace/backend/src/approval-service/app.py#L1)\n- [MYSQL-05897a9f7e748613] mysql: table=incidents {\"id\": \"61e6b6f50b134650b53b7ede4a52a8ab\", \"tenant_id\": \"default\", \"service\": \"approval-service\", \"environment\": \"prod\", \"severity\": \"critical\", \"status\": \"investigating\", \"title\": \"approval-service: ApprovalServiceCapacityError1786540588\", \"ticket_id\": \"KAN-1480\", \"payload\": \"{\\\"id\\\": \\\"61e6b6f5-0b13-4650-b53b-7ede4a52a8ab\\\", \\\"title\\\": \\\"approval-service: ApprovalServiceCapacityError1786540588\\\", \\\"status\\\": \\\"investigating\\\", \\\"service\\\": \\\"approval-service\\\", \\\"summary\\\": \\\"approval-service is unreachable, connection refused, error in list_capacity function during capacity allocation (4.3 code-analysis full v (mysql://kaiops/incidents#row=61e6b6f50b134650b53b7ede4a52a8ab)\n- [LOG-f192e23a1de410ed] log: 2026-08-12T13:08:14.412203809Z INFO: Waiting for application startup. (docker://kaiops_pub-approval-service-1#L2)\n- [CODE-7cc575a57e5f20d0] code: 7: from typing import Any 8: from uuid import UUID 9: from zoneinfo import ZoneInfo, ZoneInfoNotFoundError 10: 11: import httpx 12: from common.config import get_settings 13: from common.database import ApprovalAssignmentRecord, ApprovalCapacityRecord (code:///workspace/backend/src/approval-service/app.py#L10)\n- [MYSQL-90cd7dbc55e875a7] mysql: table=incident_projections {\"incident_id\": \"61e6b6f50b134650b53b7ede4a52a8ab\", \"alert_id\": \"c5eb6a02c83f41c18b3a4e4c9e28dbf4\", \"trace_id\": \"a4ea680dcc4641bfa04d60e9a747f919\", \"recommendation_id\": null, \"flow_id\": null, \"tenant_id\": \"default\", \"service\": \"approval-service\", \"environment\": \"prod\", \"severity\": \"critical\", \"status\": \"investigating\", \"owner\": null, \"risk_tier\": \"high\", \"execution_mode\": \"human-approval\", \"requires_approval\": 1, \"policy_version\": \"policy-v1\", \"policy_reason\": \"severity in mandatory approval set; planner=deterministic severity routing\", \"transport_provider\": \"rabbitmq\", \"latest_event_id\": \"031db53d40454a9d88f6473 (mysql://kaiops/incident_projections#row=c5eb6a02c83f41c18b3a4e4c9e28dbf4)\n- [LOG-ec9b233bd764224c] log: 2026-08-12T13:08:14.452657697Z {\"asctime\": \"2026-08-12 13:08:14,452\", \"levelname\": \"INFO\", \"name\": \"common.rabbitmq\", \"message\": \"connected rabbitmq producer\", \"service\": \"common.rabbitmq\", \"trace_id\": \"\"} (docker://kaiops_pub-approval-service-1#L3)\n- [CODE-e68d835d575dc186] code: 97: 98: 99: async def startup(app: FastAPI) -> None: 100: workers = max(1, int(getattr(settings, \"message_bus_worker_count\", 1) or 1)) 101: consumers: list[tuple[str, Any, ConsumeRunner]] = [] 102: for worker in range(workers): 103: consumers.append( (code:///workspace/backend/src/approval-service/app.py#L100)\n- [MYSQL-81cd537059cc110a] mysql: table=alerts {\"id\": \"f0b8b9b8c37e41daae325cefdcc96bb7\", \"tenant_id\": \"default\", \"source\": \"jira\", \"name\": \"kaiops-approval-service: demo-checkout-4-memory-high\", \"service\": \"jira-tickets\", \"environment\": \"prod\", \"severity\": \"warning\", \"fingerprint\": null, \"correlation_id\": null, \"payload\": \"{\\\"id\\\": \\\"f0b8b9b8-c37e-41da-ae32-5cefdcc96bb7\\\", \\\"name\\\": \\\"kaiops-approval-service: demo-checkout-4-memory-high\\\", \\\"labels\\\": {\\\"ticket_id\\\": \\\"KAN-1462\\\", \\\"jira_status\\\": \\\"To Do\\\", \\\"alert_status\\\": \\\"firing\\\", \\\"event_origin\\\": \\\"kaiops\\\", \\\"support_tier\\\": \\\"L1\\\", \\\"jira_assignee\\\": \\\"\\\", \\\"jira_issue_id\\\": \\\"12272\\\", \\\"jira_prio (mysql://kaiops/alerts#row=f0b8b9b8c37e41daae325cefdcc96bb7)\n- [CODE-1d7a718e99c67d2f] code: 23 | from sqlalchemy import func, select\n   24 | \n   25 | settings = get_settings()\n   26 | settings.service_name = \"approval-service\"\n   27 | tasks: list[asyncio.Task] = []\n   28 | _background_tasks: set[asyncio.Task] = set()\n   29 | (code:///app/backend/src/approval-service/app.py#L26)\n- [CODE-3528fc83f11a5395] code: 115 |         PENDING_INCIDENTS[incident_id] = payload\n  116 | \n  117 |     for source, consumer, consume_forever in consumers:\n  118 |         task = asyncio.create_task(consume_forever(consumer, handle), name=f\"approval-service-{source}-consumer\")\n  119 |         tasks.append(task)\n  120 | \n  121 | (code:///app/backend/src/approval-service/app.py#L118)\n- [CODE-5cdba38782bea27c] code: 573 |         incident_id=incident_id,\n  574 |         trace_id=str(recommendation.get(\"trace_id\") or \"\"),\n  575 |         correlation_id=str(recommendation.get(\"correlation_id\") or \"\") or None,\n  576 |         agent=\"approval-service\",\n  577 |         payload={\n  578 |             \"decision\": approval.decision.value,\n  579 |             \"approver\": approval.approver, (code:///app/backend/src/approval-service/app.py#L576)\n- [CODE-4d6ea3f4ef3c8f98] code: 1905 |         \"resolution-agent\",\n 1906 |         \"remediation-engine\",\n 1907 |         \"closure-service\",\n 1908 |         \"approval-service\",\n 1909 |     ):\n 1910 |         candidate = str(services_root / relative_path)\n 1911 |         if candidate not in sys.path: (code:///app/backend/src/monitoring-adapter/app.py#L1908)\n- [CODE-2e53f4ad44b3581f] code: 61 |     model_router_url: str = Field(default=\"http://model-router:8000\", alias=\"MODEL_ROUTER_URL\")\n   62 |     context_agent_url: str = Field(default=\"http://context-agent:8000\", alias=\"CONTEXT_AGENT_URL\")\n   63 |     resolution_agent_url: str = Field(default=\"http://resolution-agent:8000\", alias=\"RESOLUTION_AGENT_URL\")\n   64 |     approval_service_url: str = Field(default=\"http://approval-service:8000\", alias=\"APPROVAL_SERVICE_URL\")\n   65 |     orchestrator_url: str = Field(default=\"http://orchestrator:8000\", alias=\"ORCHESTRATOR_URL\")\n   66 |     remediation_engine_url: str = Field(default=\"http://remediation-engine:8000\", alias=\"REMEDIATION_ENGINE_URL\")\n   67 |     monitoring_adapter_url: str = Field(default=\"http://monitoring-adapter:8000\", alias=\"MONITORING_ADAPTER_URL\") (code:///app/backend/src/common/common/config.py#L64)",
+  "services": [
+    "approval-service"
+  ],
+  "evidence_ids": [
+    "LOG-d79cf48da6a12048",
+    "TICKET-643571a3928e6f4d",
+    "CODE-eb032afdb155ca03",
+    "MYSQL-05897a9f7e748613",
+    "LOG-f192e23a1de410ed",
+    "CODE-7cc575a57e5f20d0",
+    "MYSQL-90cd7dbc55e875a7",
+    "LOG-ec9b233bd764224c",
+    "CODE-e68d835d575dc186",
+    "MYSQL-81cd537059cc110a",
+    "CODE-1d7a718e99c67d2f",
+    "CODE-3528fc83f11a5395",
+    "CODE-5cdba38782bea27c",
+    "CODE-4d6ea3f4ef3c8f98",
+    "CODE-2e53f4ad44b3581f"
+  ],
+  "source_uris": [
+    "docker://kaiops_pub-approval-service-1#L1",
+    "https://kaiops-test.atlassian.net/browse/KAN-1480",
+    "code:///workspace/backend/src/approval-service/app.py#L1",
+    "mysql://kaiops/incidents#row=61e6b6f50b134650b53b7ede4a52a8ab",
+    "docker://kaiops_pub-approval-service-1#L2",
+    "code:///workspace/backend/src/approval-service/app.py#L10",
+    "mysql://kaiops/incident_projections#row=c5eb6a02c83f41c18b3a4e4c9e28dbf4",
+    "docker://kaiops_pub-approval-service-1#L3",
+    "code:///workspace/backend/src/approval-service/app.py#L100",
+    "mysql://kaiops/alerts#row=f0b8b9b8c37e41daae325cefdcc96bb7",
+    "code:///app/backend/src/approval-service/app.py#L26",
+    "code:///app/backend/src/approval-service/app.py#L118",
+    "code:///app/backend/src/approval-service/app.py#L576",
+    "code:///app/backend/src/monitoring-adapter/app.py#L1908",
+    "code:///app/backend/src/common/common/config.py#L64"
+  ],
+  "created_at": "2026-08-12T13:16:51.721722+00:00",
+  "updated_at": "2026-08-12T13:16:51.721722+00:00",
+  "reviewed_by": null,
+  "review_notes": null,
+  "approved_by": null,
+  "approved_at": null,
+  "rag_document_path": null,
+  "evidence_relevance": {
+    "verified": true,
+    "identity_terms": [
+      "approval-service",
+      "approvalservicecapacityerror1786540588"
+    ],
+    "relevant_count": 15,
+    "retrieved_count": 17
+  }
+}

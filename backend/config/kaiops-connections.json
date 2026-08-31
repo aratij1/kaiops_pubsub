@@ -1,0 +1,96 @@
+{
+  "version": "kaiops-connections-v1",
+  "environment": "${ENVIRONMENT:-local}",
+  "cloud_provider": "${CLOUD_PROVIDER:-local}",
+  "deployment_profile": "${DEPLOYMENT_PROFILE:-onprem}",
+  "connection_architecture": {
+    "mode": "externalized-shared-state",
+    "principles": [
+      "Application services are stateless and connect to shared platform endpoints.",
+      "External application connectors use named profiles with explicit auth, secret, timeout, retry, and allowed operation contracts.",
+      "Secrets are referenced by secret_ref and injected by the runtime secret provider; secret values are not stored in this file.",
+      "Every external action must pass connector allowed_operations, policy, approval, audit, and post-check gates."
+    ]
+  },
+  "platform": {
+    "database": {
+      "_comment": "Reference/documentation only - not read by common/database.py:create_engine. The actual pool is configured via DB_POOL_SIZE/DB_MAX_OVERFLOW env vars (common/config.py).",
+      "provider": "mysql",
+      "url": "${DATABASE_URL:-mysql+aiomysql://kaiops:kaiops@mysql:3306/kaiops}",
+      "pool_size": "${DB_POOL_SIZE:-10}",
+      "max_overflow": "${DB_MAX_OVERFLOW:-20}",
+      "timeout_seconds": "${DB_POOL_TIMEOUT_SECONDS:-30}"
+    },
+    "cache": {
+      "provider": "redis",
+      "url": "${REDIS_URL:-redis://redis:6379/0}",
+      "timeout_seconds": 5
+    },
+    "message_bus": {
+      "provider": "${MESSAGE_BUS_DEFAULT_PROVIDER:-rabbitmq}",
+      "event_provider": "${EVENT_BUS_PROVIDER:-rabbitmq}",
+      "kafka_bootstrap_servers": "${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}",
+      "rabbitmq_url": "${RABBITMQ_URL:-amqp://guest:guest@rabbitmq:5672/}",
+      "worker_count": "${MESSAGE_BUS_WORKER_COUNT:-1}"
+    },
+    "vector_store": {
+      "provider": "${VECTOR_STORE_PROVIDER:-file-backed-memory}",
+      "index_name": "${VECTOR_INDEX_NAME:-kaiops-rag}",
+      "embedding_provider": "${EMBEDDING_PROVIDER:-local}",
+      "embedding_model": "${EMBEDDING_MODEL:-hashing-token-counter-v1}"
+    },
+    "observability": {
+      "trace_header": "x-kaiops-trace-id",
+      "sink": "${OBSERVABILITY_SINK:-prometheus}",
+      "otlp_endpoint": "${OTEL_EXPORTER_OTLP_ENDPOINT:-}"
+    }
+  },
+  "external_applications": {
+    "default_connector": "generic-api",
+    "connectors": {
+      "orders-db": {
+        "connector_id": "orders-db-api",
+        "system": "orders-db",
+        "type": "api",
+        "endpoint": "https://orders-db.internal/api",
+        "environment": "prod",
+        "owner_team": "database-sre",
+        "auth_method": "service-account-token",
+        "secret_ref": "vault://kaiops/prod/orders-db-token",
+        "timeout_seconds": 10,
+        "retry": { "max_attempts": 3, "backoff_seconds": 2 },
+        "health_check": { "method": "GET", "path": "/health" },
+        "allowed_operations": ["read_status", "failover_database", "verify_replication_health"]
+      },
+      "payments": {
+        "connector_id": "payments-k8s",
+        "system": "payments-api",
+        "type": "kubernetes",
+        "cluster": "prod-us-east-1",
+        "namespace": "payments",
+        "environment": "prod",
+        "owner_team": "payments-sre",
+        "auth_method": "kubeconfig-service-account",
+        "secret_ref": "vault://kaiops/prod/payments-kubeconfig",
+        "timeout_seconds": 15,
+        "retry": { "max_attempts": 2, "backoff_seconds": 3 },
+        "health_check": { "type": "deployment", "name": "payments-api" },
+        "allowed_operations": ["read_status", "rollback_deployment", "restart_pod", "verify_slo"]
+      },
+      "generic-api": {
+        "connector_id": "generic-api",
+        "system": "generic",
+        "type": "api",
+        "endpoint": "https://api.internal",
+        "environment": "${ENVIRONMENT:-local}",
+        "owner_team": "platform",
+        "auth_method": "service-account-token",
+        "secret_ref": "vault://kaiops/${ENVIRONMENT:-local}/default-token",
+        "timeout_seconds": 10,
+        "retry": { "max_attempts": 2, "backoff_seconds": 2 },
+        "health_check": { "method": "GET", "path": "/health" },
+        "allowed_operations": ["read_status"]
+      }
+    }
+  }
+}

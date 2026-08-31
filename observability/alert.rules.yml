@@ -1,4 +1,35 @@
 groups:
+  - name: online-boutique-payment-health
+    rules:
+      - alert: OnlineBoutiquePaymentServiceDown
+        expr: probe_success{job="online-boutique-payment",instance="ob-paymentservice:50051"} == 0
+        for: 15s
+        labels:
+          severity: critical
+          project_name: Online Boutique
+          application: Online Boutique
+          service: ob-paymentservice
+          environment: demo
+          source_system: prometheus
+        annotations:
+          summary: "Online Boutique payment service is down"
+          description: "ob-paymentservice:50051 has been unreachable for more than 15 seconds. The alert resolves automatically when the TCP endpoint recovers."
+
+  - name: kaiops-fault-lab
+    rules:
+      - alert: KaiOpsApplicationFaultDetected
+        expr: kaiops_fault_ratio{job="kaiops-fault-lab"} > 1
+        for: 15s
+        labels:
+          source: kaiops-fault-lab
+          severity: "{{ $labels.severity }}"
+          project_name: fault-lab
+          application: fault-lab
+          environment: test
+        annotations:
+          summary: "{{ $labels.alert_name }} on {{ $labels.service }}"
+          description: "Scenario {{ $labels.scenario_id }} breached its threshold. Example context ticket: {{ $labels.ticket_example }}."
+
   - name: kaiops-service-health
     rules:
       - alert: KaiOpsServiceDown
@@ -6,6 +37,8 @@ groups:
         for: 1m
         labels:
           severity: critical
+          project_name: KaiOps
+          application: KaiOps
         annotations:
           summary: "KaiOps service is down"
           description: "Service {{ $labels.job }} is not reachable by Prometheus for more than 1 minute."
@@ -17,6 +50,8 @@ groups:
           severity: warning
           category: latency
           landing_pad: realtime
+          project_name: KaiOps
+          application: KaiOps
         annotations:
           summary: "High p95 latency in KaiOps service"
           description: "Service {{ $labels.service }} operation {{ $labels.operation }} p95 latency is above 2s."
@@ -28,6 +63,8 @@ groups:
           severity: critical
           category: latency
           landing_pad: realtime
+          project_name: KaiOps
+          application: KaiOps
         annotations:
           summary: "Critical p99 latency in KaiOps service"
           description: "Service {{ $labels.service }} operation {{ $labels.operation }} p99 latency is above 3s."
@@ -44,6 +81,8 @@ groups:
           severity: warning
           category: latency
           landing_pad: realtime
+          project_name: KaiOps
+          application: KaiOps
         annotations:
           summary: "Latency SLI regression detected"
           description: "Under 95% of requests are completing within 1 second for {{ $labels.service }} / {{ $labels.operation }} over the last 10 minutes."
@@ -55,15 +94,36 @@ groups:
         for: 1m
         labels:
           severity: critical
+          service: mysql-exporter
+          environment: prod
+          project_name: KaiOps
+          application: KaiOps
         annotations:
           summary: "MySQL exporter is down"
           description: "mysql-exporter is not reachable by Prometheus."
+
+      - alert: MySQLExporterDatabaseConnectionFailed
+        expr: mysql_up{job="mysql-exporter"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: mysql-exporter
+          environment: prod
+          project_name: KaiOps
+          application: KaiOps
+        annotations:
+          summary: "MySQL exporter cannot connect to MySQL"
+          description: "mysql-exporter is reachable, but its MySQL connection check is failing. Verify exporter credentials, grants, and the mysql:3306 endpoint."
 
       - alert: MySQLTooManyConnections
         expr: mysql_global_status_threads_connected > 150
         for: 5m
         labels:
           severity: warning
+          service: mysql-exporter
+          environment: prod
+          project_name: KaiOps
+          application: KaiOps
         annotations:
           summary: "MySQL connections are high"
           description: "MySQL threads_connected is {{ $value }} which is above threshold 150."
@@ -146,6 +206,8 @@ groups:
         for: 2m
         labels:
           severity: critical
+          project_name: KaiOps
+          application: KaiOps
         annotations:
           summary: "Service down"
           description: "Endpoint {{ $labels.job }} is unreachable."
@@ -155,6 +217,8 @@ groups:
         for: 5m
         labels:
           severity: critical
+          project_name: KaiOps
+          application: KaiOps
         annotations:
           summary: "High application error rate"
           description: "Gateway non-ok status ratio is above threshold for the last 5 minutes."
@@ -164,6 +228,8 @@ groups:
         for: 10m
         labels:
           severity: warning
+          project_name: KaiOps
+          application: KaiOps
         annotations:
           summary: "High request latency"
           description: "P95 latency is above 500ms for {{ $labels.service }} {{ $labels.operation }}."
@@ -173,6 +239,8 @@ groups:
         for: 15m
         labels:
           severity: warning
+          project_name: KaiOps
+          application: KaiOps
         annotations:
           summary: "Low request throughput"
           description: "Request throughput dropped below expected baseline."
@@ -213,23 +281,56 @@ groups:
           summary: "High network packet loss"
           description: "HTTP probe success ratio dropped below 95% for target {{ $labels.instance }}."
 
-      - alert: KafkaConsumerLag
-        expr: sum(kafka_consumergroup_lag) > 50000
-        for: 10m
+      - alert: ExternalApplicationUnavailable
+        expr: probe_success{job="blackbox", external="true"} == 0
+        for: 30s
+        labels:
+          severity: critical
+          source: public-internet-blackbox
+        annotations:
+          summary: "External application {{ $labels.application }} is unavailable"
+          description: "HTTPS probe failed for {{ $labels.instance }} in {{ $labels.environment }}. Synthetic={{ $labels.synthetic }}."
+
+      - alert: RabbitMQQueueBacklog
+        # A 1,000-alert/minute burst is expected and must not page by itself.
+        # Alert only when more than two full burst-minutes remain queued.
+        expr: sum(rabbitmq_queue_messages_ready) > 2000
+        for: 5m
         labels:
           severity: warning
+          capacity_profile: alerts-1000-per-minute
         annotations:
-          summary: "Kafka consumer lag high"
-          description: "Kafka consumer lag is above 10,000 messages."
+          summary: "Alert pipeline backlog is not draining"
+          description: "More than two minutes of peak ingress remains queued for five minutes. Inspect consumer health and oldest-message age."
 
-      - alert: KafkaBrokerDown
-        expr: up{job=~".*kafka.*"} == 0
+      - alert: RabbitMQQueueBacklogCritical
+        expr: sum(rabbitmq_queue_messages_ready) > 5000
+        for: 2m
+        labels:
+          severity: critical
+          capacity_profile: alerts-1000-per-minute
+        annotations:
+          summary: "Alert pipeline backlog exceeded the recovery envelope"
+          description: "More than five peak minutes are queued. Pause low-priority ingestion or scale alert-intelligence consumers."
+
+      - alert: RabbitMQOldestMessageDelayed
+        expr: max(rabbitmq_queue_head_message_timestamp) > 0 and (time() - max(rabbitmq_queue_head_message_timestamp)) > 120
+        for: 2m
+        labels:
+          severity: warning
+          capacity_profile: alerts-1000-per-minute
+        annotations:
+          summary: "Alert processing delay exceeds two minutes"
+          description: "At least one queue head has waited longer than the alert-processing SLO."
+
+      - alert: RabbitMQBrokerDown
+        expr: up{job="kaiops-rabbitmq"} == 0
         for: 2m
         labels:
           severity: critical
         annotations:
-          summary: "Kafka broker down"
-          description: "Kafka broker target {{ $labels.instance }} is not responding."
+          summary: "RabbitMQ broker down"
+          description: "The KaiOps RabbitMQ broker is not responding."
 
       - alert: DatabaseConnectionFailure
         expr: (rate(mysql_global_status_aborted_connects[5m]) > 0.1) or ((mysql_global_status_threads_connected / clamp_min(mysql_global_variables_max_connections, 1)) > 0.98)
@@ -294,14 +395,19 @@ groups:
           summary: "Vector DB high latency"
           description: "Context agent execute-stage P95 latency is above 3 seconds."
 
-      - alert: KafkaTopicBacklog
-        expr: sum(kafka_topic_partition_current_offset - kafka_topic_partition_oldest_offset) > 250000
+      - alert: RabbitMQUnackedBacklog
+        # Sized for 10k-alerts/day: consumer prefetch counts are small
+        # (RABBITMQ_CONSUMER_PREFETCH_COUNT default 2), so unacked should
+        # stay in the tens even under burst. 2,000 held for 10m indicates
+        # consumers are stuck processing (or crash-looping before ack), not
+        # normal in-flight work.
+        expr: sum(rabbitmq_queue_messages_unacked) > 2000
         for: 10m
         labels:
           severity: warning
         annotations:
-          summary: "Kafka topic backlog high"
-          description: "Kafka topic backlog exceeded threshold."
+          summary: "RabbitMQ unacknowledged backlog high"
+          description: "RabbitMQ unacknowledged messages exceeded the operational threshold."
 
       - alert: AgentProcessingTimeout
         expr: histogram_quantile(0.95, sum(rate(kaiops_agent_stage_latency_seconds_bucket[5m])) by (le, agent)) > 90
@@ -356,3 +462,203 @@ groups:
         annotations:
           summary: "Incident processing queue high"
           description: "Raw alerts are being processed but no closure events are observed."
+
+  - name: robot-shop
+    rules:
+      - alert: RobotShopServiceDown
+        expr: up{job=~"robot-shop-.*"} == 0
+        for: 20s
+        labels:
+          severity: critical
+          source: robot-shop
+        annotations:
+          summary: "Robot Shop dependency {{ $labels.job }} is unreachable"
+          description: "Prometheus cannot scrape {{ $labels.job }} for more than 20s."
+
+      - alert: RobotShopMySQLTooManyConnections
+        expr: mysql_global_status_threads_connected > 50
+        for: 30s
+        labels:
+          severity: warning
+          source: robot-shop
+        annotations:
+          summary: "Robot Shop MySQL connections high"
+          description: "mysql_global_status_threads_connected is {{ $value }}."
+
+      - alert: RobotShopRabbitMQQueueBacklog
+        expr: sum(rabbitmq_queue_messages_ready) > 100
+        for: 30s
+        labels:
+          severity: warning
+          source: robot-shop
+        annotations:
+          summary: "Robot Shop RabbitMQ queue backlog"
+          description: "{{ $value }} messages ready and unconsumed across queues."
+
+      - alert: RobotShopRedisDown
+        expr: redis_up == 0
+        for: 20s
+        labels:
+          severity: critical
+          source: robot-shop
+        annotations:
+          summary: "Robot Shop Redis is unreachable"
+          description: "redis_exporter cannot reach the Redis instance."
+
+      - alert: RobotShopMongoDown
+        expr: mongodb_up == 0
+        for: 20s
+        labels:
+          severity: critical
+          source: robot-shop
+        annotations:
+          summary: "Robot Shop MongoDB is unreachable"
+          description: "mongodb_exporter cannot reach the MongoDB instance."
+
+  - name: online-boutique
+    rules:
+      # Online Boutique has no app-level metrics anywhere (verified against
+      # source), so its only real signal today is this HTTP health probe.
+      # NOTE: a per-container cAdvisor CPU/restart rule was deliberately
+      # NOT added here — verified live that this cAdvisor version doesn't
+      # expose a "name" label matching container names, so a label-matched
+      # rule would silently never fire. Not fixed here; flagged as a known
+      # gap.
+      - alert: OnlineBoutiqueFrontendDown
+        expr: probe_success{job="blackbox", instance="http://ob-frontend:8080/_healthz"} == 0
+        for: 15s
+        labels:
+          severity: critical
+          source: online-boutique
+        annotations:
+          summary: "Online Boutique frontend is not responding"
+          description: "blackbox probe against ob-frontend /_healthz has been failing for 15s."
+
+      - alert: OnlineBoutiqueFrontendSlow
+        expr: probe_duration_seconds{job="blackbox", instance="http://ob-frontend:8080/_healthz"} > 1
+        for: 30s
+        labels:
+          severity: warning
+          source: online-boutique
+        annotations:
+          summary: "Online Boutique frontend responding slowly"
+          description: "Health-check probe duration is {{ $value }}s."
+
+  - name: kaiops-context-knowledge-telemetry
+    rules:
+      - record: kaiops:context_cache_hit_ratio:5m
+        expr: sum(rate(kaiops_context_strategy_requests_total{strategy="continuous",outcome="cache_hit"}[5m])) / clamp_min(sum(rate(kaiops_context_strategy_requests_total{strategy="continuous",outcome=~"cache_hit|cache_miss"}[5m])), 0.000001)
+
+      - record: kaiops:context_reused_latency_p95_seconds:5m
+        expr: histogram_quantile(0.95, sum(rate(kaiops_context_strategy_duration_seconds_bucket{strategy="continuous",path="reused"}[5m])) by (le))
+
+      - record: kaiops:context_fresh_latency_p95_seconds:5m
+        expr: histogram_quantile(0.95, sum(rate(kaiops_context_strategy_duration_seconds_bucket{path="fresh_discovery"}[5m])) by (le, strategy))
+
+      - alert: KaiOpsContextDiscoveryFailures
+        expr: sum(increase(kaiops_context_strategy_requests_total{outcome="discovery_error"}[5m])) > 0
+        for: 1m
+        labels:
+          severity: critical
+          component: context-knowledge
+          source_system: telemetry
+        annotations:
+          summary: "Context discovery is failing"
+          description: "{{ $value }} context discovery failures occurred in the last five minutes."
+
+      - alert: KaiOpsContextKnowledgeRepositoryErrors
+        expr: sum(increase(kaiops_context_knowledge_operations_total{result=~"error|invalid"}[10m])) > 0
+        for: 2m
+        labels:
+          severity: warning
+          component: context-knowledge
+          source_system: telemetry
+        annotations:
+          summary: "Context knowledge repository operations are failing"
+          description: "Lookup, persistence, validation, or RCA attachment errors were observed in the last ten minutes. Fresh discovery remains the fallback path."
+
+      - alert: KaiOpsContextCacheHitRatioLow
+        expr: kaiops:context_cache_hit_ratio:5m < 0.20 and sum(increase(kaiops_context_strategy_requests_total{strategy="continuous",outcome=~"cache_hit|cache_miss"}[15m])) >= 20
+        for: 15m
+        labels:
+          severity: warning
+          component: context-knowledge
+          source_system: telemetry
+        annotations:
+          summary: "Continuous context cache hit ratio is low"
+          description: "Cache hit ratio has remained below 20% with sufficient traffic. Check alert signatures, TTL, and knowledge persistence."
+
+      - alert: KaiOpsReusedContextLatencyHigh
+        expr: kaiops:context_reused_latency_p95_seconds:5m > 2
+        for: 10m
+        labels:
+          severity: warning
+          component: context-knowledge
+          source_system: telemetry
+        annotations:
+          summary: "Reused context retrieval is slow"
+          description: "p95 reused-context latency is {{ $value }} seconds, above the 2 second objective."
+
+      - alert: KaiOpsFreshContextLatencyHigh
+        expr: kaiops:context_fresh_latency_p95_seconds:5m > 60
+        for: 10m
+        labels:
+          severity: warning
+          component: context-discovery
+          source_system: telemetry
+        annotations:
+          summary: "Fresh context discovery is slow"
+          description: "p95 fresh-discovery latency is {{ $value }} seconds, above the 60 second objective."
+
+      - alert: KaiOpsResolutionKnowledgeNotFound
+        expr: sum(increase(kaiops_context_knowledge_operations_total{operation="attach_resolution",result="not_found"}[15m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+          component: context-knowledge
+          source_system: telemetry
+        annotations:
+          summary: "RCA could not be attached to context knowledge"
+          description: "Resolution completed but its context knowledge record was not found."
+
+  - name: kaiops-production-telemetry
+    rules:
+      - alert: KaiOpsSSEDisconnected
+        expr: sum(kaiops_sse_connections) == 0
+        for: 15m
+        labels: {severity: warning, component: sse, source_system: telemetry}
+        annotations:
+          summary: "No KaiOps live-update clients are connected"
+          description: "No authenticated SSE connection has been observed for 15 minutes; clients may be using polling fallback."
+
+      - alert: KaiOpsDeadLettersIncreasing
+        expr: sum(increase(kaiops_dead_letter_events_total[10m])) > 0
+        for: 2m
+        labels: {severity: critical, component: message-bus, source_system: telemetry}
+        annotations:
+          summary: "KaiOps events are entering dead-letter queues"
+          description: "{{ $value }} events entered a dead-letter path in the last ten minutes."
+
+      - alert: KaiOpsWorkflowFailures
+        expr: sum(increase(kaiops_workflow_failures_total[10m])) > 0
+        for: 2m
+        labels: {severity: critical, component: workflow, source_system: telemetry}
+        annotations:
+          summary: "KaiOps durable workflow activity failures detected"
+          description: "{{ $value }} workflow activity failures occurred in the last ten minutes."
+
+      - alert: KaiOpsMySQLP95LatencyHigh
+        expr: histogram_quantile(0.95, sum(rate(kaiops_mysql_query_latency_seconds_bucket[5m])) by (le)) > 1
+        for: 10m
+        labels: {severity: warning, component: mysql, source_system: telemetry}
+        annotations:
+          summary: "KaiOps MySQL p95 query latency is high"
+          description: "MySQL p95 query latency has exceeded one second for ten minutes."
+
+      - alert: KaiOpsModelFallbackRateHigh
+        expr: sum(rate(kaiops_llm_fallback_total[10m])) > 0.1
+        for: 10m
+        labels: {severity: warning, component: model-router, source_system: telemetry}
+        annotations:
+          summary: "KaiOps model fallback rate is elevated"
+          description: "Model fallbacks exceed 0.1 per second; inspect provider health and quota."

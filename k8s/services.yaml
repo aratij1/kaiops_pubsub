@@ -20,7 +20,7 @@ spec:
         - name: monitoring-adapter
           image: ghcr.io/example/kaiops/monitoring-adapter:latest
           imagePullPolicy: IfNotPresent
-          workingDir: /app/services/monitoring-adapter
+          workingDir: /app/backend/src/monitoring-adapter
           command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
           envFrom: [{ configMapRef: { name: kaiops-config } }, { secretRef: { name: kaiops-secrets } }]
           env: [{ name: SERVICE_NAME, value: monitoring-adapter }]
@@ -65,7 +65,7 @@ spec:
         - name: api-gateway
           image: ghcr.io/example/kaiops/api-gateway:latest
           imagePullPolicy: IfNotPresent
-          workingDir: /app/services/api-gateway
+          workingDir: /app/backend/src/api-gateway
           command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
           envFrom: [{ configMapRef: { name: kaiops-config } }, { secretRef: { name: kaiops-secrets } }]
           env: [{ name: SERVICE_NAME, value: api-gateway }]
@@ -109,7 +109,7 @@ spec:
       containers:
         - name: alert-intelligence
           image: ghcr.io/example/kaiops/alert-intelligence:latest
-          workingDir: /app/services/alert-intelligence
+          workingDir: /app/backend/src/alert-intelligence
           command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
           envFrom: [{ configMapRef: { name: kaiops-config } }, { secretRef: { name: kaiops-secrets } }]
           env: [{ name: SERVICE_NAME, value: alert-intelligence }]
@@ -153,7 +153,7 @@ spec:
       containers:
         - name: orchestrator
           image: ghcr.io/example/kaiops/orchestrator:latest
-          workingDir: /app/services/orchestrator
+          workingDir: /app/backend/src/orchestrator
           command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
           envFrom: [{ configMapRef: { name: kaiops-config } }, { secretRef: { name: kaiops-secrets } }]
           env: [{ name: SERVICE_NAME, value: orchestrator }]
@@ -197,7 +197,7 @@ spec:
       containers:
         - name: context-agent
           image: ghcr.io/example/kaiops/context-agent:latest
-          workingDir: /app/services/context-agent
+          workingDir: /app/ai-workbench/src/context-agent
           command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
           envFrom: [{ configMapRef: { name: kaiops-config } }, { secretRef: { name: kaiops-secrets } }]
           env: [{ name: SERVICE_NAME, value: context-agent }]
@@ -241,7 +241,7 @@ spec:
       containers:
         - name: model-router
           image: ghcr.io/example/kaiops/model-router:latest
-          workingDir: /app/services/model-router
+          workingDir: /app/ai-workbench/src/model-router
           command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
           envFrom: [{ configMapRef: { name: kaiops-config } }, { secretRef: { name: kaiops-secrets } }]
           env: [{ name: SERVICE_NAME, value: model-router }]
@@ -285,7 +285,7 @@ spec:
       containers:
         - name: resolution-agent
           image: ghcr.io/example/kaiops/resolution-agent:latest
-          workingDir: /app/services/resolution-agent
+          workingDir: /app/ai-workbench/src/resolution-agent
           command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
           envFrom: [{ configMapRef: { name: kaiops-config } }, { secretRef: { name: kaiops-secrets } }]
           env: [{ name: SERVICE_NAME, value: resolution-agent }]
@@ -329,7 +329,7 @@ spec:
       containers:
         - name: approval-service
           image: ghcr.io/example/kaiops/approval-service:latest
-          workingDir: /app/services/approval-service
+          workingDir: /app/backend/src/approval-service
           command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
           envFrom: [{ configMapRef: { name: kaiops-config } }, { secretRef: { name: kaiops-secrets } }]
           env: [{ name: SERVICE_NAME, value: approval-service }]
@@ -373,7 +373,7 @@ spec:
       containers:
         - name: remediation-engine
           image: ghcr.io/example/kaiops/remediation-engine:latest
-          workingDir: /app/services/remediation-engine
+          workingDir: /app/backend/src/remediation-engine
           command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
           envFrom: [{ configMapRef: { name: kaiops-config } }, { secretRef: { name: kaiops-secrets } }]
           env: [{ name: SERVICE_NAME, value: remediation-engine }]
@@ -417,7 +417,7 @@ spec:
       containers:
         - name: closure-service
           image: ghcr.io/example/kaiops/closure-service:latest
-          workingDir: /app/services/closure-service
+          workingDir: /app/backend/src/closure-service
           command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
           envFrom: [{ configMapRef: { name: kaiops-config } }, { secretRef: { name: kaiops-secrets } }]
           env: [{ name: SERVICE_NAME, value: closure-service }]

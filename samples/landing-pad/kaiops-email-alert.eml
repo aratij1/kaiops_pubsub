@@ -1,0 +1,26 @@
+From: application-monitoring@alerts.kaiops.example
+To: kaiops-landing-pad@operations.example
+Date: Sat, 25 Jul 2026 12:00:00 +0000
+Message-ID: <kaiops-email-provenance-20260725@alerts.kaiops.example>
+Subject: [P2][FIRING][PROD] Email ingestion verification | checkout-api
+X-KaiOps-Event-Type: alert
+X-KaiOps-Alert-Status: firing
+X-KaiOps-Application-ID: kaiops
+X-KaiOps-Service: checkout-api
+X-KaiOps-Severity: High
+X-KaiOps-Correlation-ID: INC-EMAIL-20260725
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+
+Hello KaiOps,
+
+ALERT DETAILS
+Alert: Email ingestion verification
+Status: FIRING
+Severity: High
+Application: kaiops
+Service: checkout-api
+Environment: Production
+
+The email landing pad detected a controlled verification alert. Correlate it
+with current logs, source code, deployments, and related tickets before RCA.

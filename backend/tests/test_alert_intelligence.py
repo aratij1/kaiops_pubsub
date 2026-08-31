@@ -1,0 +1,202 @@
+from alert_intelligence import AlertIntelligenceAgent
+from common.models import Alert, AlertSeverity
+from common.repository_interfaces import InMemoryAlertHistoryRepository
+import pytest
+from datetime import timedelta
+
+
+def make_alert(description: str = "payment latency above threshold") -> Alert:
+    return Alert(
+        source="prometheus",
+        name="PaymentLatencyHigh",
+        service="payments",
+        severity=AlertSeverity.WARNING,
+        description=description,
+        labels={"deployment": "payments-api", "team": "payments-sre"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_alert_intelligence_deduplicates_and_classifies() -> None:
+    agent = AlertIntelligenceAgent()
+    first, first_incident = await agent.process(make_alert())
+    second, _ = await agent.process(make_alert())
+
+    assert first.severity == AlertSeverity.CRITICAL
+    assert second.deduplicated_count == 2
+    assert first.metadata["deduplication"]["disposition"] == "new_incident"
+    assert second.metadata["deduplication"]["disposition"] == "duplicate"
+    assert second.correlation_id == first.correlation_id
+    assert first_incident.owner_team == "payments-sre"
+
+
+@pytest.mark.asyncio
+async def test_alert_intelligence_uses_embedding_correlation() -> None:
+    agent = AlertIntelligenceAgent(correlation_threshold=0.2)
+    first, _ = await agent.process(make_alert("checkout payment latency high"))
+    correlated, _ = await agent.process(make_alert("payment checkout latency degraded"))
+
+    assert correlated.correlation_id == first.correlation_id
+
+
+@pytest.mark.asyncio
+async def test_alert_intelligence_uses_enterprise_correlation_evidence() -> None:
+    agent = AlertIntelligenceAgent(correlation_threshold=0.72)
+    first, _ = await agent.process(
+        Alert(
+            source="prometheus",
+            name="PaymentLatencyHigh",
+            service="payments-api",
+            severity=AlertSeverity.HIGH,
+            description="checkout p95 latency above threshold after deployment 2.5",
+            labels={
+                "team": "payments-sre",
+                "deployment": "payments-api",
+                "namespace": "checkout",
+                "dependency": "ledger-api",
+                "metric": "http_request_duration_seconds",
+            },
+        )
+    )
+    correlated, _ = await agent.process(
+        Alert(
+            source="prometheus",
+            name="PaymentTimeoutRateHigh",
+            service="checkout",
+            severity=AlertSeverity.HIGH,
+            description="payment timeout rate degraded for checkout path",
+            labels={
+                "team": "payments-sre",
+                "deployment": "payments-api",
+                "namespace": "checkout",
+                "upstream": "payments-api",
+                "dependency": "ledger-api",
+                "metric": "http_request_duration_seconds",
+            },
+        )
+    )
+
+    assert correlated.correlation_id == first.correlation_id
+    assert correlated.metadata["correlation"]["matched"] is True
+    assert correlated.metadata["correlation"]["evidence"]["deployment_change"] > 0
+    assert "ledger" in correlated.metadata["correlation"]["evidence"]["topology_overlap"]
+
+
+@pytest.mark.asyncio
+async def test_alert_intelligence_does_not_correlate_unrelated_services() -> None:
+    agent = AlertIntelligenceAgent(correlation_threshold=0.72)
+    first, _ = await agent.process(make_alert("payment latency above threshold"))
+    unrelated, _ = await agent.process(
+        Alert(
+            source="prometheus",
+            name="WarehouseDiskUsageHigh",
+            service="warehouse-storage",
+            severity=AlertSeverity.WARNING,
+            description="warehouse disk usage crossed warning threshold",
+            labels={"deployment": "warehouse-storage", "team": "data-platform", "metric": "disk_usage_percent"},
+        )
+    )
+
+    assert unrelated.correlation_id != first.correlation_id
+    assert unrelated.metadata["correlation"]["matched"] is False
+
+
+@pytest.mark.asyncio
+async def test_process_fetches_alert_history_once_per_alert() -> None:
+    """Dedup and correlation previously issued two independent unfiltered
+    history scans per incoming alert. process() must now share a single
+    environment-scoped fetch between both steps."""
+
+    class CountingRepository(InMemoryAlertHistoryRepository):
+        def __init__(self) -> None:
+            super().__init__()
+            self.list_calls: list[str | None] = []
+
+        async def list_recent_alerts(self, *, environment: str | None = None, tenant_id: str | None = None):
+            self.list_calls.append(environment)
+            return await super().list_recent_alerts(environment=environment, tenant_id=tenant_id)
+
+    repository = CountingRepository()
+    agent = AlertIntelligenceAgent(alert_history_repository=repository)
+
+    await agent.process(make_alert())
+
+    assert repository.list_calls == ["prod"]
+
+
+def test_embedding_cache_is_bounded() -> None:
+    """The embedding cache used to be an unbounded dict that grew for the
+    life of the process. It must now evict the oldest entry once the cap is
+    exceeded instead of leaking memory across a long-running soak."""
+    agent = AlertIntelligenceAgent()
+    agent._embedding_cache_max_size = 3
+
+    agent._embed("alert-text-1")
+    agent._embed("alert-text-2")
+    agent._embed("alert-text-3")
+    agent._embed("alert-text-4")
+
+    assert len(agent._embedding_cache) == 3
+    assert "alert-text-1" not in agent._embedding_cache
+    assert "alert-text-4" in agent._embedding_cache
+
+
+@pytest.mark.asyncio
+async def test_alert_deduplication_can_be_disabled() -> None:
+    repository = InMemoryAlertHistoryRepository()
+    agent = AlertIntelligenceAgent(alert_history_repository=repository, deduplication_enabled=False)
+    original = make_alert()
+    await repository.record_alert(original)
+
+    duplicate = make_alert()
+    enriched = await agent.deduplicate_alerts(duplicate, [original])
+
+    assert enriched.deduplicated_count == 1
+    assert enriched.metadata["deduplication"]["enabled"] is False
+
+
+@pytest.mark.asyncio
+async def test_similar_alert_within_configured_hour_is_duplicate() -> None:
+    repository = InMemoryAlertHistoryRepository()
+    agent = AlertIntelligenceAgent(
+        alert_history_repository=repository,
+        deduplication_window_minutes=60,
+        correlation_threshold=0.2,
+    )
+    original = make_alert("checkout payment latency high")
+    original.fingerprint = agent._fingerprint(original)
+    await repository.record_alert(original)
+    similar = Alert(
+        source="prometheus",
+        name="CheckoutLatencyDegraded",
+        service="payments",
+        severity=AlertSeverity.WARNING,
+        description="payment response latency degraded in checkout",
+        labels={"deployment": "payments-api", "team": "payments-sre"},
+        starts_at=original.starts_at + timedelta(minutes=59),
+    )
+
+    enriched = await agent.deduplicate_alerts(similar, [original])
+
+    assert enriched.metadata["deduplication"]["disposition"] == "duplicate"
+    assert enriched.metadata["deduplication"]["match_type"] == "similar"
+
+
+@pytest.mark.asyncio
+async def test_similar_alert_outside_configured_hour_is_new() -> None:
+    agent = AlertIntelligenceAgent(deduplication_window_minutes=60, correlation_threshold=0.2)
+    original = make_alert("checkout payment latency high")
+    original.fingerprint = agent._fingerprint(original)
+    original.starts_at = original.starts_at - timedelta(minutes=61)
+    similar = Alert(
+        source="prometheus",
+        name="CheckoutLatencyDegraded",
+        service="payments",
+        severity=AlertSeverity.WARNING,
+        description="payment response latency degraded in checkout",
+        labels={"deployment": "payments-api", "team": "payments-sre"},
+    )
+
+    enriched = await agent.deduplicate_alerts(similar, [original])
+
+    assert enriched.metadata["deduplication"]["disposition"] == "new_incident"

@@ -1,0 +1,64 @@
+# Optional overlay to deploy application and AI layers independently.
+#
+# Application-only VM/cluster:
+#   docker compose --profile application-layer --env-file .env -f docker-compose.yml -f docker-compose.external-state.yml -f docker-compose.layered.yml up -d
+#
+# AI-only VM/cluster:
+#   docker compose --profile ai-layer --env-file .env -f docker-compose.yml -f docker-compose.external-state.yml -f docker-compose.layered.yml up -d
+#
+# All layers in one environment:
+#   docker compose --profile application-layer --profile ai-layer --env-file .env -f docker-compose.yml -f docker-compose.layered.yml up -d
+
+services:
+  node-exporter:
+    profiles: ["application-layer"]
+  blackbox-exporter:
+    profiles: ["application-layer"]
+  alertmanager:
+    profiles: ["application-layer"]
+  prometheus:
+    profiles: ["application-layer"]
+  monitoring-adapter:
+    profiles: ["application-layer"]
+  application-onboarding:
+    profiles: ["application-layer"]
+  discovery-service:
+    profiles: ["application-layer"]
+  metrics-validation-agent:
+    profiles: ["application-layer"]
+  rule-generation-agent:
+    profiles: ["application-layer"]
+  prometheus-config-service:
+    profiles: ["application-layer"]
+  validation-agent:
+    profiles: ["application-layer"]
+  dashboard-generator:
+    profiles: ["application-layer"]
+  audit-service:
+    profiles: ["application-layer"]
+  api-gateway:
+    profiles: ["application-layer"]
+  alert-intelligence:
+    profiles: ["application-layer"]
+  orchestrator:
+    profiles: ["application-layer"]
+    depends_on: !reset []
+  approval-service:
+    profiles: ["application-layer"]
+  notification-service:
+    profiles: ["application-layer"]
+  remediation-engine:
+    profiles: ["application-layer"]
+  closure-service:
+    profiles: ["application-layer"]
+  ui:
+    profiles: ["application-layer"]
+
+  context-agent:
+    profiles: ["ai-layer"]
+  model-router:
+    profiles: ["ai-layer"]
+  resolution-agent:
+    profiles: ["ai-layer"]
+  evaluation-service:
+    profiles: ["ai-layer"]

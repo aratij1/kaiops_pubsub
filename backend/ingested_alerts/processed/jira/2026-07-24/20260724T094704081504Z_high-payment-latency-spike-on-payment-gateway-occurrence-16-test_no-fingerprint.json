@@ -1,0 +1,215 @@
+{
+  "received_at": "2026-07-24T09:47:04.081504+00:00",
+  "source": "jira",
+  "status": "processed",
+  "error": null,
+  "alert": {
+    "source": "jira",
+    "name": "[High] Payment latency spike on payment-gateway - occurrence 16 - test",
+    "service": "KAN",
+    "environment": "prod",
+    "severity": "high",
+    "description": "KaiOps historical monitoring incident for contextual RCA retrieval.\n\nALERT DETAILS\n- Alert: Payment latency spike\n- Service: payment-gateway\n- Source: Datadog\n- Environment: Production\n- Evidence: p95 latency exceeded 2.5 seconds for 15 minutes; occurrence 16/20. KaiOps correlation found 1 related signals across 2 monitored resources.\n- Correlation ID: INC-2025-10036\n\nROOT CAUSE\nA downstream payment-provider route degraded and retries amplified request latency.\n\nBUSINESS IMPACT\npayment-gateway performance or availability was degraded; approximately 2748 transactions or events were affected, with partial SLA impact and increased support workload.\n\nRESOLUTION STEPS\n1. Shift traffic to the healthy provider route.\n2. reduce retry count.\n3. enable circuit breaker.\n4. monitor authorization latency.\n\nVALIDATION\np95 below 800 ms and authorization success above 98.5% for 20 minutes.\n\nPREVENTION\nAdd regression coverage for payment latency spike; retain the alert with early-warning threshold; track recurrence using scenario label kaiops-scenario-02; review capacity/configuration during the next problem-management cycle.",
+    "labels": {
+      "alert_status": "firing",
+      "ticket_id": "KAN-45",
+      "jira_issue_id": "10133",
+      "jira_status": "Done",
+      "jira_priority": "High",
+      "jira_reporter": "Arati",
+      "jira_assignee": "",
+      "jira_webhook_event": "jira:issue_updated",
+      "support_tier": "L2/L3"
+    },
+    "annotations": {
+      "summary": "[High] Payment latency spike on payment-gateway - occurrence 16 - test",
+      "description": "KaiOps historical monitoring incident for contextual RCA retrieval.\n\nALERT DETAILS\n- Alert: Payment latency spike\n- Service: payment-gateway\n- Source: Datadog\n- Environment: Production\n- Evidence: p95 latency exceeded 2.5 seconds for 15 minutes; occurrence 16/20. KaiOps correlation found 1 related signals across 2 monitored resources.\n- Correlation ID: INC-2025-10036\n\nROOT CAUSE\nA downstream payment-provider route degraded and retries amplified request latency.\n\nBUSINESS IMPACT\npayment-gateway performance or availability was degraded; approximately 2748 transactions or events were affected, with partial SLA impact and increased support workload.\n\nRESOLUTION STEPS\n1. Shift traffic to the healthy provider route.\n2. reduce retry count.\n3. enable circuit breaker.\n4. monitor authorization latency.\n\nVALIDATION\np95 below 800 ms and authorization success above 98.5% for 20 minutes.\n\nPREVENTION\nAdd regression coverage for payment latency spike; retain the alert with early-warning threshold; track recurrence using scenario label kaiops-scenario-02; review capacity/configuration during the next problem-management cycle."
+    }
+  },
+  "raw": {
+    "timestamp": 1784886235544,
+    "webhookEvent": "jira:issue_updated",
+    "issue_event_type_name": "issue_updated",
+    "user": {
+      "self": "https://kaiops-test.atlassian.net/rest/api/2/user?accountId=712020%3Adf3b29b4-6c2d-46f9-9b7f-4a3f2ba557c8",
+      "accountId": "712020:df3b29b4-6c2d-46f9-9b7f-4a3f2ba557c8",
+      "avatarUrls": {
+        "48x48": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png",
+        "24x24": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png",
+        "16x16": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png",
+        "32x32": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png"
+      },
+      "displayName": "Arati",
+      "active": true,
+      "timeZone": "Asia/Calcutta",
+      "accountType": "atlassian"
+    },
+    "issue": {
+      "id": "10133",
+      "self": "https://kaiops-test.atlassian.net/rest/api/2/issue/10133",
+      "key": "KAN-45",
+      "fields": {
+        "statuscategorychangedate": null,
+        "issuetype": {
+          "self": "https://kaiops-test.atlassian.net/rest/api/2/issuetype/10008",
+          "id": "10008",
+          "description": "Tasks track small, distinct pieces of work.",
+          "iconUrl": "https://kaiops-test.atlassian.net/rest/api/2/universal_avatar/view/type/issuetype/avatar/10318?size=medium",
+          "name": "Task",
+          "subtask": false,
+          "avatarId": 10318,
+          "entityId": "8963f416-c42c-4ae6-a254-4ea0ab794a4e",
+          "hierarchyLevel": 0
+        },
+        "components": [],
+        "timespent": 0,
+        "timeoriginalestimate": 0,
+        "project": {
+          "self": "https://kaiops-test.atlassian.net/rest/api/2/project/10001",
+          "id": "10001",
+          "key": "KAN",
+          "name": "kaiops-test",
+          "projectTypeKey": "software",
+          "simplified": true,
+          "avatarUrls": {
+            "48x48": "https://kaiops-test.atlassian.net/rest/api/2/universal_avatar/view/type/project/avatar/10415",
+            "24x24": "https://kaiops-test.atlassian.net/rest/api/2/universal_avatar/view/type/project/avatar/10415?size=small",
+            "16x16": "https://kaiops-test.atlassian.net/rest/api/2/universal_avatar/view/type/project/avatar/10415?size=xsmall",
+            "32x32": "https://kaiops-test.atlassian.net/rest/api/2/universal_avatar/view/type/project/avatar/10415?size=medium"
+          }
+        },
+        "description": "KaiOps historical monitoring incident for contextual RCA retrieval.\n\nALERT DETAILS\n- Alert: Payment latency spike\n- Service: payment-gateway\n- Source: Datadog\n- Environment: Production\n- Evidence: p95 latency exceeded 2.5 seconds for 15 minutes; occurrence 16/20. KaiOps correlation found 1 related signals across 2 monitored resources.\n- Correlation ID: INC-2025-10036\n\nROOT CAUSE\nA downstream payment-provider route degraded and retries amplified request latency.\n\nBUSINESS IMPACT\npayment-gateway performance or availability was degraded; approximately 2748 transactions or events were affected, with partial SLA impact and increased support workload.\n\nRESOLUTION STEPS\n1. Shift traffic to the healthy provider route.\n2. reduce retry count.\n3. enable circuit breaker.\n4. monitor authorization latency.\n\nVALIDATION\np95 below 800 ms and authorization success above 98.5% for 20 minutes.\n\nPREVENTION\nAdd regression coverage for payment latency spike; retain the alert with early-warning threshold; track recurrence using scenario label kaiops-scenario-02; review capacity/configuration during the next problem-management cycle.",
+        "fixVersions": [],
+        "statusCategory": {
+          "self": "https://kaiops-test.atlassian.net/rest/api/2/statuscategory/3",
+          "id": 3,
+          "key": "done",
+          "colorName": "green",
+          "name": "Complete"
+        },
+        "aggregatetimespent": 0,
+        "resolution": null,
+        "timetracking": {
+          "originalEstimate": "0m",
+          "remainingEstimate": "0m",
+          "timeSpent": "0m",
+          "originalEstimateSeconds": 0,
+          "remainingEstimateSeconds": 0,
+          "timeSpentSeconds": 0
+        },
+        "customfield_10015": null,
+        "security": null,
+        "attachment": [],
+        "aggregatetimeestimate": 0,
+        "resolutiondate": null,
+        "workratio": -1,
+        "summary": "[High] Payment latency spike on payment-gateway - occurrence 16 - test",
+        "lastViewed": "2026-07-24T15:13:47.740+0530",
+        "watches": {
+          "self": "https://kaiops-test.atlassian.net/rest/api/2/issue/KAN-45/watchers",
+          "watchCount": 0,
+          "isWatching": false
+        },
+        "issuerestriction": {
+          "issuerestrictions": {},
+          "shouldDisplay": true
+        },
+        "creator": {
+          "self": "https://kaiops-test.atlassian.net/rest/api/2/user?accountId=712020%3Adf3b29b4-6c2d-46f9-9b7f-4a3f2ba557c8",
+          "accountId": "712020:df3b29b4-6c2d-46f9-9b7f-4a3f2ba557c8",
+          "avatarUrls": {
+            "48x48": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png",
+            "24x24": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png",
+            "16x16": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png",
+            "32x32": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png"
+          },
+          "displayName": "Arati",
+          "active": true,
+          "timeZone": "Asia/Calcutta",
+          "accountType": "atlassian"
+        },
+        "subtasks": [],
+        "created": "2026-07-24T14:51:51.158+0530",
+        "reporter": {
+          "self": "https://kaiops-test.atlassian.net/rest/api/2/user?accountId=712020%3Adf3b29b4-6c2d-46f9-9b7f-4a3f2ba557c8",
+          "accountId": "712020:df3b29b4-6c2d-46f9-9b7f-4a3f2ba557c8",
+          "avatarUrls": {
+            "48x48": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png",
+            "24x24": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png",
+            "16x16": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png",
+            "32x32": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png"
+          },
+          "displayName": "Arati",
+          "active": true,
+          "timeZone": "Asia/Calcutta",
+          "accountType": "atlassian"
+        },
+        "customfield_10021": null,
+        "aggregateprogress": {
+          "progress": 0,
+          "total": 0
+        },
+        "priority": {
+          "self": "https://kaiops-test.atlassian.net/rest/api/2/priority/2",
+          "iconUrl": "https://kaiops-test.atlassian.net/images/icons/priorities/high_new.svg",
+          "name": "High",
+          "id": "2"
+        },
+        "customfield_10001": null,
+        "labels": [
+          "application",
+          "historical-context",
+          "kaiops",
+          "kaiops-scenario-02",
+          "monitoring"
+        ],
+        "environment": "Production",
+        "customfield_10019": "0|i00087:",
+        "timeestimate": 0,
+        "aggregatetimeoriginalestimate": 0,
+        "versions": [],
+        "duedate": null,
+        "progress": {
+          "progress": 0,
+          "total": 0
+        },
+        "votes": {
+          "self": "https://kaiops-test.atlassian.net/rest/api/2/issue/KAN-45/votes",
+          "votes": 0,
+          "hasVoted": false
+        },
+        "issuelinks": [],
+        "assignee": null,
+        "updated": "2026-07-24T15:13:55.544+0530",
+        "status": {
+          "self": "https://kaiops-test.atlassian.net/rest/api/2/status/10007",
+          "description": "",
+          "iconUrl": "https://kaiops-test.atlassian.net/images/icons/statuses/generic.png",
+          "name": "Done",
+          "id": "10007",
+          "statusCategory": {
+            "self": "https://kaiops-test.atlassian.net/rest/api/2/statuscategory/3",
+            "id": 3,
+            "key": "done",
+            "colorName": "green",
+            "name": "Complete"
+          }
+        }
+      }
+    },
+    "changelog": {
+      "id": "11140",
+      "items": [
+        {
+          "field": "summary",
+          "fieldtype": "jira",
+          "fieldId": "summary",
+          "from": null,
+          "fromString": "[High] Payment latency spike on payment-gateway - occurrence 16",
+          "to": null,
+          "toString": "[High] Payment latency spike on payment-gateway - occurrence 16 - test"
+        }
+      ]
+    }
+  }
+}

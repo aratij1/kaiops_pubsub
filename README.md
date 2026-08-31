@@ -4,6 +4,41 @@ KaiMS is an end-to-end Python 3.12 microservice platform for agentic incident
 triage, root-cause analysis, human approval, automated remediation, closure
 validation, and knowledge capture.
 
+## Recommended local startup
+
+KaiMS defaults to the `cloud-neutral` deployment profile. Provider services
+(Azure Service Bus/Monitor/OpenAI, AWS object storage, and GCP integrations)
+remain optional adapters and are activated only by an explicit profile or
+environment configuration.
+
+```powershell
+python scripts/switch_service_profile.py --profile cloud-neutral --env-file .env
+```
+
+Use the lean runtime for normal operation. It preserves the end-to-end incident
+and learning workflow while reducing the default Compose topology from 39 to 22
+services:
+
+```powershell
+.\scripts\start-kaims.ps1
+```
+
+The launcher starts an explicit 21-service runtime, builds one image at a time,
+checks Docker Desktop capacity, and waits for the UI health endpoint. Do not use
+an unscoped `docker compose up -d --build` on an 8 GB Docker Desktop instance;
+that can start optional observability, authoring, demo, and compatibility
+services together and exhaust the daemon.
+
+Rebuild only the UI with bounded Docker pressure:
+
+```powershell
+.\scripts\rebuild-ui.ps1 -Validate
+```
+
+Observability, monitoring-rule authoring, evaluation, and full compatibility are
+available as opt-in profiles. See
+[`docs/operations/deployment-profiles.md`](docs/operations/deployment-profiles.md).
+
 ## Demo Guide
 
 - End user and executive demo script: [docs/DEMO_EXECUTIVE_AND_END_USER.md](docs/DEMO_EXECUTIVE_AND_END_USER.md)
@@ -15,6 +50,16 @@ validation, and knowledge capture.
 - Event envelope schema v1: [docs/metadata/event-envelope-v1.schema.json](docs/metadata/event-envelope-v1.schema.json)
 - Docs index and standards overview: [docs/README.md](docs/README.md)
 - Deployment strategy runbook: [docs/DEPLOYMENT_STRATEGY.md](docs/DEPLOYMENT_STRATEGY.md)
+- Azure Foundry deployment runbook: [docs/AZURE_FOUNDRY_DEPLOYMENT.md](docs/AZURE_FOUNDRY_DEPLOYMENT.md)
+- Azure Foundry one-command deploy script: [scripts/deploy-azure-foundry.ps1](scripts/deploy-azure-foundry.ps1)
+- Azure Foundry provisioning script (resource bootstrap): [scripts/provision-azure-foundry.ps1](scripts/provision-azure-foundry.ps1)
+- Azure VM deployment script (SSH + Docker Compose): [scripts/deploy-to-azure-vm.ps1](scripts/deploy-to-azure-vm.ps1)
+- Cloud-agnostic scaling and migration runbook: [docs/CLOUD_AGNOSTIC_SCALING.md](docs/CLOUD_AGNOSTIC_SCALING.md)
+- Queue-depth (KEDA) autoscaling for RabbitMQ-consuming services: [docs/QUEUE_DEPTH_AUTOSCALING.md](docs/QUEUE_DEPTH_AUTOSCALING.md)
+- Cloud-neutral VM deployment script: [scripts/deploy-to-vm.ps1](scripts/deploy-to-vm.ps1)
+- Standard connection architecture: [docs/CONNECTION_ARCHITECTURE.md](docs/CONNECTION_ARCHITECTURE.md)
+- AI/application layer separation: [docs/AI_APPLICATION_LAYER_SEPARATION.md](docs/AI_APPLICATION_LAYER_SEPARATION.md)
+- Cloud switch and data migration process: [docs/CLOUD_SWITCH_AND_DATA_MIGRATION.md](docs/CLOUD_SWITCH_AND_DATA_MIGRATION.md)
 - RAG content governance and templates: [docs/RAG_CONTENT_STANDARD.md](docs/RAG_CONTENT_STANDARD.md)
 - RAG templates: [docs/rag-templates/runbook.template.md](docs/rag-templates/runbook.template.md), [docs/rag-templates/incident.template.md](docs/rag-templates/incident.template.md), [docs/rag-templates/change.template.md](docs/rag-templates/change.template.md), [docs/rag-templates/dependency.template.md](docs/rag-templates/dependency.template.md), [docs/rag-templates/deployment.template.md](docs/rag-templates/deployment.template.md), [docs/rag-templates/sop.template.md](docs/rag-templates/sop.template.md), [docs/rag-templates/onboarding.template.md](docs/rag-templates/onboarding.template.md)
 - RAG metadata validator: [scripts/validate-rag-metadata.py](scripts/validate-rag-metadata.py)
@@ -24,20 +69,20 @@ validation, and knowledge capture.
 
 ```text
 Monitoring Tools
-  Prometheus | Grafana | Datadog | Splunk | Azure Monitor
-        -> Kafka raw-alerts
+  Prometheus | Grafana | Datadog | Splunk | cloud monitoring adapters
+        -> Event Bus (RabbitMQ | Kafka | provider adapter) raw-alerts
         -> Alert Intelligence Agent
-        -> Kafka enriched-alerts
+        -> Event Bus enriched-alerts
         -> Orchestrator Agent
-  -> Kafka orchestration-events
+  -> Event Bus orchestration-events
         -> Context Intelligence Agent
-        -> Kafka context-events
+        -> Event Bus context-events
         -> Resolution Intelligence Agent (LangGraph)
-        -> Kafka resolution-events
+        -> Event Bus resolution-events
         -> Remediation Automation Engine
-        -> Kafka remediation-events
+        -> Event Bus remediation-events
         -> Closure & Validation
-        -> Kafka closure-events
+        -> Event Bus closure-events
 ```
 
 ## Agentic Orchestration Architecture
@@ -84,31 +129,91 @@ To add a new enterprise agent:
 
 Notes:
 
-- Canonical topic names are defined in `services/common/common/topics.py`.
+- Canonical topic names are defined in `backend/src/common/common/topics.py`.
 - With `KAFKA_ENABLED=false`, the local in-process workflow path bypasses Kafka topics and runs directly via gateway/monitoring-adapter workflow endpoints.
 
 ## Folder Structure
 
 ```text
-services/
-  api-gateway/             Safety checks, trace IDs, observability, proxy routes
-  monitoring-adapter/      FastAPI webhook adapter for monitoring tools
-  alert-intelligence/      Deduplication, correlation, severity, enrichment
-  orchestrator/            Workflow decision and downstream invocation
-  model-router/            GPT-4o, GPT-5, Claude, Gemini, local Llama routing
-  context-agent/           CMDB, ServiceNow, Kubernetes, Jenkins, GitHub, RAG
-  resolution-agent/        LangGraph RCA -> impact -> fix -> confidence
-  approval-service/        Slack/Teams/email/web approval API
-  remediation-engine/      Strategy plugins for Jenkins/K8s/Ansible/Terraform/API
-  closure-service/         Health validation, ticket closure, KB/RCA storage
-  common/                  Models, Kafka, SQLAlchemy, telemetry, resilience
-  ui/                      React incident operations dashboard
-rag/                       Markdown RAG corpus for runbooks, incidents, changes, dependencies
-database/schema.sql        MySQL DDL and canonical schema for the platform
-database/migrations/       Schema migrations and backfills for metadata/RBAC
-k8s/                       Namespace, ConfigMap, generated Secret workflow, Deployments, Services, Ingress, HPA
-.github/workflows/ci.yml   Lint, test, Docker build, Kubernetes validation
+backend/
+  src/
+    api-gateway/             Safety checks, trace IDs, observability, proxy routes
+    monitoring-adapter/      FastAPI webhook adapter for monitoring tools
+    alert-intelligence/      Deduplication, correlation, severity, enrichment
+    orchestrator/            Workflow decision and downstream invocation
+    model-router/            GPT-4o, GPT-5, Claude, Gemini, local Llama routing
+    context-agent/           CMDB, ServiceNow, Kubernetes, Jenkins, GitHub, RAG
+    resolution-agent/        LangGraph RCA -> impact -> fix -> confidence
+    approval-service/        Slack/Teams/email/web approval API
+    remediation-engine/      Strategy plugins for Jenkins/K8s/Ansible/Terraform/API
+    closure-service/         Health validation, ticket closure, KB/RCA storage
+    common/                  Models, Kafka, SQLAlchemy, telemetry, resilience
+  tests/                     Automated test suite (pytest)
+  database/schema.sql        MySQL DDL and canonical schema for the platform
+  database/migrations/       Schema migrations and backfills for metadata/RBAC
+  rag/                       Markdown RAG corpus for runbooks, incidents, changes, dependencies
+  ingested_alerts/           Raw/processed/failed alert samples ingested by monitoring-adapter
+realistic-apps/
+  robot-shop/                Support files (locustfile.py, my.cnf) for the Robot Shop demo app —
+                              see "Realistic Demo Applications" below
+frontend/
+  react/                     React incident operations dashboard
+k8s/                         Namespace, ConfigMap, generated Secret workflow, Deployments, Services, Ingress, HPA
+scripts/                     Local dev, RAG validation, and smoke-test tooling
+.github/workflows/ci.yml     Lint, test, Docker build, Kubernetes validation
 ```
+
+## Realistic Demo Applications
+
+Two real, multi-service demo applications generate live traffic, logs, and
+failures for the monitoring pipeline to ingest — complementary to Fault Lab's
+synthetic scenarios. Both are wired into `docker-compose.yml` as opt-in
+profiles, keeping the default KaiMS control-plane startup lean.
+
+- **Online Boutique** (`GoogleCloudPlatform/microservices-demo`) — 11
+  polyglot gRPC microservices (Go/Java/Python/Node/C#), prefixed `ob-*`.
+  Pinned public images (no local build). Has no app-level Prometheus metrics
+  (verified against source — every service's `initStats()` is an
+  unimplemented stub), so its signal comes from `ob-cadvisor`
+  (per-container CPU/memory/restart) and the existing `blackbox-exporter`
+  probing `ob-frontend:8080/_healthz`.
+- **Robot Shop** (`instana/robot-shop`) — a deliberately different failure
+  surface: real RabbitMQ queue, real MongoDB/MySQL/Redis. Pinned public
+  images (`robotshop/rs-*:2.1.0`), prefixed `rs-*`. `rs-cart`/`rs-payment`
+  expose real `/metrics` natively; standard exporters
+  (`mysqld-exporter`, `redis_exporter`, `rabbitmq-exporter`,
+  `mongodb_exporter`) cover the rest.
+
+  Robot Shop's own images have hostnames like `catalogue`/`user`/`mysql`/
+  `redis`/`rabbitmq` **baked into their nginx/app config at build time**
+  (not env-var configurable) — renaming those services breaks them. Every
+  Robot Shop service therefore keeps a unique `rs-*` compose key (avoiding
+  collisions with this project's own `redis`/`mysql`/`rabbitmq`) but joins
+  an isolated `robot-shop-net` network with a short alias (`redis`,
+  `mysql`, ...) matching what its sibling containers expect — the alias
+  only exists on that isolated network, so it never collides with the
+  main project's own services of the same name on the default network.
+
+Start them only when their live telemetry is required:
+```bash
+docker compose --profile demo-online-boutique up -d
+docker compose --profile demo-robot-shop up -d
+```
+
+Stop demo compute without deleting its data:
+```bash
+powershell -File scripts/stop-demo-workloads.ps1
+```
+- Online Boutique storefront: <http://localhost:8081>
+- Robot Shop storefront: <http://localhost:8090>
+- cAdvisor UI: <http://localhost:8082>
+
+Both apps' Prometheus scrape targets and alert rules
+(`RobotShop*`/`OnlineBoutique*`) live in `observability/prometheus.yml` and
+`observability/alert.rules.yml` alongside every other KaiOps alert source —
+alerts from either app flow through the exact same
+`/alerts/alertmanager` → centralized dedup → Jira → Landing Pad pipeline as
+Fault Lab and real production alerts, no special-casing.
 
 ## Core APIs
 
@@ -187,10 +292,10 @@ Default seeded users (override these in non-demo environments):
 
 Database objects are defined in:
 
-- `database/schema.sql`
-- `database/migrations/20260701_user_rbac.sql`
-- `database/migrations/20260708_incident_metadata_layer.sql`
-- `database/migrations/20260708_incident_projection_backfill.sql`
+- `backend/database/schema.sql`
+- `backend/database/migrations/20260701_user_rbac.sql`
+- `backend/database/migrations/20260708_incident_metadata_layer.sql`
+- `backend/database/migrations/20260708_incident_projection_backfill.sql`
 
 Apply migration manually for existing DBs before starting services.
 
@@ -201,7 +306,8 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
 pytest
-docker compose up --build
+# Docker Desktop-safe startup: pauses demo workloads and serializes builds.
+powershell -ExecutionPolicy Bypass -File scripts/start-kaims.ps1 -Profile lean -Build
 ```
 
 Real LLM calls are made through the model router. Set an API key in your
@@ -209,6 +315,8 @@ environment; do not hardcode keys in source files:
 
 ```bash
 export OPENAI_API_KEY="your-rotated-key"
+export REASONING_STANDARD_MODEL="gpt-5.6-terra"
+export REASONING_CRITICAL_MODEL="gpt-5.6-sol"
 export OPENAI_GPT5_MODEL="gpt-5"
 export OPENAI_GPT4O_MODEL="gpt-4o"
 ```
@@ -217,6 +325,9 @@ PowerShell:
 
 ```powershell
 $env:OPENAI_API_KEY = "your-rotated-key"
+$env:REASONING_STANDARD_MODEL = "gpt-5.6-terra"
+$env:REASONING_CRITICAL_MODEL = "gpt-5.6-sol"
+$env:MODEL_ROUTER_REASONING_BACKEND = "openai" # or azure-openai
 $env:OPENAI_GPT5_MODEL = "gpt-5"
 $env:OPENAI_GPT4O_MODEL = "gpt-4o"
 $env:GEMINI_API_KEY = "your-gemini-key"
@@ -225,6 +336,20 @@ $env:GROQ_API_KEY = "your-groq-key"
 $env:GROQ_MODEL = "llama-3.3-70b-versatile"
 $env:LLM_REQUEST_TIMEOUT_SECONDS = "120"
 ```
+
+`reasoning-standard` is the normal RCA route and `reasoning-critical` is the
+critical-incident route. Promote a candidate from confirmed incidents only
+after it passes the guarded evaluation thresholds:
+
+```powershell
+python scripts/evaluate_rca_predictions.py .\predictions\reasoning-standard.json `
+  --provider reasoning-standard --route '*:rca' `
+  --policy-output backend/evaluation/model-routing-policy.json
+```
+
+The model router reads that policy through a read-only Compose mount. Policies
+with fewer than 50 confirmed cases, unsafe actions, or inadequate RCA,
+citation, remediation, or abstention scores are ignored automatically.
 
 ## Kubernetes Secret Management
 
@@ -266,7 +391,7 @@ docker compose down
 docker compose up --build
 ```
 
-If your editor reports `import common.embeddings cannot be resolved`, make sure it
+If your editor reports `import ai_workbench_common.embeddings cannot be resolved`, make sure it
 is using the `.venv` interpreter created above. The repository also includes
 `pyrightconfig.json` with monorepo `extraPaths` for Cursor/Pylance.
 
@@ -311,12 +436,23 @@ terminals before using the dashboard buttons. For example:
 ```bash
 export KAFKA_ENABLED=false
 export DATABASE_ENABLED=false
-uvicorn app:app --host 0.0.0.0 --port 8001 --app-dir services/monitoring-adapter
-cd services/ui/react && npm install && npm run dev
+uvicorn app:app --host 0.0.0.0 --port 8001 --app-dir backend/src/monitoring-adapter
+cd frontend/react && npm install && npm run dev
 ```
 
 On PowerShell, use `$env:KAFKA_ENABLED="false"` and
 `$env:DATABASE_ENABLED="false"` instead of `export`.
+
+For fast UI work without installing Node locally, keep the KaiMS backend in
+Docker and start the opt-in Vite/HMR container:
+
+```powershell
+.\scripts\start-ui-dev.ps1
+```
+
+Open <http://localhost:8502>. Source edits hot-reload without rebuilding the
+production Nginx image. When a production image is required, use
+`.\scripts\rebuild-ui.ps1`; add `-Validate` before a release or handoff.
 
 Windows users can start the local demo services and UI with:
 
@@ -469,7 +605,7 @@ override flows.
 - AsyncIO-first Kafka, HTTP, and agent workflows
 - SQLAlchemy async PostgreSQL persistence
 - Redis-ready configuration
-- File-backed RAG corpus in `rag/` loaded by the Context Intelligence Agent
+- File-backed RAG corpus in `backend/rag/` loaded by the Context Intelligence Agent
 - Prometheus client metrics
 - OpenTelemetry FastAPI tracing with optional OTLP exporter
 - Structured JSON logging
@@ -483,10 +619,10 @@ override flows.
 
 ## RAG Knowledge Corpus
 
-Context retrieval loads Markdown documents from `rag/` at startup:
+Context retrieval loads Markdown documents from `backend/rag/` at startup:
 
 ```text
-rag/
+backend/rag/
   runbooks/
   incidents/
   deployments/

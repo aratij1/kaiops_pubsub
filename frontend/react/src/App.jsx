@@ -5818,7 +5818,6 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
           : "",
     };
   }, [modelProviderStatus, selectedModelProviderRows]);
-
   const selectedAlertRouting = useMemo(() => extractObservedRoutingMetrics(selectedAlertWorkflow), [selectedAlertWorkflow]);
 
   const selectedAlertEvaluation = useMemo(() => {

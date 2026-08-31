@@ -1,0 +1,32 @@
+groups:
+  - name: telemetry-platform-health
+    rules:
+      - alert: TelemetryCollectorUnavailable
+        expr: absent(otelcol_process_uptime_seconds_total{service_name="otelcol-contrib"})
+        for: 30s
+        labels:
+          severity: critical
+          project: telemetry
+          project_name: Telemetry
+          application: Telemetry
+          service: otel-collector
+          environment: prod
+          source_system: telemetry
+        annotations:
+          summary: OpenTelemetry Collector is unavailable
+          description: Telemetry Prometheus cannot scrape the collector metrics endpoint.
+
+      - alert: TelemetryApplicationSignalsMissing
+        expr: absent(otelcol_receiver_accepted_spans_total{receiver="otlp"})
+        for: 30s
+        labels:
+          severity: warning
+          project: telemetry
+          project_name: Telemetry
+          application: Telemetry
+          service: astronomy-shop
+          environment: prod
+          source_system: telemetry
+        annotations:
+          summary: Telemetry application signals are missing
+          description: The telemetry observability tier is running, but no application metric points have been accepted by the collector.

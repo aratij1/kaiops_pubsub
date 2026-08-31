@@ -1,0 +1,84 @@
+# Optional scaling overlay for VM-based deployments.
+# Usage:
+#   docker compose --env-file .env.cloud -f docker-compose.yml -f docker-compose.scale.yml up -d --build
+#   docker compose --env-file .env.cloud -f docker-compose.yml -f docker-compose.scale.yml up -d \
+#     --scale alert-intelligence=2 --scale orchestrator=2 --scale context-agent=2 \
+#     --scale resolution-agent=2 --scale remediation-engine=2 --scale closure-service=2
+#
+# Notes:
+# - UI/API ports cannot be scaled multiple times on one VM because host ports collide.
+#   Scale those horizontally by adding VMs behind a load balancer.
+# - Worker-like services can scale on the same VM because they do not publish host ports.
+# - Stateful services should be external/shared for real multi-VM scale.
+
+x-small-worker-resources: &small-worker-resources
+  resources:
+    limits:
+      cpus: "${WORKER_CPU_LIMIT:-1.0}"
+      memory: "${WORKER_MEMORY_LIMIT:-1024M}"
+    reservations:
+      cpus: "${WORKER_CPU_RESERVATION:-0.25}"
+      memory: "${WORKER_MEMORY_RESERVATION:-256M}"
+
+x-api-resources: &api-resources
+  resources:
+    limits:
+      cpus: "${API_CPU_LIMIT:-2.0}"
+      memory: "${API_MEMORY_LIMIT:-2048M}"
+    reservations:
+      cpus: "${API_CPU_RESERVATION:-0.5}"
+      memory: "${API_MEMORY_RESERVATION:-512M}"
+
+services:
+  api-gateway:
+    deploy: *api-resources
+
+  ui:
+    deploy:
+      resources:
+        limits:
+          cpus: "${UI_CPU_LIMIT:-0.5}"
+          memory: "${UI_MEMORY_LIMIT:-512M}"
+        reservations:
+          cpus: "${UI_CPU_RESERVATION:-0.1}"
+          memory: "${UI_MEMORY_RESERVATION:-128M}"
+
+  monitoring-adapter:
+    environment:
+      MESSAGE_BUS_WORKER_COUNT: ${MONITORING_ADAPTER_WORKERS:-2}
+    deploy: *small-worker-resources
+
+  alert-intelligence:
+    environment:
+      MESSAGE_BUS_WORKER_COUNT: ${ALERT_INTELLIGENCE_WORKERS:-2}
+    deploy: *small-worker-resources
+
+  orchestrator:
+    environment:
+      MESSAGE_BUS_WORKER_COUNT: ${ORCHESTRATOR_WORKERS:-2}
+    deploy: *small-worker-resources
+
+  context-agent:
+    environment:
+      MESSAGE_BUS_WORKER_COUNT: ${CONTEXT_AGENT_WORKERS:-3}
+    deploy: *small-worker-resources
+
+  resolution-agent:
+    environment:
+      MESSAGE_BUS_WORKER_COUNT: ${RESOLUTION_AGENT_WORKERS:-3}
+    deploy: *small-worker-resources
+
+  remediation-engine:
+    environment:
+      MESSAGE_BUS_WORKER_COUNT: ${REMEDIATION_ENGINE_WORKERS:-2}
+    deploy: *small-worker-resources
+
+  approval-service:
+    environment:
+      MESSAGE_BUS_WORKER_COUNT: ${APPROVAL_SERVICE_WORKERS:-1}
+    deploy: *small-worker-resources
+
+  closure-service:
+    environment:
+      MESSAGE_BUS_WORKER_COUNT: ${CLOSURE_SERVICE_WORKERS:-2}
+    deploy: *small-worker-resources

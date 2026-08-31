@@ -24,7 +24,7 @@ This guide configures Prometheus to monitor KaiOps services and MySQL, then rout
 - `observability/prometheus.yml`
 - `observability/alert.rules.yml`
 - `observability/alertmanager.yml`
-- `services/monitoring-adapter/app.py`
+- `backend/src/monitoring-adapter/app.py`
 
 ## Start / restart
 
@@ -58,8 +58,8 @@ Open:
 
 A runbook and onboarding readiness document are added to RAG corpus for this alert path:
 
-- `rag/runbooks/prometheus-mysql-landing-pad-triage.md`
-- `rag/onboarding/prometheus-mysql-monitoring-onboarding.md`
+- `backend/rag/runbooks/prometheus-mysql-landing-pad-triage.md`
+- `backend/rag/onboarding/prometheus-mysql-monitoring-onboarding.md`
 
 After edits, reload RAG index:
 

@@ -1,38 +1,111 @@
+# Cloud-neutral horizontal autoscaling policy.
+# CPU/memory metrics work on any Kubernetes distribution with metrics-server.
+# Queue-lag based scaling should be layered with KEDA or a cloud adapter — see
+# docs/QUEUE_DEPTH_AUTOSCALING.md and k8s/keda-scaledobject.yaml.example.
+
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
   name: api-gateway-hpa
   namespace: kaiops
 spec:
-  scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: api-gateway
-  minReplicas: 2
-  maxReplicas: 10
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: api-gateway }
+  minReplicas: 3
+  maxReplicas: 12
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - { type: Percent, value: 100, periodSeconds: 60 }
+        - { type: Pods, value: 4, periodSeconds: 60 }
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 1800
+      policies:
+        - { type: Percent, value: 25, periodSeconds: 300 }
   metrics:
     - type: Resource
-      resource:
-        name: cpu
-        target: { type: Utilization, averageUtilization: 70 }
+      resource: { name: cpu, target: { type: Utilization, averageUtilization: 65 } }
+    - type: Resource
+      resource: { name: memory, target: { type: Utilization, averageUtilization: 75 } }
 ---
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
-  name: kaiops-api-hpa
+  name: monitoring-adapter-hpa
   namespace: kaiops
 spec:
-  scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: alert-intelligence
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: monitoring-adapter }
   minReplicas: 2
-  maxReplicas: 8
+  maxReplicas: 10
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - { type: Percent, value: 100, periodSeconds: 60 }
+        - { type: Pods, value: 3, periodSeconds: 60 }
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 1200
+      policies:
+        - { type: Percent, value: 25, periodSeconds: 300 }
   metrics:
     - type: Resource
-      resource:
-        name: cpu
-        target: { type: Utilization, averageUtilization: 70 }
+      resource: { name: cpu, target: { type: Utilization, averageUtilization: 65 } }
+    - type: Resource
+      resource: { name: memory, target: { type: Utilization, averageUtilization: 75 } }
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: alert-intelligence-hpa
+  namespace: kaiops
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: alert-intelligence }
+  minReplicas: 2
+  maxReplicas: 12
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - { type: Percent, value: 100, periodSeconds: 60 }
+        - { type: Pods, value: 4, periodSeconds: 60 }
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 1200
+      policies:
+        - { type: Percent, value: 25, periodSeconds: 300 }
+  metrics:
+    - type: Resource
+      resource: { name: cpu, target: { type: Utilization, averageUtilization: 65 } }
+    - type: Resource
+      resource: { name: memory, target: { type: Utilization, averageUtilization: 75 } }
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: context-agent-hpa
+  namespace: kaiops
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: context-agent }
+  minReplicas: 2
+  maxReplicas: 12
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - { type: Percent, value: 100, periodSeconds: 60 }
+        - { type: Pods, value: 4, periodSeconds: 60 }
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 1200
+      policies:
+        - { type: Percent, value: 25, periodSeconds: 300 }
+  metrics:
+    - type: Resource
+      resource: { name: cpu, target: { type: Utilization, averageUtilization: 65 } }
+    - type: Resource
+      resource: { name: memory, target: { type: Utilization, averageUtilization: 75 } }
 ---
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
@@ -40,17 +113,25 @@ metadata:
   name: resolution-agent-hpa
   namespace: kaiops
 spec:
-  scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: resolution-agent
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: resolution-agent }
   minReplicas: 2
-  maxReplicas: 8
+  maxReplicas: 12
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - { type: Percent, value: 100, periodSeconds: 60 }
+        - { type: Pods, value: 4, periodSeconds: 60 }
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 1800
+      policies:
+        - { type: Percent, value: 25, periodSeconds: 300 }
   metrics:
     - type: Resource
-      resource:
-        name: cpu
-        target: { type: Utilization, averageUtilization: 70 }
+      resource: { name: cpu, target: { type: Utilization, averageUtilization: 65 } }
+    - type: Resource
+      resource: { name: memory, target: { type: Utilization, averageUtilization: 75 } }
 ---
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
@@ -58,14 +139,21 @@ metadata:
   name: remediation-engine-hpa
   namespace: kaiops
 spec:
-  scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: remediation-engine
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: remediation-engine }
   minReplicas: 2
   maxReplicas: 8
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 120
+      policies:
+        - { type: Pods, value: 2, periodSeconds: 120 }
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 1800
+      policies:
+        - { type: Percent, value: 20, periodSeconds: 300 }
   metrics:
     - type: Resource
-      resource:
-        name: cpu
-        target: { type: Utilization, averageUtilization: 70 }
+      resource: { name: cpu, target: { type: Utilization, averageUtilization: 65 } }
+    - type: Resource
+      resource: { name: memory, target: { type: Utilization, averageUtilization: 75 } }

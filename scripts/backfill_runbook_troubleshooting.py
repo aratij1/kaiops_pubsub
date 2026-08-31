@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-RUNBOOK_DIR = Path("rag/runbooks")
+RUNBOOK_DIR = Path("backend/rag/runbooks")
 
 REQUIRED_SECTIONS: list[tuple[str, str]] = [
     (
