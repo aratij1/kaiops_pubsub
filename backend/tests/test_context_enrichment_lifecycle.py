@@ -1,9 +1,10 @@
 from datetime import UTC, datetime, timedelta
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from ai_workbench_common.models import Context
 from common.context_enrichment_contract import (
+    EvidenceRecord,
     EvidenceRequirement,
     HitlRoutingConfiguration,
     build_evidence_requirements,
@@ -11,9 +12,11 @@ from common.context_enrichment_contract import (
 )
 from common.database import (
     AuditLogRecord,
+    CanonicalEvidenceRecord,
     ContextSnapshotRecord,
     IncidentInvestigationBindingRecord,
     IncidentRecord,
+    ResolutionOutboxRecord,
 )
 from common.models import Alert, AlertSeverity, Incident
 from common.repository import ContextEnrichmentRepository
@@ -140,6 +143,64 @@ async def test_missing_automatic_evidence_creates_idempotent_enrichment_jobs(
         )
         assert activity["jobs"][0]["status"] == "collected"
         assert activity["jobs"][0]["lease_owner"] is None
+
+
+@pytest.mark.asyncio
+async def test_atomic_enrichment_persists_exact_evidence_snapshot_and_outbox(
+    sqlite_session_factory,
+):
+    incident_id = uuid4()
+    requirement = EvidenceRequirement(
+        requirement_id=uuid4(), tenant_id="tenant-a", incident_id=incident_id,
+        rca_version=1, category="metrics", question="What was latency?",
+        reason="Confirm the alert", priority="high", collection_mode="automatic",
+        candidate_connectors=["prometheus"], created_at=datetime.now(UTC), updated_at=datetime.now(UTC),
+    )
+    now = datetime.now(UTC)
+    record = EvidenceRecord(
+        evidence_id="EVD-" + "a" * 64, requirement_id=str(requirement.requirement_id),
+        tenant_id="tenant-a", incident_id=str(incident_id), category="metrics",
+        source_id="prometheus:9090", connector="prometheus",
+        source_reference="prometheus://prometheus:9090/query?expr=up",
+        service="checkout-api", observed_at=now, collected_at=now, freshness="fresh",
+        content={"metric_name": "up", "labels": {"service": "checkout-api"},
+                 "samples": [{"timestamp": now.isoformat(), "value": "0"}]},
+        provenance={"query": "up"}, current_observation=True,
+    )
+    async with sqlite_session_factory() as session:
+        repo = ContextEnrichmentRepository(session)
+        await repo.upsert_context_evidence_requirements([requirement])
+        job = await repo.schedule_context_enrichment_job(
+            tenant_id="tenant-a", incident_id=incident_id,
+            requirement_id=requirement.requirement_id, connector_id="prometheus",
+            query_payload={"incident": {"id": str(incident_id), "tenant_id": "tenant-a",
+                                          "service": "checkout-api", "title": "latency"}, "decision": {}},
+            observation_start=now - timedelta(minutes=5), observation_end=now,
+        )
+        session.add(ContextSnapshotRecord(
+            snapshot_id=uuid4(), tenant_id="tenant-a", incident_id=str(incident_id),
+            alert_signature="signature", subject_fingerprint="s" * 64,
+            context_fingerprint="c" * 64, snapshot_version=1, evidence_ids=[],
+            evidence_checksums={}, contract_version="kaiops.context.v2", quality_score=0.2,
+            reusable=False, source_manifest={}, payload={"tenant_id": "tenant-a",
+                "incident_id": str(incident_id), "metadata": {"context_evidence": {}}},
+            collected_at=now, expires_at=now + timedelta(hours=1),
+        ))
+        await session.commit()
+    async with sqlite_session_factory() as session:
+        repo = ContextEnrichmentRepository(session)
+        await repo.claim_context_enrichment_jobs(worker_id="worker-a", limit=1)
+        result = await repo.persist_enrichment_result_atomically(
+            job_id=job.job_id, worker_id="worker-a", accepted_records=[record],
+            rejected_records=[], source_response_metadata={"query": "up"},
+        )
+        await session.commit()
+        assert result["evidence_ids"] == [record.evidence_id]
+        assert await session.get(CanonicalEvidenceRecord, record.evidence_id) is not None
+        assert await session.get(ResolutionOutboxRecord, result["outbox_event_id"]) is not None
+        snapshot = await session.get(ContextSnapshotRecord, UUID(result["snapshot_id"]))
+        assert snapshot.evidence_ids == [record.evidence_id]
+        assert snapshot.payload["metadata"]["context_evidence"]["metrics"][0]["evidence_id"] == record.evidence_id
 
 
 @pytest.mark.asyncio

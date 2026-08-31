@@ -28,11 +28,13 @@ from common.database import (
     AuditLogRecord,
     ContextEnrichmentJobRecord,
     ContextEvidenceRequirementRecord,
+    CanonicalEvidenceRecord,
     ContextKnowledgeRecord,
     ContextSnapshotRecord,
     DraftPullRequestOutboxRecord,
     EvaluationRecord,
     EvidenceRagDraftRecord,
+    EvidenceRejectionRecord,
     ExecutionPlanRecord,
     GovernedRagDocumentRecord,
     GovernedResolutionPlanRecord,
@@ -8423,6 +8425,159 @@ class ContextEnrichmentRepository(EvaluationRepository):
             })
         await self.session.flush()
         return result
+
+    async def persist_enrichment_result_atomically(
+        self, *, job_id: UUID | str, worker_id: str,
+        accepted_records: list[Any], rejected_records: list[dict[str, Any]],
+        source_response_metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Commit the exact validated evidence, snapshot, and RCA handoff once."""
+        job_uuid = self._to_uuid(job_id)
+        job = (await self.session.execute(select(ContextEnrichmentJobRecord).where(
+            ContextEnrichmentJobRecord.job_id == job_uuid,
+        ).with_for_update())).scalar_one_or_none()
+        if job is None:
+            raise LookupError("context enrichment job not found")
+        if job.status != "collecting" or job.lease_owner != worker_id:
+            raise RuntimeError("context enrichment job lease is not owned by this worker")
+        requirement = (await self.session.execute(select(ContextEvidenceRequirementRecord).where(
+            ContextEvidenceRequirementRecord.requirement_id == job.requirement_id,
+        ).with_for_update())).scalar_one_or_none()
+        if requirement is None or requirement.tenant_id != job.tenant_id:
+            raise RuntimeError("enrichment requirement binding is invalid")
+        latest_version = (await self.session.execute(select(func.max(
+            ContextEvidenceRequirementRecord.rca_version,
+        )).where(
+            ContextEvidenceRequirementRecord.tenant_id == job.tenant_id,
+            ContextEvidenceRequirementRecord.incident_id == job.incident_id,
+        ))).scalar_one_or_none()
+        if latest_version is not None and requirement.rca_version != int(latest_version):
+            raise RuntimeError("STALE_EVIDENCE_REQUIREMENT")
+        attempt_key = f"{job.job_id}:{job.attempt_count}"
+        accepted_ids: list[str] = []
+        accepted_payloads: list[dict[str, Any]] = []
+        for record in accepted_records:
+            payload = record.model_dump(mode="python") if hasattr(record, "model_dump") else dict(record)
+            if (
+                payload.get("tenant_id") != job.tenant_id
+                or str(payload.get("incident_id")) != str(job.incident_id)
+                or str(payload.get("requirement_id")) != str(job.requirement_id)
+            ):
+                raise RuntimeError("EVIDENCE_BINDING_MISMATCH")
+            evidence_id = self._require("evidence_id", payload.get("evidence_id"))
+            existing = await self.session.get(CanonicalEvidenceRecord, evidence_id)
+            if existing is None:
+                content = dict(payload.get("content") or {})
+                self.session.add(CanonicalEvidenceRecord(
+                    evidence_id=evidence_id, requirement_id=job.requirement_id,
+                    tenant_id=job.tenant_id, incident_id=job.incident_id,
+                    category=payload["category"], source_id=payload["source_id"],
+                    connector=payload["connector"], source_reference=payload["source_reference"],
+                    service=payload.get("service"), resource=payload.get("resource"),
+                    project_id=payload.get("project_id"), observed_at=payload["observed_at"],
+                    collected_at=payload["collected_at"],
+                    observation_window_start=payload.get("observation_window_start"),
+                    observation_window_end=payload.get("observation_window_end"),
+                    freshness=payload["freshness"], content=content,
+                    provenance=dict(payload.get("provenance") or {}),
+                    current_observation=bool(payload.get("current_observation")),
+                    contradiction_status=payload.get("contradiction_status"),
+                    content_digest=hashlib.sha256(json.dumps(
+                        content, sort_keys=True, separators=(",", ":"), default=str,
+                    ).encode()).hexdigest(),
+                ))
+            accepted_ids.append(evidence_id)
+            accepted_payloads.append(
+                record.model_dump(mode="json") if hasattr(record, "model_dump")
+                else json.loads(json.dumps(payload, default=str))
+            )
+        for index, rejection in enumerate(rejected_records):
+            exists_rejection = (await self.session.execute(select(EvidenceRejectionRecord).where(
+                EvidenceRejectionRecord.tenant_id == job.tenant_id,
+                EvidenceRejectionRecord.attempt_key == attempt_key,
+                EvidenceRejectionRecord.record_index == index,
+            ))).scalar_one_or_none()
+            if exists_rejection is None:
+                self.session.add(EvidenceRejectionRecord(
+                    tenant_id=job.tenant_id, incident_id=job.incident_id,
+                    requirement_id=job.requirement_id, job_id=job.job_id,
+                    attempt_key=attempt_key, record_index=index,
+                    reason_code=str(rejection.get("code") or "EVIDENCE_REJECTED")[:128],
+                    reason_detail=str(rejection.get("detail") or "")[:4000] or None,
+                    sanitized_record=dict(rejection),
+                    source_response_metadata=dict(source_response_metadata),
+                ))
+        if not accepted_ids:
+            await self.session.flush()
+            return {"accepted": False, "evidence_ids": [], "snapshot_id": None, "outbox_event_id": None}
+        previous = (await self.session.execute(select(ContextSnapshotRecord).where(
+            ContextSnapshotRecord.tenant_id == job.tenant_id,
+            ContextSnapshotRecord.incident_id == str(job.incident_id),
+        ).order_by(ContextSnapshotRecord.snapshot_version.desc()).limit(1).with_for_update())).scalar_one_or_none()
+        if previous is None:
+            raise RuntimeError("CONTEXT_SNAPSHOT_MISSING")
+        snapshot_payload = json.loads(json.dumps(previous.payload or {}, default=str))
+        metadata = snapshot_payload.setdefault("metadata", {})
+        buckets = metadata.setdefault("context_evidence", {})
+        bucket = buckets.setdefault(requirement.category, [])
+        known_ids = {str(item.get("evidence_id")) for item in bucket if isinstance(item, dict)}
+        bucket.extend(item for item in accepted_payloads if item["evidence_id"] not in known_ids)
+        evidence_ids = list(dict.fromkeys([*(previous.evidence_ids or []), *accepted_ids]))
+        evidence_digest = hashlib.sha256("\n".join(evidence_ids).encode()).hexdigest()
+        context_fingerprint = hashlib.sha256(json.dumps(
+            snapshot_payload, sort_keys=True, separators=(",", ":"), default=str,
+        ).encode()).hexdigest()
+        snapshot_id = uuid5(NAMESPACE_URL, f"kaims:enriched-snapshot:{job.incident_id}:{evidence_digest}")
+        metadata.update({"context_snapshot_id": str(snapshot_id), "context_fingerprint": context_fingerprint,
+                         "evidence_ids": evidence_ids, "evidence_set_digest": evidence_digest})
+        snapshot = await self.session.get(ContextSnapshotRecord, snapshot_id)
+        if snapshot is None:
+            previous_expiry = previous.expires_at
+            if previous_expiry.tzinfo is None:
+                previous_expiry = previous_expiry.replace(tzinfo=UTC)
+            snapshot = ContextSnapshotRecord(
+                snapshot_id=snapshot_id, tenant_id=job.tenant_id,
+                incident_id=str(job.incident_id), source_incident_id=previous.source_incident_id,
+                alert_signature=previous.alert_signature, subject_fingerprint=previous.subject_fingerprint,
+                context_fingerprint=context_fingerprint, parent_snapshot_id=previous.snapshot_id,
+                snapshot_stage="enriched", snapshot_version=int(previous.snapshot_version or 0) + 1,
+                evidence_ids=evidence_ids,
+                evidence_checksums={**dict(previous.evidence_checksums or {}), **{
+                    row.evidence_id: hashlib.sha256(json.dumps(
+                        row.content, sort_keys=True, separators=(",", ":"), default=str,
+                    ).encode()).hexdigest() for row in accepted_records
+                }},
+                contract_version="kaiops.evidence.v1", quality_score=previous.quality_score,
+                reusable=False, source_manifest={**dict(previous.source_manifest or {}),
+                                                 requirement.category: source_response_metadata},
+                payload=snapshot_payload, collected_at=datetime.now(UTC),
+                expires_at=max(previous_expiry, datetime.now(UTC) + timedelta(hours=1)),
+            )
+            self.session.add(snapshot)
+        context_payload = snapshot_payload
+        event_id = f"context-enriched:{job.incident_id}:{evidence_digest}"
+        outbox_payload = {
+            "context": context_payload,
+            "incident": dict(job.query_payload.get("incident") or {}),
+            "decision": {**dict(job.query_payload.get("decision") or {}),
+                         "context_snapshot_id": str(snapshot_id), "evidence_set_digest": evidence_digest},
+            "transport": "outbox", "event_contract": {"event_id": event_id},
+        }
+        if await self.session.get(ResolutionOutboxRecord, event_id) is None:
+            self.session.add(ResolutionOutboxRecord(
+                event_id=event_id, tenant_id=job.tenant_id, aggregate_id=str(job.incident_id),
+                topic="context-events", partition_key=str(job.incident_id), payload=outbox_payload,
+                status="pending", attempts=0, next_attempt_at=datetime.now(UTC),
+            ))
+        requirement.status = "collected"
+        requirement.evidence_ids = evidence_ids
+        requirement.version += 1
+        job.status = "collected"; job.last_error = None; job.version += 1
+        job.lease_owner = None; job.lease_expires_at = None
+        await self.session.flush()
+        return {"accepted": True, "evidence_ids": accepted_ids, "snapshot_id": str(snapshot_id),
+                "snapshot_version": snapshot.snapshot_version, "outbox_event_id": event_id,
+                "outbox_payload": outbox_payload}
 
     async def finish_context_enrichment_job(
         self, *, job_id: UUID | str, worker_id: str, collected: bool, error: str | None = None,

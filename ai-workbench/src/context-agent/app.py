@@ -21,9 +21,9 @@ from common.context_enrichment_contract import (
     EvidenceRequirement,
     HumanEvidenceResponse,
     build_evidence_requirements,
-    validate_enrichment_observation,
+    normalize_connector_response,
 )
-from common.database import AuditLogRecord
+from common.database import AuditLogRecord, ContextEnrichmentJobRecord
 from common.event_publishers import EventPublisher, RabbitMQPublisher, build_agent_event_contract, build_event_envelope
 from common.kafka import KafkaConsumer
 from common.kafka import consume_forever as consume_kafka_forever
@@ -130,7 +130,6 @@ def _has_code_evidence(context: Context) -> bool:
 
 
 def _context_identity(alert: Alert) -> tuple[str, str, str, str]:
-    metadata = alert.metadata if isinstance(alert.metadata, dict) else {}
     labels = alert.labels if isinstance(alert.labels, dict) else {}
     tenant_id = require_tenant_id(alert.tenant_id, source="context alert identity")
     service = str(alert.service or "unknown").strip().lower() or "unknown"
@@ -715,8 +714,6 @@ async def _context_enrichment_worker(app: FastAPI) -> None:
                 await asyncio.sleep(3)
                 continue
             for job in jobs:
-                collected = False
-                accepted_evidence_ids: list[str] = []
                 failure = "connector returned no attributable evidence"
                 try:
                     query = job.get("query_payload") if isinstance(job.get("query_payload"), dict) else {}
@@ -733,69 +730,49 @@ async def _context_enrichment_worker(app: FastAPI) -> None:
                     connector = next((item for item in agent.connectors if item.name == connector_name), None)
                     if connector is None:
                         raise RuntimeError(f"connector {job['connector_id']} is not installed")
-                    observation = await connector.fetch(alert, incident)
-                    validation = validate_enrichment_observation(
-                        requirement, job["connector_id"], observation, incident, alert, datetime.now(UTC),
+                    raw_response = await connector.fetch(alert, incident)
+                    normalization = normalize_connector_response(
+                        raw_response=raw_response, requirement=requirement, incident=incident,
+                        connector=job["connector_id"], collected_at=datetime.now(UTC),
                     )
-                    if not validation.accepted:
-                        failure = (
-                            "; ".join(validation.rejection_reasons)
-                            or "connector returned no attributable evidence"
+                    async with app.state.session_factory() as session:
+                        repository = ContextEnrichmentRepository(session)
+                        persisted = await repository.persist_enrichment_result_atomically(
+                            job_id=job["job_id"], worker_id=worker_id,
+                            accepted_records=normalization.records,
+                            rejected_records=normalization.rejected,
+                            source_response_metadata=normalization.metadata,
                         )
-                    if validation.accepted:
-                        accepted_evidence_ids = [row["evidence_id"] for row in validation.accepted_evidence]
-                        decision = dict(query.get("decision") or {})
-                        analysis_request_id = str(uuid5(NAMESPACE_URL, f"kaims:enrichment:{job['job_id']}"))
-                        decision.update({
-                            "analysis_request_id": analysis_request_id,
-                            "analysis_mode": "fresh",
-                            "context_strategy": "realtime",
-                            "enrichment_job_id": job["job_id"],
-                        })
-                        context = await _collect_context_with_strategy(app, alert, incident, "realtime", None)
-                        context = _attach_analysis_request_metadata(
-                            context, decision=decision,
-                            analysis_request={"id": analysis_request_id, "mode": "fresh"},
-                        )
-                        context = context.model_copy(
-                            update={"metadata": {
-                                **context.metadata,
-                                "accepted_enrichment_evidence": validation.accepted_evidence,
-                                "evidence_ids": list(dict.fromkeys([
-                                    *(context.metadata.get("evidence_ids") or []),
-                                    *accepted_evidence_ids,
-                                ])),
-                            }}
-                        )
-                        provider = str(getattr(settings, "event_bus_provider", "rabbitmq") or "rabbitmq")
-                        publishers = getattr(app.state, "message_bus_publishers", {})
-                        provider_used = provider if publishers.get(provider) is not None else "rabbitmq"
-                        outgoing = _build_context_event_payload(
-                            alert=alert, incident=incident, context=context,
-                            decision=decision, provider_used=provider_used,
-                        )
-                        enqueued = await _persist_context_event(
-                            app=app, alert=alert, incident=incident, context=context,
-                            decision=decision, provider_used=provider_used, outgoing_payload=outgoing,
-                        )
-                        if enqueued:
-                            collected = True
-                            await _publish_context_event(
-                                app=app, provider=provider_used, alert=alert, incident=incident,
-                                context=context, decision=decision, payload=outgoing,
+                        if not persisted["accepted"]:
+                            failure = "; ".join(
+                                str(item.get("code") or "EVIDENCE_REJECTED")
+                                for item in normalization.rejected
+                            ) or failure
+                            await repository.finish_context_enrichment_job(
+                                job_id=job["job_id"], worker_id=worker_id,
+                                collected=False, error=failure,
+                                retry_after_seconds=min(300, 15 * (2 ** max(0, int(job["attempt_count"]) - 1))),
                             )
+                        await session.commit()
+                    if persisted["accepted"]:
+                        outgoing = dict(persisted["outbox_payload"])
+                        context = Context.model_validate(outgoing["context"])
+                        await _publish_context_event(
+                            app=app, provider="rabbitmq", alert=alert, incident=incident,
+                            context=context, decision=outgoing["decision"], payload=outgoing,
+                        )
                 except Exception as exc:
-                    collected = False
                     failure = str(exc)[:1000]
                     logger.exception("context enrichment job failed job_id=%s", job.get("job_id"))
-                finally:
                     async with app.state.session_factory() as session:
-                        await ContextEnrichmentRepository(session).finish_context_enrichment_job(
-                            job_id=job["job_id"], worker_id=worker_id,
-                            collected=collected, error=failure,
-                            evidence_ids=accepted_evidence_ids,
-                            retry_after_seconds=min(300, 15 * (2 ** max(0, int(job["attempt_count"]) - 1))),
-                        )
+                        repository = ContextEnrichmentRepository(session)
+                        current = await session.get(ContextEnrichmentJobRecord, UUID(job["job_id"]))
+                        if current is not None and current.status == "collecting" and current.lease_owner == worker_id:
+                            await repository.finish_context_enrichment_job(
+                                job_id=job["job_id"], worker_id=worker_id,
+                                collected=False, error=failure,
+                                retry_after_seconds=min(300, 15 * (2 ** max(0, int(job["attempt_count"]) - 1))),
+                            )
                         await session.commit()
         except asyncio.CancelledError:
             raise
