@@ -190,6 +190,13 @@ export default function IncidentCommand() {
   const recommendationMetadata = record(recommendation.metadata);
   const iterativeInvestigation = record(recommendationMetadata.iterative_investigation);
   const investigationConclusion = record(iterativeInvestigation.conclusion);
+  const investigationHypotheses = Array.isArray(iterativeInvestigation.hypotheses)
+    ? iterativeInvestigation.hypotheses.map(record)
+    : [];
+  const selectedHypothesis = investigationHypotheses.find((candidate) =>
+    text(candidate.hypothesis_id) === text(investigationConclusion.hypothesis_id),
+  ) || investigationHypotheses[0] || {};
+  const falsificationCheck = record(selectedHypothesis.falsification_check);
   const canonicalIncidentId = incidentId(row);
   const canonicalAlertId = text(
     recommendationMetadata.alert_id,
@@ -230,7 +237,31 @@ export default function IncidentCommand() {
   const inFailure = FAILED.some((value) => status.includes(value));
   const isTerminal = TERMINAL.some((value) => status.includes(value));
   const currentJourneyIndex = isTerminal ? 6 : status.includes("validat") || status.includes("verif") ? 5 : status.includes("execut") || status.includes("remediat") || status.includes("rollback") ? 4 : status.includes("approval") || recommendation.action || recommendation.title ? 3 : rootCause ? 2 : status.includes("investigat") || status.includes("analy") ? 1 : 0;
-  const action = text(recommendation.title, recommendation.action, recommendation.recommended_action, eventPayload.recommended_action, projection.recommended_action);
+  const publishedAction = text(recommendation.title, recommendation.action, recommendation.recommended_action, eventPayload.recommended_action, projection.recommended_action);
+  const isLegacyGenericAction = publishedAction.toLowerCase().includes("highest-value targeted diagnostic");
+  const isDiagnosticOnly = confidenceKind !== "confirmed_rca" && (
+    text(recommendationMetadata.resolution_outcome).toLowerCase() === "inconclusive"
+    || text(recommendationMetadata.investigation_status).toLowerCase() === "inconclusive"
+    || Boolean(leadingHypothesis)
+    || isLegacyGenericAction
+  );
+  const missingEvidenceSources = Array.isArray(iterativeInvestigation.next_evidence)
+    ? iterativeInvestigation.next_evidence.map((item) => text(record(item).source)).filter(Boolean)
+    : [];
+  const nextDiagnostic = text(
+    analysis.recommended_next_diagnostic,
+    selectedHypothesis.recommended_next_diagnostic,
+    falsificationCheck.objective,
+  );
+  const affectedService = text(row.service, contextAlert.service, source.service) || "the affected service";
+  const diagnosticAction = nextDiagnostic
+    ? `${nextDiagnostic} (${titleFor(row)} on ${affectedService})`
+    : missingEvidenceSources.length
+      ? `Collect ${missingEvidenceSources.join(", ")} evidence for ${titleFor(row)} on ${affectedService}.`
+      : leadingHypothesis
+        ? `Collect independent evidence to confirm or falsify: ${leadingHypothesis}`
+        : "Continue evidence collection until a falsifiable incident-specific diagnostic is available.";
+  const action = isDiagnosticOnly ? diagnosticAction : publishedAction;
   const approvalCandidatePending = Boolean(approval) && !["approved", "rejected", "completed"].includes(text(approval?.approval_status, approval?.status).toLowerCase());
   const sourceTimestamp = text(source.received_at, source.created_at, row.created_at);
   const updatedTimestamp = text(row.latest_event_at, row.updated_at, row.created_at);
@@ -251,6 +282,7 @@ export default function IncidentCommand() {
   const contextCollectedAt = text(contextSnapshot.collected_at, contextMetadata.context_collected_at);
   const contextQuality = confidenceValue(contextSnapshot.quality_score);
   const resolutionAvailable = Boolean(action || Object.keys(executionPlan).length);
+  const governedResolutionAvailable = !isDiagnosticOnly && Object.keys(executionPlan).length > 0;
   const executionReady = executionPlan.execution_ready === true;
   const executionUnavailableReason = text(
     executionPlan.readiness_reason,
@@ -352,10 +384,12 @@ export default function IncidentCommand() {
         </section>
 
         <section className="ic-section ic-resolution">
-          <header><div><span>Recommended resolution</span><h3>{action || "No resolution recommendation available"}</h3></div><Wrench aria-hidden="true" /></header>
+          <header><div><span>{isDiagnosticOnly ? "Recommended investigation" : "Recommended resolution"}</span><h3>{action || "No resolution recommendation available"}</h3></div><Wrench aria-hidden="true" /></header>
           {resolutionAvailable ? <>
-            <p className="ic-resolution-why">{text(recommendation.why, recommendation.rationale, recommendation.reason, projection.recommendation_reason) || "The backend did not include a human-readable rationale."}</p>
-            <div className="ic-resolution-facts">
+            <p className="ic-resolution-why">{isDiagnosticOnly
+              ? `${titleFor(row)} remains under investigation. ${supportingReasons.length} validated supporting signal(s) are linked; the evidence gate must pass before Kai can recommend a change.`
+              : text(recommendation.why, recommendation.rationale, recommendation.reason, projection.recommendation_reason) || "The backend did not include a human-readable rationale."}</p>
+            {governedResolutionAvailable ? <><div className="ic-resolution-facts">
               <Metric label="Risk" value={valueOrUnavailable(text(recommendation.risk_tier, row.risk_tier))} />
               <Metric label="Blast radius" value={valueOrUnavailable(text(recommendation.blast_radius, executionPlan.blast_radius, safety.allowed_scope))} />
               <Metric label="Target" value={valueOrUnavailable(text(recommendation.target, executionPlan.target, row.service))} />
@@ -369,7 +403,7 @@ export default function IncidentCommand() {
               ["Automatic stop", safety.automatic_stop || safety.stop_conditions],
               ["Rollback", safety.rollback || executionPlan.rollback],
               ["Approval", safety.approval || row.approval_status || (approvalPending ? "Required" : "Not recorded")],
-            ].map(([label, value]) => <div key={String(label)}><dt>{String(label)}</dt><dd>{valueOrUnavailable(Array.isArray(value) ? value.join("; ") : value)}</dd></div>)}</dl></section>
+            ].map(([label, value]) => <div key={String(label)}><dt>{String(label)}</dt><dd>{valueOrUnavailable(Array.isArray(value) ? value.join("; ") : value)}</dd></div>)}</dl></section></> : null}
             {approvalPending && approval ? <section className="ic-inline-approval"><header><FileCheck2 aria-hidden="true" /><div><span>Kai needs your decision</span><strong>{action || "Review this production action"}</strong></div></header><p>{text(row.environment).toLowerCase().includes("prod") ? "This action may change Production. Review its scope and stop conditions before approving." : "Policy requires a human decision before Kai can continue."}</p>{approvalExpanded ? <div className="ic-approval-preview"><article><span>What will change</span><p>{action || "Action detail unavailable"}</p></article><article><span>What Kai will watch</span><p>{valueOrUnavailable(safety.stop_conditions || validation.watch_conditions)}</p></article><article><span>When Kai will rollback</span><p>{valueOrUnavailable(safety.rollback_conditions || executionPlan.rollback_conditions)}</p></article></div> : null}<div className="ic-decision-actions"><button type="button" className="button-secondary" onClick={() => setApprovalExpanded((open) => !open)}>{approvalExpanded ? "Hide preview" : "Review safety preview"}</button><button type="button" className="button-secondary" onClick={() => approvals.toggleReject(incidentId(approval))}>Reject</button><button type="button" className="button-primary" disabled={!approvals.ready || approvals.actionLoading} onClick={() => approvals.approve(approval as ApprovalRow)}>{approvals.actionLoading ? "Submitting decision..." : "Approve & let Kai resolve"}</button></div>{approvals.actionError ? <p className="ic-action-error">{approvals.actionError}</p> : null}</section> : <div className="ic-resolution-actions"><button type="button" className="button-secondary" disabled={!executionReady} title={!executionReady ? executionUnavailableReason : undefined} onClick={() => incidents.openTechnical(row, "resolution")}>{executionReady ? "Open technical execution workspace" : "Execution unavailable — collect evidence"}</button>{row.jira_url ? <a className="button-secondary" href={row.jira_url} target="_blank" rel="noreferrer">Open ticket <ExternalLink aria-hidden="true" /></a> : null}</div>}
           </> : <EmptyState title="No safe action is ready" description="Kai will keep investigating until the backend publishes a governed resolution plan." />}
         </section>
