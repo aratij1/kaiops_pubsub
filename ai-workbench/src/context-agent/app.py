@@ -1027,12 +1027,77 @@ async def _governed_rag_retry_loop(app: FastAPI) -> None:
         await asyncio.sleep(max(5.0, float(getattr(settings, "rag_index_retry_seconds", 30.0) or 30.0)))
 
 
+async def _context_reconciliation_loop(app: FastAPI) -> None:
+    """Continuously reconcile all enabled tenants under a durable global lease."""
+    owner = f"{settings.service_name}:{os.getenv('HOSTNAME', 'local')}:{os.getpid()}"
+    lease_key = "active-incident-evidence"
+    interval = max(5.0, float(settings.context_reconciliation_interval_seconds or 30.0))
+    lease_seconds = max(30, int(settings.context_reconciliation_lease_seconds or 120))
+    batch_size = max(1, min(int(settings.context_reconciliation_batch_size or 100), 500))
+    while True:
+        acquired = False
+        try:
+            async with app.state.session_factory() as session:
+                repository = ContextEnrichmentRepository(session)
+                acquired = await repository.claim_reconciliation_lease(
+                    lease_key=lease_key, owner=owner, lease_seconds=lease_seconds,
+                )
+                tenants = await repository.enabled_reconciliation_tenants() if acquired else []
+                await session.commit()
+            for tenant_id in tenants:
+                async with app.state.session_factory() as session:
+                    repository = ContextEnrichmentRepository(session)
+                    if not await repository.claim_reconciliation_lease(
+                        lease_key=lease_key, owner=owner, lease_seconds=lease_seconds,
+                    ):
+                        await session.rollback()
+                        break
+                    run = await repository.start_reconciliation_run(owner=owner, tenant_id=tenant_id)
+                    run_id = run.run_id
+                    await session.commit()
+                summary: dict[str, Any]
+                try:
+                    summary = await _reconcile_context_enrichment_tenant(ContextEnrichmentReconcileRequest(
+                        tenant_id=tenant_id, limit=batch_size, dry_run=False,
+                    ))
+                    run_status = "completed_with_errors" if summary.get("errors") else "completed"
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.exception("context reconciliation failed tenant=%s", tenant_id)
+                    summary = {"errors": [{"code": "RECONCILIATION_FAILED", "detail": str(exc)[:500]}]}
+                    run_status = "failed"
+                async with app.state.session_factory() as session:
+                    await ContextEnrichmentRepository(session).finish_reconciliation_run(
+                        run_id=run_id, summary=summary, status=run_status,
+                    )
+                    await session.commit()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("context reconciliation scheduler iteration failed")
+        finally:
+            if acquired:
+                try:
+                    async with app.state.session_factory() as session:
+                        await ContextEnrichmentRepository(session).release_reconciliation_lease(
+                            lease_key=lease_key, owner=owner,
+                        )
+                        await session.commit()
+                except Exception:
+                    logger.exception("context reconciliation lease release failed")
+        await asyncio.sleep(interval)
+
+
 async def startup(app: FastAPI) -> None:
     if settings.database_enabled:
         try:
             async with app.state.session_factory() as session:
                 await session.execute(text(
                     "SELECT lease_owner, lease_expires_at FROM context_enrichment_jobs LIMIT 0"
+                ))
+                await session.execute(text(
+                    "SELECT lease_owner, lease_expires_at FROM context_reconciliation_leases LIMIT 0"
                 ))
         except Exception as exc:
             raise RuntimeError(
@@ -1058,6 +1123,10 @@ async def startup(app: FastAPI) -> None:
 
     tasks.append(asyncio.create_task(_context_outbox_dispatch_loop(app), name="context-agent-event-outbox"))
     tasks.append(asyncio.create_task(_context_enrichment_worker(app), name="context-agent-enrichment-worker"))
+    if settings.context_reconciliation_enabled:
+        tasks.append(asyncio.create_task(
+            _context_reconciliation_loop(app), name="context-agent-enrichment-reconciler",
+        ))
 
     index_consumer = RabbitMQConsumer(settings, GOVERNED_RAG_APPROVED_TOPIC)
     tasks.append(asyncio.create_task(
@@ -2176,14 +2245,9 @@ async def transition_incident_lifecycle(
         }) from exc
 
 
-@app.post("/internal/context-enrichment/reconcile")
-async def reconcile_context_enrichment(
+async def _reconcile_context_enrichment_tenant(
     request: ContextEnrichmentReconcileRequest,
-    x_kaiops_internal_token: str = Header(default=""),
 ) -> dict[str, Any]:
-    expected = str(settings.service_internal_token or "")
-    if not expected or not hmac.compare_digest(x_kaiops_internal_token, expected):
-        raise HTTPException(status_code=403, detail="service authentication is required")
     summary: dict[str, Any] = {
         "incidents_scanned": 0, "gaps_found": 0, "requirements_created": 0,
         "jobs_scheduled": 0, "human_requests_created": 0, "skipped_incidents": 0,
@@ -2214,6 +2278,15 @@ async def reconcile_context_enrichment(
                     row for row in requirements
                     if (row.rca_version, row.category, row.question) not in existing_keys
                 ]
+                existing_by_key = {
+                    (int(row["rca_version"]), str(row["category"]), str(row["question"])): row
+                    for row in existing
+                }
+                work = [
+                    row for row in requirements
+                    if str((existing_by_key.get((row.rca_version, row.category, row.question)) or {}).get("status") or "identified").lower()
+                    not in {"collected", "answered", "satisfied", "blocked", "dead_letter"}
+                ]
                 summary["requirements_created"] += len(missing)
                 context_payload = candidate["context"] if isinstance(candidate["context"], dict) else {}
                 alert_payload = context_payload.get("alert") if isinstance(context_payload.get("alert"), dict) else {}
@@ -2231,12 +2304,12 @@ async def reconcile_context_enrichment(
                 authorized.update({"local-evidence", "vector-db"})
                 planned: list[tuple[EvidenceRequirement, str | None]] = [
                     (requirement, next((name for name in requirement.candidate_connectors if name in authorized), None))
-                    for requirement in missing
+                    for requirement in work
                 ]
                 summary["jobs_scheduled"] += sum(1 for _, connector in planned if connector)
                 summary["human_requests_created"] += sum(1 for _, connector in planned if not connector)
-                if not request.dry_run and missing:
-                    await repository.upsert_context_evidence_requirements(missing)
+                if not request.dry_run and work:
+                    await repository.upsert_context_evidence_requirements(requirements)
                     window_end = datetime.now(UTC).replace(microsecond=0)
                     for requirement, connector in planned:
                         if connector:
@@ -2276,6 +2349,17 @@ async def reconcile_context_enrichment(
             ))
             await session.commit()
     return summary
+
+
+@app.post("/internal/context-enrichment/reconcile")
+async def reconcile_context_enrichment(
+    request: ContextEnrichmentReconcileRequest,
+    x_kaiops_internal_token: str = Header(default=""),
+) -> dict[str, Any]:
+    expected = str(settings.service_internal_token or "")
+    if not expected or not hmac.compare_digest(x_kaiops_internal_token, expected):
+        raise HTTPException(status_code=403, detail="service authentication is required")
+    return await _reconcile_context_enrichment_tenant(request)
 
 
 @app.post("/incidents/{incident_id}/context-gaps/{requirement_id}/responses")

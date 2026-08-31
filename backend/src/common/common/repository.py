@@ -30,6 +30,8 @@ from common.database import (
     ContextEvidenceRequirementRecord,
     CanonicalEvidenceRecord,
     ContextKnowledgeRecord,
+    ContextReconciliationLeaseRecord,
+    ContextReconciliationRunRecord,
     ContextSnapshotRecord,
     DraftPullRequestOutboxRecord,
     EvaluationRecord,
@@ -8242,6 +8244,93 @@ class EvaluationRepository:
 class ContextEnrichmentRepository(EvaluationRepository):
     """Tenant-scoped persistence for autonomous and human evidence gaps."""
 
+    async def enabled_reconciliation_tenants(self) -> list[str]:
+        """Enumerate configured tenants plus tenants with active incident work."""
+        configured = (await self.session.execute(select(OnboardingControlPlaneRecord.tenant_id).where(
+            OnboardingControlPlaneRecord.status.in_(("ACTIVE", "COMPLETED", "READY")),
+        ).distinct())).scalars().all()
+        active = (await self.session.execute(select(IncidentProjectionRecord.tenant_id).where(
+            IncidentProjectionRecord.lifecycle_state.notin_(("CLOSED",)),
+            IncidentProjectionRecord.status.notin_(("closed", "resolved", "cancelled", "canceled")),
+        ).distinct())).scalars().all()
+        return sorted({require_tenant_id(value, source="reconciliation tenant") for value in [*configured, *active]})
+
+    async def claim_reconciliation_lease(
+        self, *, lease_key: str, owner: str, lease_seconds: int,
+    ) -> bool:
+        key = self._require("reconciliation.lease_key", lease_key)[:128]
+        normalized_owner = self._require("reconciliation.owner", owner)[:255]
+        now = datetime.now(UTC)
+        dialect = self.session.get_bind().dialect.name
+        values = {"lease_key": key, "version": 1, "updated_at": now}
+        if dialect == "mysql":
+            await self.session.execute(mysql_insert(ContextReconciliationLeaseRecord).values(**values).prefix_with("IGNORE"))
+        elif dialect == "sqlite":
+            await self.session.execute(sqlite_insert(ContextReconciliationLeaseRecord).values(**values).on_conflict_do_nothing(
+                index_elements=[ContextReconciliationLeaseRecord.lease_key],
+            ))
+        row = await self.session.scalar(select(ContextReconciliationLeaseRecord).where(
+            ContextReconciliationLeaseRecord.lease_key == key,
+        ).with_for_update())
+        if row is None:
+            row = ContextReconciliationLeaseRecord(**values)
+            self.session.add(row)
+            await self.session.flush()
+        expires = row.lease_expires_at
+        if expires is not None and expires.tzinfo is None:
+            expires = expires.replace(tzinfo=UTC)
+        if row.lease_owner and row.lease_owner != normalized_owner and expires and expires > now:
+            return False
+        row.lease_owner = normalized_owner
+        row.lease_expires_at = now + timedelta(seconds=max(10, int(lease_seconds)))
+        row.version = int(row.version or 0) + 1
+        row.updated_at = now
+        await self.session.execute(update(ContextReconciliationRunRecord).where(
+            ContextReconciliationRunRecord.status == "running",
+            ContextReconciliationRunRecord.started_at < now - timedelta(seconds=max(10, int(lease_seconds))),
+        ).values(status="interrupted", completed_at=now))
+        await self.session.flush()
+        return True
+
+    async def release_reconciliation_lease(self, *, lease_key: str, owner: str) -> None:
+        row = await self.session.scalar(select(ContextReconciliationLeaseRecord).where(
+            ContextReconciliationLeaseRecord.lease_key == lease_key,
+        ).with_for_update())
+        if row is not None and row.lease_owner == owner:
+            row.lease_owner = None
+            row.lease_expires_at = None
+            row.version = int(row.version or 0) + 1
+
+    async def start_reconciliation_run(
+        self, *, owner: str, tenant_id: str | None,
+    ) -> ContextReconciliationRunRecord:
+        row = ContextReconciliationRunRecord(
+            lease_owner=self._require("reconciliation.owner", owner),
+            tenant_id=require_tenant_id(tenant_id, source="reconciliation run") if tenant_id else None,
+            status="running", errors=[], started_at=datetime.now(UTC),
+        )
+        self.session.add(row)
+        await self.session.flush()
+        return row
+
+    async def finish_reconciliation_run(
+        self, *, run_id: UUID, summary: dict[str, Any], status: str,
+    ) -> None:
+        row = await self.session.get(ContextReconciliationRunRecord, run_id)
+        if row is None:
+            raise LookupError("reconciliation run not found")
+        completed = datetime.now(UTC)
+        started = row.started_at if row.started_at.tzinfo else row.started_at.replace(tzinfo=UTC)
+        row.status = status
+        for field in (
+            "incidents_scanned", "gaps_found", "requirements_created", "jobs_scheduled",
+            "human_requests_created", "skipped_incidents",
+        ):
+            setattr(row, field, int(summary.get(field) or 0))
+        row.errors = list(summary.get("errors") or [])
+        row.completed_at = completed
+        row.duration_ms = max(0, int((completed - started).total_seconds() * 1000))
+
     async def upsert_context_evidence_requirements(
         self, requirements: list[Any],
     ) -> list[ContextEvidenceRequirementRecord]:
@@ -8398,6 +8487,13 @@ class ContextEnrichmentRepository(EvaluationRepository):
         observation_end: datetime,
     ) -> ContextEnrichmentJobRecord:
         tenant = require_tenant_id(tenant_id, source="context enrichment job")
+        active = await self.session.scalar(select(ContextEnrichmentJobRecord).where(
+            ContextEnrichmentJobRecord.tenant_id == tenant,
+            ContextEnrichmentJobRecord.requirement_id == self._to_uuid(requirement_id),
+            ContextEnrichmentJobRecord.connector_id == connector_id,
+        ).order_by(ContextEnrichmentJobRecord.created_at.desc()).limit(1))
+        if active is not None:
+            return active
         material = json.dumps({
             "tenant": tenant, "incident": str(incident_id), "requirement": str(requirement_id),
             "connector": connector_id, "query": query_payload,
@@ -9036,7 +9132,7 @@ class ContextEnrichmentRepository(EvaluationRepository):
                 requirement.retry_after = row.available_at
                 requirement.version += 1
         else:
-            row.status = "blocked"
+            row.status = "dead_letter"
             row.last_error = str(error or "maximum collection attempts reached")[:4000]
             if requirement is not None:
                 requirement.status = "blocked"

@@ -1754,6 +1754,39 @@ class ContextEnrichmentJobRecord(Base, TimestampMixin):
     version: Mapped[int] = mapped_column(Integer, default=1)
 
 
+class ContextReconciliationLeaseRecord(Base):
+    __tablename__ = "context_reconciliation_leases"
+
+    lease_key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    lease_owner: Mapped[str | None] = mapped_column(String(255), index=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+
+class ContextReconciliationRunRecord(Base):
+    __tablename__ = "context_reconciliation_runs"
+    __table_args__ = (
+        Index("ix_context_reconciliation_runs_started", "status", "started_at"),
+        Index("ix_context_reconciliation_runs_tenant", "tenant_id", "started_at"),
+    )
+
+    run_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    lease_owner: Mapped[str] = mapped_column(String(255), index=True)
+    tenant_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    status: Mapped[str] = mapped_column(String(32), index=True, default="running")
+    incidents_scanned: Mapped[int] = mapped_column(Integer, default=0)
+    gaps_found: Mapped[int] = mapped_column(Integer, default=0)
+    requirements_created: Mapped[int] = mapped_column(Integer, default=0)
+    jobs_scheduled: Mapped[int] = mapped_column(Integer, default=0)
+    human_requests_created: Mapped[int] = mapped_column(Integer, default=0)
+    skipped_incidents: Mapped[int] = mapped_column(Integer, default=0)
+    errors: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    duration_ms: Mapped[int | None] = mapped_column(Integer)
+
+
 class HumanEvidenceRequestRecord(Base, TimestampMixin):
     __tablename__ = "human_evidence_requests"
     __table_args__ = (UniqueConstraint("tenant_id", "requirement_id", name="uq_human_evidence_requirement"),)

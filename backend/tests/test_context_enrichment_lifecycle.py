@@ -14,6 +14,7 @@ from common.database import (
     AuditLogRecord,
     CanonicalEvidenceRecord,
     ContextSnapshotRecord,
+    ContextReconciliationRunRecord,
     IncidentLifecycleTransitionRecord,
     IncidentProjectionRecord,
     IncidentInvestigationBindingRecord,
@@ -115,7 +116,7 @@ async def test_missing_automatic_evidence_creates_idempotent_enrichment_jobs(
             tenant_id="tenant-a", incident_id=incident_id,
             requirement_id=requirements[0].requirement_id, connector_id="opensearch",
             query_payload={"service": "checkout-api", "environment": "prod"},
-            observation_start=now - timedelta(minutes=10), observation_end=now,
+            observation_start=now - timedelta(minutes=20), observation_end=now + timedelta(seconds=1),
         )
         second = await repo.schedule_context_enrichment_job(
             tenant_id="tenant-a", incident_id=incident_id,
@@ -201,10 +202,17 @@ async def test_operations_state_is_tenant_scoped(sqlite_session_factory):
             id=incident_id, tenant_id="tenant-a", service="checkout-api", environment="prod",
             severity="critical", status="investigating", title="Checkout latency", payload={},
         ))
+        session.add(IncidentProjectionRecord(
+            incident_id=incident_id, tenant_id="tenant-a", service="checkout-api",
+            environment="prod", status="investigating", first_seen_at=datetime.now(UTC),
+            projection_payload={},
+        ))
         await session.commit()
-        assert await ContextEnrichmentRepository(session).incident_operations_state(
+        repository = ContextEnrichmentRepository(session)
+        assert await repository.incident_operations_state(
             tenant_id="tenant-b", incident_id=incident_id,
         ) is None
+        assert await repository.enabled_reconciliation_tenants() == ["tenant-a"]
 
 
 @pytest.mark.asyncio
@@ -290,6 +298,76 @@ async def test_incident_lifecycle_rejects_missing_prerequisite_and_failure_code(
                 target_state="COLLECTION_BLOCKED", expected_version=1,
                 actor="context-agent", reason="connector exhausted", idempotency_key="blocked",
             )
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_lease_prevents_overlap_and_records_run(sqlite_session_factory):
+    async with sqlite_session_factory() as first_session:
+        first = ContextEnrichmentRepository(first_session)
+        assert await first.claim_reconciliation_lease(
+            lease_key="active-incidents", owner="worker-a", lease_seconds=60,
+        ) is True
+        await first_session.commit()
+
+    async with sqlite_session_factory() as second_session:
+        second = ContextEnrichmentRepository(second_session)
+        assert await second.claim_reconciliation_lease(
+            lease_key="active-incidents", owner="worker-b", lease_seconds=60,
+        ) is False
+        await second_session.rollback()
+
+    async with sqlite_session_factory() as first_session:
+        first = ContextEnrichmentRepository(first_session)
+        await first.release_reconciliation_lease(lease_key="active-incidents", owner="worker-a")
+        await first_session.commit()
+
+    async with sqlite_session_factory() as second_session:
+        second = ContextEnrichmentRepository(second_session)
+        assert await second.claim_reconciliation_lease(
+            lease_key="active-incidents", owner="worker-b", lease_seconds=60,
+        ) is True
+        run = await second.start_reconciliation_run(owner="worker-b", tenant_id="tenant-a")
+        await second.finish_reconciliation_run(
+            run_id=run.run_id,
+            summary={"incidents_scanned": 2, "jobs_scheduled": 1, "errors": []},
+            status="completed",
+        )
+        await second_session.commit()
+        persisted = await second_session.get(ContextReconciliationRunRecord, run.run_id)
+        assert persisted.status == "completed"
+        assert persisted.incidents_scanned == 2
+        assert persisted.jobs_scheduled == 1
+        assert persisted.duration_ms >= 0
+
+
+@pytest.mark.asyncio
+async def test_exhausted_context_job_is_dead_lettered(sqlite_session_factory):
+    incident_id = uuid4()
+    now = datetime.now(UTC)
+    requirement = build_evidence_requirements(
+        tenant_id="tenant-a", incident_id=incident_id, rca_version=1,
+        missing_evidence=[{"category": "metrics", "question": "What failed?"}], now=now,
+    )[0]
+    async with sqlite_session_factory() as session:
+        repo = ContextEnrichmentRepository(session)
+        await repo.upsert_context_evidence_requirements([requirement])
+        job = await repo.schedule_context_enrichment_job(
+            tenant_id="tenant-a", incident_id=incident_id,
+            requirement_id=requirement.requirement_id, connector_id="prometheus",
+            query_payload={}, observation_start=now - timedelta(minutes=5), observation_end=now,
+        )
+        await session.commit()
+        await repo.claim_context_enrichment_jobs(worker_id="worker-a", limit=1)
+        await repo.finish_context_enrichment_job(
+            job_id=job.job_id, worker_id="worker-a", collected=False,
+            error="connector unavailable", maximum_attempts=1,
+        )
+        await session.commit()
+        activity = await repo.list_context_enrichment_activity(
+            tenant_id="tenant-a", incident_id=incident_id,
+        )
+        assert activity["jobs"][0]["status"] == "dead_letter"
+        assert "connector unavailable" in activity["jobs"][0]["last_error"]
 
 
 @pytest.mark.asyncio
