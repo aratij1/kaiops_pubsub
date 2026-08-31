@@ -2142,6 +2142,10 @@ async def reconcile_context_enrichment(
         candidates = await repository.active_incident_gap_candidates(
             tenant_id=request.tenant_id, limit=request.limit,
         )
+        if not request.dry_run:
+            summary["human_requests_created"] += await repository.escalate_latest_blocked_requirements(
+                tenant_id=request.tenant_id,
+            )
         summary["incidents_scanned"] = len(candidates)
         for candidate in candidates:
             try:

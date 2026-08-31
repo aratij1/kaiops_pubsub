@@ -8358,6 +8358,40 @@ class ContextEnrichmentRepository(EvaluationRepository):
             } for row in requests],
         }
 
+    async def escalate_latest_blocked_requirements(self, *, tenant_id: str) -> int:
+        """Turn each incident's newest terminal gap into idempotent human work."""
+        tenant = require_tenant_id(tenant_id, source="blocked context escalation")
+        blocked = (await self.session.execute(
+            select(ContextEvidenceRequirementRecord).where(
+                ContextEvidenceRequirementRecord.tenant_id == tenant,
+                ContextEvidenceRequirementRecord.status == "blocked",
+            ).order_by(
+                ContextEvidenceRequirementRecord.incident_id,
+                ContextEvidenceRequirementRecord.rca_version.desc(),
+            )
+        )).scalars().all()
+        latest: dict[UUID, ContextEvidenceRequirementRecord] = {}
+        for requirement in blocked:
+            latest.setdefault(requirement.incident_id, requirement)
+        created = 0
+        for requirement in latest.values():
+            existing = (await self.session.execute(select(HumanEvidenceRequestRecord).where(
+                HumanEvidenceRequestRecord.tenant_id == tenant,
+                HumanEvidenceRequestRecord.requirement_id == requirement.requirement_id,
+            ))).scalar_one_or_none()
+            if existing is not None:
+                continue
+            await self.create_human_evidence_request(
+                tenant_id=tenant, incident_id=requirement.incident_id,
+                requirement_id=requirement.requirement_id, expected_responder="incident-owner",
+                due_at=datetime.now(UTC) + timedelta(hours=1),
+                acceptable_format="A source reference and a concise factual observation.",
+                evidence_already_checked=list(requirement.candidate_connectors or []),
+                hypothesis_impact=requirement.reason, investigation_can_continue=True,
+            )
+            created += 1
+        return created
+
     async def schedule_context_enrichment_job(
         self, *, tenant_id: str, incident_id: UUID | str, requirement_id: UUID | str,
         connector_id: str, query_payload: dict[str, Any], observation_start: datetime,
