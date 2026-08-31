@@ -17,7 +17,7 @@ test("production incident renders durable context enrichment without raw Not Fou
   await expect(page.getByText("Not Found", { exact: true })).toHaveCount(0);
   await expect(page.locator(".context-enrichment-list article").first()).toBeVisible();
   await expect(page.getByText(/no durable work items were created/i)).toHaveCount(0);
-  await expect(page.getByText(/Release [a-f0-9]{12}/)).toBeVisible();
+  await expect(page.getByText(/UI [a-f0-9]{12} · Gateway [a-f0-9]{12}/)).toBeVisible();
   await page.screenshot({ path: testInfo.outputPath("incident-context-enrichment.png"), fullPage: true });
 });
 
@@ -31,8 +31,10 @@ test("authenticated operator can submit an explicit connector-unavailable observ
   await page.getByRole("button", { name: /sign in/i }).click();
 
   const responseField = page.getByLabel(/Response for traces/).last();
+  const sourceField = page.getByLabel(/Source reference for traces/).last();
   await expect(responseField).toBeVisible({ timeout: 45_000 });
   await responseField.fill(response);
+  await sourceField.fill(process.env.KAIOPS_LIVE_HUMAN_SOURCE || "jira://release-validation/operator-response");
   await page.getByRole("button", { name: "Submit evidence" }).click();
   await expect(responseField).toHaveCount(0, { timeout: 45_000 });
 });
