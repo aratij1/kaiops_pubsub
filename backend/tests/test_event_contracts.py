@@ -98,7 +98,16 @@ async def test_inconclusive_investigation_preserves_diagnostic_evidence_handoff(
             rationale="No citations",
             commands=[],
             risk="high",
-            metadata={"rca_analysis": {"evidence_used": [], "confidence_score": 0.12}},
+            metadata={
+                "rca_analysis": {
+                    "root_cause": "Gateway saturation is the leading model-generated hypothesis.",
+                    "evidence_used": [],
+                    "confidence_score": 0.12,
+                },
+                "model_usage": [{
+                    "task": "rca", "provider": "reasoning-standard", "model": "gpt-4o",
+                }],
+            },
         )
 
     monkeypatch.setattr(resolution_agent_app.investigator, "investigate", fake_investigate)
@@ -115,7 +124,9 @@ async def test_inconclusive_investigation_preserves_diagnostic_evidence_handoff(
     assert recommendation.metadata["confidence_kind"] == "leading_hypothesis"
     assert recommendation.metadata["confidence_actionable"] is False
     assert "missing application sources" not in recommendation.recommended_action
-    assert analysis["leading_hypothesis"] == "A latency mechanism is under test."
+    assert analysis["leading_hypothesis"] == "Gateway saturation is the leading model-generated hypothesis."
+    assert analysis["investigator_candidate"] == "A latency mechanism is under test."
+    assert analysis["hypothesis_source"] == "model"
     assert analysis["recommended_next_diagnostic"] == "Compare gateway and upstream latency."
     assert "ApiLatencyHigh" in recommendation.root_cause
     assert "api-gateway" in recommendation.root_cause

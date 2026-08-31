@@ -473,6 +473,29 @@ async def _resolve_context(context: Context) -> Recommendation:
             if not investigation_report.get("conclusive"):
                 alert_name = str(context.alert.name or "alert").strip() or "alert"
                 service_name = str(context.alert.service or "unknown service").strip() or "unknown service"
+                model_usage = [
+                    item for item in recommendation.metadata.get("model_usage", [])
+                    if isinstance(item, dict)
+                ]
+                rca_usage = next((item for item in model_usage if item.get("task") == "rca"), {})
+                fix_usage = next((item for item in model_usage if item.get("task") == "fix"), {})
+                model_rca_available = bool(rca_usage) and str(rca_usage.get("provider") or "").lower() not in {
+                    "", "deterministic", "fallback",
+                } and not rca_usage.get("error")
+                model_fix_available = bool(fix_usage) and str(fix_usage.get("provider") or "").lower() not in {
+                    "", "deterministic", "fallback",
+                } and not fix_usage.get("error")
+                generated_analysis = (
+                    recommendation.metadata.get("rca_analysis")
+                    if isinstance(recommendation.metadata.get("rca_analysis"), dict)
+                    else {}
+                )
+                generated_hypothesis = (
+                    str(generated_analysis.get("root_cause") or recommendation.root_cause or "").strip()
+                    if model_rca_available
+                    else ""
+                )
+                generated_action = str(recommendation.recommended_action or "").strip() if model_fix_available else ""
                 next_evidence = [
                     item for item in investigation_report.get("next_evidence", [])
                     if isinstance(item, dict) and str(item.get("source") or "").strip()
@@ -512,7 +535,8 @@ async def _resolve_context(context: Context) -> Recommendation:
                     ),
                     hypotheses[0] if hypotheses else {},
                 )
-                leading_claim = str(conclusion.get("claim") or leading.get("claim") or "").strip()
+                investigator_claim = str(conclusion.get("claim") or leading.get("claim") or "").strip()
+                leading_claim = generated_hypothesis
                 falsification_check = (
                     leading.get("falsification_check")
                     if isinstance(leading.get("falsification_check"), dict)
@@ -528,9 +552,12 @@ async def _resolve_context(context: Context) -> Recommendation:
                     + (f" Leading unconfirmed hypothesis: {leading_claim}" if leading_claim else "")
                 )
                 recommendation.recommended_action = (
-                    f"Collect {missing} evidence for {alert_name} on {service_name}, then test: {next_diagnostic}"
-                    if missing
-                    else f"For {alert_name} on {service_name}, run this targeted diagnostic: {next_diagnostic}"
+                    generated_action
+                    or (
+                        f"Collect {missing} evidence for {alert_name} on {service_name}, then test: {next_diagnostic}"
+                        if missing
+                        else f"For {alert_name} on {service_name}, run this targeted diagnostic: {next_diagnostic}"
+                    )
                 )
                 rca_analysis = dict(
                     recommendation.metadata.get("rca_analysis")
@@ -540,6 +567,8 @@ async def _resolve_context(context: Context) -> Recommendation:
                 rca_analysis.update({
                     "root_cause": recommendation.root_cause,
                     "leading_hypothesis": leading_claim,
+                    "investigator_candidate": investigator_claim,
+                    "hypothesis_source": "model" if generated_hypothesis else "deterministic_investigator",
                     "recommended_next_diagnostic": next_diagnostic,
                     "confidence_score": diagnostic_confidence,
                     "confidence_kind": "leading_hypothesis",
@@ -568,6 +597,18 @@ async def _resolve_context(context: Context) -> Recommendation:
                 recommendation.metadata["resolution_outcome"] = "inconclusive"
                 recommendation.metadata["confidence_kind"] = "leading_hypothesis"
                 recommendation.metadata["confidence_actionable"] = False
+                recommendation.metadata["analysis_generation"] = {
+                    "rca": "model" if model_rca_available else "fallback",
+                    "impact": "model" if any(
+                        item.get("task") == "impact"
+                        and str(item.get("provider") or "").lower() not in {"", "deterministic", "fallback"}
+                        and not item.get("error")
+                        for item in model_usage
+                    ) else "fallback",
+                    "remediation": "model" if model_fix_available else "fallback",
+                    "provider": str(rca_usage.get("provider") or "unavailable"),
+                    "model": str(rca_usage.get("model") or "unavailable"),
+                }
             _attach_resolution_options(recommendation, context, investigation_report)
         recommendation.metadata = {
             **(recommendation.metadata if isinstance(recommendation.metadata, dict) else {}),

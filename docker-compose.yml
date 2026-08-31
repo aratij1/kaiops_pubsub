@@ -984,10 +984,10 @@ services:
       LLM_REQUEST_TIMEOUT_SECONDS: ${RESOLUTION_LLM_REQUEST_TIMEOUT_SECONDS:-45}
       RABBITMQ_HANDLER_TIMEOUT_SECONDS: ${RESOLUTION_HANDLER_TIMEOUT_SECONDS:-180}
       MESSAGE_BUS_WORKER_COUNT: ${RESOLUTION_AGENT_WORKER_COUNT:-2}
-      # RCA is the synchronous model call. Impact and remediation use the
-      # evidence-aware deterministic path by default, avoiding two serialized
-      # provider round trips; opt in only for investigations that need them.
-      RESOLUTION_DEEP_ANALYSIS_ENABLED: ${RESOLUTION_DEEP_ANALYSIS_ENABLED:-false}
+      # Generate RCA, impact, and remediation analysis through the configured
+      # model router. Evidence validation and execution policy remain
+      # deterministic and authoritative after synthesis.
+      RESOLUTION_DEEP_ANALYSIS_ENABLED: ${RESOLUTION_DEEP_ANALYSIS_ENABLED:-true}
       RESOLUTION_ITERATIVE_INVESTIGATION_ENABLED: ${RESOLUTION_ITERATIVE_INVESTIGATION_ENABLED:-true}
       # The investigator can require all ten bounded evidence planes. Keep the
       # default step budget large enough to query each plane once; a smaller

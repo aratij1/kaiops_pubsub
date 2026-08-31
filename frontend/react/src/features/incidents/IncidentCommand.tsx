@@ -188,6 +188,7 @@ export default function IncidentCommand() {
   const contextSourceManifest = record(contextSnapshot.source_manifest);
   const recommendation = firstRecord(row.recommendation, projection.recommendation, projection.remediation_recommendation, projection.resolution_plan, eventPayload.recommendation, source.recommendation);
   const recommendationMetadata = record(recommendation.metadata);
+  const analysisGeneration = record(recommendationMetadata.analysis_generation);
   const iterativeInvestigation = record(recommendationMetadata.iterative_investigation);
   const investigationConclusion = record(iterativeInvestigation.conclusion);
   const investigationHypotheses = Array.isArray(iterativeInvestigation.hypotheses)
@@ -215,7 +216,7 @@ export default function IncidentCommand() {
   const before = record(validation.before || validation.pre_state);
   const after = record(validation.after || validation.post_state);
   const analysis = firstRecord(projection.analysis, projection.rca, eventPayload.analysis, eventPayload.rca, recommendation.analysis, recommendation.rca, recommendationMetadata.rca_analysis, source.analysis);
-  const leadingHypothesis = text(analysis.leading_hypothesis, investigationConclusion.claim);
+  const leadingHypothesis = text(analysis.leading_hypothesis);
   const confidence = confidenceValue(recommendation.confidence, recommendationMetadata.confidence, analysis.confidence, eventPayload.confidence, projection.confidence, row.confidence);
   const confidenceKind = text(recommendationMetadata.confidence_kind, projection.confidence_kind).toLowerCase();
   const publishedRootCause = text(row.root_cause, projection.root_cause, eventPayload.root_cause, analysis.root_cause, recommendation.root_cause, recommendationMetadata.root_cause, sourceAnnotations.root_cause);
@@ -360,6 +361,7 @@ export default function IncidentCommand() {
 
         <section className="ic-section ic-rca">
           <header><div><span>Root cause story</span><h3>{rootCause || "Kai has not published a root-cause hypothesis"}</h3></div>{confidence !== null ? <div className="ic-confidence"><small>{confidenceLabel}</small><strong>{confidence}%</strong></div> : <StatusBadge tone="inactive">Confidence unavailable</StatusBadge>}</header>
+          {text(analysisGeneration.rca) === "model" ? <p className="ic-resolution-why">Agent synthesis: {text(analysisGeneration.provider, "configured provider")} / {text(analysisGeneration.model, "configured model")}. Evidence policy remains authoritative.</p> : null}
           {rootCause ? <>
             <div className="ic-reasoning"><article><h4>Why Kai thinks this</h4>{supportingReasons.length ? <ul>{supportingReasons.map((reason) => <li key={reason}><CheckCircle2 aria-hidden="true" />{reason}</li>)}</ul> : <p>Supporting reasons were not included in the backend analysis.</p>}</article><article><h4>What Kai ruled out</h4>{contradictions.length ? <ul>{contradictions.map((reason) => <li key={reason}><X aria-hidden="true" />{reason}</li>)}</ul> : <p>No ruled-out hypotheses were included.</p>}</article></div>
             <TechnicalDetails summary="Why this confidence?"><p>{confidence === null ? "The backend did not publish a confidence score." : `${confidence}% is the normalized ${confidenceLabel.toLowerCase()} published with this incident analysis.`}</p><p>{confidenceKind === "confirmed_rca" ? "The RCA is confirmed but remains governed by policy gates." : "The investigation is not conclusive; this score cannot authorize remediation."}</p><p>{supportingReasons.length} supporting reason(s) and {contradictions.length} contradiction or ruled-out item(s) are available.</p></TechnicalDetails>

@@ -30,10 +30,10 @@ def test_resolution_model_timeout_leaves_time_for_fallback_and_acknowledgement()
     assert handler_timeout - investigation_timeout - model_timeout >= 30
 
 
-def test_synchronous_resolution_defaults_to_one_model_synthesis_path() -> None:
+def test_synchronous_resolution_defaults_to_agent_generated_analysis() -> None:
     block = _resolution_service_block()
 
-    assert "RESOLUTION_DEEP_ANALYSIS_ENABLED: ${RESOLUTION_DEEP_ANALYSIS_ENABLED:-false}" in block
+    assert "RESOLUTION_DEEP_ANALYSIS_ENABLED: ${RESOLUTION_DEEP_ANALYSIS_ENABLED:-true}" in block
 
 
 def test_local_investigation_budget_can_query_every_evidence_plane_once() -> None:
