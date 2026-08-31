@@ -15,6 +15,8 @@ test("production incident renders durable context enrichment without raw Not Fou
     timeout: 45_000,
   });
   await expect(page.getByText("Not Found", { exact: true })).toHaveCount(0);
+  await expect(page.locator(".context-enrichment-list article").first()).toBeVisible();
+  await expect(page.getByText(/no durable work items were created/i)).toHaveCount(0);
   await expect(page.getByText(/Release [a-f0-9]{12}/)).toBeVisible();
   await page.screenshot({ path: testInfo.outputPath("incident-context-enrichment.png"), fullPage: true });
 });
