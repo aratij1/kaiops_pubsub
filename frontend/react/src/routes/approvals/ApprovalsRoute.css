@@ -177,6 +177,29 @@
   white-space: pre-wrap;
 }
 
+.approval-review-steps {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin: 14px 0;
+  padding: 0;
+  list-style: none;
+}
+
+.approval-review-steps li {
+  display: grid;
+  gap: 2px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface-soft);
+}
+
+.approval-review-steps span {
+  color: var(--muted);
+  font-size: .84rem;
+}
+
 .approval-receipt {
   display: flex;
   gap: 12px;
@@ -195,7 +218,8 @@
 @media (max-width: 720px) {
   .approval-decision-story,
   .approval-safety-plan,
-  .approval-modify-plan { grid-template-columns: 1fr; }
+  .approval-modify-plan,
+  .approval-review-steps { grid-template-columns: 1fr; }
   .approval-workspace .approval-ticket {
     grid-template-columns: 1fr;
     min-height: 0;

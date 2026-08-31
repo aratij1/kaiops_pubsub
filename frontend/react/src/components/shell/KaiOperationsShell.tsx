@@ -32,6 +32,21 @@ type NavigationGroupView = { id: string; label: string; items: readonly Navigati
 type OperationalItem = { kind?: string; label?: string | number; meta?: string; row?: unknown };
 type KaiStateItem = { label: string; value: number; tone?: "attention" | "active" | "calm" };
 
+const PAGE_STEPS: Partial<Record<NavigationIcon, readonly string[]>> = {
+  dashboard: ["Review items marked Attention", "Open the highest-priority incident", "Check pending approvals"],
+  incidents: ["Choose an active incident", "Review evidence and the RCA gate", "Complete the requested next action"],
+  approvals: ["Open a decision assigned to you", "Verify evidence, scope, and rollback", "Approve or reject with a reason"],
+  copilot: ["Ask one operational question", "Check the cited sources", "Open the related incident or service"],
+  knowledge: ["Review documents awaiting approval", "Verify ownership and applicability", "Approve only trustworthy production guidance"],
+  applications: ["Select an application", "Confirm ownership and services", "Complete missing monitoring setup"],
+  cloudResources: ["Filter to the service or provider", "Open the affected resource", "Verify owner and relationships"],
+  operationsCockpit: ["Find a blocked capability", "Review missing configuration", "Run a safe readiness check"],
+  cloudConnections: ["Add or select a connection", "Validate credentials and reachability", "Run discovery and review results"],
+  platformOverview: ["Review degraded components", "Open the reported dependency", "Confirm recovery after correction"],
+  settings: ["Choose the setting to manage", "Review its security impact", "Save and verify the result"],
+  audit: ["Filter by incident, actor, or action", "Open the relevant event", "Export evidence when needed"],
+};
+
 const ICONS: Record<NavigationIcon, typeof Activity> = {
   dashboard: LayoutDashboard,
   alerts: Activity,
@@ -132,6 +147,9 @@ export function KaiOperationsShell({
   const searchRef = useRef<HTMLInputElement>(null);
   const navigationMatches = useMemo(() => searchNavigation(operationalQuery, role).slice(0, 6), [operationalQuery, role]);
   const hasQuery = Boolean(operationalQuery.trim());
+  const currentGroup = navigationGroups.find((group) => group.items.some((item) => item.id === currentItem.id));
+  const pageSteps = PAGE_STEPS[currentItem.id] || ["Review the current status", "Open the item requiring attention", "Complete the suggested next action"];
+  const relatedItems = (currentItem.related || []).map((id) => navigationGroups.flatMap((group) => group.items).find((item) => item.id === id)).filter(Boolean) as NavigationItem[];
 
   useEffect(() => {
     const handleShortcut = (event: KeyboardEvent) => {
@@ -234,9 +252,10 @@ export function KaiOperationsShell({
         <main className="kai-route-content" id="workspace-content" tabIndex={-1}>
           {aiCapability?.degraded ? <div className="kai-ai-degraded" role="status"><Bot aria-hidden="true" /><span><strong>AI capability degraded.</strong> {aiCapability.message || "AI investigation may be delayed; deterministic monitoring remains active and execution stays governed by backend policy."}</span></div> : null}
           <header className="kai-route-context">
-            <div><span>{navigationGroups.find((group) => group.items.some((item) => item.id === currentItem.id))?.label || "KaiMS"}</span><h1>{currentItem.pageTitle}</h1></div>
-            <p>{currentItem.keywords.slice(0, 4).join(" · ")}</p>
+            <div><span>{currentGroup?.label || "KaiMS"} / {currentItem.label}</span><h1>{currentItem.pageTitle}</h1><p>{currentItem.description}</p></div>
+            <details className="kai-page-guide"><summary>How to use this page</summary><div><ol>{pageSteps.map((step) => <li key={step}>{step}</li>)}</ol>{relatedItems.length ? <nav aria-label="Related pages"><span>Related</span>{relatedItems.map((item) => <button type="button" key={item.id} onClick={() => selectNavigation(item)}>{item.label}</button>)}</nav> : null}</div></details>
           </header>
+          {currentItem.id === "dashboard" ? <section className="kai-next-action" aria-label="Recommended next action"><div><span>Recommended next action</span><strong>{approvalCount > 0 ? `${approvalCount} decision${approvalCount === 1 ? "" : "s"} waiting for review` : health.ok ? "Review active incidents" : "Check platform health"}</strong><p>{approvalCount > 0 ? "Start with the oldest assigned decision and verify its evidence and rollback plan." : health.ok ? "Open the incident list and continue the highest-severity investigation." : "Resolve degraded platform dependencies before relying on automated investigation."}</p></div><button type="button" onClick={() => { const targetId = approvalCount > 0 ? "approvals" : health.ok ? "incidents" : "platformOverview"; const item = navigationGroups.flatMap((group) => group.items).find((candidate) => candidate.id === targetId); if (item) selectNavigation(item); }}>{approvalCount > 0 ? "Review approvals" : health.ok ? "Open incidents" : "View platform health"}</button></section> : null}
           {restrictedDestination ? <div className="kai-permission-notice" role="status"><CircleAlert aria-hidden="true" /><span><strong>Access is restricted.</strong> {restrictedDestination} is not available to your role.</span></div> : null}
           {children}
         </main>

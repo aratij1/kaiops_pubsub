@@ -47,7 +47,7 @@ describe("authoritative navigation", () => {
 
   it("keeps the unified inbox active for an incident detail URL", () => {
     expect(tabForPath("/incidents/INC-3481")).toBe("summary");
-    expect(breadcrumbForPath("/incidents/INC-3481").map((item) => item.label)).toEqual(["Operations", "Unified Inbox"]);
+    expect(breadcrumbForPath("/incidents/INC-3481").map((item) => item.label)).toEqual(["Operations", "Incidents"]);
   });
 
   it("keeps audit and administration as distinct canonical workspaces", () => {
@@ -56,7 +56,7 @@ describe("authoritative navigation", () => {
     const audit = NAVIGATION_ITEMS.find((item) => item.id === "audit");
     const administration = NAVIGATION_ITEMS.find((item) => item.id === "admin");
     expect(audit?.path).not.toBe(NAVIGATION_ITEMS.find((item) => item.id === "settings")?.path);
-    expect(audit?.pageTitle).toBe("Platform Health & Audit");
+    expect(audit?.pageTitle).toBe("Audit Log");
     expect(administration?.pageTitle).toBe("Platform Settings");
   });
 
