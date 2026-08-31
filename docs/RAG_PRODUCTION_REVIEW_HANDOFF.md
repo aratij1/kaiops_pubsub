@@ -8,7 +8,9 @@ Production RAG activation remains blocked. The active Markdown corpus under
 any quarantined content retrievable.
 
 An accountable service owner and a RAG governance approver must review at least
-one candidate before the required CI production-readiness gate can pass.
+one candidate before either production deployment workflow can pass its hard
+production-readiness gate. Pull-request CI reports this state as a warning so
+code repairs can be integrated without claiming that the corpus is deployable.
 
 ## Initial review set
 
@@ -93,5 +95,6 @@ Before promotion, attach or record the following in the pull request:
 - safety, rollback, and staging evidence reviewed;
 - any expiration or mandatory next-review date.
 
-Until that record exists, the correct system state is an empty production corpus
-and a failing non-empty production RAG readiness gate.
+Until that record exists, the correct system state is an empty production corpus,
+a visible pull-request warning, and production deployments blocked by the
+non-empty production RAG readiness gate.
