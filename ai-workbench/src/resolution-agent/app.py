@@ -471,19 +471,13 @@ async def _resolve_context(context: Context) -> Recommendation:
             recommendation.metadata["investigation_id"] = investigation_report.get("investigation_id")
             recommendation.metadata["investigation_status"] = investigation_report.get("status")
             if not investigation_report.get("conclusive"):
+                alert_name = str(context.alert.name or "alert").strip() or "alert"
+                service_name = str(context.alert.service or "unknown service").strip() or "unknown service"
                 next_evidence = [
                     item for item in investigation_report.get("next_evidence", [])
                     if isinstance(item, dict) and str(item.get("source") or "").strip()
                 ]
                 missing = ", ".join(str(item["source"]) for item in next_evidence)
-                recommendation.root_cause = (
-                    "Investigation inconclusive: the collected evidence does not independently corroborate a causal hypothesis."
-                )
-                recommendation.recommended_action = (
-                    f"Collect the next required read-only evidence ({missing}) and rerun resolution."
-                    if missing
-                    else "Review the collected evidence, run the highest-value targeted diagnostic, and rerun resolution."
-                )
                 conclusion = (
                     investigation_report.get("conclusion")
                     if isinstance(investigation_report.get("conclusion"), dict)
@@ -518,6 +512,26 @@ async def _resolve_context(context: Context) -> Recommendation:
                     ),
                     hypotheses[0] if hypotheses else {},
                 )
+                leading_claim = str(conclusion.get("claim") or leading.get("claim") or "").strip()
+                falsification_check = (
+                    leading.get("falsification_check")
+                    if isinstance(leading.get("falsification_check"), dict)
+                    else {}
+                )
+                next_diagnostic = str(
+                    leading.get("recommended_next_diagnostic")
+                    or falsification_check.get("objective")
+                    or "collect independent evidence that can confirm or falsify the leading hypothesis"
+                ).strip()
+                recommendation.root_cause = (
+                    f"No causal conclusion yet for {alert_name} on {service_name}."
+                    + (f" Leading unconfirmed hypothesis: {leading_claim}" if leading_claim else "")
+                )
+                recommendation.recommended_action = (
+                    f"Collect {missing} evidence for {alert_name} on {service_name}, then test: {next_diagnostic}"
+                    if missing
+                    else f"For {alert_name} on {service_name}, run this targeted diagnostic: {next_diagnostic}"
+                )
                 rca_analysis = dict(
                     recommendation.metadata.get("rca_analysis")
                     if isinstance(recommendation.metadata.get("rca_analysis"), dict)
@@ -525,6 +539,8 @@ async def _resolve_context(context: Context) -> Recommendation:
                 )
                 rca_analysis.update({
                     "root_cause": recommendation.root_cause,
+                    "leading_hypothesis": leading_claim,
+                    "recommended_next_diagnostic": next_diagnostic,
                     "confidence_score": diagnostic_confidence,
                     "confidence_kind": "leading_hypothesis",
                     "evidence_used": diagnostic_evidence_ids,
@@ -543,8 +559,10 @@ async def _resolve_context(context: Context) -> Recommendation:
                 })
                 recommendation.metadata["rca_analysis"] = rca_analysis
                 recommendation.rationale = (
-                    f"The leading diagnostic hypothesis is supported by {len(diagnostic_evidence_ids)} "
-                    f"validated evidence citation(s); confidence={diagnostic_confidence:.2f}. "
+                    f"For {alert_name} on {service_name}, the unconfirmed hypothesis"
+                    f"{f' — {leading_claim}' if leading_claim else ''} is supported by "
+                    f"{len(diagnostic_evidence_ids)} validated evidence citation(s); "
+                    f"confidence={diagnostic_confidence:.2f}. "
                     "It remains non-actionable until the conclusive evidence gate passes."
                 )
                 recommendation.metadata["resolution_outcome"] = "inconclusive"

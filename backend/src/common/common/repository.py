@@ -1110,6 +1110,8 @@ class IncidentRepository:
             )
 
             service_name = str(alert_payload.get("service") or "selected service").strip() or "selected service"
+            alert_name = str(alert_payload.get("name") or "the selected alert").strip() or "the selected alert"
+            observed_signal = str(alert_payload.get("description") or "").strip()
             hypotheses = discovery_report.get("hypotheses") if isinstance(discovery_report.get("hypotheses"), list) else []
             first_hypothesis = hypotheses[0] if hypotheses and isinstance(hypotheses[0], dict) else {}
             evidence_ids = [
@@ -1121,7 +1123,8 @@ class IncidentRepository:
                 f"RCA pending: evidence for {service_name} has been collected but no validated causal conclusion exists yet."
             )
             fallback_impact = (
-                f"No direct customer or service impact is established by the collected evidence for {service_name}; "
+                f"No direct impact measurement was cited for {alert_name} on {service_name}. "
+                f"{f'Observed signal: {observed_signal[:320]} ' if observed_signal else ''}"
                 "validate availability, latency, error rate, and dependency health before assigning impact."
             )
             recommendation = {

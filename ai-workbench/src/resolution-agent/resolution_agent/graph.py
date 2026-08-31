@@ -1261,9 +1261,13 @@ class ResolutionIntelligenceAgent(BaseAgent):
             "unresolved-service",
         }
         affected_service = service_name if service_name.lower() not in source_only_services else ""
+        alert_name = str(context.alert.name or "the active alert").strip() or "the active alert"
+        observed_signal = str(context.alert.description or "").strip()
         evidence_safe_fallback = (
-            f"No direct customer or service impact is established by the collected evidence"
-            f"{f' for {affected_service}' if affected_service else ''}; validate availability, latency, "
+            f"No direct impact measurement was cited for {alert_name}"
+            f"{f' on {affected_service}' if affected_service else ''}."
+            f"{f' Observed signal: {observed_signal[:320]}' if observed_signal else ''} "
+            "Validate availability, latency, "
             "error rate, and dependency health before assigning impact."
         )
         prompt = PROMPT_ASSESS_IMPACT

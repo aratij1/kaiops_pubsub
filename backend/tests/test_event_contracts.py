@@ -75,7 +75,11 @@ async def test_inconclusive_investigation_preserves_diagnostic_evidence_handoff(
             "confidence": 0.58,
             "evidence_ids": ["EV-1", "UNKNOWN"],
         },
-        "hypotheses": [{"hypothesis_id": "hypothesis-1", "claim": "A latency mechanism is under test."}],
+        "hypotheses": [{
+            "hypothesis_id": "hypothesis-1",
+            "claim": "A latency mechanism is under test.",
+            "falsification_check": {"objective": "Compare gateway and upstream latency."},
+        }],
         "evidence": [{"evidence_id": "EV-1", "source_type": "telemetry"}],
     }
 
@@ -111,6 +115,12 @@ async def test_inconclusive_investigation_preserves_diagnostic_evidence_handoff(
     assert recommendation.metadata["confidence_kind"] == "leading_hypothesis"
     assert recommendation.metadata["confidence_actionable"] is False
     assert "missing application sources" not in recommendation.recommended_action
+    assert analysis["leading_hypothesis"] == "A latency mechanism is under test."
+    assert analysis["recommended_next_diagnostic"] == "Compare gateway and upstream latency."
+    assert "ApiLatencyHigh" in recommendation.root_cause
+    assert "api-gateway" in recommendation.root_cause
+    assert "Compare gateway and upstream latency" in recommendation.recommended_action
+    assert "non-actionable" in recommendation.rationale
 
 _APPROVAL_APP_PATH = Path(__file__).resolve().parents[1] / "src" / "approval-service" / "app.py"
 _APPROVAL_SPEC = importlib.util.spec_from_file_location("approval_service_app", _APPROVAL_APP_PATH)

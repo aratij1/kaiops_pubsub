@@ -188,6 +188,8 @@ export default function IncidentCommand() {
   const contextSourceManifest = record(contextSnapshot.source_manifest);
   const recommendation = firstRecord(row.recommendation, projection.recommendation, projection.remediation_recommendation, projection.resolution_plan, eventPayload.recommendation, source.recommendation);
   const recommendationMetadata = record(recommendation.metadata);
+  const iterativeInvestigation = record(recommendationMetadata.iterative_investigation);
+  const investigationConclusion = record(iterativeInvestigation.conclusion);
   const canonicalIncidentId = incidentId(row);
   const canonicalAlertId = text(
     recommendationMetadata.alert_id,
@@ -206,9 +208,11 @@ export default function IncidentCommand() {
   const before = record(validation.before || validation.pre_state);
   const after = record(validation.after || validation.post_state);
   const analysis = firstRecord(projection.analysis, projection.rca, eventPayload.analysis, eventPayload.rca, recommendation.analysis, recommendation.rca, recommendationMetadata.rca_analysis, source.analysis);
-  const rootCause = text(row.root_cause, projection.root_cause, eventPayload.root_cause, analysis.root_cause, analysis.leading_hypothesis, recommendation.root_cause, recommendationMetadata.root_cause, sourceAnnotations.root_cause);
+  const leadingHypothesis = text(analysis.leading_hypothesis, investigationConclusion.claim);
   const confidence = confidenceValue(recommendation.confidence, recommendationMetadata.confidence, analysis.confidence, eventPayload.confidence, projection.confidence, row.confidence);
   const confidenceKind = text(recommendationMetadata.confidence_kind, projection.confidence_kind).toLowerCase();
+  const publishedRootCause = text(row.root_cause, projection.root_cause, eventPayload.root_cause, analysis.root_cause, recommendation.root_cause, recommendationMetadata.root_cause, sourceAnnotations.root_cause);
+  const rootCause = confidenceKind === "confirmed_rca" ? publishedRootCause : text(leadingHypothesis, publishedRootCause);
   const confidenceLabel = confidenceKind === "confirmed_rca" ? "Confirmed RCA confidence" : "Leading hypothesis confidence";
   const analysisSupportingSignals = arrayOfText(analysis.supporting_signals);
   const supportingReasons = [
@@ -231,6 +235,12 @@ export default function IncidentCommand() {
   const sourceTimestamp = text(source.received_at, source.created_at, row.created_at);
   const updatedTimestamp = text(row.latest_event_at, row.updated_at, row.created_at);
   const impact = text(row.customer_impact, row.business_impact, projection.customer_impact, projection.business_impact, projection.impact, eventPayload.impact, recommendation.impact, sourceAnnotations.business_impact, sourceAnnotations.summary, source.summary, source.description, row.summary);
+  const causalNodes = [
+    { label: confidenceKind === "confirmed_rca" ? "Confirmed root cause" : "Unconfirmed hypothesis", value: rootCause },
+    { label: "Affected service", value: text(row.service, contextAlert.service, source.service) },
+    { label: "Triggering signal", value: titleFor(row) },
+    { label: "Observed impact", value: impact },
+  ].filter((node, index, nodes) => node.value && nodes.findIndex((candidate) => candidate.value === node.value) === index);
   const sourceName = text(row.origin_system, row.source, source.origin_system, source.source, sourceLabels.origin_system, sourceLabels.transport);
   const signalCount = text(row.deduplicated_count, source.deduplicated_count, source.occurrence_count, contextAlert.deduplicated_count, contextAlert.occurrence_count);
   const correlationDetail = text(row.deduplication_reason, deduplication.reason, deduplication.disposition, deduplication.match_type) || "Correlation detail unavailable";
@@ -336,7 +346,7 @@ export default function IncidentCommand() {
         <section className="ic-section ic-causal">
           <header><div><span>Relevant causal path</span><h3>How the signal connects to impact</h3></div><GitBranch aria-hidden="true" /></header>
           <div className="ic-causal-path">
-            {[text(rootCause), text(row.service), titleFor(row), impact].filter((value, index, values) => value && values.indexOf(value) === index).map((value, index, values) => <div key={value}><button type="button"><span>{index === 0 && rootCause ? "Hypothesis" : index === values.length - 1 ? "Observed impact" : "Affected component"}</span><strong>{value}</strong></button>{index < values.length - 1 ? <ArrowDown aria-hidden="true" /> : null}</div>)}
+            {causalNodes.map((node, index) => <div key={`${node.label}-${node.value}`}><button type="button"><span>{node.label}</span><strong>{node.value}</strong></button>{index < causalNodes.length - 1 ? <ArrowDown aria-hidden="true" /> : null}</div>)}
           </div>
           {!rootCause && !impact ? <p className="ic-unavailable">The backend has not supplied enough evidence to construct a causal path.</p> : null}
         </section>
