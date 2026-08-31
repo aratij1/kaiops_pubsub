@@ -14,6 +14,8 @@ from common.database import (
     AuditLogRecord,
     CanonicalEvidenceRecord,
     ContextSnapshotRecord,
+    IncidentLifecycleTransitionRecord,
+    IncidentProjectionRecord,
     IncidentInvestigationBindingRecord,
     IncidentRecord,
     ResolutionOutboxRecord,
@@ -203,6 +205,91 @@ async def test_operations_state_is_tenant_scoped(sqlite_session_factory):
         assert await ContextEnrichmentRepository(session).incident_operations_state(
             tenant_id="tenant-b", incident_id=incident_id,
         ) is None
+
+
+@pytest.mark.asyncio
+async def test_incident_lifecycle_transition_is_atomic_idempotent_and_versioned(
+    sqlite_session_factory,
+):
+    incident_id, alert_id = uuid4(), uuid4()
+    now = datetime.now(UTC)
+    requirement = build_evidence_requirements(
+        tenant_id="tenant-a", incident_id=incident_id, rca_version=1,
+        missing_evidence=[{"category": "metrics", "question": "What is failing?"}], now=now,
+    )[0]
+    async with sqlite_session_factory() as session:
+        repo = ContextEnrichmentRepository(session)
+        session.add(IncidentRecord(
+            id=incident_id, tenant_id="tenant-a", service="checkout-api", environment="prod",
+            severity="critical", status="investigating", title="Checkout latency", payload={},
+        ))
+        session.add(IncidentProjectionRecord(
+            incident_id=incident_id, alert_id=alert_id, tenant_id="tenant-a",
+            service="checkout-api", environment="prod", severity="critical",
+            status="investigating", first_seen_at=now, projection_payload={},
+        ))
+        await repo.upsert_context_evidence_requirements([requirement])
+        await session.commit()
+
+        first = await repo.transition_incident_lifecycle(
+            tenant_id="tenant-a", incident_id=incident_id,
+            target_state="REQUIREMENTS_IDENTIFIED", expected_version=1,
+            actor="context-agent", reason="RCA evidence gaps persisted",
+            idempotency_key="requirements-v1",
+        )
+        await session.commit()
+        repeated = await repo.transition_incident_lifecycle(
+            tenant_id="tenant-a", incident_id=incident_id,
+            target_state="REQUIREMENTS_IDENTIFIED", expected_version=1,
+            actor="context-agent", reason="ignored on replay",
+            idempotency_key="requirements-v1",
+        )
+        assert first["transition_id"] == repeated["transition_id"]
+        assert repeated["idempotent"] is True
+
+        with pytest.raises(RuntimeError, match="STALE_LIFECYCLE_VERSION"):
+            await repo.transition_incident_lifecycle(
+                tenant_id="tenant-a", incident_id=incident_id,
+                target_state="COLLECTING", expected_version=1,
+                actor="context-agent", reason="stale writer",
+                idempotency_key="collecting-stale",
+            )
+        await session.rollback()
+
+        projection = await session.get(IncidentProjectionRecord, incident_id)
+        assert projection.lifecycle_state == "REQUIREMENTS_IDENTIFIED"
+        assert projection.lifecycle_version == 2
+        transitions = list((await session.execute(select(IncidentLifecycleTransitionRecord))).scalars())
+        assert len(transitions) == 1
+        assert await session.get(ResolutionOutboxRecord, f"incident-lifecycle:{first['transition_id']}") is not None
+
+
+@pytest.mark.asyncio
+async def test_incident_lifecycle_rejects_missing_prerequisite_and_failure_code(
+    sqlite_session_factory,
+):
+    incident_id = uuid4()
+    async with sqlite_session_factory() as session:
+        repo = ContextEnrichmentRepository(session)
+        session.add(IncidentProjectionRecord(
+            incident_id=incident_id, tenant_id="tenant-a", service="checkout-api",
+            environment="prod", status="investigating", first_seen_at=datetime.now(UTC),
+            projection_payload={},
+        ))
+        await session.commit()
+        with pytest.raises(ValueError, match="REQUIREMENTS_MISSING"):
+            await repo.transition_incident_lifecycle(
+                tenant_id="tenant-a", incident_id=incident_id,
+                target_state="REQUIREMENTS_IDENTIFIED", expected_version=1,
+                actor="context-agent", reason="no requirements", idempotency_key="missing",
+            )
+        await session.rollback()
+        with pytest.raises(ValueError, match="failure_code"):
+            await repo.transition_incident_lifecycle(
+                tenant_id="tenant-a", incident_id=incident_id,
+                target_state="COLLECTION_BLOCKED", expected_version=1,
+                actor="context-agent", reason="connector exhausted", idempotency_key="blocked",
+            )
 
 
 @pytest.mark.asyncio

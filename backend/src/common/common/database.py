@@ -1133,6 +1133,10 @@ class IncidentProjectionRecord(Base, TimestampMixin):
     environment: Mapped[str] = mapped_column(String(64), index=True)
     severity: Mapped[str | None] = mapped_column(String(32), index=True)
     status: Mapped[str] = mapped_column(String(64), index=True)
+    lifecycle_state: Mapped[str] = mapped_column(String(64), nullable=False, index=True, default="DETECTED")
+    lifecycle_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    lifecycle_failure_code: Mapped[str | None] = mapped_column(String(128), index=True)
+    lifecycle_failure_reason: Mapped[str | None] = mapped_column(Text)
     owner: Mapped[str | None] = mapped_column(String(128), index=True)
     risk_tier: Mapped[str | None] = mapped_column(String(32), index=True)
     execution_mode: Mapped[str | None] = mapped_column(String(32), index=True)
@@ -1146,6 +1150,29 @@ class IncidentProjectionRecord(Base, TimestampMixin):
     first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     document_available: Mapped[bool | None] = mapped_column(Boolean)
     projection_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class IncidentLifecycleTransitionRecord(Base):
+    """Immutable audit record for an overarching incident lifecycle transition."""
+
+    __tablename__ = "incident_lifecycle_transitions"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "idempotency_key", name="uq_incident_lifecycle_idempotency"),
+        UniqueConstraint("tenant_id", "incident_id", "sequence_no", name="uq_incident_lifecycle_sequence"),
+        Index("ix_incident_lifecycle_history", "tenant_id", "incident_id", "sequence_no"),
+    )
+
+    transition_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    incident_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    sequence_no: Mapped[int] = mapped_column(Integer)
+    previous_state: Mapped[str] = mapped_column(String(64), index=True)
+    new_state: Mapped[str] = mapped_column(String(64), index=True)
+    actor: Mapped[str] = mapped_column(String(160), index=True)
+    reason: Mapped[str] = mapped_column(Text)
+    failure_code: Mapped[str | None] = mapped_column(String(128), index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(160))
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
 
 
 class RoleRecord(Base, TimestampMixin):

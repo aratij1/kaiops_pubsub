@@ -43,6 +43,7 @@ from common.database import (
     IncidentCorrelationOwnershipRecord,
     IncidentEventRecord,
     IncidentInvestigationBindingRecord,
+    IncidentLifecycleTransitionRecord,
     IncidentOccurrenceRecord,
     IncidentProjectionRecord,
     IncidentRecord,
@@ -78,6 +79,7 @@ from common.database import (
     ValidationObservationRecord,
 )
 from common.incident_investigation import IncidentInvestigationContract, is_traceable_evidence_citation
+from common.incident_lifecycle import FAILURE_INCIDENT_STATES, IncidentLifecycleState, validate_incident_transition
 from common.incident_status import reduce_incident_status
 from common.orchestration.execution_plan_contract import (
     ExecutionPlanV2,
@@ -8739,6 +8741,31 @@ class ContextEnrichmentRepository(EvaluationRepository):
             lifecycle_state = "RCA_READY" if str(binding.status).lower() in {"grounded", "ready", "conclusive"} else "INVESTIGATING"
             next_action = {"type": "REVIEW_RCA", "message": "Review the current governed RCA version."}
 
+        if projection is not None:
+            try:
+                persisted_state = IncidentLifecycleState(projection.lifecycle_state)
+            except ValueError:
+                persisted_state = None
+            if persisted_state is not None:
+                lifecycle_state = persisted_state.value
+                next_action = {
+                    IncidentLifecycleState.DETECTED: {
+                        "type": "IDENTIFY_REQUIREMENTS", "message": "KaiMS is identifying evidence requirements.",
+                    },
+                    IncidentLifecycleState.REQUIREMENTS_IDENTIFIED: {
+                        "type": "SCHEDULE_COLLECTION", "message": "KaiMS is scheduling governed evidence collection.",
+                    },
+                    IncidentLifecycleState.COLLECTING: {
+                        "type": "AUTONOMOUS_COLLECTION", "message": "KaiMS is collecting governed evidence.",
+                    },
+                    IncidentLifecycleState.WAITING_FOR_HUMAN: {
+                        "type": "HUMAN_EVIDENCE", "message": "KaiMS is waiting for assigned human evidence.",
+                    },
+                    IncidentLifecycleState.CONTEXT_READY: {
+                        "type": "INVESTIGATE", "message": "KaiMS is preparing a governed investigation.",
+                    },
+                }.get(persisted_state, next_action)
+
         resolution_ready = lifecycle_state == "RCA_READY" and bool(quality.get("passed"))
         blocked_reasons = list(quality.get("blocking_reasons") or analysis.get("missing_evidence") or [])
         timestamps = [
@@ -8755,6 +8782,11 @@ class ContextEnrichmentRepository(EvaluationRepository):
             "schema_version": "kaiops.operations-state.v1",
             "incident_id": str(incident_uuid), "tenant_id": tenant,
             "lifecycle_state": lifecycle_state,
+            "lifecycle_version": int(projection.lifecycle_version or 1) if projection else 0,
+            "lifecycle_failure": {
+                "code": projection.lifecycle_failure_code,
+                "reason": projection.lifecycle_failure_reason,
+            } if projection and projection.lifecycle_failure_code else None,
             "context": {
                 "snapshot_id": str(snapshot.snapshot_id) if snapshot else None,
                 "version": int(snapshot.snapshot_version) if snapshot else 0,
@@ -8789,6 +8821,191 @@ class ContextEnrichmentRepository(EvaluationRepository):
             "next_action": next_action,
             "updated_at": updated_at,
         }
+
+    async def transition_incident_lifecycle(
+        self, *, tenant_id: str, incident_id: UUID | str, target_state: str,
+        expected_version: int, actor: str, reason: str, idempotency_key: str,
+        failure_code: str | None = None,
+    ) -> dict[str, Any]:
+        """Atomically validate, audit, project, and enqueue one lifecycle transition."""
+        tenant = require_tenant_id(tenant_id, source="incident lifecycle transition")
+        incident_uuid = self._to_uuid(incident_id)
+        key = self._require("incident_lifecycle.idempotency_key", idempotency_key)[:160]
+        existing = await self.session.scalar(select(IncidentLifecycleTransitionRecord).where(
+            IncidentLifecycleTransitionRecord.tenant_id == tenant,
+            IncidentLifecycleTransitionRecord.idempotency_key == key,
+        ))
+        if existing is not None:
+            if existing.incident_id != incident_uuid or existing.new_state != str(target_state):
+                raise ValueError("incident lifecycle idempotency key was reused for a different transition")
+            return self._lifecycle_transition_payload(existing, idempotent=True)
+
+        projection = await self.session.scalar(select(IncidentProjectionRecord).where(
+            IncidentProjectionRecord.incident_id == incident_uuid,
+            IncidentProjectionRecord.tenant_id == tenant,
+        ).with_for_update())
+        if projection is None:
+            raise LookupError("incident projection not found")
+        if int(projection.lifecycle_version or 1) != int(expected_version):
+            raise RuntimeError("STALE_LIFECYCLE_VERSION")
+        current, target = validate_incident_transition(projection.lifecycle_state, target_state)
+        await self._validate_incident_transition_prerequisites(
+            tenant_id=tenant, incident_id=incident_uuid, target=target,
+        )
+        normalized_reason = self._require("incident_lifecycle.reason", reason)
+        normalized_actor = self._require("incident_lifecycle.actor", actor)[:160]
+        normalized_failure = str(failure_code or "").strip()[:128] or None
+        if target in FAILURE_INCIDENT_STATES and normalized_failure is None:
+            raise ValueError("failure lifecycle transitions require a machine-readable failure_code")
+        transition = IncidentLifecycleTransitionRecord(
+            tenant_id=tenant, incident_id=incident_uuid,
+            sequence_no=int(projection.lifecycle_version or 1),
+            previous_state=current.value, new_state=target.value,
+            actor=normalized_actor, reason=normalized_reason,
+            failure_code=normalized_failure, idempotency_key=key,
+        )
+        self.session.add(transition)
+        await self.session.flush()
+        projection.lifecycle_state = target.value
+        projection.lifecycle_version = int(projection.lifecycle_version or 1) + 1
+        projection.lifecycle_failure_code = normalized_failure
+        projection.lifecycle_failure_reason = normalized_reason if normalized_failure else None
+        projection.projection_payload = {
+            **dict(projection.projection_payload or {}),
+            "incident_lifecycle": {
+                "state": target.value, "version": projection.lifecycle_version,
+                "transition_id": str(transition.transition_id), "actor": normalized_actor,
+                "reason": normalized_reason, "failure_code": normalized_failure,
+                "occurred_at": transition.occurred_at.isoformat(),
+            },
+        }
+        event_id = f"incident-lifecycle:{transition.transition_id}"
+        self.session.add(ResolutionOutboxRecord(
+            event_id=event_id, tenant_id=tenant, aggregate_id=str(incident_uuid),
+            topic="incident-lifecycle-events", partition_key=str(incident_uuid),
+            payload={
+                "schema_version": "kaiops.incident-lifecycle.v1",
+                "transition_id": str(transition.transition_id), "incident_id": str(incident_uuid),
+                "tenant_id": tenant, "previous_state": current.value, "new_state": target.value,
+                "version": projection.lifecycle_version, "actor": normalized_actor,
+                "reason": normalized_reason, "failure_code": normalized_failure,
+            },
+            status="pending", attempts=0, next_attempt_at=datetime.now(UTC),
+        ))
+        await self.session.flush()
+        return self._lifecycle_transition_payload(transition, idempotent=False)
+
+    @staticmethod
+    def _lifecycle_transition_payload(
+        row: IncidentLifecycleTransitionRecord, *, idempotent: bool,
+    ) -> dict[str, Any]:
+        return {
+            "transition_id": str(row.transition_id), "incident_id": str(row.incident_id),
+            "tenant_id": row.tenant_id, "previous_state": row.previous_state,
+            "new_state": row.new_state, "version": row.sequence_no + 1,
+            "actor": row.actor, "reason": row.reason, "failure_code": row.failure_code,
+            "occurred_at": row.occurred_at, "idempotent": idempotent,
+        }
+
+    async def _validate_incident_transition_prerequisites(
+        self, *, tenant_id: str, incident_id: UUID, target: IncidentLifecycleState,
+    ) -> None:
+        if target in FAILURE_INCIDENT_STATES:
+            return
+        if target == IncidentLifecycleState.REQUIREMENTS_IDENTIFIED:
+            exists_row = await self.session.scalar(select(func.count()).select_from(
+                ContextEvidenceRequirementRecord,
+            ).where(
+                ContextEvidenceRequirementRecord.tenant_id == tenant_id,
+                ContextEvidenceRequirementRecord.incident_id == incident_id,
+            ))
+            if not exists_row:
+                raise ValueError("REQUIREMENTS_MISSING")
+        elif target == IncidentLifecycleState.COLLECTING:
+            exists_row = await self.session.scalar(select(func.count()).select_from(
+                ContextEnrichmentJobRecord,
+            ).where(
+                ContextEnrichmentJobRecord.tenant_id == tenant_id,
+                ContextEnrichmentJobRecord.incident_id == incident_id,
+                ContextEnrichmentJobRecord.status.in_(("scheduled", "collecting", "retry")),
+            ))
+            if not exists_row:
+                raise ValueError("COLLECTION_JOB_MISSING")
+        elif target == IncidentLifecycleState.WAITING_FOR_HUMAN:
+            exists_row = await self.session.scalar(select(func.count()).select_from(
+                HumanEvidenceRequestRecord,
+            ).where(
+                HumanEvidenceRequestRecord.tenant_id == tenant_id,
+                HumanEvidenceRequestRecord.incident_id == incident_id,
+                HumanEvidenceRequestRecord.status.in_(("pending", "assigned", "open", "in_progress")),
+            ))
+            if not exists_row:
+                raise ValueError("ACTIVE_HUMAN_REQUEST_MISSING")
+        elif target == IncidentLifecycleState.CONTEXT_READY:
+            snapshot = await self.session.scalar(select(ContextSnapshotRecord.snapshot_id).where(
+                ContextSnapshotRecord.tenant_id == tenant_id,
+                ContextSnapshotRecord.incident_id == str(incident_id),
+            ).limit(1))
+            unresolved = await self.session.scalar(select(func.count()).select_from(
+                ContextEvidenceRequirementRecord,
+            ).where(
+                ContextEvidenceRequirementRecord.tenant_id == tenant_id,
+                ContextEvidenceRequirementRecord.incident_id == incident_id,
+                ContextEvidenceRequirementRecord.status.notin_(("collected", "answered", "satisfied")),
+            ))
+            if snapshot is None or unresolved:
+                raise ValueError("CONTEXT_NOT_READY")
+        elif target in {IncidentLifecycleState.INVESTIGATING, IncidentLifecycleState.RCA_READY}:
+            binding = await self.session.scalar(select(IncidentInvestigationBindingRecord).where(
+                IncidentInvestigationBindingRecord.tenant_id == tenant_id,
+                IncidentInvestigationBindingRecord.incident_id == incident_id,
+            ).order_by(IncidentInvestigationBindingRecord.rca_version.desc()).limit(1))
+            if target == IncidentLifecycleState.RCA_READY:
+                latest_snapshot = await self.session.scalar(select(ContextSnapshotRecord.snapshot_id).where(
+                    ContextSnapshotRecord.tenant_id == tenant_id,
+                    ContextSnapshotRecord.incident_id == str(incident_id),
+                ).order_by(ContextSnapshotRecord.snapshot_version.desc()).limit(1))
+                if binding is None or binding.context_snapshot_id != latest_snapshot:
+                    raise ValueError("CURRENT_RCA_BINDING_MISSING")
+            if target == IncidentLifecycleState.INVESTIGATING:
+                snapshot = await self.session.scalar(select(ContextSnapshotRecord.snapshot_id).where(
+                    ContextSnapshotRecord.tenant_id == tenant_id,
+                    ContextSnapshotRecord.incident_id == str(incident_id),
+                ).limit(1))
+                if snapshot is None:
+                    raise ValueError("CONTEXT_SNAPSHOT_MISSING")
+        elif target in {IncidentLifecycleState.PLAN_READY, IncidentLifecycleState.AWAITING_APPROVAL}:
+            plan = await self.session.scalar(select(IncidentInvestigationBindingRecord.resolution_plan_id).where(
+                IncidentInvestigationBindingRecord.tenant_id == tenant_id,
+                IncidentInvestigationBindingRecord.incident_id == incident_id,
+            ).order_by(IncidentInvestigationBindingRecord.rca_version.desc()).limit(1))
+            if plan is None:
+                raise ValueError("RESOLUTION_PLAN_MISSING")
+        elif target == IncidentLifecycleState.EXECUTING:
+            binding = await self.session.scalar(select(IncidentInvestigationBindingRecord).where(
+                IncidentInvestigationBindingRecord.tenant_id == tenant_id,
+                IncidentInvestigationBindingRecord.incident_id == incident_id,
+            ).order_by(IncidentInvestigationBindingRecord.rca_version.desc()).limit(1))
+            approval = await self.session.scalar(select(ApprovalRecord.id).where(
+                ApprovalRecord.tenant_id == tenant_id, ApprovalRecord.incident_id == incident_id,
+                ApprovalRecord.recommendation_id == binding.recommendation_id if binding else literal(False),
+                ApprovalRecord.decision == "approved",
+            ).order_by(ApprovalRecord.updated_at.desc()).limit(1))
+            if approval is None:
+                raise ValueError("APPROVAL_MISSING")
+        elif target == IncidentLifecycleState.VALIDATING:
+            succeeded = await self.session.scalar(select(ActionRecord.id).where(
+                ActionRecord.tenant_id == tenant_id, ActionRecord.incident_id == incident_id,
+                ActionRecord.status.in_(("succeeded", "completed")),
+            ).order_by(ActionRecord.updated_at.desc()).limit(1))
+            if succeeded is None:
+                raise ValueError("EXECUTION_EVIDENCE_MISSING")
+        elif target == IncidentLifecycleState.CLOSED:
+            incident_status = await self.session.scalar(select(IncidentRecord.status).where(
+                IncidentRecord.tenant_id == tenant_id, IncidentRecord.id == incident_id,
+            ))
+            if str(incident_status or "").lower() not in {"resolved", "closed"}:
+                raise ValueError("VALIDATED_CLOSURE_MISSING")
     async def finish_context_enrichment_job(
         self, *, job_id: UUID | str, worker_id: str, collected: bool, error: str | None = None,
         retry_after_seconds: int = 60, maximum_attempts: int = 4,

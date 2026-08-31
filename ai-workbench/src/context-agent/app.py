@@ -2131,6 +2131,51 @@ class ContextEnrichmentReconcileRequest(BaseModel):
     dry_run: bool = True
 
 
+class IncidentLifecycleTransitionRequest(BaseModel):
+    tenant_id: str = Field(min_length=1, max_length=128)
+    target_state: str = Field(min_length=1, max_length=64)
+    expected_version: int = Field(ge=1)
+    actor: str = Field(min_length=1, max_length=160)
+    reason: str = Field(min_length=1, max_length=4000)
+    idempotency_key: str = Field(min_length=1, max_length=160)
+    failure_code: str | None = Field(default=None, max_length=128)
+
+
+@app.post("/internal/incidents/{incident_id}/lifecycle/transition")
+async def transition_incident_lifecycle(
+    incident_id: str,
+    payload: IncidentLifecycleTransitionRequest,
+    x_kaiops_internal_token: str = Header(default=""),
+) -> dict[str, Any]:
+    expected = str(settings.service_internal_token or "")
+    if not expected or not hmac.compare_digest(x_kaiops_internal_token, expected):
+        raise HTTPException(status_code=403, detail={
+            "code": "internal_auth_required", "message": "Service authentication is required.",
+        })
+    try:
+        async with app.state.session_factory() as session:
+            result = await ContextEnrichmentRepository(session).transition_incident_lifecycle(
+                tenant_id=payload.tenant_id, incident_id=incident_id,
+                target_state=payload.target_state, expected_version=payload.expected_version,
+                actor=payload.actor, reason=payload.reason,
+                idempotency_key=payload.idempotency_key, failure_code=payload.failure_code,
+            )
+            await session.commit()
+        return {"schema_version": "kaiops.incident-lifecycle.v1", **result}
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail={
+            "code": "incident_not_found", "message": "The incident was not found.",
+        }) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail={
+            "code": "stale_lifecycle_version", "message": "The incident lifecycle changed; reload and retry.",
+        }) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail={
+            "code": "lifecycle_transition_rejected", "message": str(exc),
+        }) from exc
+
+
 @app.post("/internal/context-enrichment/reconcile")
 async def reconcile_context_enrichment(
     request: ContextEnrichmentReconcileRequest,
