@@ -2168,11 +2168,15 @@ async def reconcile_context_enrichment(
                     row for row in requirements
                     if (row.rca_version, row.category, row.question) not in existing_keys
                 ]
+                latest_persisted_rca = max(
+                    (int(row["rca_version"]) for row in existing),
+                    default=int(candidate["rca_version"]),
+                )
                 stalled = [
                     EvidenceRequirement.model_validate({
                         key: value for key, value in row.items() if key != "version"
                     }) for row in existing
-                    if int(row["rca_version"]) == int(candidate["rca_version"])
+                    if int(row["rca_version"]) == latest_persisted_rca
                     and row["status"] == "blocked"
                     and str(row["requirement_id"]) not in requested_requirement_ids
                 ]
