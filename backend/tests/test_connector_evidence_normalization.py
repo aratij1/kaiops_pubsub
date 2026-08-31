@@ -5,6 +5,7 @@ from uuid import uuid4
 
 from common.context_enrichment_contract import (
     EvidenceRequirement,
+    build_evidence_requirements,
     normalize_connector_response,
 )
 from common.models import Incident
@@ -114,3 +115,16 @@ def test_unapproved_rag_document_is_rejected_with_reason() -> None:
     )
     assert result.records == []
     assert result.rejected == [{"code": "KNOWLEDGE_NOT_APPROVED", "record_index": 0}]
+
+
+def test_rca_domain_gap_aliases_create_executable_canonical_requirements() -> None:
+    incident = Incident(tenant_id="tenant-a", service="api-gateway", title="availability")
+    requirements = build_evidence_requirements(
+        tenant_id=incident.tenant_id, incident_id=incident.id, rca_version=2,
+        missing_evidence=["dependency", "dependencies", "runbooks"],
+        now=datetime(2024, 8, 26, 13, 32, tzinfo=UTC),
+    )
+    assert [(item.category, item.candidate_connectors) for item in requirements] == [
+        ("topology", ["discovery-mcp", "cmdb"]),
+        ("runbook", ["vector-db"]),
+    ]

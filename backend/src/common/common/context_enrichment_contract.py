@@ -583,11 +583,14 @@ _CATEGORY_ALIASES = {
     "jaeger": "traces",
     "deployments": "deployment",
     "changes": "change",
+    "dependency": "topology",
+    "dependencies": "topology",
     "code": "source_code",
     "tickets": "ticket",
     "jira": "ticket",
     "rag": "runbook",
     "knowledge": "runbook",
+    "runbooks": "runbook",
 }
 
 
