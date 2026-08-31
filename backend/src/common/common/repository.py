@@ -8350,7 +8350,7 @@ class ContextEnrichmentRepository(EvaluationRepository):
                 ContextEvidenceRequirementRecord.requirement_key == requirement_key,
             ))).scalar_one_or_none()
             if existing is None:
-                existing = ContextEvidenceRequirementRecord(
+                candidate = ContextEvidenceRequirementRecord(
                     requirement_id=self._to_uuid(item["requirement_id"]), tenant_id=tenant_id,
                     incident_id=incident_id, rca_version=int(item.get("rca_version") or 1),
                     requirement_key=requirement_key, category=category, question=question,
@@ -8363,8 +8363,24 @@ class ContextEnrichmentRepository(EvaluationRepository):
                     assigned_to=item.get("assigned_to"), jira_issue_key=item.get("jira_issue_key"),
                     evidence_ids=list(item.get("evidence_ids") or []), version=1,
                 )
-                self.session.add(existing)
-                await self.session.flush()
+                try:
+                    async with self.session.begin_nested():
+                        self.session.add(candidate)
+                        await self.session.flush()
+                    existing = candidate
+                except IntegrityError:
+                    # A scheduler and an explicit reconciliation request can
+                    # race on the same deterministic requirement. The
+                    # savepoint keeps the outer transaction usable; the row
+                    # committed by the winner is the authoritative result.
+                    existing = (await self.session.execute(select(ContextEvidenceRequirementRecord).where(
+                        ContextEvidenceRequirementRecord.tenant_id == tenant_id,
+                        ContextEvidenceRequirementRecord.incident_id == incident_id,
+                        ContextEvidenceRequirementRecord.rca_version == int(item.get("rca_version") or 1),
+                        ContextEvidenceRequirementRecord.requirement_key == requirement_key,
+                    ))).scalar_one_or_none()
+                    if existing is None:
+                        raise
             rows.append(existing)
         return rows
 
