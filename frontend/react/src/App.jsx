@@ -5909,7 +5909,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       analysis.rca?.causal_chain || analysis.rca?.mechanism || analysis.rca?.reasoning || analysis.rca?.contributing_factors,
       "The causal mechanism was not supplied by the current analysis.",
     );
-    const hasLinkedEvidence = selectedAiTrust.evidence.length > 0;
+    const hasAcceptedEvidence = selectedAiTrust.evidence.some((row) => row.accepted === true);
     // This is the backend's bounded diagnostic confidence. Grounding and
     // execution eligibility are enforced independently below.
     const confidence = Number(selectedAiTrust.confidence ?? 0);
@@ -5920,9 +5920,22 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       && String(investigation?.status || "").toLowerCase() === "conclusive";
     const investigationConfidence = Number(investigation?.conclusion?.confidence || 0);
     const groundingScore = Number(selectedAlertEvaluation.groundingScore || 0);
+    const citationCoverage = Number(selectedAlertEvaluation.citationCoverage || 0);
+    const publicationBlockers = [
+      !hasAcceptedEvidence ? "no evidence has been accepted as RCA support" : "",
+      citationCoverage <= 0 ? "no traceable RCA citations are attached" : "",
+      confidence < 0.85 ? `RCA confidence is ${formatQualityPercent(confidence)} (85% required)` : "",
+      groundingScore < 0.85 ? `grounding is ${formatQualityPercent(groundingScore)} (85% required)` : "",
+      !investigationConclusive ? "the investigation is not conclusive" : "",
+      investigationConfidence < 0.85 ? `investigation confidence is ${formatQualityPercent(investigationConfidence)} (85% required)` : "",
+      selectedAiTrust.missing.length ? `${selectedAiTrust.missing.length} declared evidence gap(s) remain` : "",
+      selectedAiTrust.conflicting.length ? `${selectedAiTrust.conflicting.length} evidence conflict(s) remain` : "",
+      analysis.status !== "resolved-analysis" ? `analysis status is ${String(analysis.status || "unavailable").replaceAll("-", " ")}` : "",
+    ].filter(Boolean);
     const reviewRequired = Boolean(
       selectedAlertEvaluation.requiresReview
-      || !hasLinkedEvidence
+      || !hasAcceptedEvidence
+      || citationCoverage <= 0
       || confidence < 0.85
       || groundingScore < 0.85
       || !investigationConclusive
@@ -5935,7 +5948,8 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       ...analysis,
       confidence,
       reviewRequired,
-      confidenceLabel: !hasLinkedEvidence ? "Ungrounded" : confidence >= 0.85 ? "High confidence" : confidence >= 0.7 ? "Moderate confidence" : "Low confidence",
+      publicationBlockers,
+      confidenceLabel: !hasAcceptedEvidence ? "Ungrounded" : confidence >= 0.85 ? "High confidence" : confidence >= 0.7 ? "Moderate confidence" : "Low confidence",
       impactedServices,
       causalDetails,
       impactEvidence: evidenceUsed,
@@ -11242,7 +11256,11 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                             <div className="alert-document-draft-heading"><div><span className="eyebrow">Editable draft</span><h4>{evidenceDraftReview.draft.title || "Incident knowledge document"}</h4></div><span className={`workflow-pill ${evidenceDraftReview.draft.status === "reviewed" ? "workflow-pill-clear" : "workflow-pill-attention"}`}>{evidenceDraftReview.draft.status || "draft"}</span></div>
                             <div className="report-view-switch" role="tablist" aria-label="Incident report detail"><button type="button" role="tab" aria-selected={incidentReportView === "simple"} className={incidentReportView === "simple" ? "active" : ""} onClick={() => setIncidentReportView("simple")}>Simple</button><button type="button" role="tab" aria-selected={incidentReportView === "detailed"} className={incidentReportView === "detailed" ? "active" : ""} onClick={() => setIncidentReportView("detailed")}>Detailed</button></div>
                             {incidentReportView === "simple" ? <pre className="simple-incident-report">{simpleIncidentReport(evidenceDraftReview.content)}</pre> : <><label>Document content<textarea rows={18} value={evidenceDraftReview.content} onChange={(event) => setEvidenceDraftReview((current) => ({ ...current, content: event.target.value }))} disabled={evidenceDraftReview.loading || evidenceDraftReview.draft.status === "approved"} /></label><label>Reviewer notes<textarea rows={3} value={evidenceDraftReview.notes} onChange={(event) => setEvidenceDraftReview((current) => ({ ...current, notes: event.target.value }))} placeholder="Record corrections, exclusions, and evidence that still needs confirmation." disabled={evidenceDraftReview.loading || evidenceDraftReview.draft.status === "approved"} /></label></>}
-                            {selectedRcaDecision.reviewRequired ? <p className="subtitle" role="status">This evidence-backed hypothesis can be reviewed and saved now. Publishing remains locked until confidence, grounding, investigation, and evidence-gap checks pass.</p> : null}
+                            {selectedRcaDecision.reviewRequired ? <div className="subtitle" role="status">
+                              <p>This draft hypothesis can be reviewed and saved, but it is not yet verified or reusable operational knowledge.</p>
+                              <p><strong>Publication blockers:</strong> {selectedRcaDecision.publicationBlockers?.join("; ") || "RCA verification has not passed"}.</p>
+                              <p>Evidence IDs shown in the draft are available context; only evidence explicitly cited and accepted by the RCA counts as causal support.</p>
+                            </div> : null}
                             <div className="alert-documents-empty-actions"><button type="button" className="button-secondary" onClick={saveEvidenceDraft} disabled={evidenceDraftReview.loading || evidenceDraftReview.content.trim().length < 20}>Save draft</button><button type="button" className="button-primary" onClick={approveEvidenceDraft} disabled={evidenceDraftReview.loading || evidenceDraftReview.content.trim().length < 20 || selectedRcaDecision.reviewRequired}>{selectedRcaDecision.reviewRequired ? "Publish locked — verify RCA" : "Approve & publish"}</button><button type="button" className="button-ghost" onClick={() => selectedAlertRow && openDocumentPrompt(selectedAlertRow)}>Add source document</button></div>
                           </div> : null}
                           <div className="alert-documents-empty-actions">
