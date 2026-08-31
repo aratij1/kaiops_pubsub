@@ -16,7 +16,6 @@ from common.database import (
     ResolutionOutboxRecord,
     ResolutionPlanSupersessionRecord,
 )
-from common.orchestration.execution_plan_contract import verify_plan_fingerprint
 from common.repository import IncidentRepository
 from sqlalchemy import func, select
 

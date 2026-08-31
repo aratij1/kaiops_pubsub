@@ -18,38 +18,38 @@ from sqlalchemy.orm import load_only
 from common.database import (
     ActionRecord,
     AgentWorkItemRecord,
-    AnalysisRequestRecord,
     AlertRecord,
     AlertRuleRecord,
+    AnalysisRequestRecord,
     ApplicationEnvironmentRecord,
     ApplicationLabelRecord,
     ApplicationRecord,
     ApprovalRecord,
     AuditLogRecord,
-    ContextKnowledgeRecord,
     ContextEnrichmentJobRecord,
     ContextEvidenceRequirementRecord,
+    ContextKnowledgeRecord,
     ContextSnapshotRecord,
     DraftPullRequestOutboxRecord,
-    EvidenceRagDraftRecord,
     EvaluationRecord,
+    EvidenceRagDraftRecord,
     ExecutionPlanRecord,
-    GrafanaDashboardRecord,
-    GovernedResolutionPlanRecord,
     GovernedRagDocumentRecord,
+    GovernedResolutionPlanRecord,
+    GrafanaDashboardRecord,
+    HumanEvidenceRequestRecord,
     IncidentCorrelationOwnershipRecord,
     IncidentEventRecord,
     IncidentInvestigationBindingRecord,
     IncidentOccurrenceRecord,
     IncidentProjectionRecord,
     IncidentRecord,
-    JiraTicketLinkRecord,
-    HumanEvidenceRequestRecord,
     JiraIncidentBindingRecord,
     JiraSyncCursorRecord,
+    JiraTicketLinkRecord,
     JiraWebhookEventRecord,
-    KnowledgeRagDraftRecord,
     KnowledgeBaseRecord,
+    KnowledgeRagDraftRecord,
     LearningAuditRecord,
     MonitoringAlertMappingRecord,
     MonitoringConnectionAuditRecord,
@@ -75,10 +75,13 @@ from common.database import (
     ValidationHistoryRecord,
     ValidationObservationRecord,
 )
-from common.incident_status import reduce_incident_status
 from common.incident_investigation import IncidentInvestigationContract, is_traceable_evidence_citation
-from common.orchestration.execution_plan_contract import canonical_plan_fingerprint, verify_plan_fingerprint
-from common.orchestration.execution_plan_contract import ExecutionPlanV2
+from common.incident_status import reduce_incident_status
+from common.orchestration.execution_plan_contract import (
+    ExecutionPlanV2,
+    canonical_plan_fingerprint,
+    verify_plan_fingerprint,
+)
 from common.orchestration.resolution_selection_contract import ResolutionSelectionV1
 from common.resolution_lifecycle import select_current_lifecycle
 from common.tenant_identity import require_tenant_id
@@ -90,7 +93,9 @@ class ObjectStorageRepository:
 
     async def upsert(self, values: dict[str, Any]) -> ObjectStorageRecord:
         object_key = str(values["object_key"])
-        row = (await self.session.execute(select(ObjectStorageRecord).where(ObjectStorageRecord.object_key == object_key))).scalar_one_or_none()
+        row = (
+            await self.session.execute(select(ObjectStorageRecord).where(ObjectStorageRecord.object_key == object_key))
+        ).scalar_one_or_none()
         if row is None:
             row = ObjectStorageRecord(**values)
             self.session.add(row)
@@ -3820,7 +3825,7 @@ class IncidentRepository:
                 if existing is not None:
                     return self._knowledge_draft_payload(existing)
                 if attempt == 2:
-                    raise RuntimeError("concurrent knowledge draft creation could not be resolved")
+                    raise RuntimeError("concurrent knowledge draft creation could not be resolved") from None
         raise RuntimeError("knowledge draft creation failed")
 
     async def list_knowledge_rag_drafts(
@@ -4042,7 +4047,7 @@ class IncidentRepository:
                         results.append(self._evidence_draft_payload(existing))
                         break
                     if attempt == 2:
-                        raise RuntimeError("concurrent evidence draft creation could not be resolved")
+                        raise RuntimeError("concurrent evidence draft creation could not be resolved") from None
         return results
 
     async def list_evidence_rag_drafts(

@@ -3,8 +3,8 @@ import sys
 from pathlib import Path
 
 import pytest
-from starlette.requests import Request
 from common.orchestration.execution_plan_contract import canonical_plan_fingerprint
+from starlette.requests import Request
 
 
 def _approval_plan(incident_id: str, recommendation_id: str = "22222222-2222-2222-2222-222222222222") -> dict:
@@ -548,7 +548,9 @@ async def test_approval_rejects_valid_diagnostic_plan_until_readiness_controls_p
     plan["diagnostic_only"] = True
     plan["plan_kind"] = "diagnostic"
     plan["plan_fingerprint"] = canonical_plan_fingerprint(plan)
-    module.PENDING_INCIDENTS[module._pending_key("tenant-a", incident_id)]["recommendation"]["metadata"] = _readiness_metadata(plan)
+    module.PENDING_INCIDENTS[module._pending_key("tenant-a", incident_id)]["recommendation"]["metadata"] = (
+        _readiness_metadata(plan)
+    )
     request = module.ApprovalRequest(
         incident_id=incident_id,
         recommendation_id=recommendation_id,

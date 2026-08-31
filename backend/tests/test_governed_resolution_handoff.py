@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
-from pathlib import Path
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
@@ -11,7 +11,6 @@ from common.models import Alert, AlertSeverity, ApprovalDecision, Recommendation
 from common.orchestration.execution_plan import resolve_execution_plan
 from common.orchestration.execution_plan_contract import ExecutionPlanV2
 from common.repository import IncidentRepository
-
 from test_bound_incident_investigation_repository import _seed_pair
 
 
@@ -50,8 +49,9 @@ async def test_incident_and_approval_use_exact_persisted_execution_plan(sqlite_s
             snapshot_id=snapshot_id, recommendation_id=recommendation_id,
             fingerprint="d" * 64, evidence_id="metric:up:api-gateway",
         )
-        from common.database import IncidentProjectionRecord
         from datetime import UTC, datetime
+
+        from common.database import IncidentProjectionRecord
         session.add(IncidentProjectionRecord(
             incident_id=incident_id, alert_id=alert_id, recommendation_id=recommendation_id,
             tenant_id="tenant-a", service="api-gateway", environment="prod", severity="critical",

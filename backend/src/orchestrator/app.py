@@ -10,7 +10,7 @@ from common.logging import get_logger
 from common.models import Alert, Incident
 from common.service import create_app
 from common.telemetry import EVENTS_PROCESSED
-from common.topics import ENRICHED_ALERTS, ORCHESTRATION_EVENTS, RESOLUTION_EVENTS
+from common.topics import ENRICHED_ALERTS, ORCHESTRATION_EVENTS
 from fastapi import FastAPI, HTTPException
 from orchestrator.message_bus import publish_orchestration_event
 from orchestrator import OrchestratorAgent
@@ -22,9 +22,6 @@ tasks: list[asyncio.Task] = []
 logger = get_logger(__name__)
 MESSAGE_BUS_DUAL_CONSUME_ENABLED = str(
     os.getenv("MESSAGE_BUS_DUAL_CONSUME_ENABLED", "false")
-).strip().lower() in {"1", "true", "yes", "on"}
-ORCHESTRATOR_INLINE_RESOLUTION_ENABLED = str(
-    os.getenv("ORCHESTRATOR_INLINE_RESOLUTION_ENABLED", "false")
 ).strip().lower() in {"1", "true", "yes", "on"}
 
 
@@ -108,25 +105,6 @@ async def startup(app: FastAPI) -> None:
             deployment_provider=app.state.message_bus_provider,
         )
         EVENTS_PROCESSED.labels(settings.service_name, f"{ENRICHED_ALERTS}:{provider_used}", "ok").inc()
-        # The normal path is event-driven:
-        # orchestration-events -> context-agent -> context-events -> resolution-agent.
-        # Running the same work inline as well duplicates context retrieval, model
-        # calls, persistence records, and downstream approval messages.
-        if ORCHESTRATOR_INLINE_RESOLUTION_ENABLED:
-            try:
-                await _run_resolution_and_publish(
-                    app,
-                    alert=alert,
-                    incident=incident,
-                    decision_dict=decision.__dict__,
-                )
-            except Exception:
-                logger.exception(
-                    "inline resolution fallback failed for incident=%s; event-driven processing remains active",
-                    incident.id,
-                )
-            else:
-                EVENTS_PROCESSED.labels(settings.service_name, RESOLUTION_EVENTS, "ok").inc()
 
     for source, consumer, consume_forever in _build_ingress_consumers():
         task = asyncio.create_task(consume_forever(consumer, handle), name=f"orchestrator-{source}-consumer")

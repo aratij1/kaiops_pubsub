@@ -4,9 +4,9 @@ import asyncio
 import hashlib
 import hmac
 import json
-from collections.abc import Awaitable, Callable, Coroutine
 import logging
-from datetime import datetime, timedelta, timezone
+from collections.abc import Awaitable, Callable, Coroutine
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -15,14 +15,16 @@ import httpx
 from common.config import get_settings
 from common.database import ApprovalAssignmentRecord, ApprovalCapacityRecord
 from common.event_publishers import build_agent_event_contract, build_event_envelope
-from common.kafka import KafkaConsumer, consume_forever as consume_kafka_forever
+from common.kafka import KafkaConsumer
+from common.kafka import consume_forever as consume_kafka_forever
 from common.models import Approval, ApprovalDecision
 from common.orchestration.execution_plan_contract import verify_plan_fingerprint
-from common.rabbitmq import RabbitMQConsumer, consume_forever as consume_rabbitmq_forever
+from common.rabbitmq import RabbitMQConsumer
+from common.rabbitmq import consume_forever as consume_rabbitmq_forever
 from common.repository import IncidentRepository
 from common.service import create_app
-from common.topics import APPROVAL_EVENTS, RESOLUTION_EVENTS
 from common.tenant_identity import require_tenant_id
+from common.topics import APPROVAL_EVENTS, RESOLUTION_EVENTS
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
@@ -130,7 +132,9 @@ def _signed_approval_readiness(context: dict[str, Any]) -> dict[str, Any]:
         "rca_version_binding": bool(plan.get("rca_version")),
         "evidence_snapshot_binding": bool(plan.get("evidence_snapshot_id")),
         "recommendation_version_binding": bool(plan.get("recommendation_version")),
-        "approved_runbook": str(metadata.get("runbook_status") or plan.get("runbook_status") or "").lower() == "approved",
+        "approved_runbook": (
+            str(metadata.get("runbook_status") or plan.get("runbook_status") or "").lower() == "approved"
+        ),
         "valid_plan": bool(plan.get("plan_id") and plan.get("plan_fingerprint") and verify_plan_fingerprint(plan)),
         "execution_ready": (
             plan.get("execution_ready") is True
@@ -138,11 +142,14 @@ def _signed_approval_readiness(context: dict[str, Any]) -> dict[str, Any]:
             and str(plan.get("plan_kind") or "").lower() != "diagnostic"
         ),
         "governed_target": bool(plan.get("target_resource_id") or plan.get("remediation_target")),
-        "available_connector": bool(plan.get("connector_id") or profile.get("connector_id") or profile.get("executor_type")),
+        "available_connector": bool(
+            plan.get("connector_id") or profile.get("connector_id") or profile.get("executor_type")
+        ),
         "current_credentials": opaque_credential,
         "required_validators": bool(validators),
         "rollback_readiness": str(plan.get("rollback_mode") or "").lower() == "not_applicable" or bool(rollback),
-        "policy_acceptance": str(policy.get("decision") or metadata.get("policy_decision") or "").lower() in {"allow", "approved", "accept", "hitl"},
+        "policy_acceptance": str(policy.get("decision") or metadata.get("policy_decision") or "").lower()
+        in {"allow", "approved", "accept", "hitl"},
         "evidence_threshold": (
             float(quality.get("evidence_coverage") or 0.0) >= 0.85
             and float(quality.get("citation_coverage") or 0.0) > 0.0
@@ -154,7 +161,7 @@ def _signed_approval_readiness(context: dict[str, Any]) -> dict[str, Any]:
     if not signing_key:
         checks["readiness_signing_key"] = False
     missing = [name for name, passed in checks.items() if not passed]
-    issued_at = datetime.now(timezone.utc).isoformat()
+    issued_at = datetime.now(UTC).isoformat()
     material = {
         "tenant_id": str(context.get("tenant_id") or recommendation.get("tenant_id") or ""),
         "incident_id": str(context.get("incident_id") or recommendation.get("incident_id") or ""),
@@ -193,7 +200,9 @@ async def startup(app: FastAPI) -> None:
         incident_id = str(payload["recommendation"]["incident_id"])
         recommendation = payload.get("recommendation", {}) if isinstance(payload.get("recommendation"), dict) else {}
         tenant_id = require_tenant_id(
-            recommendation.get("tenant_id") or payload.get("tenant_id") or (payload.get("incident") or {}).get("tenant_id"),
+            recommendation.get("tenant_id")
+            or payload.get("tenant_id")
+            or (payload.get("incident") or {}).get("tenant_id"),
             source="resolution approval event",
         )
         cache_key = _pending_key(tenant_id, incident_id)
@@ -297,7 +306,7 @@ def _is_working_now(row: ApprovalCapacityRecord) -> bool:
 
 
 def _current_week_start() -> datetime:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
 
 
@@ -548,7 +557,7 @@ async def _approval_from_request(
         if str(request.plan_id or "") != expected_plan_id or request.plan_fingerprint != expected_fingerprint:
             raise HTTPException(status_code=409, detail="Approval is not bound to the current execution plan fingerprint.")
         expiry = datetime.fromisoformat(str(plan.get("expiry") or "").replace("Z", "+00:00"))
-        if expiry <= datetime.now(timezone.utc):
+        if expiry <= datetime.now(UTC):
             raise HTTPException(status_code=409, detail="Approval blocked: execution plan has expired.")
     else:
         expected_plan_id = str(request.plan_id or "") or None
@@ -824,7 +833,7 @@ async def _store_and_publish(approval: Approval) -> None:
                         "team": None,
                     },
                     state={
-                        "severity": str((recommendation.get("severity") or "warning")).lower(),
+                        "severity": str(recommendation.get("severity") or "warning").lower(),
                         "status": status,
                         "owner": str(approval.approver or "") or None,
                     },

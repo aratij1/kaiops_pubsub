@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -155,7 +155,7 @@ class JiraClient:
         after_issue_key: str | None = None,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
-        since = updated_since.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M")
+        since = updated_since.astimezone(UTC).strftime("%Y-%m-%d %H:%M")
         boundary = f' AND key > "{after_issue_key}"' if after_issue_key else ""
         jql = (
             f'project = "{self.project_key}" AND updated >= "{since}"{boundary} '

@@ -4,14 +4,32 @@ ALTER TABLE governed_rag_documents
     MODIFY context_snapshot_id CHAR(36) NULL,
     MODIFY context_fingerprint CHAR(64) NULL,
     MODIFY recommendation_id CHAR(36) NULL,
-    MODIFY rca_version INT NULL,
-    ADD COLUMN source_ref VARCHAR(512) NULL AFTER rca_version,
-    ADD COLUMN document_metadata JSON NULL AFTER source_ref;
+    MODIFY rca_version INT NULL;
+
+SET @ddl = IF(
+    (SELECT COUNT(*) FROM information_schema.columns
+     WHERE table_schema = DATABASE() AND table_name = 'governed_rag_documents' AND column_name = 'source_ref') = 0,
+    'ALTER TABLE governed_rag_documents ADD COLUMN source_ref VARCHAR(512) NULL AFTER rca_version',
+    'SELECT 1'
+);
+PREPARE statement FROM @ddl;
+EXECUTE statement;
+DEALLOCATE PREPARE statement;
+
+SET @ddl = IF(
+    (SELECT COUNT(*) FROM information_schema.columns
+     WHERE table_schema = DATABASE() AND table_name = 'governed_rag_documents' AND column_name = 'document_metadata') = 0,
+    'ALTER TABLE governed_rag_documents ADD COLUMN document_metadata JSON NULL AFTER source_ref',
+    'SELECT 1'
+);
+PREPARE statement FROM @ddl;
+EXECUTE statement;
+DEALLOCATE PREPARE statement;
 
 UPDATE governed_rag_documents SET document_metadata = JSON_OBJECT() WHERE document_metadata IS NULL;
 ALTER TABLE governed_rag_documents MODIFY document_metadata JSON NOT NULL;
 
-CREATE TABLE knowledge_rag_drafts (
+CREATE TABLE IF NOT EXISTS knowledge_rag_drafts (
     draft_id CHAR(36) NOT NULL, tenant_id VARCHAR(128) NOT NULL,
     document_kind VARCHAR(32) NOT NULL, document_version INT NOT NULL,
     source_ref VARCHAR(512) NOT NULL, title VARCHAR(160) NOT NULL,
