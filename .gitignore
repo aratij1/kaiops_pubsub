@@ -50,3 +50,4 @@ backend/rag/runbooks/*-rule-runbook.md
 .env*
 # Runtime review packets are evidence awaiting governance, never source fixtures.
 backend/rag/_review/**/*.json
+scripts/err.log
