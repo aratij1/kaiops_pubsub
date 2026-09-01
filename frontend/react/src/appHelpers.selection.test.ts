@@ -1,5 +1,60 @@
 import { describe, expect, it } from "vitest";
-import { capLatestAlertsPerSource, shouldRetainAlertSelection, resolveCanonicalAlertForRow } from "./appHelpers.jsx";
+import { capLatestAlertsPerSource, dedupeAndConsolidateAlertRows, ensureMinimumAlertsBySource, filterRowsForMonitor, shouldRetainAlertSelection, resolveCanonicalAlertForRow } from "./appHelpers.jsx";
+
+describe("alert stream and inbox identity", () => {
+  it("keeps canonical identity and incident linkage when a newer landing occurrence wins", () => {
+    const alertId = "bbe1b2c1-2542-488c-81d3-f57b38a25296";
+    const incidentId = "2a3b34d2-b5e1-453f-924a-04ebe115a518";
+    const rows = dedupeAndConsolidateAlertRows([{
+      id: alertId, alert_id: alertId, incident_id: incidentId, ticket_id: "KAN-1246",
+      name: "RobotShopServiceDown", service: "robot-shop-redis", created_at: "2026-08-12T09:54:59.000Z",
+      labels: { alert_fingerprint: "8478690570ded4e4", alertname: "RobotShopServiceDown", service: "robot-shop-redis" },
+      _stream_kind: "alerts_api",
+    }, {
+      id: "20260812T095500Z_robotshop.json", alert_id: "20260812T095500Z_robotshop.json",
+      name: "RobotShopServiceDown", service: "robot-shop-redis", received_at: "2026-08-12T09:55:00.000Z",
+      labels: { alert_fingerprint: "8478690570ded4e4", alertname: "RobotShopServiceDown", service: "robot-shop-redis" },
+      _stream_kind: "landing_pad",
+    }], { preferLatestState: true });
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ id: alertId, alert_id: alertId, incident_id: incidentId, ticket_id: "KAN-1246" });
+    expect(rows[0].received_at).toBe("2026-08-12T09:55:00.000Z");
+
+    const reverseOrder = dedupeAndConsolidateAlertRows([{
+      id: "20260812T095500Z_robotshop.json", alert_id: "20260812T095500Z_robotshop.json",
+      name: "RobotShopServiceDown", service: "robot-shop-redis", received_at: "2026-08-12T09:55:00.000Z",
+      labels: { alert_fingerprint: "8478690570ded4e4", alertname: "RobotShopServiceDown", service: "robot-shop-redis" },
+      _stream_kind: "landing_pad",
+    }, {
+      id: alertId, alert_id: alertId, incident_id: incidentId, ticket_id: "KAN-1246",
+      name: "RobotShopServiceDown", service: "robot-shop-redis", created_at: "2026-08-12T09:54:59.000Z",
+      labels: { alert_fingerprint: "8478690570ded4e4", alertname: "RobotShopServiceDown", service: "robot-shop-redis" },
+      _stream_kind: "alerts_api",
+    }], { preferLatestState: true });
+    expect(reverseOrder[0]).toMatchObject({ id: alertId, alert_id: alertId, incident_id: incidentId, ticket_id: "KAN-1246" });
+    expect(reverseOrder[0].received_at).toBe("2026-08-12T09:55:00.000Z");
+  });
+
+  it("keeps persisted E2E incidents out of production scope while retaining them in test scope", () => {
+    const production = { title: "PolicyEngineUnavailable", service: "kaiops-orchestrator", environment: "prod" };
+    const testRun = { title: "ServiceDown-E2E-20260826050115", service: "kaiops-discovery-mcp", environment: "review-20260826050115" };
+    expect(filterRowsForMonitor([production, testRun], "real-usecases")).toEqual([production]);
+    expect(filterRowsForMonitor([production, testRun], "test-usecases")).toEqual([testRun]);
+  });
+
+  it("does not backfill the raw landing occurrence after consolidation", () => {
+    const canonical = {
+      id: "bbe1b2c1-2542-488c-81d3-f57b38a25296", name: "RobotShopServiceDown", service: "robot-shop-redis",
+      labels: { alert_fingerprint: "8478690570ded4e4" }, source_channel: "prometheus",
+    };
+    const landing = {
+      file: "20260812T095500Z_robotshop.json", name: "RobotShopServiceDown", service: "robot-shop-redis",
+      labels: { alert_fingerprint: "8478690570ded4e4" }, source_channel: "prometheus",
+    };
+    expect(ensureMinimumAlertsBySource([canonical], [canonical, landing], { prometheus: 2, telemetry: 0, email: 0, ticket: 0, log: 0 })).toEqual([canonical]);
+  });
+});
 
 describe("capLatestAlertsPerSource", () => {
   it("keeps the newest alert type for mysql-exporter during a noisy Prometheus burst", () => {

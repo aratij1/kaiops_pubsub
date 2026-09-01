@@ -57,7 +57,12 @@ class JiraClient:
         labels: dict[str, str] | None = None,
     ) -> str:
         """Creates a new Jira issue and returns its key (e.g. "KAI-123")."""
-        jira_labels = [f"kaiops-severity-{severity}", "kaiops-auto-created"]
+        jira_labels = [
+            f"kaiops-severity-{severity}",
+            "kaiops-auto-created",
+            "managed_by_kaiops",
+            "kaiops-managed-by-kaiops",
+        ]
         for key, value in (labels or {}).items():
             safe = re.sub(r"[^a-zA-Z0-9_.-]", "-", f"kaiops-{key}-{value}")[:255]
             if safe:
@@ -128,9 +133,15 @@ class JiraClient:
         return str(status.get("name") or "")
 
     async def list_recent_issues(self, *, limit: int = 25) -> list[dict[str, Any]]:
-        """Return recently updated issues for read-only source ingestion."""
+        """Return recently updated issues for read-only source ingestion.
+
+        Requests "comment" alongside the other fields so callers can tell
+        whether the most recent activity on an issue was KaiOps commenting
+        on its own ticket (see _jira_poll_worker's loop-prevention check)
+        without needing a second per-issue API call.
+        """
         jql = f'project = "{self.project_key}" ORDER BY updated DESC'
-        fields = "summary,description,status,priority,reporter,assignee,labels,components,updated,created"
+        fields = "summary,description,status,priority,reporter,assignee,labels,components,updated,created,comment"
         async with httpx.AsyncClient(auth=self._auth, timeout=20.0) as client:
             response = await client.get(
                 f"{self.base_url}/rest/api/3/search/jql",

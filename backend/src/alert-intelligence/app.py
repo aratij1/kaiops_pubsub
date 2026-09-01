@@ -269,10 +269,21 @@ async def _reuse_correlated_jira(incident: Any) -> str | None:
     metadata = incident.metadata if isinstance(incident.metadata, dict) else {}
     candidate = metadata.get("incident_candidate") if isinstance(metadata.get("incident_candidate"), dict) else {}
     correlation_key = str(candidate.get("correlation_key") or "").strip()
-    if not correlation_key:
+    canonical = metadata.get("canonical_correlation") if isinstance(metadata.get("canonical_correlation"), dict) else {}
+    project_id = str(canonical.get("project_id") or "").strip()
+    tenant_id = str(incident.tenant_id or "").strip()
+    environment = str(incident.environment or "").strip()
+    service = str(incident.service or "").strip()
+    if not all((correlation_key, tenant_id, project_id, environment, service)):
         return None
     async with app.state.session_factory() as session:
-        jira_key = await IncidentRepository(session).find_open_jira_by_correlation_key(correlation_key)
+        jira_key = await IncidentRepository(session).find_open_jira_by_correlation_key(
+            correlation_key,
+            tenant_id=tenant_id,
+            project_id=project_id,
+            environment=environment,
+            service=service,
+        )
     if jira_key:
         incident.ticket_id = jira_key
         candidate["jira_key"] = jira_key
@@ -287,20 +298,83 @@ async def _reuse_correlated_jira(incident: Any) -> str | None:
     return jira_key
 
 
+def _incident_from_persisted_payload(payload: dict[str, Any], incident_type: type[Incident] = Incident) -> Incident:
+    """Hydrate a strict Incident from its enriched persistence/read payload."""
+    return incident_type.model_validate({
+        key: value for key, value in payload.items() if key in incident_type.model_fields
+    })
+
+
 async def _merge_duplicate_into_canonical(alert: Alert, incident: Any) -> Any | None:
     deduplication = alert.metadata.get("deduplication") if isinstance(alert.metadata, dict) else {}
-    if not isinstance(deduplication, dict) or deduplication.get("disposition") != "duplicate":
-        return None
     if not settings.database_enabled or getattr(app.state, "session_factory", None) is None:
         return None
     candidate = incident.metadata.get("incident_candidate") if isinstance(incident.metadata, dict) else {}
-    correlation_key = str(candidate.get("correlation_key") or alert.correlation_id or "").strip()
+    correlation_key = str(
+        candidate.get("correlation_key") or alert.fingerprint or alert.correlation_id or alert.id
+    ).strip()
+    project_id = str(
+        alert.labels.get("project_id")
+        or alert.labels.get("project")
+        or alert.labels.get("project_name")
+        or alert.metadata.get("project_id")
+        or candidate.get("application")
+        or alert.service
+    ).strip()
+    source_event_ids = candidate.get("source_event_ids") if isinstance(candidate, dict) else None
+    source_event_id = (
+        str(source_event_ids[0]).strip()
+        if isinstance(source_event_ids, list) and source_event_ids and str(source_event_ids[0]).strip()
+        else str(alert.id)
+    )
+    # Candidate idempotency identifies a correlation family; occurrence
+    # idempotency must identify the immutable source event within that family.
+    idempotency_key = f"alert-occurrence:{source_event_id}"
+    window_minutes = int(
+        (deduplication.get("window_minutes") if isinstance(deduplication, dict) else None)
+        or agent.deduplication_window_minutes
+        or 60
+    )
     async with app.state.session_factory() as session:
         repo = IncidentRepository(session)
-        payload = await repo.find_open_incident_by_correlation_key(correlation_key)
-        if not payload:
+        ownership = await repo.acquire_canonical_incident(
+            incident=incident,
+            occurrence_id=alert.id,
+            correlation_key=correlation_key,
+            project_id=project_id,
+            idempotency_key=idempotency_key,
+            causation_id=str(candidate.get("idempotency_key") or alert.correlation_id or "") or None,
+            correlation_window_minutes=window_minutes,
+            observed_at=alert.starts_at,
+        )
+        canonical_incident_id = ownership["canonical_incident_id"]
+        correlation_metadata = {
+            "correlation_family_id": str(ownership["correlation_family_id"]),
+            "canonical_incident_id": str(canonical_incident_id),
+            "correlation_generation": int(ownership["correlation_generation"]),
+            "correlation_key": correlation_key,
+            "project_id": project_id,
+        }
+        incident.metadata["canonical_correlation"] = correlation_metadata
+        alert.metadata["canonical_correlation"] = correlation_metadata
+        alert.labels["kaiops_incident_id"] = str(canonical_incident_id)
+        if canonical_incident_id == incident.id:
+            await repo.save_alert(alert)
+            await repo.save_incident(incident)
+            await repo.save_incident_event(_build_alert_enriched_envelope(alert, incident))
+            await session.commit()
             return None
-        canonical = type(incident).model_validate(payload)
+        payload = await repo.get_incident(
+            str(canonical_incident_id), tenant_id=str(alert.tenant_id or "default")
+        )
+        if not payload:
+            raise RuntimeError("Canonical correlation ownership references a missing incident")
+        # Persistence payloads intentionally include read-model annotations
+        # such as approval_status/state. The strict domain model forbids those
+        # extras, so hydrate only its declared fields. This keeps a delayed
+        # duplicate from failing merely because the canonical incident has
+        # already advanced to an approval or terminal lifecycle state.
+        canonical = _incident_from_persisted_payload(payload, type(incident))
         if alert.id not in canonical.alert_ids:
             canonical.alert_ids.append(alert.id)
         canonical_metadata = canonical.metadata if isinstance(canonical.metadata, dict) else {}
@@ -310,20 +384,22 @@ async def _merge_duplicate_into_canonical(alert: Alert, incident: Any) -> Any | 
             "window_minutes": deduplication.get("window_minutes"),
         }
         canonical.metadata = canonical_metadata
-        deduplication.update(
-            {
-                "canonical_incident_id": str(canonical.id),
-                "canonical_jira_key": str(canonical.ticket_id or ""),
-                "processing_stopped": True,
-                "reason": "Duplicate occurrence linked to canonical incident",
-            }
-        )
-        alert.labels["kaiops_incident_id"] = str(canonical.id)
+        canonical.metadata["canonical_correlation"] = correlation_metadata
+        if isinstance(deduplication, dict):
+            deduplication.update(
+                {
+                    "canonical_incident_id": str(canonical.id),
+                    "canonical_jira_key": str(canonical.ticket_id or ""),
+                    "processing_stopped": True,
+                    "reason": "Duplicate occurrence linked to canonical incident",
+                }
+            )
         if canonical.ticket_id:
             alert.labels["ticket_id"] = str(canonical.ticket_id)
             alert.labels["jira_issue_key"] = str(canonical.ticket_id)
         await repo.save_alert(alert)
         await repo.save_incident(canonical)
+        await repo.save_incident_event(_build_alert_enriched_envelope(alert, canonical))
         await session.commit()
     logger.info(
         "incident_pipeline stage=deduplicate outcome=linked_duplicate alert=%s canonical_incident=%s issue=%s",
@@ -360,7 +436,7 @@ def _build_alert_enriched_envelope(alert: Alert, incident: Any) -> dict[str, Any
             "parent_event_id": None,
         },
         scope={
-            "tenant_id": "default",
+            "tenant_id": str(alert.tenant_id or "default"),
             "service": str(alert.service or "unknown"),
             "environment": str(alert.environment or "prod"),
             "region": None,
@@ -487,13 +563,6 @@ async def startup(app: FastAPI) -> None:
         if canonical is not None:
             EVENTS_PROCESSED.labels(settings.service_name, RAW_ALERTS, "duplicate").inc()
             return
-        if settings.database_enabled:
-            async with app.state.session_factory() as session:
-                repo = IncidentRepository(session)
-                await repo.save_alert(alert)
-                await repo.save_incident(incident)
-                await repo.save_incident_event(_build_alert_enriched_envelope(alert, incident))
-                await session.commit()
         # Investigation must not be gated on Jira ticket creation succeeding —
         # see the matching fix in process() below for the full rationale.
         # This handle() function is the real message-bus consumer for every
@@ -604,7 +673,6 @@ async def process(alert: Alert) -> dict:
             repo = IncidentRepository(session)
             await repo.save_alert(enriched)
             await repo.save_incident(incident)
-            await repo.save_incident_event(_build_alert_enriched_envelope(enriched, incident))
             await session.commit()
     # Investigation (context-agent -> resolution-agent RCA/impact/fix) must not
     # be gated on Jira ticket creation succeeding. Previously this only fired

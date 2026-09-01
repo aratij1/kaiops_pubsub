@@ -2,7 +2,7 @@ import { QueryClient } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { AlertRowsResponseSchema } from "../schemas/alerts";
-import { ApiValidationError, getValidated } from "./apiClient";
+import { ApiRequestError, ApiValidationError, getValidated } from "./apiClient";
 import { alertRowsQueryOptions } from "./alerts";
 
 afterEach(() => {
@@ -40,6 +40,44 @@ describe("typed alert API boundary", () => {
       issueCount: expect.any(Number),
     });
     expect(JSON.stringify(consoleError.mock.calls)).not.toContain("not-an-array");
+  });
+
+  it("normalizes retryable service errors with trace context", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      detail: "The database is recovering.",
+      trace_id: "trace-recovery-1",
+      error: {
+        code: "database_temporarily_unavailable",
+        message: "The database is recovering.",
+        category: "dependency",
+        retryable: true,
+      },
+    }), { status: 503, headers: { "Content-Type": "application/json", "x-trace-id": "trace-recovery-1", "Retry-After": "5" } })));
+
+    const request = getValidated("/api-gateway/alerts/all?limit=10", AlertRowsResponseSchema);
+    await expect(request).rejects.toMatchObject({
+      name: "ApiRequestError",
+      status: 503,
+      code: "database_temporarily_unavailable",
+      traceId: "trace-recovery-1",
+      retryable: true,
+      retryAfterMs: 5_000,
+      category: "dependency",
+    } satisfies Partial<ApiRequestError>);
+  });
+
+  it("fails closed when a JSON service returns malformed content", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("{broken", {
+      status: 200,
+      headers: { "Content-Type": "application/json", "x-trace-id": "bad-json-trace" },
+    })));
+
+    await expect(getValidated("/api-gateway/alerts/all", AlertRowsResponseSchema)).rejects.toMatchObject({
+      name: "ApiRequestError",
+      code: "invalid_json_response",
+      traceId: "bad-json-trace",
+      retryable: false,
+    } satisfies Partial<ApiRequestError>);
   });
 
   it("deduplicates concurrent requests with the same query key", async () => {

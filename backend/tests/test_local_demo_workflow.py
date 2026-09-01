@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 from context_agent import ContextIntelligenceAgent
+from context_agent.connectors import VectorDBConnector
 from model_router import ModelRouter
 from model_router.router import ModelProvider, ModelResponse, build_usage
 from resolution_agent import ResolutionIntelligenceAgent
@@ -86,8 +87,11 @@ def load_monitoring_app_module():
 
 
 class InProcessAiLayerClient:
-    def __init__(self, router: ModelRouter) -> None:
-        self.context_agent = ContextIntelligenceAgent()
+    def __init__(self, router: ModelRouter, rag_root=None) -> None:
+        connectors = ContextIntelligenceAgent().connectors
+        if rag_root is not None:
+            connectors[-1] = VectorDBConnector(rag_root=rag_root)
+        self.context_agent = ContextIntelligenceAgent(connectors=connectors)
         self.resolution_agent = ResolutionIntelligenceAgent(model_router=router)
 
     async def collect_context(self, *, alert, incident, decision=None):
@@ -98,11 +102,11 @@ class InProcessAiLayerClient:
 
 
 @pytest.mark.asyncio
-async def test_local_payment_workflow_generates_recommendation() -> None:
+async def test_local_payment_workflow_generates_recommendation(governed_rag_root) -> None:
     module = load_monitoring_app_module()
     module.settings.database_enabled = False
     router = static_router()
-    module.AiLayerClient = lambda _settings: InProcessAiLayerClient(router)
+    module.AiLayerClient = lambda _settings: InProcessAiLayerClient(router, governed_rag_root)
 
     workflow = await module.run_local_payment_workflow(trace_id="trace-123", model_router=router, run_comparison=False)
 
@@ -114,7 +118,7 @@ async def test_local_payment_workflow_generates_recommendation() -> None:
     assert workflow["decision"]["workflow"] == "critical-auto-remediation"
     assert workflow["decision"]["policy_version"] == "policy-v1"
     assert workflow["decision"]["policy_reason"]
-    assert workflow["context"]["deployment"] == "Deployment 2.5"
+    assert workflow["context"]["deployment"] == "payments"
     assert workflow["recommendation"]["recommended_action"] == "Rollback deployment"
     assert workflow["recommendation"]["metadata"]["policy_version"] == workflow["decision"]["policy_version"]
     assert workflow["approval"]["metadata"]["policy_version"] == workflow["decision"]["policy_version"]
@@ -130,7 +134,10 @@ async def test_local_payment_workflow_generates_recommendation() -> None:
     assert "gpt-5" in providers or "gpt-4o" in providers
     resolution_event = next(event for event in workflow["events"] if event["agent"] == "Resolution Intelligence Agent")
     assert resolution_event["llm_calls"]
-    assert {"prompt", "payload", "response", "usage"}.issubset(resolution_event["llm_calls"][0])
+    assert {"prompt_sha256", "payload_sha256", "response_sha256", "usage"}.issubset(
+        resolution_event["llm_calls"][0]
+    )
+    assert {"prompt", "payload", "response"}.isdisjoint(resolution_event["llm_calls"][0])
     assert [event["agent"] for event in workflow["events"]] == [
         "Alert Intelligence Agent",
         "Orchestrator Agent",

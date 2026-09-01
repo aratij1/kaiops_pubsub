@@ -459,6 +459,9 @@ function isGeneratedOrTestAlert(row) {
   const labels = typeof row?.labels === "object" && row.labels ? row.labels : {};
   const metadata = typeof row?.metadata === "object" && row.metadata ? row.metadata : {};
   const annotations = typeof row?.annotations === "object" && row.annotations ? row.annotations : {};
+  const projection = typeof row?.projection_payload === "object" && row.projection_payload ? row.projection_payload : {};
+  const eventPayload = typeof projection?.event_payload === "object" && projection.event_payload ? projection.event_payload : {};
+  const projectionLabels = typeof eventPayload?.labels === "object" && eventPayload.labels ? eventPayload.labels : {};
   const explicitTestFlag = [
     row?.is_test,
     row?.test_alert,
@@ -476,6 +479,7 @@ function isGeneratedOrTestAlert(row) {
     row?.alert_id,
     row?.incident_id,
     row?.name,
+    row?.title,
     row?.alert_name,
     row?.rule_name,
     row?.rule,
@@ -503,6 +507,18 @@ function isGeneratedOrTestAlert(row) {
     metadata?.project,
     metadata?.project_name,
     metadata?.environment,
+    projection?.title,
+    projection?.alert_name,
+    projection?.application,
+    projection?.environment,
+    eventPayload?.title,
+    eventPayload?.name,
+    eventPayload?.alert_name,
+    eventPayload?.application,
+    eventPayload?.environment,
+    projectionLabels?.alertname,
+    projectionLabels?.application,
+    projectionLabels?.environment,
   ].map((value) => String(value || "").toLowerCase()).join(" ");
   return /(^|[-_\s])(e2e|ui-e2e|admin-e2e|setup-doc-e2e|stress|smoke|onboarding-smoke-test|test\d*|testing|demo|sample|mock|synthetic|fake|dummy)([-_\s]|$)/i.test(tokens)
     || tokens.includes("stresspipelinealert")
@@ -676,15 +692,7 @@ function ensureMinimumAlertsBySource(rows, sourceRows, minimums = MIN_VISIBLE_AL
   const candidates = (Array.isArray(sourceRows) ? sourceRows : [])
     .slice()
     .sort((left, right) => alertTimeMs(right) - alertTimeMs(left));
-  const seen = new Set(
-    selected.map((row) => String(
-      row?.alert_id
-      || row?.id
-      || row?.event_id
-      || row?.file
-      || `${normalizeAlertChannel(row)}:${row?.name || ""}:${row?.created_at || row?.received_at || ""}`
-    ))
-  );
+  const seen = new Set(selected.flatMap((row) => alertIdentityKeys(row)));
   const counts = Object.fromEntries(
     Object.keys(minimums).map((channel) => [
       channel,
@@ -698,17 +706,12 @@ function ensureMinimumAlertsBySource(rows, sourceRows, minimums = MIN_VISIBLE_AL
     if (!required || counts[channel] >= required) {
       continue;
     }
-    const identity = String(
-      row?.alert_id
-      || row?.id
-      || row?.event_id
-      || row?.file
-      || `${channel}:${row?.name || ""}:${row?.created_at || row?.received_at || ""}`
-    );
-    if (seen.has(identity)) {
+    const identities = alertIdentityKeys(row);
+    const fallbackIdentity = `${channel}:${row?.name || ""}:${row?.created_at || row?.received_at || ""}`;
+    if (identities.some((identity) => seen.has(identity)) || (!identities.length && seen.has(fallbackIdentity))) {
       continue;
     }
-    seen.add(identity);
+    (identities.length ? identities : [fallbackIdentity]).forEach((identity) => seen.add(identity));
     selected.push(row);
     counts[channel] += 1;
   }
@@ -983,7 +986,14 @@ function dedupeAndConsolidateAlertRows(rows, options = {}) {
           ? true
           : !existingIsLandingPad && incomingIsLandingPad
             ? false
-            : incomingScore > existingScore || (incomingScore === existingScore && incomingTime > existingTime);
+          : incomingScore > existingScore || (incomingScore === existingScore && incomingTime > existingTime);
+      const priorRow = group.row;
+      const priorCanonicalId = [priorRow?.alert_id, priorRow?.id]
+        .map((value) => String(value || "").trim())
+        .find((value) => ALERT_UUID_PATTERN.test(value)) || "";
+      const incomingCanonicalId = [row?.alert_id, row?.id]
+        .map((value) => String(value || "").trim())
+        .find((value) => ALERT_UUID_PATTERN.test(value)) || "";
       const priorApplication = alertApplicationCandidate(group.row);
       const incomingApplication = alertApplicationCandidate(row);
       if (shouldReplace) {
@@ -994,6 +1004,23 @@ function dedupeAndConsolidateAlertRows(rows, options = {}) {
       } else if (!priorApplication && incomingApplication) {
         group.row.application = incomingApplication;
       }
+      // Landing-pad occurrences can be newer than their canonical database
+      // row regardless of input order. Their filename is not an alert
+      // identity, so always merge the UUID and downstream relationship fields
+      // from the row that was not selected as the display state.
+      const canonicalId = incomingCanonicalId || priorCanonicalId;
+      const selectedCanonicalId = [group.row?.alert_id, group.row?.id]
+        .map((value) => String(value || "").trim())
+        .find((value) => ALERT_UUID_PATTERN.test(value)) || "";
+      if (!selectedCanonicalId && canonicalId) {
+        group.row.id = canonicalId;
+        group.row.alert_id = canonicalId;
+      }
+      const relationshipRow = shouldReplace ? priorRow : row;
+      ["incident_id", "ticket_id", "jira_key", "jira_url", "incident_projection", "correlation_id", "trace_id"]
+        .forEach((field) => {
+          if (!group.row[field] && relationshipRow?.[field]) group.row[field] = relationshipRow[field];
+        });
     }
 
     // Register every candidate key from this row against the resolved group so a later
@@ -1077,7 +1104,9 @@ function mapLandingPadRowToAlertStreamRow(row, index = 0) {
     ...payload,
     id: incidentId,
     alert_id: String(payload.alert_id || incidentId).trim(),
-    incident_id: String(payload.incident_id || incidentId).trim(),
+    // Alert identity is not incident identity. Keep this empty until the
+    // backend returns a persisted incident projection for the alert.
+    incident_id: String(payload.incident_id || "").trim(),
     name: alertName,
     alert_name: alertName,
     application: String(payload.application || payload.project_name || payload.project || labels.application || labels.project || labels.project_name || "").trim(),
@@ -1787,6 +1816,9 @@ function deriveExecutionCommands(workflow, traceRows) {
 
   explicit.forEach((item) => pushUnique(item, "cmd: "));
 
+  // Prefer the governed catalog contract when model analysis is diagnostic-only.
+  pushPlan(recommendationMetadata.execution_plan);
+
   const remediationParams = typeof remediationAction.parameters === "object" && remediationAction.parameters
     ? remediationAction.parameters
     : {};
@@ -1838,10 +1870,11 @@ function remediationOutcomeFromAction(action) {
   }
 
   let title = "Remediation status";
-  if (status === "succeeded") {
+  if (actionType === "diagnostic_completion" && status === "skipped") title = "Diagnostic assessment completed";
+  else if (status === "succeeded") {
     title = "Remediation executed successfully";
   } else if (automaticPolicyBlocked) {
-    title = "Automatic execution deferred for human approval";
+    title = "Human approval required";
   } else if (status === "skipped") {
     title = "Remediation was not executed";
   } else if (["failed", "dispatch_failed", "execution_failed", "validation_failed", "rollback_failed", "timed_out"].includes(status)) {
@@ -1857,8 +1890,9 @@ function remediationOutcomeFromAction(action) {
   }
 
   let detail = reason || `Remediation engine returned status ${status || "unknown"}.`;
+  if (actionType === "diagnostic_completion" && status === "skipped") detail = reason || "Diagnostic evidence was recorded and no corrective action was required.";
   if (automaticPolicyBlocked) {
-    detail = `${reason || "Automatic execution did not meet the policy threshold."} Complete dry run and human approval, then use Execute approved plan.`;
+    detail = `${reason || "Automatic execution did not meet the policy threshold."} Review and approve the plan, then confirm execution.`;
   }
   if (/no real .*executor is configured/i.test(detail) || /configure a connector executor/i.test(detail)) {
     detail = `${detail} Add a real remediation connector with executor settings and secret_ref, or edit the plan to use the approved local triage script.`;
@@ -4142,6 +4176,7 @@ function groundedIntelligenceDisplay(label, value, structuredOverride) {
           ]
       : [
           ["Why", parsed.why_this_action],
+          ["Blocked corrective candidate", parsed.blocked_candidate_action],
           ["Validation", parsed.validation_queries],
           ["Rollback", parsed.rollback_plan],
           ["Missing evidence", parsed.missing_evidence],
@@ -4224,6 +4259,14 @@ function canonicalIncidentAnalysis(workflow, alertRow = null) {
     report.external_knowledge_error || metadata.external_knowledge_error,
     "",
   );
+  const rcaStatus = String(metadata.rca_status || "").trim().toLowerCase();
+  const analysisStatus = rcaStatus === "insufficient_evidence"
+    ? "insufficient-evidence"
+    : rcaStatus === "grounded"
+      ? "resolved-analysis"
+      : confirmedRootCause
+        ? "resolved-analysis"
+        : hypothesis ? "hypothesis" : "insufficient-evidence";
   return {
     rootCause,
     impact: explicitImpact || "Impact not established from current evidence.",
@@ -4231,7 +4274,7 @@ function canonicalIncidentAnalysis(workflow, alertRow = null) {
     rca,
     impactAnalysis: impact,
     remediation,
-    status: confirmedRootCause ? "resolved-analysis" : hypothesis ? "hypothesis" : "insufficient-evidence",
+    status: analysisStatus,
     confidence: Number(recommendation.confidence ?? rca.confidence_score ?? hypothesis?.confidence ?? 0),
     externalKnowledgeUsed,
     externalKnowledgeEligible,
@@ -4337,8 +4380,6 @@ function IntelligenceConnectionView({
     // literal text "[object Object]".
     ...(Array.isArray(rcaAnalysis.evidence_used) ? rcaAnalysis.evidence_used.filter((item) => typeof item === "string") : []),
     ...(Array.isArray(impactAnalysis.evidence_used) ? impactAnalysis.evidence_used.filter((item) => typeof item === "string") : []),
-    ...evidence.map((item) => item?.evidence_id),
-    ...detectedErrors.map((item) => item?.evidence_id),
   ].filter(Boolean)));
   const queryTerms = Array.isArray(discovery.query_terms)
     ? discovery.query_terms
@@ -4430,8 +4471,8 @@ function IntelligenceConnectionView({
             ),
             evidence_used: Array.isArray(rcaAnalysis.evidence_used) && rcaAnalysis.evidence_used.length
               ? rcaAnalysis.evidence_used
-              : (hypotheses[0]?.supporting_evidence || supportingIds || []).filter((item) => typeof item === "string"),
-            confidence_score: Number.isFinite(Number(rcaAnalysis.confidence_score)) && Number(rcaAnalysis.confidence_score) > 0
+              : (hypotheses[0]?.supporting_evidence || []).filter((item) => typeof item === "string"),
+            confidence_score: Number.isFinite(Number(rcaAnalysis.confidence_score))
               ? Number(rcaAnalysis.confidence_score)
               : Number(recommendation.confidence ?? report.confidence_score ?? hypotheses[0]?.confidence ?? 0),
           }
@@ -4458,8 +4499,8 @@ function IntelligenceConnectionView({
             ),
             evidence_used: Array.isArray(impactAnalysis.evidence_used) && impactAnalysis.evidence_used.length
               ? impactAnalysis.evidence_used
-              : (supportingIds || []).filter((item) => typeof item === "string"),
-            confidence_score: Number.isFinite(Number(impactAnalysis.confidence_score)) && Number(impactAnalysis.confidence_score) > 0
+              : [],
+            confidence_score: Number.isFinite(Number(impactAnalysis.confidence_score))
               ? Number(impactAnalysis.confidence_score)
               : Number(recommendation.confidence ?? report.confidence_score ?? 0),
           }
@@ -4503,7 +4544,16 @@ function IntelligenceConnectionView({
     {
       label: "Recommended action",
       value: Object.keys(remediationAnalysis).length
-        ? remediationAnalysis
+        ? remediationAnalysis.execution_ready === false
+          ? {
+              ...remediationAnalysis,
+              recommended_action: Array.isArray(rcaAnalysis.missing_evidence) && rcaAnalysis.missing_evidence.length
+                ? `Collect missing evidence (${rcaAnalysis.missing_evidence.join(", ")}) and rerun analysis.`
+                : "Collect the next required diagnostic evidence and rerun analysis.",
+              why_this_action: "Corrective execution is blocked because the causal hypothesis is not sufficiently corroborated.",
+              blocked_candidate_action: remediationAnalysis.recommended_action,
+            }
+          : remediationAnalysis
         : recommendation.recommended_action || (Array.isArray(report.recommended_next_checks)
           ? {
               recommended_action: report.recommended_next_checks[0],
@@ -6941,64 +6991,6 @@ function summarizeAlertRuleContext(row, workflow = {}) {
   };
 }
 
-function buildWorkflowFlowStages(workflow, timelineRows = []) {
-  const safeWorkflow = workflow && typeof workflow === "object" ? workflow : {};
-  const safeRows = Array.isArray(timelineRows) ? timelineRows : [];
-  const findStage = (needle) => safeRows.find((row) => String(row?.stage || row?.agent || row?.detail || "").toLowerCase().includes(needle));
-  const hasParallelProcessing = safeRows.some((row) => {
-    const token = String(row?.agent || row?.service || row?.detail || "").toLowerCase();
-    return token.includes("alert intelligence") || token.includes("orchestrator") || token.includes("context") || token.includes("resolution");
-  });
-  const remediation = safeWorkflow?.remediation_action && typeof safeWorkflow.remediation_action === "object"
-    ? safeWorkflow.remediation_action
-    : {};
-  const remediationStatus = String(remediation.status || "").trim().toLowerCase();
-  const remediationPolicyBlocked = String(remediation.action_type || "").trim().toLowerCase() === "policy-blocked"
-    || remediation?.metadata?.policy_blocked === true;
-  const closureComplete = safeWorkflow?.closure_report?.health_restored === true;
-  return [
-    {
-      id: "landing-pad",
-      label: "Landing Pad",
-      detail: "Raw alerts are accepted, normalized, and added to the incident stream.",
-      status: findStage("landing") ? "done" : "active",
-    },
-    {
-      id: "parallel-processing",
-      label: "Parallel Processing",
-      detail: hasParallelProcessing
-        ? "Alert intelligence, orchestration, context, and resolution work the stream in parallel workers."
-        : "Backend workers fan out the alert stream through independent services for concurrent processing.",
-      status: hasParallelProcessing ? "done" : "active",
-    },
-    {
-      id: "approval",
-      label: "Approval Gate",
-      detail: String(safeWorkflow?.approval?.status || safeWorkflow?.decision?.status || "pending").trim(),
-      status: safeWorkflow?.approval?.status ? "done" : "active",
-    },
-    {
-      id: "remediation",
-      label: "Remediation Execution",
-      detail: remediationPolicyBlocked
-        ? String(remediation.error || remediation.metadata?.policy_reason || "Execution blocked by policy; operator review is required.")
-        : `${Array.isArray(remediation?.parameters?.execution_plan?.commands) ? remediation.parameters.execution_plan.commands.length : 0} commands captured for execution or review.`,
-      status: remediationPolicyBlocked ? "blocked" : remediationStatus ? "done" : "waiting",
-    },
-    {
-      id: "closure",
-      label: "Closure & Validation",
-      detail: String(closureComplete
-        ? "Service restored and closure completed."
-        : remediationPolicyBlocked
-          ? "Waiting for an approved remediation outcome before validation."
-          : "Validation starts after remediation completes.").trim(),
-      status: closureComplete ? "done" : "waiting",
-    },
-  ];
-}
-
-
 export {
   DEFAULT_ALERT,
   REAL_USE_CASE_SCOPE,
@@ -7140,5 +7132,4 @@ export {
   inferRuleSeverity,
   buildPrometheusRulePreview,
   summarizeAlertRuleContext,
-  buildWorkflowFlowStages,
 };

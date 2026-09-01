@@ -7,6 +7,8 @@
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--panel);
+  min-width: 0;
+  max-width: 100%;
 }
 
 .rca-analysis-mode {
@@ -17,6 +19,7 @@
   padding: 3px;
   border-radius: 7px;
   background: var(--surface-muted, #eef3f6);
+  min-width: 0;
 }
 
 .rca-analysis-mode button {
@@ -37,7 +40,11 @@
 .rca-analysis-mode button.active { border-color: #82bdd1; background: var(--panel); box-shadow: 0 1px 4px rgb(16 64 83 / 12%); }
 .rca-analysis-mode button.active strong { color: #075f7f; }
 
-@media (max-width: 900px) {
+@media (max-width: 1200px) {
   .rca-analysis-toolbar { flex-direction: column; }
+  .rca-analysis-mode { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+
+@media (max-width: 700px) {
   .rca-analysis-mode { grid-template-columns: 1fr; }
 }

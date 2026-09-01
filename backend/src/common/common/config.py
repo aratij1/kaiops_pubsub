@@ -74,6 +74,17 @@ class Settings(BaseSettings):
     knowledge_development_url: str = Field(default="http://knowledge-development-worker:8000", alias="KNOWLEDGE_DEVELOPMENT_URL")
     api_gateway_url: str = Field(default="http://api-gateway:8000", alias="API_GATEWAY_URL")
     application_onboarding_url: str = Field(default="http://application-onboarding:8000", alias="APPLICATION_ONBOARDING_URL")
+    cloud_operations_url: str = Field(default="http://cloud-operations:8000", alias="CLOUD_OPERATIONS_URL")
+    cloud_operations_enabled: bool = Field(default=False, alias="CLOUD_OPERATIONS_ENABLED")
+    cloud_execution_simulator_enabled: bool = Field(default=True, alias="CLOUD_EXECUTION_SIMULATOR_ENABLED")
+    cloud_execution_aws_enabled: bool = Field(default=False, alias="CLOUD_EXECUTION_AWS_ENABLED")
+    cloud_execution_azure_enabled: bool = Field(default=False, alias="CLOUD_EXECUTION_AZURE_ENABLED")
+    cloud_azure_kill_switch_engaged: bool = Field(default=True, alias="CLOUD_AZURE_KILL_SWITCH_ENGAGED")
+    cloud_azure_canary_resource_ids: str = Field(default="", alias="CLOUD_AZURE_CANARY_RESOURCE_IDS")
+    cloud_azure_rate_limit_per_minute: int = Field(default=2, alias="CLOUD_AZURE_RATE_LIMIT_PER_MINUTE", ge=1, le=30)
+    cloud_execution_gcp_enabled: bool = Field(default=False, alias="CLOUD_EXECUTION_GCP_ENABLED")
+    cloud_execution_lease_minutes: int = Field(default=15, alias="CLOUD_EXECUTION_LEASE_MINUTES", ge=1, le=120)
+    cloud_credential_session_minutes: int = Field(default=10, alias="CLOUD_CREDENTIAL_SESSION_MINUTES", ge=1, le=60)
     ai_layer_mode: str = Field(default="endpoint", alias="AI_LAYER_MODE")
     ai_layer_request_timeout_seconds: float = Field(default=120.0, alias="AI_LAYER_REQUEST_TIMEOUT_SECONDS")
     ai_layer_auth_token: str = Field(default="", alias="AI_LAYER_AUTH_TOKEN")
@@ -163,6 +174,10 @@ class Settings(BaseSettings):
     remediation_temporal_enabled: bool = Field(default=False, alias="REMEDIATION_TEMPORAL_ENABLED")
     remediation_temporal_task_queue: str = Field(default="kaiops-remediation", alias="REMEDIATION_TEMPORAL_TASK_QUEUE")
     remediation_internal_token: str = Field(default="", alias="REMEDIATION_INTERNAL_TOKEN")
+    service_internal_token: str = Field(default="", alias="SERVICE_INTERNAL_TOKEN")
+    event_envelope_signing_required: bool = Field(default=False, alias="EVENT_ENVELOPE_SIGNING_REQUIRED")
+    event_envelope_signing_key: str = Field(default="", alias="EVENT_ENVELOPE_SIGNING_KEY")
+    event_envelope_signing_issuer: str = Field(default="", alias="EVENT_ENVELOPE_SIGNING_ISSUER")
     temporal_approval_timeout_hours: int = Field(default=24, alias="TEMPORAL_APPROVAL_TIMEOUT_HOURS")
     orchestration_llm_planner_enabled: bool = Field(default=False, alias="ORCHESTRATION_LLM_PLANNER_ENABLED")
     kafka_startup_attempts: int = Field(default=30, alias="KAFKA_STARTUP_ATTEMPTS")
@@ -218,6 +233,12 @@ class Settings(BaseSettings):
     # Defaults to "gpt-4o" since that's the deployment already proven live on
     # this endpoint via the evaluation client.
     azure_openai_chat_deployment: str = Field(default="gpt-4o", alias="AZURE_OPENAI_CHAT_DEPLOYMENT")
+    azure_openai_reasoning_standard_deployment: str = Field(
+        default="", alias="AZURE_OPENAI_REASONING_STANDARD_DEPLOYMENT"
+    )
+    azure_openai_reasoning_critical_deployment: str = Field(
+        default="", alias="AZURE_OPENAI_REASONING_CRITICAL_DEPLOYMENT"
+    )
     llm_request_timeout_seconds: float = Field(default=120.0, alias="LLM_REQUEST_TIMEOUT_SECONDS")
     model_router_prompt_cache_enabled: bool = Field(default=True, alias="MODEL_ROUTER_PROMPT_CACHE_ENABLED")
     model_router_prompt_cache_ttl_seconds: float = Field(default=300.0, alias="MODEL_ROUTER_PROMPT_CACHE_TTL_SECONDS")
@@ -348,6 +369,12 @@ class Settings(BaseSettings):
             raise ValueError(f"Missing production OIDC settings: {', '.join(name.upper() for name in missing_oidc)}")
         if not self.oidc_issuer.lower().startswith("https://"):
             raise ValueError("Production OIDC_ISSUER must use HTTPS")
+        if not self.event_envelope_signing_required:
+            raise ValueError("Production requires EVENT_ENVELOPE_SIGNING_REQUIRED=true")
+        if len(self.event_envelope_signing_key) < 32:
+            raise ValueError("Production EVENT_ENVELOPE_SIGNING_KEY must contain at least 32 characters")
+        if not self.event_envelope_signing_issuer.strip():
+            raise ValueError("Production EVENT_ENVELOPE_SIGNING_ISSUER is required")
         # Local JWT keys and seeded passwords are not authentication inputs in
         # OIDC mode; do not force operators to create unused production secrets.
         return

@@ -96,26 +96,30 @@ def test_assemble_context_runbook_selection_finds_matching_runbook() -> None:
     assert selected == "approval-service runbook"
 
 
-def test_read_metadata_normalizes_singular_service_frontmatter_key() -> None:
-    """The real regression: runbooks/mysql-alerts-table-rows-high-runbook.md
-    (and other corpus documents) use a singular "service: mysql" frontmatter
-    field, not the plural "services:" list. Before this fix, _read_metadata
-    only looked at "services", so this document's services list came back
-    empty -- which _service_matches treats as "matches every alert" -- and it
-    was surfacing as runbook evidence for completely unrelated services."""
-    connector = VectorDBConnector()
-    root = connector.root_path()
-    path = root / "runbooks" / "mysql-alerts-table-rows-high-runbook.md"
-    assert path.exists(), f"expected fixture runbook at {path}"
-
-    metadata = connector._read_metadata(path)
+def test_read_metadata_normalizes_singular_service_frontmatter_key(tmp_path: Path) -> None:
+    """Runbooks using singular 'service: mysql' frontmatter field must normalize to 'services': ['mysql']."""
+    runbook = tmp_path / "mysql-test-runbook.md"
+    runbook.write_text(
+        "---\nservice: mysql\ntitle: MySQL Test Runbook\n---\n# MySQL Remediation\nSteps...",
+        encoding="utf-8",
+    )
+    connector = VectorDBConnector(rag_root=tmp_path)
+    metadata = connector._read_metadata(runbook)
 
     assert metadata["services"] == ["mysql"]
+    assert metadata["title"] == "MySQL Test Runbook"
 
 
-def test_load_full_document_normalizes_singular_service_frontmatter_key() -> None:
-    connector = VectorDBConnector()
-
-    document = connector._load_full_document("mysql-alerts-table-rows-high-runbook.md")
+def test_load_full_document_normalizes_singular_service_frontmatter_key(tmp_path: Path) -> None:
+    runbooks_dir = tmp_path / "runbooks"
+    runbooks_dir.mkdir(parents=True, exist_ok=True)
+    runbook = runbooks_dir / "mysql-alerts-test.md"
+    runbook.write_text(
+        "---\nservice: mysql\ntitle: MySQL Alerts Test\n---\n# Content\nBody text...",
+        encoding="utf-8",
+    )
+    connector = VectorDBConnector(rag_root=tmp_path)
+    document = connector._load_full_document(str(runbook))
 
     assert document["services"] == ["mysql"]
+    assert document["title"] == "MySQL Alerts Test"

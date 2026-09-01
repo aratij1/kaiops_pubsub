@@ -12,9 +12,9 @@ export type LegacyTabId =
   | "summary"
   | "approval";
 
-export type NavigationGroup = "operations" | "governance" | "platform" | "administration";
-export type NavigationRole = "administrator" | "l1_operator" | "l2_engineer" | "l3_engineer" | "executive";
-export type NavigationIcon = "dashboard" | "alerts" | "incidents" | "approvals" | "copilot" | "agentFlow" | "knowledge" | "safety" | "audit" | "closed" | "applications" | "integrations" | "admin" | "settings" | "executive";
+export type NavigationGroup = "operations" | "intelligence" | "automation" | "platform";
+export type NavigationRole = "admin" | "hitl_reviewer";
+export type NavigationIcon = "dashboard" | "alerts" | "incidents" | "approvals" | "copilot" | "agentFlow" | "knowledge" | "safety" | "audit" | "closed" | "applications" | "operationsCockpit" | "cloudConnections" | "cloudResources" | "serviceOnboarding" | "services" | "integrations" | "platformOverview" | "admin" | "settings" | "executive";
 export type NavigationId = NavigationIcon;
 
 export interface NavigationItem {
@@ -23,6 +23,7 @@ export interface NavigationItem {
   path: string;
   label: string;
   pageTitle: string;
+  description: string;
   group: NavigationGroup;
   routeModule: string;
   icon: NavigationIcon;
@@ -32,33 +33,38 @@ export interface NavigationItem {
   showInNavigation?: boolean;
 }
 
-const ALL_ROLES = ["administrator", "l1_operator", "l2_engineer", "l3_engineer", "executive"] as const;
-const ENGINEERING_ROLES = ["administrator", "l2_engineer", "l3_engineer"] as const;
-const INCIDENT_ROLES = ["administrator", "l2_engineer", "l3_engineer", "executive"] as const;
+const ALL_ROLES = ["admin", "hitl_reviewer"] as const;
+const ADMIN_ROLES = ["admin"] as const;
 
 export const NAVIGATION_GROUPS = [
   { id: "operations", label: "Operations" },
+  { id: "intelligence", label: "Intelligence" },
+  { id: "automation", label: "Automation" },
   { id: "platform", label: "Platform" },
-  { id: "governance", label: "Governance" },
-  { id: "administration", label: "Administration" },
 ] as const satisfies readonly { id: NavigationGroup; label: string }[];
 
 export const NAVIGATION_ITEMS: readonly NavigationItem[] = [
-  { id: "dashboard", legacyTab: "home", path: "/", label: "Overview", pageTitle: "Operations Overview", group: "operations", routeModule: "dashboard", icon: "dashboard", keywords: ["attention", "reliability", "overview", "incident", "summary"], allowedRoles: ALL_ROLES },
-  { id: "incidents", legacyTab: "summary", path: "/incidents", label: "Unified Inbox", pageTitle: "Unified Inbox", group: "operations", routeModule: "incidents", icon: "incidents", keywords: ["signals", "alerts", "problems", "case", "investigation", "resolution"], allowedRoles: ALL_ROLES, related: ["alerts", "approvals"] },
-  { id: "alerts", legacyTab: "stream", path: "/alerts", label: "Alerts", pageTitle: "Alert Signals", group: "operations", routeModule: "alerts", icon: "alerts", keywords: ["signals", "live", "ingestion", "stream", "events"], allowedRoles: ALL_ROLES, related: ["incidents"] },
-  { id: "approvals", legacyTab: "approval", path: "/approvals", label: "Approvals", pageTitle: "Approvals", group: "operations", routeModule: "approvals", icon: "approvals", keywords: ["review", "decision", "human gate"], allowedRoles: INCIDENT_ROLES, related: ["incidents", "closed"], showInNavigation: true },
-  { id: "copilot", legacyTab: "copilot", path: "/copilot", label: "Kai Assistant", pageTitle: "Kai Assistant", group: "operations", routeModule: "copilot", icon: "copilot", keywords: ["ask", "assistant", "analysis", "ai"], allowedRoles: INCIDENT_ROLES, showInNavigation: false },
-  { id: "agentFlow", legacyTab: "trace", path: "/agent-flow", label: "Agent Flow", pageTitle: "Agent Flow", group: "governance", routeModule: "agent-flow", icon: "agentFlow", keywords: ["trace", "workflow", "agents"], allowedRoles: ENGINEERING_ROLES, showInNavigation: false },
-  { id: "applications", legacyTab: "admin", path: "/applications", label: "Applications", pageTitle: "Application Portfolio", group: "platform", routeModule: "applications", icon: "applications", keywords: ["projects", "services", "inventory", "readiness"], allowedRoles: ENGINEERING_ROLES },
-  { id: "integrations", legacyTab: "admin", path: "/integrations", label: "Integrations", pageTitle: "Integration Launchpad", group: "platform", routeModule: "integrations", icon: "integrations", keywords: ["connectors", "monitoring", "providers", "onboarding"], allowedRoles: ENGINEERING_ROLES },
-  { id: "knowledge", legacyTab: "rag", path: "/knowledge", label: "Knowledge", pageTitle: "Operational Knowledge", group: "platform", routeModule: "knowledge", icon: "knowledge", keywords: ["runbooks", "rag", "documents", "evidence"], allowedRoles: ENGINEERING_ROLES },
-  { id: "safety", legacyTab: "safety", path: "/automation", label: "Automation", pageTitle: "AI Trust & Automation", group: "governance", routeModule: "gateway-safety", icon: "safety", keywords: ["autonomy", "policy", "risk", "guardrail", "trust"], allowedRoles: ENGINEERING_ROLES },
-  { id: "audit", legacyTab: "audit", path: "/audit", label: "Audit", pageTitle: "Audit Trail", group: "governance", routeModule: "audit", icon: "audit", keywords: ["history", "compliance", "events"], allowedRoles: ENGINEERING_ROLES },
-  { id: "closed", legacyTab: "closed", path: "/closed-incidents", label: "Closed Incidents", pageTitle: "Closed Incidents", group: "governance", routeModule: "closed-incidents", icon: "closed", keywords: ["resolved", "historical", "tickets"], allowedRoles: INCIDENT_ROLES, related: ["incidents"], showInNavigation: false },
-  { id: "admin", legacyTab: "admin", path: "/admin/users", label: "Users & Access", pageTitle: "Users & Access", group: "administration", routeModule: "admin", icon: "admin", keywords: ["users", "roles", "access", "identity"], allowedRoles: ["administrator"] },
-  { id: "settings", legacyTab: "admin", path: "/service-control", label: "Service Control", pageTitle: "Service Control Panel", group: "platform", routeModule: "admin", icon: "settings", keywords: ["platform", "services", "health", "status", "control panel"], allowedRoles: ENGINEERING_ROLES },
-  { id: "executive", legacyTab: "executive", path: "/executive", label: "Executive Dashboard", pageTitle: "Executive Dashboard", group: "governance", routeModule: "executive", icon: "executive", keywords: ["leadership", "business", "metrics"], allowedRoles: ["administrator", "l3_engineer", "executive"], showInNavigation: false },
+  { id: "dashboard", legacyTab: "home", path: "/", label: "Overview", pageTitle: "Operations Overview", description: "Production health, attention, automation, approvals, changes, and readiness.", group: "operations", routeModule: "dashboard", icon: "dashboard", keywords: ["operations", "overview", "command center"], allowedRoles: ALL_ROLES },
+  { id: "incidents", legacyTab: "summary", path: "/incidents", label: "Unified Inbox", pageTitle: "Unified Inbox", description: "Triage correlated signals, investigate evidence, and prepare governed decisions.", group: "operations", routeModule: "incidents", icon: "incidents", keywords: ["signals", "alerts", "case", "investigate", "evidence", "rca"], allowedRoles: ALL_ROLES, related: ["alerts", "approvals"] },
+  { id: "applications", legacyTab: "admin", path: "/applications", label: "Applications", pageTitle: "Applications", description: "Onboard and manage business applications.", group: "operations", routeModule: "applications", icon: "applications", keywords: ["projects", "applications", "onboarding"], allowedRoles: ADMIN_ROLES },
+  { id: "cloudResources", legacyTab: "admin", path: "/cloud-ops/resources", label: "Estate", pageTitle: "Resource Estate", description: "Browse resources, ownership, tags, and topology evidence.", group: "operations", routeModule: "cloud-ops/resources", icon: "cloudResources", keywords: ["estate", "inventory", "resources", "topology", "cloud"], allowedRoles: ADMIN_ROLES, related: ["cloudConnections", "services"] },
+  { id: "copilot", legacyTab: "copilot", path: "/copilot", label: "Kai", pageTitle: "Kai Intelligence", description: "Grounded operational intelligence and investigation.", group: "intelligence", routeModule: "copilot", icon: "copilot", keywords: ["kai", "assistant", "analysis", "insight"], allowedRoles: ALL_ROLES },
+  { id: "knowledge", legacyTab: "rag", path: "/knowledge", label: "Knowledge", pageTitle: "Knowledge", description: "Govern evidence sources and approved runbooks.", group: "intelligence", routeModule: "knowledge", icon: "knowledge", keywords: ["rag", "documents", "runbooks"], allowedRoles: ADMIN_ROLES },
+  { id: "approvals", legacyTab: "approval", path: "/approvals", label: "Approvals", pageTitle: "Approvals", description: "Review complete decision packets assigned to you.", group: "automation", routeModule: "approvals", icon: "approvals", keywords: ["review", "decision", "human gate"], allowedRoles: ALL_ROLES, related: ["incidents", "closed"] },
+  { id: "operationsCockpit", legacyTab: "admin", path: "/cloud-ops/cockpit", label: "Capabilities", pageTitle: "Automation Capabilities", description: "Inspect readiness and safely simulate governed capabilities.", group: "automation", routeModule: "cloud-ops/cockpit", icon: "operationsCockpit", keywords: ["capabilities", "automation", "readiness", "execution"], allowedRoles: ADMIN_ROLES, related: ["cloudResources", "services"] },
+  { id: "platformOverview", legacyTab: "admin", path: "/platform", label: "Control Plane", pageTitle: "Platform Control Plane", description: "Live readiness, data flow, AI, context, and governance posture.", group: "platform", routeModule: "platform", icon: "platformOverview", keywords: ["platform", "control plane", "health", "governance"], allowedRoles: ADMIN_ROLES, related: ["cloudConnections", "admin", "operationsCockpit"] },
+  { id: "cloudConnections", legacyTab: "admin", path: "/cloud-ops/connections", label: "Integrations", pageTitle: "Integrations", description: "Register and validate provider-neutral connections.", group: "platform", routeModule: "cloud-ops/connections", icon: "cloudConnections", keywords: ["integrations", "connectors", "cloud", "providers"], allowedRoles: ADMIN_ROLES, related: ["cloudResources", "services"] },
+  { id: "admin", legacyTab: "admin", path: "/admin", label: "Platform Settings", pageTitle: "Platform Settings", description: "Compatibility route for platform administration.", group: "platform", routeModule: "admin", icon: "admin", keywords: ["users", "roles", "access", "settings", "configuration"], allowedRoles: ADMIN_ROLES, showInNavigation: false },
+  { id: "settings", legacyTab: "admin", path: "/admin/settings", label: "Settings", pageTitle: "Platform Settings", description: "Manage identities, roles, reviewer capacity, authentication, and security controls.", group: "platform", routeModule: "settings", icon: "settings", keywords: ["users", "roles", "access", "reviewers", "authentication", "security", "settings"], allowedRoles: ADMIN_ROLES },
+  { id: "alerts", legacyTab: "stream", path: "/alerts", label: "Alert Stream", pageTitle: "Alert Stream", description: "Technical alert intake.", group: "operations", routeModule: "alerts", icon: "alerts", keywords: ["triage", "alerts", "events"], allowedRoles: ALL_ROLES, related: ["incidents"], showInNavigation: false },
+  { id: "closed", legacyTab: "closed", path: "/closed-incidents", label: "Closed Incidents", pageTitle: "Closed Incidents", description: "Verified outcomes and immutable decision history.", group: "operations", routeModule: "closed-incidents", icon: "closed", keywords: ["resolved", "historical", "outcomes"], allowedRoles: ALL_ROLES, related: ["incidents"], showInNavigation: false },
+  { id: "serviceOnboarding", legacyTab: "admin", path: "/services/onboarding", label: "Service Onboarding", pageTitle: "Service Onboarding", description: "Compatibility onboarding route.", group: "platform", routeModule: "services/onboarding", icon: "serviceOnboarding", keywords: ["onboarding", "templates"], allowedRoles: ADMIN_ROLES, showInNavigation: false },
+  { id: "services", legacyTab: "admin", path: "/services/360", label: "Service 360", pageTitle: "Service 360", description: "Service readiness context.", group: "operations", routeModule: "services/360", icon: "services", keywords: ["service", "readiness"], allowedRoles: ADMIN_ROLES, showInNavigation: false },
+  { id: "audit", legacyTab: "audit", path: "/audit", label: "Platform Health & Audit", pageTitle: "Platform Health & Audit", description: "Review platform health and tenant-scoped immutable governance events.", group: "platform", routeModule: "audit", icon: "audit", keywords: ["health", "history", "audit", "compliance"], allowedRoles: ADMIN_ROLES },
+  { id: "integrations", legacyTab: "admin", path: "/integrations", label: "Integration setup", pageTitle: "Integration setup", description: "Compatibility route.", group: "platform", routeModule: "integrations", icon: "integrations", keywords: ["connectors"], allowedRoles: ADMIN_ROLES, showInNavigation: false },
+  { id: "agentFlow", legacyTab: "trace", path: "/agent-flow", label: "Kai Trace", pageTitle: "Kai Trace", description: "Developer-mode workflow details.", group: "platform", routeModule: "agent-flow", icon: "agentFlow", keywords: ["trace", "developer"], allowedRoles: ADMIN_ROLES, showInNavigation: false },
+  { id: "safety", legacyTab: "safety", path: "/gateway-safety", label: "Gateway safety details", pageTitle: "Gateway safety details", description: "Developer-mode policy details.", group: "platform", routeModule: "gateway-safety", icon: "safety", keywords: ["policy", "developer"], allowedRoles: ADMIN_ROLES, showInNavigation: false },
+  { id: "executive", legacyTab: "executive", path: "/executive", label: "Reliability report", pageTitle: "Reliability report", description: "Compatibility reporting route.", group: "operations", routeModule: "executive", icon: "executive", keywords: ["metrics"], allowedRoles: ADMIN_ROLES, showInNavigation: false },
 ];
 
 export const LEGACY_REDIRECTS = [
@@ -66,9 +72,7 @@ export const LEGACY_REDIRECTS = [
   { from: "/approval-queue-legacy", to: "/approvals" },
   { from: "/stream", to: "/alerts" },
   { from: "/summary", to: "/incidents" },
-  { from: "/gateway-safety", to: "/automation" },
-  { from: "/admin", to: "/admin/users" },
-  { from: "/admin/settings", to: "/service-control" },
+  { from: "/automation", to: "/gateway-safety" },
 ] as const;
 
 export const TAB_SHORTCUT_BY_CODE: Readonly<Record<string, LegacyTabId>> = Object.freeze({
@@ -93,12 +97,20 @@ export function navigationItemForPath(pathname: string): NavigationItem {
   return candidates[0] ?? NAVIGATION_ITEMS[0];
 }
 
+/** Compatibility mapping while stored users are migrated to the two-role model. */
+export function canonicalNavigationRole(role: string): NavigationRole {
+  const normalized = role.trim().toLowerCase().replaceAll(" ", "_");
+  if (["admin", "administrator"].includes(normalized)) return "admin";
+  return "hitl_reviewer";
+}
+
 export function tabForPath(pathname: string): LegacyTabId {
   return navigationItemForPath(pathname).legacyTab;
 }
 
 export function navigationForRole(role: string): readonly NavigationItem[] {
-  return NAVIGATION_ITEMS.filter((item) => item.showInNavigation !== false && item.allowedRoles.includes(role as NavigationRole));
+  const canonicalRole = canonicalNavigationRole(role);
+  return NAVIGATION_ITEMS.filter((item) => item.showInNavigation !== false && item.allowedRoles.includes(canonicalRole));
 }
 
 export function groupedNavigationForRole(role: string) {
@@ -107,9 +119,12 @@ export function groupedNavigationForRole(role: string) {
 }
 
 export function searchNavigation(query: string, role: string): readonly NavigationItem[] {
+  const canonicalRole = canonicalNavigationRole(role);
   const words = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
   if (!words.length) return navigationForRole(role);
-  return NAVIGATION_ITEMS.filter((item) => item.allowedRoles.includes(role as NavigationRole)).filter((item) => {
+  return NAVIGATION_ITEMS.filter(
+    (item) => item.showInNavigation !== false && item.allowedRoles.includes(canonicalRole),
+  ).filter((item) => {
     const corpus = [item.label, item.pageTitle, item.group, ...item.keywords].join(" ").toLowerCase();
     return words.every((word) => corpus.includes(word));
   });

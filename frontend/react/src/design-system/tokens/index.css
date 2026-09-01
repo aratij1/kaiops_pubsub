@@ -1,0 +1,28 @@
+@import "../../styles/tokens.css";
+
+:root {
+  --kai-midnight: #07111f;
+  --kai-graphite: #101926;
+  --kai-surface-elevated: #1c2838;
+  --kai-intelligence: #4f7cff;
+  --kai-electric: #6c8eff;
+  --kai-signal: #21d4d4;
+  --kai-ai: #8b7cff;
+  --kai-semantic-healthy: #20a875;
+  --kai-semantic-degraded: #d28a18;
+  --kai-semantic-critical: #d6455d;
+  --kai-semantic-informational: #4f7cff;
+  --kai-semantic-ai-insight: #8b7cff;
+  --kai-semantic-automated: #21a6a6;
+  --kai-semantic-human-review: #b075e8;
+  --kai-semantic-blocked: #b4233b;
+  --kai-font-display: "Space Grotesk", "IBM Plex Sans", sans-serif;
+  --kai-font-interface: "IBM Plex Sans", "Segoe UI", sans-serif;
+  --kai-font-mono: "IBM Plex Mono", ui-monospace, monospace;
+  --kai-border-default: 1px solid var(--k-color-border);
+  --kai-elevation-raised: var(--k-shadow-md);
+  --kai-motion-enter: var(--k-motion-normal) ease-out;
+  --kai-breakpoint-command-center: 1100px;
+  --kai-z-drawer: 90;
+  --kai-z-toast: 120;
+}

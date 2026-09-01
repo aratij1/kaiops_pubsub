@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from common.tenant_identity import require_tenant_id
+from common.remediation_plan import RemediationPlan
 
 
 def utc_now() -> datetime:
@@ -23,10 +26,13 @@ class IncidentStatus(StrEnum):
     OPEN = "open"
     INVESTIGATING = "investigating"
     AWAITING_APPROVAL = "awaiting_approval"
+    APPROVED = "approved"
     REMEDIATING = "remediating"
     VALIDATING = "validating"
+    RESOLVED = "resolved"
     CLOSED = "closed"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 class ApprovalDecision(StrEnum):
@@ -34,6 +40,7 @@ class ApprovalDecision(StrEnum):
     APPROVED = "approved"
     REJECTED = "rejected"
     MODIFIED = "modified"
+    EVIDENCE_REQUESTED = "evidence_requested"
 
 
 class RemediationStatus(StrEnum):
@@ -46,6 +53,7 @@ class RemediationStatus(StrEnum):
     PENDING = "pending"
     RUNNING = "running"
     VERIFYING = "verifying"
+    PENDING_STABILITY = "pending_stability"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     SKIPPED = "skipped"
@@ -382,6 +390,7 @@ class Incident(BaseEvent):
 
 
 class Recommendation(BaseEvent):
+    tenant_id: str
     incident_id: UUID
     root_cause: str
     confidence: float = Field(ge=0.0, le=1.0)
@@ -391,21 +400,37 @@ class Recommendation(BaseEvent):
     rationale: str
     commands: list[str] = Field(default_factory=list)
     risk: str = "medium"
+    remediation_plan: RemediationPlan | None = None
+
+    @field_validator("tenant_id")
+    @classmethod
+    def tenant_must_be_verified(cls, value: str) -> str:
+        return require_tenant_id(value, source="recommendation identity")
 
 
 class Approval(BaseEvent):
-    tenant_id: str = "default"
+    tenant_id: str
     incident_id: UUID
     recommendation_id: UUID
+    plan_id: UUID | None = None
+    plan_fingerprint: str | None = None
+    approval_expires_at: datetime | None = None
+    approver_role: str | None = None
+    authorization_scope: Literal["dry_run", "execution"] = "execution"
     decision: ApprovalDecision = ApprovalDecision.PENDING
     approver: str | None = None
     channel: str = "web"
     comment: str | None = None
     modified_action: str | None = None
 
+    @field_validator("tenant_id")
+    @classmethod
+    def tenant_must_be_verified(cls, value: str) -> str:
+        return require_tenant_id(value, source="approval identity")
+
 
 class RemediationAction(BaseEvent):
-    tenant_id: str = "default"
+    tenant_id: str
     incident_id: UUID
     approval_id: UUID | None = None
     action_type: str
@@ -422,8 +447,14 @@ class RemediationAction(BaseEvent):
     output: str = ""
     error: str | None = None
 
+    @field_validator("tenant_id")
+    @classmethod
+    def tenant_must_be_verified(cls, value: str) -> str:
+        return require_tenant_id(value, source="remediation action identity")
+
 
 class ResolutionReport(BaseEvent):
+    tenant_id: str
     incident_id: UUID
     ticket_id: str | None = None
     recommendation_id: UUID | None = None
@@ -436,6 +467,11 @@ class ResolutionReport(BaseEvent):
     health_restored: bool = False
     knowledge_base_entry: str = ""
     lessons_learned: list[str] = Field(default_factory=list)
+
+    @field_validator("tenant_id")
+    @classmethod
+    def tenant_must_be_verified(cls, value: str) -> str:
+        return require_tenant_id(value, source="resolution report identity")
 
 
 class SafetyCheckResult(BaseModel):

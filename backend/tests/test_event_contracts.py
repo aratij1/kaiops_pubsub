@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -31,6 +32,12 @@ assert _RESOLUTION_SPEC is not None and _RESOLUTION_SPEC.loader is not None
 resolution_agent_app = importlib.util.module_from_spec(_RESOLUTION_SPEC)
 _RESOLUTION_SPEC.loader.exec_module(resolution_agent_app)
 
+
+def test_resolution_snapshot_expiry_normalizes_naive_database_datetime() -> None:
+    normalized = resolution_agent_app._utc_aware(datetime(2026, 8, 27, 12, 0, 0))
+    assert normalized.tzinfo is UTC
+    assert normalized == datetime(2026, 8, 27, 12, 0, 0, tzinfo=UTC)
+
 _APPROVAL_APP_PATH = Path(__file__).resolve().parents[1] / "src" / "approval-service" / "app.py"
 _APPROVAL_SPEC = importlib.util.spec_from_file_location("approval_service_app", _APPROVAL_APP_PATH)
 assert _APPROVAL_SPEC is not None and _APPROVAL_SPEC.loader is not None
@@ -55,6 +62,26 @@ assert _MONITORING_SPEC is not None and _MONITORING_SPEC.loader is not None
 monitoring_adapter_app = importlib.util.module_from_spec(_MONITORING_SPEC)
 _MONITORING_SPEC.loader.exec_module(monitoring_adapter_app)
 
+
+def test_inconclusive_diagnostic_recommendation_cannot_await_approval() -> None:
+    metadata = {
+        "iterative_investigation": {"conclusive": False},
+        "rca_analysis": {"evidence_used": []},
+        "execution_plan": {"execution_ready": False, "mutating": False},
+        "resolution_lifecycle": {"state": "awaiting_approval"},
+    }
+    assert resolution_agent_app._resolution_projection_status(metadata, requires_approval=True) == "investigating"
+
+
+def test_only_grounded_executable_recommendation_can_await_approval() -> None:
+    metadata = {
+        "iterative_investigation": {"conclusive": True},
+        "rca_analysis": {"evidence_used": ["metric:checkout:5xx"]},
+        "execution_plan": {"execution_ready": True, "mutating": True},
+        "resolution_lifecycle": {"state": "awaiting_approval"},
+    }
+    assert resolution_agent_app._resolution_projection_status(metadata, requires_approval=True) == "awaiting_approval"
+
 _API_GATEWAY_APP_PATH = Path(__file__).resolve().parents[1] / "src" / "api-gateway" / "app.py"
 _API_GATEWAY_SPEC = importlib.util.spec_from_file_location("api_gateway_app", _API_GATEWAY_APP_PATH)
 assert _API_GATEWAY_SPEC is not None and _API_GATEWAY_SPEC.loader is not None
@@ -67,7 +94,7 @@ def test_build_event_envelope_exposes_contract_friendly_fields() -> None:
     envelope = build_event_envelope(
         event_type="incident.workflow.selected",
         identity={"incident_id": "inc-1", "trace_id": "tr-1"},
-        scope={"flow_id": "flow-1", "agent": "orchestrator"},
+        scope={"tenant_id": "tenant-a", "flow_id": "flow-1", "agent": "orchestrator"},
         state={"status": "investigating"},
         policy={"risk_tier": "high"},
         transport={"provider": "rabbitmq"},
@@ -106,16 +133,34 @@ def test_incident_contract_accepts_persisted_jira_enrichment() -> None:
     assert incident.jira_status == "In Progress"
 
 
+def test_context_agent_hydrates_incident_from_enriched_projection() -> None:
+    incident = context_agent_app._incident_from_workflow_payload(
+        {
+            "service": "checkout",
+            "title": "Checkout unavailable",
+            "status": "failed",
+            "state": "failed",
+            "approval_status": "failed",
+            "approval": {"id": "approval-1", "authorization_scope": "execution"},
+        }
+    )
+
+    assert incident.service == "checkout"
+    assert incident.status.value == "failed"
+    assert not hasattr(incident, "approval_status")
+
+
 @pytest.mark.asyncio
 async def test_publish_orchestration_event_emits_event_contract() -> None:
     alert = Alert(
+        tenant_id="tenant-a",
         source="prometheus",
         name="PaymentsLatencyHigh",
         service="payments",
         severity=AlertSeverity.CRITICAL,
         description="latency increased",
     )
-    incident = Incident(service="payments", severity=AlertSeverity.CRITICAL, title="payments latency")
+    incident = Incident(tenant_id="tenant-a", service="payments", severity=AlertSeverity.CRITICAL, title="payments latency")
     decision = {
         "workflow": "critical-auto-remediation",
         "next_action": "collect-context",
@@ -150,13 +195,14 @@ async def test_publish_orchestration_event_emits_event_contract() -> None:
 @pytest.mark.asyncio
 async def test_context_event_payload_includes_event_contract() -> None:
     alert = Alert(
+        tenant_id="tenant-a",
         source="prometheus",
         name="PaymentsLatencyHigh",
         service="payments",
         severity=AlertSeverity.CRITICAL,
         description="latency increased",
     )
-    incident = Incident(service="payments", severity=AlertSeverity.CRITICAL, title="payments latency")
+    incident = Incident(tenant_id="tenant-a", service="payments", severity=AlertSeverity.CRITICAL, title="payments latency")
     context = await ContextIntelligenceAgent().collect(alert, incident)
 
     payload = context_agent_app._build_context_event_payload(
@@ -173,17 +219,89 @@ async def test_context_event_payload_includes_event_contract() -> None:
 
 
 @pytest.mark.asyncio
-async def test_resolution_event_payload_includes_event_contract() -> None:
+async def test_analysis_request_identity_flows_from_context_to_recommendation() -> None:
     alert = Alert(
+        tenant_id="tenant-a",
         source="prometheus",
         name="PaymentsLatencyHigh",
         service="payments",
         severity=AlertSeverity.CRITICAL,
         description="latency increased",
     )
-    incident = Incident(service="payments", severity=AlertSeverity.CRITICAL, title="payments latency")
+    incident = Incident(
+        tenant_id="tenant-a",
+        service="payments",
+        severity=AlertSeverity.CRITICAL,
+        title="payments latency",
+    )
+    context = await ContextIntelligenceAgent().collect(alert, incident)
+    first_request_id = "11111111-1111-4111-8111-111111111111"
+    second_request_id = "22222222-2222-4222-8222-222222222222"
+    first = context_agent_app._attach_analysis_request_metadata(
+        context,
+        decision={"analysis_request_id": first_request_id, "analysis_mode": "fresh", "force_full_analysis": True},
+    )
+    second = context_agent_app._attach_analysis_request_metadata(
+        context,
+        decision={"analysis_request_id": second_request_id, "analysis_mode": "fresh", "force_full_analysis": True},
+    )
+
+    first_payload = context_agent_app._build_context_event_payload(
+        alert=alert,
+        incident=incident,
+        context=first,
+        decision={},
+        provider_used="rabbitmq",
+    )
+    second_payload = context_agent_app._build_context_event_payload(
+        alert=alert,
+        incident=incident,
+        context=second,
+        decision={},
+        provider_used="rabbitmq",
+    )
+
+    assert first.metadata["force_full_analysis"] is True
+    assert first_payload["event_contract"]["event_id"].endswith(first_request_id)
+    assert second_payload["event_contract"]["event_id"].endswith(second_request_id)
+    assert (
+        resolution_agent_app._deterministic_recommendation_id(first)
+        != resolution_agent_app._deterministic_recommendation_id(second)
+    )
+
+    first = first.model_copy(update={"metadata": {**first.metadata, "context_snapshot_id": "snapshot-v1"}})
+    recommendation = Recommendation(
+        id=resolution_agent_app._deterministic_recommendation_id(first),
+        tenant_id=first.tenant_id, incident_id=first.incident_id,
+        root_cause="Insufficient evidence", confidence=0.2, impact="Unknown",
+        recommended_action="Collect evidence", severity=first.alert.severity,
+        rationale="Evidence is incomplete", commands=[], risk="low",
+    )
+    resolution_agent_app._attach_rca_governance_binding(recommendation, first)
+    assert recommendation.metadata["analysis_request_id"] == first_request_id
+    assert recommendation.metadata["context_snapshot_id"] == "snapshot-v1"
+    assert recommendation.metadata["context_fingerprint"] == first.metadata["context_fingerprint"]
+    assert recommendation.metadata["rca_version"] == 1
+    assert recommendation.metadata["recommendation_version"] == str(recommendation.id)
+    assert recommendation.metadata["recommendation_version"] == str(recommendation.id)
+    plan = resolution_agent_app._apply_catalog_plan(recommendation, first)
+    assert plan["rca_version"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_resolution_event_payload_includes_event_contract() -> None:
+    alert = Alert(
+        tenant_id="tenant-a",
+        source="prometheus",
+        name="PaymentsLatencyHigh",
+        service="payments",
+        severity=AlertSeverity.CRITICAL,
+        description="latency increased",
+    )
+    incident = Incident(tenant_id="tenant-a", service="payments", severity=AlertSeverity.CRITICAL, title="payments latency")
     context = await ContextIntelligenceAgent().collect(alert, incident)
     recommendation = Recommendation(
+        tenant_id=context.tenant_id,
         incident_id=context.incident_id,
         root_cause="Deployment 2.5",
         confidence=0.91,
@@ -216,6 +334,7 @@ def test_approval_event_payload_includes_event_contract() -> None:
     approval = Approval(
         incident_id="11111111-1111-1111-1111-111111111111",
         recommendation_id="22222222-2222-2222-2222-222222222222",
+        tenant_id="tenant-a",
         decision=ApprovalDecision.APPROVED,
         approver="alice",
         channel="web",
@@ -248,6 +367,7 @@ def test_remediation_payload_builder_and_approval_extractor_compatibility() -> N
     assert extracted["incident_id"] == "11111111-1111-1111-1111-111111111111"
 
     action = RemediationAction(
+        tenant_id="tenant-a",
         incident_id="11111111-1111-1111-1111-111111111111",
         action_type="restart_pod",
         target="payments",
@@ -263,11 +383,13 @@ def test_remediation_payload_builder_and_approval_extractor_compatibility() -> N
     assert "event_contract" in payload
     assert payload["event_contract"]["agent"] == "remediation-engine"
     assert payload["event_contract"]["incident_id"] == str(action.incident_id)
+    assert payload["event_contract"]["event_id"] == f"remediation:{action.id}:{action.status.value}"
 
 
 def test_closure_payload_builder_and_action_extractor_compatibility() -> None:
     raw = {
         "remediation_action": {
+            "tenant_id": "tenant-a",
             "incident_id": "11111111-1111-1111-1111-111111111111",
             "action_type": "restart_pod",
             "target": "payments",
@@ -280,6 +402,7 @@ def test_closure_payload_builder_and_action_extractor_compatibility() -> None:
 
     action = RemediationAction.model_validate(extracted)
     report = ResolutionReport(
+        tenant_id=action.tenant_id,
         incident_id=action.incident_id,
         root_cause="Deployment regression",
         impact="Payment latency",
@@ -298,10 +421,12 @@ def test_closure_payload_builder_and_action_extractor_compatibility() -> None:
     assert "event_contract" in payload
     assert payload["event_contract"]["agent"] == "closure-service"
     assert payload["event_contract"]["incident_id"] == str(action.incident_id)
+    assert payload["event_contract"]["event_id"] == f"closure:{action.id}:closed"
 
 
 def test_closure_service_name_prefers_incident_service_over_action_target() -> None:
     action = RemediationAction(
+        tenant_id="tenant-a",
         incident_id="11111111-1111-1111-1111-111111111111",
         action_type="validate_pipeline",
         target="11111111-1111-1111-1111-111111111111",
@@ -314,6 +439,7 @@ def test_closure_service_name_prefers_incident_service_over_action_target() -> N
 
 def test_closure_final_incident_payload_ignores_ui_approval_fields() -> None:
     action = RemediationAction(
+        tenant_id="tenant-a",
         incident_id="11111111-1111-1111-1111-111111111111",
         action_type="script_execution",
         target="mysql",
@@ -322,6 +448,7 @@ def test_closure_final_incident_payload_ignores_ui_approval_fields() -> None:
         parameters={"environment": "prod"},
     )
     report = ResolutionReport(
+        tenant_id=action.tenant_id,
         incident_id=action.incident_id,
         remediation_action_id=action.id,
         root_cause="Alert table growth",

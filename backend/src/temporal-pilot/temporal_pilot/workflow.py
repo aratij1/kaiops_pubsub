@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import timedelta
+import math
 from typing import Any
 
 from temporalio import workflow
@@ -98,6 +99,25 @@ class KaiOpsRemediationWorkflow:
     def status(self) -> dict[str, Any]:
         return dict(self._state)
 
+    async def _finish_or_rollback(self, approval: dict[str, Any], action: dict[str, Any]) -> dict[str, Any]:
+        status = str(action.get("status") or "execution_failed").lower()
+        if status != "validation_failed":
+            self._stage(status, action=action)
+            return action
+        self._stage("rolling_back", failed_action=action)
+        rollback = await workflow.execute_activity(
+            "rollback_remediation_action",
+            approval,
+            start_to_close_timeout=timedelta(minutes=15),
+            heartbeat_timeout=timedelta(seconds=30),
+            retry_policy=RetryPolicy(
+                initial_interval=timedelta(seconds=5), maximum_interval=timedelta(seconds=30), maximum_attempts=3,
+            ),
+        )
+        rollback_status = str(rollback.get("status") or "rollback_failed").lower()
+        self._stage(rollback_status, action=rollback, failed_action=action)
+        return rollback
+
     @workflow.run
     async def run(self, approval: dict[str, Any]) -> dict[str, Any]:
         self._stage(
@@ -124,13 +144,16 @@ class KaiOpsRemediationWorkflow:
             "timed_out", "cancelled", "manual_intervention_required",
         }
         if status in terminal:
-            self._stage(status, action=action)
-            return action
+            return await self._finish_or_rollback(approval, action)
         self._stage("executor_accepted", action_id=str(action.get("id") or ""))
         # Temporal owns the wait. Each activity performs one bounded read-only
         # observation, so worker/API restarts never lose the external build.
-        for attempt in range(150):
-            await workflow.sleep(timedelta(seconds=10))
+        profile = approval.get("metadata", {}).get("connection_profile", {})
+        timeout_seconds = int(profile.get("timeout_seconds") or 1200) if isinstance(profile, dict) else 1200
+        timeout_seconds = max(60, min(timeout_seconds, 3600))
+        poll_seconds = 10
+        for attempt in range(math.ceil(timeout_seconds / poll_seconds)):
+            await workflow.sleep(timedelta(seconds=poll_seconds))
             action = await workflow.execute_activity(
                 "reconcile_remediation_action",
                 approval,
@@ -141,14 +164,14 @@ class KaiOpsRemediationWorkflow:
             status = str(action.get("status") or "execution_failed").lower()
             self._stage(status, reconciliation_attempt=attempt + 1, action=action)
             if status in terminal:
-                return action
+                return await self._finish_or_rollback(approval, action)
         action = await workflow.execute_activity(
             "timeout_remediation_action",
             approval,
             start_to_close_timeout=timedelta(seconds=45),
             retry_policy=RetryPolicy(maximum_attempts=3),
         )
-        self._stage("timed_out", action=action)
+        self._stage("timed_out", timeout_seconds=timeout_seconds, action=action)
         return action
 
 

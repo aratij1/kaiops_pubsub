@@ -3,29 +3,34 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import heapq
+import ipaddress
 import json
 import os
 import re
 import threading
-from time import monotonic
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
+from time import monotonic
 from typing import Any, TypedDict
+from urllib.parse import urlsplit
 
 import httpx
+from ai_workbench_common.agent_runtime import AgentRuntime, ContextFailure
+from ai_workbench_common.agentic import AgentContext, BaseAgent
+from ai_workbench_common.embeddings import cosine_similarity, describe_embedding_model, get_embedding_model
+from ai_workbench_common.models import Context
+from common.config import get_settings
+from common.models import Alert, Incident
+from common.rag_governance import production_retrievable, retrieval_allowed
+from common.resilience import retry_async
+from common.tenant_identity import require_tenant_id
+from common.tool_registry import ToolRegistry, ToolSpec
 from langchain_core.embeddings import Embeddings
 from langgraph.graph import END, StateGraph
 
+from context_agent.context_quality import context_subject_fingerprint, govern_context, plan_connectors
 from context_agent.knowledge_graph import KnowledgeGraph
-
-from ai_workbench_common.agent_runtime import AgentRuntime, ContextFailure
-from ai_workbench_common.agentic import AgentContext, BaseAgent
-from common.config import get_settings
-from ai_workbench_common.embeddings import describe_embedding_model, get_embedding_model, cosine_similarity
-from ai_workbench_common.models import Context
-from common.models import Alert, Incident
-from common.resilience import retry_async
-from common.tool_registry import ToolRegistry, ToolSpec
 
 
 class BaseConnector:
@@ -35,20 +40,161 @@ class BaseConnector:
         raise NotImplementedError
 
 
+def _metadata_dict(alert: Alert, *keys: str) -> dict[str, Any]:
+    metadata = alert.metadata if isinstance(alert.metadata, dict) else {}
+    for key in keys:
+        value = metadata.get(key)
+        if isinstance(value, dict):
+            return dict(value)
+    return {}
+
+
+def _metadata_rows(alert: Alert, *keys: str) -> list[dict[str, Any]]:
+    metadata = alert.metadata if isinstance(alert.metadata, dict) else {}
+    for key in keys:
+        value = metadata.get(key)
+        if isinstance(value, list):
+            return [dict(row) for row in value if isinstance(row, dict)]
+    return []
+
+
+def _metadata_values(alert: Alert, *keys: str) -> list[str]:
+    metadata = alert.metadata if isinstance(alert.metadata, dict) else {}
+    for key in keys:
+        value = metadata.get(key)
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()]
+        if isinstance(value, str) and value.strip():
+            return [item.strip() for item in value.split(",") if item.strip()]
+    return []
+
+
 class ServiceNowConnector(BaseConnector):
     name = "servicenow"
 
     async def fetch(self, alert: Alert, incident: Incident) -> dict[str, Any]:
         await asyncio.sleep(0)
-        return {"ticket": incident.ticket_id, "change_records": [{"id": "CHG-1024", "service": alert.service}]}
+        # This adapter only accepts facts carried by the normalized ingress
+        # contract. Live ticket search belongs to discovery-mcp; manufacturing
+        # a sample change here previously contaminated RCA for every incident.
+        changes = _metadata_rows(alert, "change_records", "changes", "servicenow_changes")
+        ticket = str(incident.ticket_id or alert.metadata.get("ticket_id") or "") or None
+        if not changes and not ticket:
+            return {}
+        return {
+            "ticket": ticket,
+            "change_records": changes,
+            "provenance": {"source": "alert-metadata", "grounded": bool(changes or incident.ticket_id)},
+        }
 
 
 class PrometheusConnector(BaseConnector):
     name = "prometheus"
 
     async def fetch(self, alert: Alert, incident: Incident) -> dict[str, Any]:
-        await asyncio.sleep(0)
-        return {"latency_p95_ms": 1250, "cpu_percent": 71, "error_rate": 0.08, "alerts_cleared": False}
+        snapshot = _metadata_dict(alert, "observability", "metrics", "prometheus")
+        observed = _metadata_dict(alert, "observed_values", "signal")
+        metadata = alert.metadata if isinstance(alert.metadata, dict) else {}
+        resolved = (
+            metadata.get("resolved_context_connectors")
+            if isinstance(metadata.get("resolved_context_connectors"), list)
+            else []
+        )
+        connector = next(
+            (
+                row
+                for row in resolved
+                if str(row.get("provider") or "").lower() in {"prometheus", "alertmanager"}
+            ),
+            None,
+        )
+        if connector and (metadata.get("connector_resolution") or {}).get("status") == "completed":
+            endpoint = str(connector.get("endpoint_identity") or "").rstrip("/")
+            if not endpoint:
+                return {"_source_status": "misconfigured", "error": "configured Prometheus endpoint is missing"}
+            labels = alert.labels if isinstance(alert.labels, dict) else {}
+            config = connector.get("config") if isinstance(connector.get("config"), dict) else {}
+            expression = next(
+                (
+                    str(metadata.get(key) or labels.get(key) or "").strip()
+                    for key in ("prometheus_expression", "rule_expression", "expression", "promql")
+                    if str(metadata.get(key) or labels.get(key) or "").strip()
+                ),
+                "",
+            )
+            metric_name = str(
+                metadata.get("metric_name") or labels.get("__name__") or labels.get("metric") or ""
+            ).strip()
+            if not expression and metric_name:
+                matchers = []
+                for key in ("environment", "cluster", "namespace", "service", "instance"):
+                    fallback = alert.environment if key == "environment" else alert.service if key == "service" else ""
+                    value = str(labels.get(key) or fallback).strip()
+                    if value and re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", key):
+                        escaped_value = value.replace('"', '\\"')
+                        matchers.append(f'{key}="{escaped_value}"')
+                expression = f'{metric_name}{{{",".join(matchers)}}}' if matchers else metric_name
+            if not expression:
+                return {
+                    "_source_status": "misconfigured",
+                    "error": "alert rule expression and metric identity are missing",
+                }
+            end = datetime.now(UTC)
+            window_seconds = max(60, min(int(config.get("observation_window_seconds") or 900), 86400))
+            params = {
+                "query": expression,
+                "start": (end - timedelta(seconds=window_seconds)).timestamp(),
+                "end": end.timestamp(),
+                "step": max(15, min(int(config.get("step_seconds") or 60), 3600)),
+            }
+            headers: dict[str, str] = {}
+            secret_ref = str(connector.get("secret_ref") or "")
+            if secret_ref.startswith("env://"):
+                token = os.getenv(secret_ref.removeprefix("env://"), "")
+                if not token:
+                    return {"_source_status": "unauthorized", "error": "configured environment secret is unavailable"}
+                headers["Authorization"] = f"Bearer {token}"
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    response = await client.get(f"{endpoint}/api/v1/query_range", params=params, headers=headers)
+                if response.status_code in {401, 403}:
+                    return {
+                        "_source_status": "unauthorized",
+                        "error": f"Prometheus returned HTTP {response.status_code}",
+                    }
+                response.raise_for_status()
+                payload = response.json()
+                result = ((payload.get("data") or {}).get("result") or []) if isinstance(payload, dict) else []
+                return {
+                    "_source_status": "completed" if result else "empty",
+                    "query": expression,
+                    "query_kind": "range",
+                    "endpoint_identity": endpoint,
+                    "observation_window": {"start": params["start"], "end": params["end"], "step": params["step"]},
+                    "series": result,
+                    "preserved_labels": {
+                        key: labels.get(key)
+                        for key in ("environment", "cluster", "namespace", "service", "instance")
+                        if labels.get(key)
+                    },
+                    "provenance": {
+                        "source": "onboarded-prometheus",
+                        "integration_id": connector.get("integration_id"),
+                        "grounded": bool(result),
+                    },
+                }
+            except httpx.TimeoutException:
+                return {"_source_status": "timed_out", "error": "Prometheus range query timed out"}
+            except (httpx.HTTPError, ValueError) as exc:
+                return {"_source_status": "unavailable", "error": str(exc)[:300]}
+        if not snapshot and not observed:
+            return {}
+        return {
+            **snapshot,
+            **observed,
+            "observed_at": alert.created_at.isoformat(),
+            "provenance": {"source": "alert-payload", "grounded": bool(snapshot or observed)},
+        }
 
 
 class KubernetesConnector(BaseConnector):
@@ -56,7 +202,16 @@ class KubernetesConnector(BaseConnector):
 
     async def fetch(self, alert: Alert, incident: Incident) -> dict[str, Any]:
         await asyncio.sleep(0)
-        return {"namespace": alert.environment, "deployment": alert.labels.get("deployment", alert.service)}
+        supplied = _metadata_dict(alert, "kubernetes", "k8s", "runtime_topology")
+        labels = alert.labels if isinstance(alert.labels, dict) else {}
+        facts = {
+            key: str(labels.get(key) or "").strip()
+            for key in ("cluster", "namespace", "deployment", "statefulset", "daemonset", "pod", "container")
+            if str(labels.get(key) or "").strip()
+        }
+        if not supplied and not facts:
+            return {}
+        return {**supplied, **facts, "provenance": {"source": "alert-metadata", "grounded": bool(supplied or facts)}}
 
 
 class JenkinsConnector(BaseConnector):
@@ -64,7 +219,17 @@ class JenkinsConnector(BaseConnector):
 
     async def fetch(self, alert: Alert, incident: Incident) -> dict[str, Any]:
         await asyncio.sleep(0)
-        return {"recent_deployments": [{"version": "Deployment 2.5", "status": "success"}]}
+        deployments = _metadata_rows(alert, "recent_deployments", "deployments", "jenkins_builds")
+        labels = alert.labels if isinstance(alert.labels, dict) else {}
+        observed_version = str(labels.get("deployment") or labels.get("release") or labels.get("version") or "").strip()
+        if observed_version and not deployments:
+            deployments = [{"version": observed_version, "status": "observed", "source": "alert-label"}]
+        if not deployments:
+            return {}
+        return {
+            "recent_deployments": deployments,
+            "provenance": {"source": "alert-metadata", "grounded": bool(deployments)},
+        }
 
 
 class GitHubConnector(BaseConnector):
@@ -73,14 +238,21 @@ class GitHubConnector(BaseConnector):
     async def fetch(self, alert: Alert, incident: Incident) -> dict[str, Any]:
         await asyncio.sleep(0)
         # No VCS access is configured for this environment (no .git checkout
-        # and no GitHub API credentials reach this connector), so there is no
-        # real commit history to report. Returning a fixed, unrelated commit
-        # here would present fabricated evidence as if it were real deployment
-        # history -- report an explicit unavailable state instead.
+        # and no GitHub API credentials reach this connector), so real commit
+        # history can only come from facts already carried on the normalized
+        # alert. Returning a fixed, unrelated commit here would present
+        # fabricated evidence as if it were real deployment history -- fall
+        # back to an explicit unavailable state instead of inventing one.
+        commits = _metadata_rows(alert, "recent_commits", "commits", "github_commits")
+        if not commits:
+            return {
+                "recent_commits": [],
+                "recent_commits_unavailable": True,
+                "recent_commits_reason": "Source control access is not configured for this environment.",
+            }
         return {
-            "recent_commits": [],
-            "recent_commits_unavailable": True,
-            "recent_commits_reason": "Source control access is not configured for this environment.",
+            "recent_commits": commits,
+            "provenance": {"source": "alert-metadata", "grounded": bool(commits)},
         }
 
 
@@ -89,10 +261,21 @@ class CMDBConnector(BaseConnector):
 
     async def fetch(self, alert: Alert, incident: Incident) -> dict[str, Any]:
         await asyncio.sleep(0)
+        supplied = _metadata_dict(alert, "cmdb", "service_inventory")
+        dependencies = _metadata_values(alert, "dependencies", "dependency_services")
+        owner_team = str(alert.metadata.get("owner_team") or alert.labels.get("owner_team") or "").strip()
+        tier = str(alert.metadata.get("service_tier") or alert.labels.get("service_tier") or "").strip()
+        if not supplied and not dependencies and not owner_team and not tier:
+            return {}
         return {
-            "owner_team": alert.metadata.get("owner_team", "platform-ops"),
-            "tier": "tier-1" if alert.service in {"payments", "checkout"} else "tier-2",
-            "dependencies": ["checkout", "ledger", "fraud"] if alert.service == "payments" else [],
+            **supplied,
+            "owner_team": owner_team or supplied.get("owner_team"),
+            "tier": tier or supplied.get("tier"),
+            "dependencies": dependencies or list(supplied.get("dependencies") or []),
+            "provenance": {
+                "source": "alert-metadata",
+                "grounded": bool(supplied or dependencies or owner_team or tier),
+            },
         }
 
 
@@ -205,6 +388,13 @@ class DiscoveryMCPConnector(BaseConnector):
     """Evidence-grounded discovery over a read-only MCP JSON-RPC server."""
 
     name = "discovery-mcp"
+    _DISCOVERY_TOOL_ORDER = (
+        "logs.search",
+        "tickets.search",
+        "code.search",
+        "mysql.search",
+        "telemetry.search",
+    )
 
     def __init__(self) -> None:
         self.mcp_url = os.getenv("DISCOVERY_MCP_URL", "http://discovery-mcp:8000/mcp")
@@ -226,6 +416,88 @@ class DiscoveryMCPConnector(BaseConnector):
         )
 
     @staticmethod
+    def _internal_url(url: str) -> bool:
+        host = str(urlsplit(url).hostname or "").strip().lower()
+        if not host or host == "localhost" or host.endswith((".local", ".internal")) or "." not in host:
+            return True
+        try:
+            address = ipaddress.ip_address(host)
+            return address.is_private or address.is_loopback
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _safe_proxy_description(proxy_url: str | None) -> dict[str, Any]:
+        if not proxy_url:
+            return {"configured": False}
+        parsed = urlsplit(proxy_url)
+        return {
+            "configured": True,
+            "scheme": parsed.scheme.lower(),
+            "host": parsed.hostname or "",
+            "port": parsed.port,
+            "credentials_redacted": bool(parsed.username or parsed.password),
+        }
+
+    def _client_policy(self, target_url: str) -> tuple[dict[str, Any], dict[str, Any]]:
+        internal = self._internal_url(target_url)
+        proxy_url = str(os.getenv("DISCOVERY_MCP_PROXY_URL") or "").strip() or None
+        if internal:
+            return {"timeout": self.timeout, "trust_env": False}, {
+                "target": "internal", "trust_env": False, "proxy": {"configured": False},
+            }
+        if proxy_url:
+            scheme = str(urlsplit(proxy_url).scheme or "").lower()
+            if scheme not in {"http", "https", "socks5", "socks5h"}:
+                raise ValueError(f"Unsupported discovery proxy scheme: {scheme or 'missing'}")
+        options: dict[str, Any] = {"timeout": self.timeout, "trust_env": False}
+        if proxy_url:
+            options["proxy"] = proxy_url
+        return options, {
+            "target": "external", "trust_env": False,
+            "proxy": self._safe_proxy_description(proxy_url),
+        }
+
+    def _build_client(self, target_url: str) -> tuple[httpx.AsyncClient, dict[str, Any]]:
+        options, policy = self._client_policy(target_url)
+        return httpx.AsyncClient(**options), policy
+
+    def _degraded_discovery(
+        self, *, terms: list[str], tools: list[str], stages: list[dict[str, Any]], error: Exception
+    ) -> dict[str, Any]:
+        message = str(error)[:240] or type(error).__name__
+        failed_stages = [
+            *stages,
+            {"stage": "client_construction", "status": "failed", "error": message},
+            {"stage": "discovery_completed", "status": "degraded", "result_count": 0},
+        ]
+        return {
+            "protocol": "mcp-jsonrpc-2.0",
+            "server": self.mcp_url,
+            "provider_status": "degraded",
+            "query_terms": terms,
+            "collection_plan": {"mode": "adaptive", "selected_tools": tools},
+            "evidence": [],
+            "evidence_gap": {
+                "source": self.name,
+                "reason": "discovery_client_unavailable",
+                "detail": message,
+                "execution_ready": False,
+                "confidence_ceiling": 0.49,
+            },
+            "report": {
+                "summary": "Discovery evidence is unavailable; root cause remains ungrounded.",
+                "hypotheses": [],
+                "insufficient_evidence": True,
+                "confidence_ceiling": 0.49,
+            },
+            "detected_errors": [],
+            "retrieval_stages": failed_stages,
+            "model_usage": {},
+            "model_interaction": {"task": "rca", "status": "skipped", "reason": "discovery_client_unavailable"},
+        }
+
+    @staticmethod
     def _query_terms(alert: Alert, incident: Incident) -> list[str]:
         values = [
             alert.service,
@@ -244,6 +516,103 @@ class DiscoveryMCPConnector(BaseConnector):
         for value in values:
             terms.extend(re.findall(r"[a-zA-Z0-9_.-]{3,}", str(value or "").lower()))
         return list(dict.fromkeys(terms))[:24]
+
+    @classmethod
+    def _plan_discovery_tools(cls, alert: Alert) -> tuple[list[str], list[str]]:
+        """Route an alert to relevant read-only evidence systems."""
+
+        labels = alert.labels if isinstance(alert.labels, dict) else {}
+        annotations = alert.annotations if isinstance(alert.annotations, dict) else {}
+        metadata = alert.metadata if isinstance(alert.metadata, dict) else {}
+        source = str(alert.source or "").strip().lower()
+        raw_haystack = " ".join(
+            [
+                source,
+                str(alert.service or ""),
+                str(alert.name or ""),
+                str(alert.description or ""),
+                " ".join(f"{key}={value}" for key, value in labels.items()),
+                " ".join(f"{key}={value}" for key, value in annotations.items()),
+            ]
+        )
+        haystack = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", raw_haystack).lower()
+        selected: set[str] = set()
+        reasons: list[str] = []
+
+        if source in {"prometheus", "grafana", "azure-monitor", "datadog", "newrelic", "otel", "opentelemetry"}:
+            selected.add("telemetry.search")
+            reasons.append("metric_or_trace_signal")
+        elif source in {"logs", "log", "opensearch", "elasticsearch", "loki", "splunk"}:
+            selected.add("logs.search")
+            reasons.append("log_signal")
+        elif source in {"jira", "servicenow", "ticket", "email"}:
+            selected.add("tickets.search")
+            reasons.append("ticket_or_human_report")
+        else:
+            selected.update({"logs.search", "telemetry.search"})
+            reasons.append("unknown_source_observation_baseline")
+
+        if re.search(
+            r"\b(error|exception|traceback|stacktrace|crash|crashloop|panic|segfault|"
+            r"failed|failure|timeout|timed out|refused|unavailable|unreachable|5\d\d)\b",
+            haystack,
+        ):
+            selected.add("logs.search")
+            reasons.append("failure_diagnostics")
+
+        if re.search(r"\b(deploy|deployment|release|rollout|revision|commit|build|change|regression)\b", haystack):
+            selected.update({"tickets.search", "code.search"})
+            reasons.append("change_correlation")
+
+        if re.search(r"\b(code|source|function|module|package|config|configuration|stacktrace|traceback)\b", haystack):
+            selected.add("code.search")
+            reasons.append("source_or_configuration_diagnostics")
+
+        database_identity = any(
+            str(labels.get(key) or metadata.get(key) or "").strip()
+            for key in ("database", "database_name", "schema", "table", "query_id")
+        )
+        if database_identity or re.search(
+            r"\b(mysql|mariadb|database|sql|query|deadlock|replica|replication|innodb|connection pool)\b",
+            haystack,
+        ):
+            selected.add("mysql.search")
+            reasons.append("database_diagnostics")
+
+        has_history_signal = bool(
+            int(getattr(alert, "deduplicated_count", 1) or 1) > 1
+            or re.search(r"\b(recurring|repeat|reopened|known issue|previous incident|problem record)\b", haystack)
+            or any(str(labels.get(key) or metadata.get(key) or "").strip() for key in ("ticket_id", "incident_id", "problem_id"))
+        )
+        if has_history_signal:
+            selected.add("tickets.search")
+            reasons.append("incident_history")
+
+        requested = metadata.get("context_sources")
+        if isinstance(requested, str):
+            requested = [item.strip() for item in requested.split(",")]
+        if isinstance(requested, list):
+            aliases = {
+                "logs": "logs.search",
+                "tickets": "tickets.search",
+                "code": "code.search",
+                "database": "mysql.search",
+                "mysql": "mysql.search",
+                "telemetry": "telemetry.search",
+            }
+            explicit = {
+                aliases.get(str(item).strip().lower(), str(item).strip().lower())
+                for item in requested
+            }
+            explicit.intersection_update(cls._DISCOVERY_TOOL_ORDER)
+            if explicit:
+                selected.update(explicit)
+                reasons.append("explicit_source_request")
+
+        if not selected:
+            selected.update({"logs.search", "telemetry.search"})
+            reasons.append("safe_observation_fallback")
+        return [tool for tool in cls._DISCOVERY_TOOL_ORDER if tool in selected], list(dict.fromkeys(reasons))
 
     @staticmethod
     def _validated_code_review(report: dict[str, Any], evidence: list[dict[str, Any]]) -> dict[str, Any]:
@@ -627,12 +996,37 @@ class DiscoveryMCPConnector(BaseConnector):
 
     async def fetch(self, alert: Alert, incident: Incident) -> dict[str, Any]:
         terms = self._query_terms(alert, incident)
-        stages: list[dict[str, Any]] = [{"stage": "query_planned", "status": "completed", "terms": terms}]
+        discovery_tools, routing_reasons = self._plan_discovery_tools(alert)
+        skipped_tools = [tool for tool in self._DISCOVERY_TOOL_ORDER if tool not in discovery_tools]
+        stages: list[dict[str, Any]] = [
+            {
+                "stage": "query_planned",
+                "status": "completed",
+                "terms": terms,
+                "selected_tools": discovery_tools,
+                "skipped_tools": skipped_tools,
+                "reasons": routing_reasons,
+            },
+            *(
+                {
+                    "stage": tool.replace(".", "_"),
+                    "status": "skipped",
+                    "reason": "not_selected_by_context_policy",
+                    "result_count": 0,
+                }
+                for tool in skipped_tools
+            ),
+        ]
         evidence_by_tool: dict[str, list[dict[str, Any]]] = {}
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            discovery_tools = ["logs.search", "tickets.search", "code.search", "mysql.search", "telemetry.search"]
-            if self.external_tools_enabled:
-                discovery_tools.append("external.search")
+        client: httpx.AsyncClient | None = None
+        try:
+            client, mcp_proxy_policy = self._build_client(self.mcp_url)
+            model_client, model_proxy_policy = self._build_client(self.model_router_url)
+        except Exception as exc:
+            if client is not None:
+                await client.aclose()
+            return self._degraded_discovery(terms=terms, tools=discovery_tools, stages=stages, error=exc)
+        async with client, model_client:
             results = await asyncio.gather(
                 *(
                     self._call_mcp(client, tool, terms, alert)
@@ -653,6 +1047,47 @@ class DiscoveryMCPConnector(BaseConnector):
                         "status": provider_status,
                         "result_count": len(rows),
                         "error": result.get("provider_error"),
+                    }
+                )
+            local_evidence_count = sum(len(rows) for rows in evidence_by_tool.values())
+            if self.external_tools_enabled and local_evidence_count == 0:
+                try:
+                    external_result = await self._call_mcp(client, "external.search", terms, alert)
+                    external_rows = (
+                        external_result.get("evidence", [])
+                        if isinstance(external_result.get("evidence"), list)
+                        else []
+                    )
+                    evidence_by_tool["external.search"] = [
+                        row for row in external_rows if isinstance(row, dict)
+                    ]
+                    discovery_tools.append("external.search")
+                    stages.append(
+                        {
+                            "stage": "external_search",
+                            "status": str(external_result.get("provider_status") or "completed"),
+                            "result_count": len(external_rows),
+                            "reason": "no_local_evidence",
+                            "error": external_result.get("provider_error"),
+                        }
+                    )
+                except Exception as exc:
+                    discovery_tools.append("external.search")
+                    stages.append(
+                        {
+                            "stage": "external_search",
+                            "status": "failed",
+                            "reason": "no_local_evidence",
+                            "error": str(exc)[:240],
+                        }
+                    )
+            else:
+                stages.append(
+                    {
+                        "stage": "external_search",
+                        "status": "skipped",
+                        "reason": "disabled" if not self.external_tools_enabled else "local_evidence_available",
+                        "result_count": 0,
                     }
                 )
             deduped: list[dict[str, Any]] = []
@@ -688,7 +1123,7 @@ class DiscoveryMCPConnector(BaseConnector):
                     }
                     stages.append({"stage": "llm_analysis", "status": "deferred_to_resolution_agent"})
                 else:
-                    report, usage, model_interaction = await self._analyze(client, alert, deduped, stages)
+                    report, usage, model_interaction = await self._analyze(model_client, alert, deduped, stages)
                     stages.append({"stage": "llm_analysis", "status": "completed", "model": report.get("model")})
             except Exception as exc:
                 report = self._fallback_report(deduped, stages)
@@ -720,12 +1155,19 @@ class DiscoveryMCPConnector(BaseConnector):
             "protocol": "mcp-jsonrpc-2.0",
             "server": self.mcp_url,
             "query_terms": terms,
+            "collection_plan": {
+                "mode": "adaptive",
+                "selected_tools": discovery_tools,
+                "skipped_tools": skipped_tools,
+                "reasons": routing_reasons,
+            },
             "evidence": deduped,
             "report": report,
             "detected_errors": detected_errors,
             "retrieval_stages": stages,
             "model_usage": usage,
             "model_interaction": model_interaction,
+            "proxy_policy": {"discovery": mcp_proxy_policy, "model_router": model_proxy_policy},
         }
 
 
@@ -771,8 +1213,17 @@ class AzureAISearchVectorStore:
     def _odata_literal(self, value: str) -> str:
         return "'" + str(value).replace("'", "''") + "'"
 
-    def _filter(self, *, preferred_kinds: set[str] | None, service: str | None) -> str | None:
-        filters: list[str] = []
+    def _filter(self, *, preferred_kinds: set[str] | None, service: str | None, tenant_id: str) -> str | None:
+        tenant = str(tenant_id or "").strip()
+        if not tenant:
+            raise ValueError("remote RAG search requires authenticated tenant identity")
+        filters: list[str] = [
+            "("
+            f"(tenant_scope eq {self._odata_literal(tenant)} and corpus_classification eq 'TENANT_CURATED')"
+            " or (tenant_scope eq 'global' and corpus_classification eq 'PRODUCTION_CURATED')"
+            ")",
+            "review_status eq 'approved'",
+        ]
         kinds = sorted({str(item).strip().lower() for item in (preferred_kinds or set()) if str(item).strip()})
         if kinds:
             filters.append("(" + " or ".join(f"kind eq {self._odata_literal(kind)}" for kind in kinds) + ")")
@@ -809,6 +1260,7 @@ class AzureAISearchVectorStore:
         limit: int,
         preferred_kinds: set[str] | None = None,
         service: str | None = None,
+        tenant_id: str,
     ) -> list[dict[str, Any]]:
         if not self.configured:
             return []
@@ -817,7 +1269,8 @@ class AzureAISearchVectorStore:
             "top": max(1, min(limit, 50)),
             "select": (
                 "id,document_id,chunk_id,kind,title,content,services,deployment,dependencies,change_id,"
-                "alert_id,incident_id,source_system,source_ref,owner,version,freshness_score,embedding_model,path"
+                "alert_id,incident_id,tenant_scope,source_system,source_ref,review_status,content_version,"
+                "corpus_classification,owner,version,freshness_score,embedding_model,path"
             ),
             "vectorQueries": [
                 {
@@ -828,7 +1281,7 @@ class AzureAISearchVectorStore:
                 }
             ],
         }
-        filter_expression = self._filter(preferred_kinds=preferred_kinds, service=service)
+        filter_expression = self._filter(preferred_kinds=preferred_kinds, service=service, tenant_id=tenant_id)
         if filter_expression:
             payload["filter"] = filter_expression
         try:
@@ -856,7 +1309,8 @@ class AzureAISearchVectorStore:
             services = doc.get("services", [])
             if isinstance(services, str):
                 doc["services"] = [item.strip() for item in services.split(",") if item.strip()]
-            results.append(doc)
+            if retrieval_allowed(doc, tenant_id):
+                results.append(doc)
         return results
 
     def upsert_documents(self, documents: list[dict[str, Any]]) -> dict[str, Any]:
@@ -892,8 +1346,12 @@ class AzureAISearchVectorStore:
                         "change_id": str(doc.get("change_id") or ""),
                         "alert_id": str(doc.get("alert_id") or ""),
                         "incident_id": str(doc.get("incident_id") or ""),
+                        "tenant_scope": str(doc.get("tenant_scope") or ""),
                         "source_system": str(doc.get("source_system") or ""),
                         "source_ref": str(doc.get("source_ref") or ""),
+                        "review_status": str(doc.get("review_status") or ""),
+                        "content_version": str(doc.get("content_version") or ""),
+                        "corpus_classification": str(doc.get("corpus_classification") or ""),
                         "owner": str(doc.get("owner") or doc.get("resolved_by") or "unassigned"),
                         "version": str(doc.get("version") or "v1"),
                         "freshness_score": float(doc.get("freshness_score") or 0.75),
@@ -912,6 +1370,44 @@ class AzureAISearchVectorStore:
             return {"attempted": True, "indexed": 0, "error": str(exc)}
         self.last_error = ""
         return {"attempted": True, "indexed": len(rows), "index_name": self._index_name}
+
+    def delete_document(self, document_id: str) -> dict[str, Any]:
+        """Remove every remote chunk for one quarantined or superseded document."""
+        if not self.configured:
+            return {"attempted": False, "deleted": 0, "reason": "azure ai search is not configured"}
+        identity = str(document_id or "").strip()
+        if not identity:
+            raise ValueError("document_id is required for remote RAG deletion")
+        search_payload = {
+            "search": "*",
+            "top": 1000,
+            "select": "id,document_id",
+            "filter": f"document_id eq {self._odata_literal(identity)}",
+        }
+        try:
+            with httpx.Client(timeout=self._timeout_seconds) as client:
+                response = client.post(
+                    self._url("/docs/search"), headers=self._headers(), json=search_payload
+                )
+                response.raise_for_status()
+                rows = response.json().get("value", [])
+                deletions = [
+                    {"@search.action": "delete", "id": str(row.get("id"))}
+                    for row in rows
+                    if isinstance(row, dict) and str(row.get("id") or "").strip()
+                ]
+                if deletions:
+                    deleted = client.post(
+                        self._url("/docs/index"),
+                        headers=self._headers(),
+                        json={"value": deletions},
+                    )
+                    deleted.raise_for_status()
+        except Exception as exc:
+            self.last_error = str(exc)
+            return {"attempted": True, "deleted": 0, "error": str(exc)}
+        self.last_error = ""
+        return {"attempted": True, "deleted": len(deletions), "document_id": identity}
 
 
 @dataclass
@@ -947,11 +1443,19 @@ class VectorDBConnector(BaseConnector):
                 " ".join(f"{key}={value}" for key, value in alert.annotations.items()),
             ]
         )
+        tenant_id = str(getattr(alert, "tenant_id", "") or getattr(incident, "tenant_id", "")).strip()
+        if not tenant_id:
+            return {
+                "matches": [],
+                "document_count": len(self.documents),
+                "evidence_gap": "authenticated tenant identity is missing",
+            }
         ranked = self.search(
             query,
             limit=8,
             preferred_kinds={"runbook", "incident", "deployment", "dependency", "change"},
             service=str(alert.service or "").strip(),
+            tenant_id=tenant_id,
         )
         return {
             "matches": ranked,
@@ -1021,6 +1525,15 @@ class VectorDBConnector(BaseConnector):
 
         return documents + derived_documents
 
+    def ensure_loaded(self) -> list[dict[str, Any]]:
+        if not self.documents:
+            with self._load_lock:
+                if not self.documents:
+                    self.documents = self.load_documents()
+                    if self._knowledge_graph is None:
+                        self._knowledge_graph = KnowledgeGraph.from_documents(self.documents)
+        return self.documents
+
     def reload(self) -> int:
         self.documents = self.load_documents()
         self._knowledge_graph = KnowledgeGraph.from_documents(self.documents)
@@ -1060,10 +1573,16 @@ class VectorDBConnector(BaseConnector):
             for doc in self.documents
             if not doc.get("_synthetic")
         ]
-        return remote.upsert_documents([doc for doc in full_docs if doc])
+        return remote.upsert_documents([doc for doc in full_docs if doc and production_retrievable(doc)])
 
     def index_info(self) -> dict[str, Any]:
         docs = [doc for doc in self.documents if not doc.get("_synthetic")]
+        active_docs = [doc for doc in docs if production_retrievable(doc)]
+        pending_docs = [
+            doc for doc in docs
+            if str(doc.get("review_status") or "").strip().lower() in {"draft", "pending_review"}
+        ]
+        quarantined_docs = [doc for doc in docs if doc not in active_docs and doc not in pending_docs]
         synthetic_docs = [doc for doc in self.documents if doc.get("_synthetic")]
         by_kind: dict[str, int] = {}
         embedded_metadata = 0
@@ -1074,12 +1593,19 @@ class VectorDBConnector(BaseConnector):
                 embedded_metadata += 1
         return {
             "contract_version": "kaiops.rag-index.v1",
-            "status": "ready" if docs else "empty",
+            "status": "ready" if active_docs else "degraded_empty_corpus",
+            "execution_ready": bool(active_docs),
+            "degraded": not active_docs,
+            "degraded_reason": "no approved retrievable RAG documents" if not active_docs else "",
             "vector_store": self.vector_store_info(),
             "embedding_model": self.embedding_info(),
             "remote_index_enabled": self.remote_store().configured,
             "enterprise_index_enabled": self.remote_store().configured,
-            "document_count": len(docs),
+            "document_count": len(active_docs),
+            "inventory_count": len(docs),
+            "approved_retrievable_count": len(active_docs),
+            "pending_review_count": len(pending_docs),
+            "quarantined_count": len(quarantined_docs),
             "synthetic_document_count": len(synthetic_docs),
             "metadata_embedding_count": embedded_metadata,
             "full_document_cache_count": len(self._document_cache),
@@ -1110,7 +1636,15 @@ class VectorDBConnector(BaseConnector):
         preferred_kind: str | None = None,
         preferred_kinds: set[str] | None = None,
         service: str | None = None,
+        tenant_id: str,
     ) -> list[dict[str, Any]]:
+        normalized_tenant = str(tenant_id or "").strip()
+        if not normalized_tenant:
+            raise ValueError("RAG search requires authenticated tenant identity")
+        if not self.documents:
+            with self._load_lock:
+                if not self.documents:
+                    self.documents = self.load_documents()
         query_vector = self.embedding_model.embed(query)
         kind_filter = (
             {preferred_kind.strip().lower()}
@@ -1123,6 +1657,7 @@ class VectorDBConnector(BaseConnector):
             limit=limit,
             preferred_kinds=kind_filter,
             service=service,
+            tenant_id=normalized_tenant,
         )
         if remote_matches:
             return remote_matches
@@ -1132,7 +1667,12 @@ class VectorDBConnector(BaseConnector):
             limit=limit,
             preferred_kinds=kind_filter,
             service=service,
+            tenant_id=normalized_tenant,
         )
+
+    @staticmethod
+    def _tenant_allowed(doc: dict[str, Any], tenant_id: str) -> bool:
+        return retrieval_allowed(doc, tenant_id)
 
     def root_path(self) -> Path:
         root = self.rag_root or self._discover_rag_root()
@@ -1328,6 +1868,25 @@ class VectorDBConnector(BaseConnector):
             return True
         return str(doc.get("kind", "")).strip().lower() in preferred_kinds
 
+    def context_match_relevant(self, doc: dict[str, Any], service: str) -> bool:
+        """Apply a stricter gate than exploratory RAG search.
+
+        Context may contain service-scoped reviewed knowledge with a modest
+        semantic score. Untagged corpus documents need materially stronger
+        semantic and metadata evidence before they can enter an incident
+        package; otherwise generic demo/history documents become false facts.
+        """
+
+        services = doc.get("services", [])
+        if isinstance(services, str):
+            services = [services]
+        services = [str(item).strip() for item in services if str(item).strip()] if isinstance(services, list) else []
+        confidence = float(doc.get("match_confidence", doc.get("_similarity", 0.0)) or 0.0)
+        metadata_score = float(doc.get("_metadata_match_score", 0.0) or 0.0)
+        if services:
+            return self._service_matches(doc, service) and confidence >= 0.08
+        return confidence >= 0.30 and metadata_score >= 0.10
+
     def has_service_tagged_match(self, alert: Alert, min_similarity: float = 0.1) -> bool:
         """True only if some doc explicitly declares this alert's service.
 
@@ -1464,17 +2023,22 @@ class VectorDBConnector(BaseConnector):
         limit: int,
         preferred_kinds: set[str] | None = None,
         service: str | None = None,
+        tenant_id: str,
     ) -> list[dict[str, Any]]:
         limit = max(1, min(limit, 20))
         candidates = [
             doc
             for doc in self.documents
-            if self._kind_matches(doc, preferred_kinds) and self._service_matches(doc, service)
+            if self._tenant_allowed(doc, tenant_id)
+            and self._kind_matches(doc, preferred_kinds)
+            and self._service_matches(doc, service)
         ]
         if not candidates and preferred_kinds:
-            candidates = [doc for doc in self.documents if self._service_matches(doc, service)]
-        if not candidates:
-            candidates = list(self.documents)
+            candidates = [
+                doc
+                for doc in self.documents
+                if self._tenant_allowed(doc, tenant_id) and self._service_matches(doc, service)
+            ]
 
         shortlist_size = min(max(limit * 4, 12), len(candidates))
         shortlisted = heapq.nlargest(
@@ -1523,6 +2087,8 @@ class ContextGraphState(TypedDict, total=False):
     graph_stages: list[str]
     connector_health: dict[str, dict[str, Any]]
     collection_latency_ms: float
+    selected_connectors: list[str]
+    collection_plan: dict[str, Any]
 
 
 @dataclass
@@ -1610,6 +2176,15 @@ class ContextIntelligenceAgent(BaseAgent):
     async def validate_event(self, state: ContextGraphState) -> ContextGraphState:
         if not isinstance(state.get("alert"), Alert) or not isinstance(state.get("incident"), Incident):
             raise ContextFailure("context graph requires alert and incident")
+        available = [connector.name for connector in self.connectors]
+        selected, reasons = plan_connectors(state["alert"], available)
+        state["selected_connectors"] = selected
+        state["collection_plan"] = {
+            "mode": "adaptive",
+            "selected": selected,
+            "skipped": [name for name in available if name not in selected],
+            "reasons": reasons,
+        }
         state["graph_stages"] = [*state.get("graph_stages", []), "validate_event"]
         return state
 
@@ -1630,23 +2205,32 @@ class ContextIntelligenceAgent(BaseAgent):
                     attempts=attempts,
                     base_delay=0.15,
                 )
+                explicit_status = str(result.get("_source_status") or "").strip().lower()
                 return result, {
-                    "status": "collected",
+                    "status": explicit_status or "completed",
                     "latency_ms": round((monotonic() - connector_started) * 1000, 2),
                     "attempts": attempts,
                 }
             except Exception as exc:  # A connector failure must not erase healthy evidence.
+                failure_status = (
+                    "timed_out" if isinstance(exc, (TimeoutError, asyncio.TimeoutError))
+                    else "unauthorized" if isinstance(exc, PermissionError)
+                    else "misconfigured" if isinstance(exc, (KeyError, ValueError))
+                    else "unavailable"
+                )
                 return {}, {
-                    "status": "failed",
+                    "status": failure_status,
                     "latency_ms": round((monotonic() - connector_started) * 1000, 2),
                     "attempts": attempts,
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:300],
                 }
 
+        selected_names = set(state.get("selected_connectors") or [connector.name for connector in self.connectors])
+        selected_connectors = [connector for connector in self.connectors if connector.name in selected_names]
         tasks = {
             connector.name: asyncio.create_task(collect_one(connector), name=f"context:{connector.name}")
-            for connector in self.connectors
+            for connector in selected_connectors
         }
         done, pending = await asyncio.wait(tasks.values(), timeout=budget_seconds)
         results: dict[str, dict[str, Any]] = {}
@@ -1656,7 +2240,19 @@ class ContextIntelligenceAgent(BaseAgent):
             name = task_names[task]
             result, status = task.result()
             results[name] = result
-            health[name] = status
+            has_material_result = bool(
+                result
+                and any(
+                    value not in (None, "", [], {}, False)
+                    for key, value in result.items()
+                    if key not in {"provenance", "_source_status", "error"}
+                )
+            )
+            health[name] = (
+                status
+                if status.get("status") != "completed"
+                else {**status, "status": "completed" if has_material_result else "empty"}
+            )
         for task in pending:
             name = task_names[task]
             task.cancel()
@@ -1669,6 +2265,14 @@ class ContextIntelligenceAgent(BaseAgent):
             }
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
+        for connector in self.connectors:
+            if connector.name not in selected_names:
+                health[connector.name] = {
+                    "status": "skipped",
+                    "latency_ms": 0.0,
+                    "attempts": 0,
+                    "reason": "not required by adaptive collection plan",
+                }
         state["connector_results"] = results
         state["connector_health"] = health
         state["collection_latency_ms"] = round((monotonic() - started) * 1000, 2)
@@ -1678,7 +2282,7 @@ class ContextIntelligenceAgent(BaseAgent):
     async def assemble_context(self, state: ContextGraphState) -> ContextGraphState:
         alert = state["alert"]
         incident = state["incident"]
-        by_name = {
+        connector_defaults = {
             "vector-db": {"matches": [], "document_count": 0, "knowledge_graph": {}},
             "jenkins": {"recent_deployments": []},
             "cmdb": {"dependencies": []},
@@ -1688,11 +2292,31 @@ class ContextIntelligenceAgent(BaseAgent):
             "prometheus": {},
             "local-evidence": {},
             "discovery-mcp": {},
-            **state["connector_results"],
         }
-        vector_matches = by_name["vector-db"]["matches"]
+        by_name = {
+            name: {
+                **defaults,
+                **(
+                    state["connector_results"].get(name, {})
+                    if isinstance(state["connector_results"].get(name), dict)
+                    else {}
+                ),
+            }
+            for name, defaults in connector_defaults.items()
+        }
+        by_name.update({
+            name: result
+            for name, result in state["connector_results"].items()
+            if name not in by_name and isinstance(result, dict)
+        })
+        raw_vector_matches = by_name["vector-db"]["matches"]
         vector_connector = next((c for c in self.connectors if isinstance(c, VectorDBConnector)), None)
-        service_tagged_match = bool(vector_connector and vector_connector.has_service_tagged_match(alert))
+        vector_matches = [
+            doc for doc in raw_vector_matches
+            if isinstance(doc, dict)
+            and vector_connector is not None
+            and vector_connector.context_match_relevant(doc, str(alert.service or ""))
+        ]
         def explicitly_matches_service(doc: dict[str, Any]) -> bool:
             if not vector_connector:
                 return False
@@ -1709,6 +2333,8 @@ class ContextIntelligenceAgent(BaseAgent):
         # the vector connector already exposes, but via _service_matches (not
         # explicitly_matches_service) so a genuinely untagged/general runbook
         # -- which has no services field to check -- still matches, as before.
+        service_tagged_match = any(explicitly_matches_service(doc) for doc in vector_matches)
+
         runbook = next(
             (
                 doc["content"]
@@ -1803,6 +2429,8 @@ class ContextIntelligenceAgent(BaseAgent):
                 "title": doc.get("title"),
                 "path": doc.get("path"),
                 "snippet": str(doc.get("content") or doc.get("summary") or "")[:500],
+                "epistemic_role": "historical_knowledge",
+                "current_observation": False,
                 "similarity": float(doc.get("_similarity", 0.0) or 0.0),
                 "match_confidence": float(doc.get("match_confidence", doc.get("_similarity", 0.0)) or 0.0),
             }
@@ -1827,13 +2455,19 @@ class ContextIntelligenceAgent(BaseAgent):
                 for stage_name in source_stage_names.get(source_name, ())
                 if stage_name in stage_by_name
             ]
+            source_attempted = source_name == "rag" or any(
+                str(stage.get("status") or "").lower() != "skipped"
+                for stage in attempted_stages
+            )
             context_source_manifest[source_name] = {
-                "attempted": source_name == "rag" or bool(attempted_stages),
+                "attempted": source_attempted,
                 "status": (
                     "collected"
                     if rows
                     else "failed"
                     if any(str(stage.get("status") or "").lower() == "failed" for stage in attempted_stages)
+                    else "skipped"
+                    if attempted_stages and not source_attempted
                     else "no_matches"
                 ),
                 "result_count": len(rows),
@@ -1843,7 +2477,20 @@ class ContextIntelligenceAgent(BaseAgent):
                     if str(row.get("evidence_id") or "").strip()
                 ],
             }
+        prometheus_health = state.get("connector_health", {}).get("prometheus", {})
+        if isinstance(prometheus_health, dict) and prometheus_health:
+            context_source_manifest["telemetry"] = {
+                **context_source_manifest.get("telemetry", {}),
+                "attempted": prometheus_health.get("status") != "skipped",
+                "status": str(prometheus_health.get("status") or "unavailable"),
+                "connector": "prometheus",
+                "endpoint_identity": by_name["prometheus"].get("endpoint_identity"),
+                "query": by_name["prometheus"].get("query"),
+                "result_count": len(by_name["prometheus"].get("series") or []),
+                "error": prometheus_health.get("error") or by_name["prometheus"].get("error"),
+            }
         context = Context(
+            tenant_id=alert.tenant_id,
             incident_id=incident.id,
             alert=alert,
             deployment=deployment,
@@ -1873,6 +2520,7 @@ class ContextIntelligenceAgent(BaseAgent):
                 "rag_top_metadata_match_score": max((doc.get("_metadata_match_score", 0.0) for doc in vector_matches), default=0.0),
                 "rag_top_match_confidence": max((doc.get("match_confidence", doc.get("_similarity", 0.0)) for doc in vector_matches), default=0.0),
                 "rag_service_tagged_match": service_tagged_match,
+                "rag_rejected_match_count": max(0, len(raw_vector_matches) - len(vector_matches)),
                 "rag_index": vector_connector.index_info() if vector_connector else {},
                 "discovery_evidence": local_evidence,
                 "discovery_report": discovery_report,
@@ -1881,20 +2529,30 @@ class ContextIntelligenceAgent(BaseAgent):
                 "context_graph": {
                     "enabled": True,
                     "stages": [*state.get("graph_stages", []), "assemble_context"],
-                    "connector_count": len(self.connectors),
+                    "connector_count": len(state.get("selected_connectors") or self.connectors),
+                    "available_connector_count": len(self.connectors),
+                    "collection_plan": state.get("collection_plan", {}),
                     "collection_latency_ms": state.get("collection_latency_ms", 0.0),
                     "connectors": state.get("connector_health", {}),
                     "collected_count": sum(
                         1 for item in state.get("connector_health", {}).values()
-                        if item.get("status") == "collected"
+                        if item.get("status") == "completed"
                     ),
                     "degraded": any(
-                        item.get("status") != "collected"
+                        item.get("status") in {"unavailable", "unauthorized", "misconfigured", "timed_out"}
                         for item in state.get("connector_health", {}).values()
                     ),
                 },
                 "knowledge_graph": knowledge_graph,
             },
+        )
+        tenant_id = require_tenant_id(alert.tenant_id, source="context collection alert identity")
+        context = govern_context(
+            context,
+            tenant_id=tenant_id,
+            subject_fingerprint=context_subject_fingerprint(alert, tenant_id),
+            threshold=float(os.getenv("CONTEXT_MIN_QUALITY_SCORE", "0.70")),
+            max_evidence_per_source=int(os.getenv("CONTEXT_MAX_EVIDENCE_PER_SOURCE", "20")),
         )
         state["context"] = context
         state["graph_stages"] = [*state.get("graph_stages", []), "assemble_context"]

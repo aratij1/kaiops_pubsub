@@ -6,6 +6,8 @@ from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from api_gateway.modules.users.service import UserService
+from common.tenant_identity import require_tenant_id
+from common.authorization import role_is_allowed
 
 security = HTTPBearer(auto_error=True)
 optional_security = HTTPBearer(auto_error=False)
@@ -50,10 +52,15 @@ async def current_auth_context(
             raise HTTPException(status_code=401, detail="Access token is missing session binding")
         await user_service.ensure_active_session(session_jti=session_jti, user_id=int(payload.get("sub", "0")))
 
+    try:
+        tenant_id = require_tenant_id(payload.get("tenant_id"), source="validated access token")
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+
     return AuthContext(
         user_id=str(payload.get("sub")) if external else int(payload.get("sub", "0")),
         role=str(payload.get("role") or ""),
-        tenant_id=str(payload.get("tenant_id") or "default"),
+        tenant_id=tenant_id,
         jwt_id=str(payload.get("jti") or ""),
         session_jti=session_jti,
         token_type=token_type,
@@ -100,7 +107,7 @@ async def current_tenant_id(
 
 def require_roles(*allowed_roles: str):
     async def _dependency(auth: AuthContext = Depends(current_auth_context)) -> AuthContext:
-        if auth.role not in allowed_roles:
+        if not role_is_allowed(auth.role, allowed_roles):
             raise HTTPException(status_code=403, detail="Insufficient role permissions")
         return auth
 

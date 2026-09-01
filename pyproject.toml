@@ -8,7 +8,7 @@ dependencies = [
     "aiokafka>=0.12.0",
     "aiomysql>=0.2.0",
     "fastapi>=0.115.0",
-    "httpx>=0.28.0",
+    "httpx[socks]>=0.28.0",
     "langchain>=0.3.0",
     "langgraph>=0.2.0",
     "numpy>=2.0.0",
@@ -46,6 +46,8 @@ where = [
     "backend/src/api-gateway",
     "backend/src/application-onboarding",
     "backend/src/alert-intelligence",
+    "backend/src/cloud-operations",
+    "backend/src/connector-hub",
     "ai-workbench/src/context-agent",
     "backend/src/dashboard-generator",
     "backend/src/discovery-service",
@@ -70,6 +72,8 @@ include = [
     "api_gateway*",
     "application_onboarding*",
     "alert_intelligence*",
+    "cloud_operations*",
+    "connector_hub*",
     "context_agent*",
     "dashboard_generator*",
     "discovery_service*",
@@ -91,6 +95,7 @@ include = [
 
 [project.optional-dependencies]
 dev = [
+    "pip-audit>=2.9.0",
     "pytest>=8.3.0",
     "pytest-asyncio>=0.25.0",
     "ruff>=0.8.0",
@@ -101,22 +106,12 @@ dev = [
 asyncio_mode = "auto"
 pythonpath = [
     ".",
-    "services/common",
-    "services/api-gateway",
-    "services/alert-intelligence",
-    "services/approval-service",
-    "services/closure-service",
-    "services/context-agent",
-    "services/model-router",
-    "services/monitoring-adapter",
-    "services/orchestrator",
-    "services/remediation-engine",
-    "services/resolution-agent",
     "backend/src/common",
     "ai-workbench/src",
     "backend/src/api-gateway",
     "backend/src/application-onboarding",
     "backend/src/alert-intelligence",
+    "backend/src/cloud-operations",
     "ai-workbench/src/context-agent",
     "backend/src/dashboard-generator",
     "backend/src/discovery-service",
@@ -134,8 +129,12 @@ pythonpath = [
     "backend/src/audit-service",
     "backend/src/monitoring-adapter",
     "backend/src/notification-service",
+    "backend/src/connector-hub",
+    "backend/src/knowledge-development-worker",
+    "backend/src/discovery-mcp",
+    "backend/src/temporal-pilot",
 ]
-testpaths = ["backend/tests", "tests"]
+testpaths = ["backend/tests"]
 
 [tool.ruff]
 line-length = 120

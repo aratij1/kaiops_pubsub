@@ -7,16 +7,14 @@ from contextlib import asynccontextmanager
 from time import perf_counter
 from typing import Any
 
-from fastapi import FastAPI, Request
-from fastapi import HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Request
 from sqlalchemy import text
 
 from common.config import Settings
 from common.database import create_engine, create_schema, create_session_factory
+from common.errors import install_exception_handlers, request_trace_id
 from common.event_publishers import build_event_publisher
 from common.logging import configure_logging
-from common.resilience import CircuitOpenError
 from common.telemetry import metrics_response, setup_tracing
 
 _MAX_HTTP_BODY_LOG_BYTES = 4096
@@ -136,35 +134,33 @@ def create_app(
     app = FastAPI(title=title, lifespan=lifespan)
     setup_tracing(app, settings)
 
-    @app.exception_handler(CircuitOpenError)
-    async def database_circuit_open(_request: Request, exc: CircuitOpenError) -> JSONResponse:
-        return JSONResponse(
-            status_code=503,
-            headers={"Retry-After": "5"},
-            content={
-                "detail": "The database is recovering. Please retry in a few seconds.",
-                "code": "database_temporarily_unavailable",
-            },
-        )
+    install_exception_handlers(app, logger)
 
     @app.middleware("http")
     async def log_http_io(request: Request, call_next):
+        trace_id = request_trace_id(request)
         path = request.url.path
         if path in _SKIP_HTTP_LOG_PATHS:
-            return await call_next(request)
+            response = await call_next(request)
+            response.headers.setdefault("x-trace-id", trace_id)
+            return response
 
         started = perf_counter()
-        request_body = await request.body()
-        request_payload = (
-            "<omitted: high-volume ingestion payload>"
-            if path in _OMIT_HTTP_REQUEST_BODY_PATHS
-            else _sanitize_http_payload(request_body, request.headers.get("content-type"))
-        )
+        if path in _OMIT_HTTP_REQUEST_BODY_PATHS:
+            # Do not buffer high-volume alert payloads merely to omit them from
+            # logs. Keeping the original receive stream also lowers peak memory
+            # during alert bursts.
+            request_body = None
+            request_payload = "<omitted: high-volume ingestion payload>"
+        else:
+            request_body = await request.body()
+            request_payload = _sanitize_http_payload(request_body, request.headers.get("content-type"))
 
         async def receive() -> dict[str, Any]:
+            assert request_body is not None
             return {"type": "http.request", "body": request_body, "more_body": False}
 
-        request_for_handler = Request(request.scope, receive)
+        request_for_handler = request if request_body is None else Request(request.scope, receive)
 
         try:
             response = await call_next(request_for_handler)
@@ -194,6 +190,7 @@ def create_app(
             },
         )
 
+        response.headers.setdefault("x-trace-id", trace_id)
         return response
 
     @app.get("/healthz")

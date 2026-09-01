@@ -286,3 +286,41 @@ def test_evaluate_many_omits_metrics_missing_required_context(monkeypatch) -> No
 def test_evaluate_many_empty_metrics_list_returns_empty() -> None:
     client = AzureAIEvaluationClient(_enabled_settings())
     assert client.evaluate_many("prediction text", metrics=[]) == []
+
+
+def test_metrics_are_genuinely_decoupled() -> None:
+    # High confidence but zero grounding (no citations, no matches, no context overlap)
+    unsupported = build_quality_evaluation(
+        prediction="Arbitrary hallucinated fix for database locks",
+        context="Memory usage in cache node was 90%",
+        confidence=0.99,
+        citations=[],
+        rag_matches=[],
+        runbook_found=False,
+    )
+    # Low confidence but strong grounding (direct verbatim overlap and runbook matches)
+    grounded_hesitant = build_quality_evaluation(
+        prediction="Memory usage in cache node was 90%",
+        context="Memory usage in cache node was 90%",
+        confidence=0.20,
+        citations=["runbook://redis", "incident://db-1"],
+        rag_matches=[{"similarity": 0.95}],
+        runbook_found=True,
+    )
+
+    # 1. Confidence scores reflect input confidence independently
+    assert unsupported["confidence_score"] == 0.99
+    assert grounded_hesitant["confidence_score"] == 0.20
+
+    # 2. Grounding score is high for grounded even if hesitant, and low for unsupported even if confident
+    assert grounded_hesitant["grounding_score"] > unsupported["grounding_score"]
+    assert grounded_hesitant["grounding_score"] >= 0.70
+    assert unsupported["grounding_score"] < 0.20
+
+    # 3. Hallucination risk is high when grounding is low, low when grounding is high
+    assert unsupported["hallucination_risk"] > grounded_hesitant["hallucination_risk"]
+
+    # 4. Overall score properly blends both without forcing them to equal each other
+    assert unsupported["overall_score"] != unsupported["confidence_score"]
+    assert grounded_hesitant["overall_score"] != grounded_hesitant["grounding_score"]
+

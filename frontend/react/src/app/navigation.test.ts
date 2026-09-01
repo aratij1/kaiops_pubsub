@@ -7,7 +7,7 @@ describe("authoritative navigation", () => {
   it("has unique canonical paths and destination identifiers", () => {
     expect(new Set(NAVIGATION_ITEMS.map((item) => item.path)).size).toBe(NAVIGATION_ITEMS.length);
     expect(new Set(NAVIGATION_ITEMS.map((item) => item.id)).size).toBe(NAVIGATION_ITEMS.length);
-    expect(NAVIGATION_GROUPS.map((group) => group.label)).toEqual(["Operations", "Platform", "Governance", "Administration"]);
+    expect(NAVIGATION_GROUPS.map((group) => group.label)).toEqual(["Operations", "Intelligence", "Automation", "Platform"]);
   });
 
   it("maps every route through its legacy compatibility tab", () => {
@@ -21,32 +21,53 @@ describe("authoritative navigation", () => {
     expect(LEGACY_REDIRECTS).toContainEqual({ from: "/approval", to: "/approvals" });
     expect(LEGACY_REDIRECTS).toContainEqual({ from: "/approval-queue-legacy", to: "/approvals" });
     expect(LEGACY_REDIRECTS).toContainEqual({ from: "/stream", to: "/alerts" });
-    expect(LEGACY_REDIRECTS).toContainEqual({ from: "/gateway-safety", to: "/automation" });
-    expect(LEGACY_REDIRECTS).toContainEqual({ from: "/admin", to: "/admin/users" });
+    expect(LEGACY_REDIRECTS).toContainEqual({ from: "/automation", to: "/gateway-safety" });
   });
 
   it("keeps restricted destinations out of role navigation and explains why", () => {
-    expect(canAccessTab("l1_operator", "home")).toBe(true);
-    expect(canAccessDestination("l1_operator", "alerts")).toBe(true);
-    expect(canAccessDestination("l1_operator", "admin")).toBe(false);
-    expect(allowedLegacyTabsForRole("l1_operator")).toEqual(["home", "summary", "stream"]);
+    expect(canAccessTab("hitl_reviewer", "home")).toBe(true);
+    expect(canAccessDestination("hitl_reviewer", "alerts")).toBe(true);
+    expect(canAccessDestination("hitl_reviewer", "admin")).toBe(false);
+    expect(allowedLegacyTabsForRole("hitl_reviewer")).toEqual(["home", "summary", "copilot", "approval", "stream", "closed"]);
     expect(allowedLegacyTabsForRole("administrator")).toContain("executive");
-    expect(permissionExplanation("l1_operator", "admin")).toMatch(/not available.*l1 operator/i);
+    expect(permissionExplanation("hitl_reviewer", "admin")).toMatch(/not available.*hitl reviewer/i);
   });
 
   it("uses the same permitted registry for global navigation search", () => {
-    expect(searchNavigation("connector", "administrator").map((item) => item.id)).toEqual(["integrations"]);
-    expect(searchNavigation("connector", "l1_operator")).toEqual([]);
+    expect(searchNavigation("connectors", "administrator").map((item) => item.id)).toEqual(["cloudConnections"]);
+    expect(searchNavigation("cloud topology", "administrator").map((item) => item.id)).toEqual(["cloudResources"]);
+    expect(searchNavigation("readiness", "administrator").map((item) => item.id)).toEqual(["operationsCockpit"]);
+    expect(searchNavigation("connectors", "hitl_reviewer")).toEqual([]);
     expect(searchNavigation("human gate", "administrator").map((item) => item.id)).toEqual(["approvals"]);
   });
 
   it("derives breadcrumbs and contextual workflow relationships", () => {
-    expect(breadcrumbForPath("/approvals").map((item) => item.label)).toEqual(["Operations", "Approvals"]);
+    expect(breadcrumbForPath("/approvals").map((item) => item.label)).toEqual(["Automation", "Approvals"]);
     expect(NAVIGATION_ITEMS.find((item) => item.id === "incidents")?.related).toEqual(["alerts", "approvals"]);
   });
 
-  it("keeps the incident destination active for a command-center URL", () => {
+  it("keeps the unified inbox active for an incident detail URL", () => {
     expect(tabForPath("/incidents/INC-3481")).toBe("summary");
     expect(breadcrumbForPath("/incidents/INC-3481").map((item) => item.label)).toEqual(["Operations", "Unified Inbox"]);
+  });
+
+  it("keeps audit and administration as distinct canonical workspaces", () => {
+    expect(tabForPath("/audit")).toBe("audit");
+    expect(tabForPath("/admin/settings")).toBe("admin");
+    const audit = NAVIGATION_ITEMS.find((item) => item.id === "audit");
+    const administration = NAVIGATION_ITEMS.find((item) => item.id === "admin");
+    expect(audit?.path).not.toBe(NAVIGATION_ITEMS.find((item) => item.id === "settings")?.path);
+    expect(audit?.pageTitle).toBe("Platform Health & Audit");
+    expect(administration?.pageTitle).toBe("Platform Settings");
+  });
+
+  it("exposes one settings destination distinct from the control plane", () => {
+    const controlPlane = NAVIGATION_ITEMS.find((item) => item.id === "platformOverview");
+    const settings = NAVIGATION_ITEMS.find((item) => item.id === "settings");
+    const legacyAdmin = NAVIGATION_ITEMS.find((item) => item.id === "admin");
+    expect(controlPlane?.path).toBe("/platform");
+    expect(settings?.path).toBe("/admin/settings");
+    expect(settings?.path).not.toBe(controlPlane?.path);
+    expect(legacyAdmin?.showInNavigation).toBe(false);
   });
 });

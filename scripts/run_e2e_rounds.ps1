@@ -81,7 +81,7 @@ function Run-Round {
     $processed = $null
     for ($i = 0; $i -lt 240; $i++) {
         try {
-            $processed = Invoke-RestMethod -Uri ("{0}/alerts/{1}/processed-result" -f $MonitoringAdapterUrl.TrimEnd('/'), $row.id) -Method Get -TimeoutSec 60
+            $processed = Invoke-RestMethod -Uri ("{0}/alerts/{1}/processed-result?tenant_id=default" -f $MonitoringAdapterUrl.TrimEnd('/'), $row.id) -Method Get -TimeoutSec 60
             if ($processed.recommendation.id) { break }
         }
         catch {

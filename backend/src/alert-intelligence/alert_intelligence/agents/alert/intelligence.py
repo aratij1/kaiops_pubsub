@@ -12,6 +12,7 @@ from common.config import get_settings
 from ai_workbench_common.embeddings import HashingEmbeddingModel, cosine_similarity
 from common.models import Alert, AlertSeverity, Incident, IncidentStatus, utc_now
 from common.incident_policy import IncidentSeverityPolicy
+from common.incident_identity import environment_family, is_ephemeral_environment, same_environment_family
 from common.repository_interfaces import AlertHistoryRepository, InMemoryAlertHistoryRepository
 from alert_intelligence.discovery import build_incident_candidate
 
@@ -92,7 +93,11 @@ class AlertIntelligenceAgent(BaseAgent):
         matches: list[Alert] = []
         match_details: list[dict[str, Any]] = []
         for item in candidates:
-            if item.starts_at < cutoff or item.ends_at is not None:
+            if (
+                item.starts_at < cutoff
+                or (item.ends_at is not None and item.ends_at <= utc_now())
+                or not same_environment_family(alert.environment, item.environment)
+            ):
                 continue
             exact = item.fingerprint == fingerprint
             similarity, evidence = self._correlation_score(alert, item)
@@ -129,6 +134,8 @@ class AlertIntelligenceAgent(BaseAgent):
         best_score = 0.0
         best_evidence: dict[str, Any] = {}
         for candidate in candidates:
+            if not same_environment_family(alert.environment, candidate.environment):
+                continue
             candidate_score, evidence = self._correlation_score(alert, candidate)
             if candidate_score > best_score:
                 best_match = candidate
@@ -182,6 +189,7 @@ class AlertIntelligenceAgent(BaseAgent):
         )
         await self.alert_history_repository.record_alert(alert)
         incident = Incident(
+            tenant_id=alert.tenant_id,
             alert_ids=[alert.id],
             service=alert.service,
             environment=alert.environment,
@@ -197,8 +205,14 @@ class AlertIntelligenceAgent(BaseAgent):
         # Dedup and correlation both need a recent-alert candidate pool; fetch
         # it once (environment-scoped) instead of two independent unfiltered
         # history scans per incoming alert.
+        # Run-scoped test environments (for example e2e-<timestamp>) belong
+        # to one operational environment. Fetch the tenant pool for those
+        # environments, then apply the family boundary in both algorithms.
+        candidate_environment = alert.environment
+        if is_ephemeral_environment(alert.environment):
+            candidate_environment = None
         candidates = await self.alert_history_repository.list_recent_alerts(
-            environment=alert.environment, tenant_id=alert.tenant_id
+            environment=candidate_environment, tenant_id=alert.tenant_id
         )
         alert = await self.deduplicate_alerts(alert, candidates)
         alert = await self.correlate_alerts(alert, candidates)
@@ -240,7 +254,19 @@ class AlertIntelligenceAgent(BaseAgent):
         return isinstance(result, dict) and "alert" in result and "incident" in result
 
     def _fingerprint(self, alert: Alert) -> str:
-        stable = "|".join([alert.source, alert.name, alert.service, alert.environment, alert.labels.get("pod", "")])
+        alert_identity = (
+            self._alert_family(alert.name)
+            if is_ephemeral_environment(alert.environment)
+            else self._norm(alert.name)
+        )
+        stable = "|".join(
+            [
+                self._norm(alert.source),
+                alert_identity,
+                self._norm(alert.service),
+                environment_family(alert.environment),
+            ]
+        )
         return hashlib.sha256(stable.encode("utf-8")).hexdigest()
 
     def _correlation_text(self, alert: Alert) -> str:
@@ -253,7 +279,7 @@ class AlertIntelligenceAgent(BaseAgent):
             self._embed(self._correlation_text(candidate)),
         )
         service_score = self._service_score(alert, candidate)
-        environment_score = 1.0 if self._norm(alert.environment) == self._norm(candidate.environment) else 0.0
+        environment_score = 1.0 if same_environment_family(alert.environment, candidate.environment) else 0.0
         topology_score, topology_evidence = self._token_overlap_score(alert, candidate, _TOPOLOGY_KEYS + _DEPENDENCY_KEYS)
         deployment_score, deployment_evidence = self._token_overlap_score(alert, candidate, _DEPLOYMENT_KEYS)
         metric_score, metric_evidence = self._token_overlap_score(alert, candidate, _METRIC_KEYS)

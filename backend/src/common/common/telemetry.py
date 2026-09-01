@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from opentelemetry import trace
+
 try:
     from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 except (ImportError, Exception):
@@ -26,6 +27,16 @@ EVENTS_PROCESSED = Counter(
     "kaiops_events_processed_total",
     "Events processed by service and topic",
     ["service", "topic", "status"],
+)
+LIFECYCLE_TRANSITIONS = Counter(
+    "kaiops_resolution_lifecycle_transitions_total",
+    "Guarded resolution lifecycle transitions by actor and outcome",
+    ["from_state", "to_state", "actor", "outcome"],
+)
+LIFECYCLE_RECONCILIATION = Counter(
+    "kaiops_resolution_reconciliation_total",
+    "Persisted terminal action reconciliation decisions",
+    ["mode", "decision", "reason"],
 )
 REQUEST_LATENCY = Histogram(
     "kaiops_request_latency_seconds",
@@ -109,21 +120,85 @@ CONTEXT_KNOWLEDGE_REUSE_COUNT = Histogram(
     "Observed reuse count for context knowledge cache hits",
     buckets=(1, 2, 3, 5, 10, 25, 50, 100, 250, 500, 1000),
 )
-WORKFLOW_LATENCY = Histogram("kaiops_workflow_latency_seconds", "Workflow activity duration by workflow, stage, and outcome", ["workflow", "stage", "outcome"])
-WORKFLOW_FAILURES = Counter("kaiops_workflow_failures_total", "Workflow failures by workflow and stage", ["workflow", "stage"])
+CONTEXT_QUALITY_SCORE = Histogram(
+    "kaiops_context_quality_score",
+    "Context quality dimensions evaluated before reuse or resolution handoff",
+    ["dimension"],
+    buckets=(0.0, 0.25, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0),
+)
+CONTEXT_REUSE_DECISIONS = Counter(
+    "kaiops_context_reuse_decisions_total",
+    "Context reuse decisions by outcome and bounded reason",
+    ["decision", "reason"],
+)
+CONTEXT_SOURCE_RESULTS = Counter(
+    "kaiops_context_source_results_total",
+    "Context source collection or freshness outcomes",
+    ["source", "status"],
+)
+WORKFLOW_LATENCY = Histogram(
+    "kaiops_workflow_latency_seconds",
+    "Workflow activity duration by workflow, stage, and outcome",
+    ["workflow", "stage", "outcome"],
+)
+WORKFLOW_FAILURES = Counter(
+    "kaiops_workflow_failures_total", "Workflow failures by workflow and stage", ["workflow", "stage"]
+)
 QUEUE_DEPTH = Gauge("kaiops_queue_depth", "Broker-reported queue depth", ["provider", "queue"])
 QUEUE_AGE = Histogram("kaiops_queue_age_seconds", "Age of a message when consumed", ["provider", "queue"])
-DEAD_LETTER_EVENTS = Counter("kaiops_dead_letter_events_total", "Events sent to dead letter", ["provider", "queue", "reason"])
-CONNECTOR_LATENCY = Histogram("kaiops_connector_latency_seconds", "External connector latency", ["connector", "operation", "outcome"])
-CONNECTOR_FAILURES = Counter("kaiops_connector_failures_total", "External connector failures", ["connector", "operation"])
-MYSQL_QUERY_LATENCY = Histogram("kaiops_mysql_query_latency_seconds", "MySQL query latency by operation", ["database", "operation"])
-OBJECT_STORAGE_LATENCY = Histogram("kaiops_object_storage_latency_seconds", "Object storage latency", ["provider", "operation", "outcome"])
+DEAD_LETTER_EVENTS = Counter(
+    "kaiops_dead_letter_events_total", "Events sent to dead letter", ["provider", "queue", "reason"]
+)
+CONNECTOR_LATENCY = Histogram(
+    "kaiops_connector_latency_seconds", "External connector latency", ["connector", "operation", "outcome"]
+)
+CONNECTOR_FAILURES = Counter(
+    "kaiops_connector_failures_total", "External connector failures", ["connector", "operation"]
+)
+MYSQL_QUERY_LATENCY = Histogram(
+    "kaiops_mysql_query_latency_seconds", "MySQL query latency by operation", ["database", "operation"]
+)
+OBJECT_STORAGE_LATENCY = Histogram(
+    "kaiops_object_storage_latency_seconds", "Object storage latency", ["provider", "operation", "outcome"]
+)
 LLM_LATENCY = Histogram("kaiops_llm_latency_seconds", "Model request latency", ["provider", "task", "outcome"])
 LLM_TOKENS = Counter("kaiops_llm_tokens_total", "Model tokens by provider and direction", ["provider", "direction"])
 LLM_COST_USD = Counter("kaiops_llm_cost_usd_total", "Estimated model cost in USD", ["provider"])
 LLM_FALLBACKS = Counter("kaiops_llm_fallback_total", "Model fallback attempts", ["primary", "fallback"])
 LLM_CACHE_REQUESTS = Counter("kaiops_llm_cache_requests_total", "Model prompt-cache requests", ["result"])
 LLM_GUARDRAIL_EVENTS = Counter("kaiops_llm_guardrail_events_total", "Model request guardrail events", ["reason"])
+RCA_CONFIDENCE = Histogram(
+    "kaiops_rca_confidence",
+    "Observed RCA confidence at a persisted decision boundary",
+    ["service", "outcome"],
+    buckets=(0.0, 0.25, 0.5, 0.65, 0.75, 0.85, 0.95, 1.0),
+)
+APPROVAL_DECISIONS = Counter(
+    "kaiops_approval_decisions_total", "Persisted human approval decisions", ["decision", "risk_tier"]
+)
+AUTOMATION_DECISIONS = Counter("kaiops_automation_decisions_total", "Governed autonomy decisions", ["mode", "outcome"])
+REMEDIATION_OUTCOMES = Counter(
+    "kaiops_remediation_outcomes_total", "Deterministic remediation outcomes", ["capability", "outcome"]
+)
+ROLLBACK_OUTCOMES = Counter("kaiops_rollback_outcomes_total", "Governed rollback outcomes", ["capability", "outcome"])
+VALIDATION_OUTCOMES = Counter(
+    "kaiops_validation_outcomes_total", "Post-remediation validation outcomes", ["validator", "outcome"]
+)
+INCIDENT_MTTR = Histogram(
+    "kaiops_incident_mttr_seconds",
+    "Measured time from incident creation to verified closure",
+    ["severity"],
+    buckets=(60, 300, 900, 1800, 3600, 7200, 14400, 28800, 86400),
+)
+NOISE_REDUCTION = Histogram(
+    "kaiops_noise_reduction_ratio",
+    "Measured alert-to-correlated-incident reduction ratio",
+    ["tenant"],
+    buckets=(0.0, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 1.0),
+)
+FALSE_AUTOMATION = Counter(
+    "kaiops_false_automation_total", "Human-confirmed incorrect autonomous actions", ["capability", "reason"]
+)
 
 
 def setup_tracing(app, settings: Settings) -> None:

@@ -70,6 +70,7 @@ def reduce_incident_status(
     approval_updated_at: Any = None,
     action_status: Any = None,
     action_updated_at: Any = None,
+    closure_kind: Any = None,
 ) -> dict[str, str]:
     """Return one lifecycle status from the latest durable incident facts.
 
@@ -83,10 +84,17 @@ def reduce_incident_status(
     canonical = _status(canonical_status)
     approval = _status(approval_status)
     action = _status(action_status)
+    closure = _status(closure_kind)
 
     if canonical in SUCCESS_TERMINAL_STATUSES or projection in SUCCESS_TERMINAL_STATUSES:
         status = "closed" if "closed" in {canonical, projection} else "resolved"
-        return {"status": status, "source": "closure", "reason": "Recovery validation closed the incident."}
+        if closure == "manual":
+            reason = "An authorized operator administratively closed the incident without a technical recovery claim."
+        elif closure == "diagnostic":
+            reason = "Diagnostic work was completed and closed without a technical recovery claim."
+        else:
+            reason = "Recovery validation closed the incident."
+        return {"status": status, "source": "closure", "reason": reason}
     if canonical in {"cancelled", "canceled"} or projection in {"cancelled", "canceled"}:
         return {"status": "cancelled", "source": "incident", "reason": "The incident was explicitly cancelled."}
 
@@ -96,6 +104,22 @@ def reduce_incident_status(
     projection_at = _timestamp(projection_updated_at)
 
     action_fact = _action_incident_status(action)
+
+    # A fresh analysis can deliberately reopen an incident after an older
+    # approval or execution attempt. The materialized projection is the durable
+    # result of that analysis; stale action/approval/canonical rows must not
+    # keep the read model pinned to a superseded failure. Successful closure
+    # remains monotonic because it is handled above.
+    if (
+        projection
+        and projection_at > max(canonical_at, approval_at, action_at)
+    ):
+        return {
+            "status": projection,
+            "source": "projection",
+            "reason": "A newer persisted lifecycle projection supersedes earlier approval or remediation attempts.",
+        }
+
     if action_fact is not None and action_at >= approval_at:
         status, reason = action_fact
         return {"status": status, "source": "remediation_action", "reason": reason}

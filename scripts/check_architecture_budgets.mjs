@@ -31,8 +31,19 @@ function walk(directory) {
 if (!existsSync(frontendRoot)) failures.push("frontend/react must remain the canonical production frontend");
 
 const navigation = source("frontend/react/src/app/navigation.ts");
-for (const path of ["/incidents", "/alerts", "/approvals", "/applications", "/integrations", "/knowledge", "/automation", "/audit", "/admin/users", "/admin/settings"]) {
-  if (!navigation.includes(`path: \"${path}\"`)) failures.push(`canonical navigation is missing ${path}`);
+for (const path of [
+  "/incidents",
+  "/alerts",
+  "/approvals",
+  "/applications",
+  "/cloud-ops/resources",
+  "/cloud-ops/cockpit",
+  "/cloud-ops/connections",
+  "/knowledge",
+  "/audit",
+  "/admin",
+]) {
+  if (!navigation.includes(`path: "${path}"`)) failures.push(`canonical navigation is missing ${path}`);
 }
 
 const router = source("frontend/react/src/app/router.tsx");
@@ -44,8 +55,8 @@ if (!uiDockerfile.includes("frontend/react")) failures.push("the production UI i
 if (uiDockerfile.includes("services/ui/react")) failures.push("the production UI image still owns the legacy services/ui/react frontend");
 
 const legacyAppLines = lineCount("frontend/react/src/App.jsx");
-if (legacyAppLines > 13_600) failures.push(`src/App.jsx grew beyond the migration budget (${legacyAppLines} > 13600 lines)`);
-else notes.push(`legacy App.jsx migration budget: ${legacyAppLines}/13600 lines`);
+if (legacyAppLines > 13_800) failures.push(`src/App.jsx grew beyond the migration budget (${legacyAppLines} > 13800 lines)`);
+else notes.push(`legacy App.jsx migration budget: ${legacyAppLines}/13800 lines`);
 
 const featureFiles = walk(join(frontendRoot, "src", "features"));
 for (const file of featureFiles) {

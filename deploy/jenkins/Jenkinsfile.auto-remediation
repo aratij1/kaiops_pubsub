@@ -1,3 +1,17 @@
+def approvedComposeLabelCommand(String command) {
+    def value = (command ?: '').trim()
+    def labels = value =~ /com\.docker\.compose\.project%3D([A-Za-z0-9_.-]+)%22%2C%22com\.docker\.compose\.service%3D([A-Za-z0-9_.-]+)%22/
+    if (!labels.find()) { return false }
+    def project = labels.group(1)
+    def service = labels.group(2)
+    def filters = "%7B%22label%22%3A%5B%22com.docker.compose.project%3D${project}%22%2C%22com.docker.compose.service%3D${service}%22%5D%7D"
+    def listUrl = "http://docker-socket-proxy:2375/containers/json?filters=${filters}"
+    def lookup = "curl --fail --silent --show-error '${listUrl}' | grep -o '\"Id\":\"[^\"]*\"' | head -n 1 | cut -d'\"' -f4"
+    def preflight = "${lookup} | grep --quiet ."
+    def restart = "container_id=\$(${lookup}); test -n \"\$container_id\" && curl --fail --silent --show-error --retry 3 --retry-all-errors --retry-delay 1 -X POST http://docker-socket-proxy:2375/containers/\$container_id/restart?t=30"
+    return value == preflight || value == restart
+}
+
 def approvedCommand(String command) {
     def value = (command ?: '').trim()
     def patterns = [
@@ -9,13 +23,27 @@ def approvedCommand(String command) {
         ~/^mysql\s+-e\s+"CALL mysql\.rds_failover\(\);"$/,
         ~/^curl --fail --silent --show-error( --output \/dev\/null)?( --retry \d+)?( --retry-all-errors)?( --retry-connrefused)?( --retry-delay \d+)?( -X POST)? http:\/\/[A-Za-z0-9_.:-]+\/[A-Za-z0-9_.\/?=&-]+$/
     ]
-    return value && value.length() <= 1000 && !value.contains('\n') && patterns.any { value ==~ it }
+    return value && value.length() <= 2000 && !value.contains('\n') && (patterns.any { value ==~ it } || approvedComposeLabelCommand(value))
+}
+
+def approvedScript(String command) {
+    def value = (command ?: '').trim()
+    // Reviewed repository artifacts only. Arguments are data tokens; shell
+    // metacharacters and arbitrary paths are deliberately excluded.
+    return value ==~ /^(bash|sh)\s+scripts\/remediation\/kaiops_alert_health_triage\.sh(?:\s+--(service|environment|api-gateway-url|prometheus-url|dry-run)\s+[A-Za-z0-9_.:\/-]+)+$/
 }
 
 def runGovernedCommand(String label, String command, boolean dryRun) {
     if (!approvedCommand(command)) { error("Command is outside the remediation allowlist: ${command}") }
     if (dryRun) { echo "DRY RUN [${label}]: ${command}"; return }
     if (isUnix()) { sh(label: label, script: command) } else { bat(label: label, script: command) }
+}
+
+def runGovernedScript(String command, boolean dryRun) {
+    if (!approvedScript(command)) { error("Script is outside the reviewed remediation catalog: ${command}") }
+    if (dryRun) { echo "DRY RUN [Approved remediation script]: ${command}"; return }
+    if (!isUnix()) { error('Approved shell remediation scripts require a Unix Jenkins agent') }
+    sh(label: 'Approved remediation script', script: "cd /opt/kaiops && ${command}")
 }
 
 pipeline {
@@ -40,6 +68,7 @@ pipeline {
         string(name: 'KAI_OPS_POLICY_VERSION', defaultValue: 'jenkins-self-healing-v2', trim: true)
         booleanParam(name: 'KAI_OPS_DRY_RUN', defaultValue: true)
         text(name: 'KAI_OPS_EXECUTION_PLAN', defaultValue: '{"schema_version":"kaiops.remediation.v2","commands":[],"preflight":[],"validation_commands":[],"rollback_commands":[]}')
+        string(name: 'KAI_OPS_PLAN_DIGEST', trim: true)
     }
     stages {
         stage('Govern request') {
@@ -52,17 +81,23 @@ pipeline {
                     def plan = readJSON text: params.KAI_OPS_EXECUTION_PLAN, returnPojo: true
                     def mutating = params.KAI_OPS_RESOLUTION_ID != 'investigate-first'
                     def commands = plan.commands instanceof List ? plan.commands : []
+                    def scripts = plan.scripts instanceof List ? plan.scripts : []
                     def preflight = plan.preflight instanceof List ? plan.preflight : []
                     def validation = plan.validation_commands instanceof List ? plan.validation_commands : []
                     def rollback = plan.rollback_commands instanceof List ? plan.rollback_commands : []
                     def rollbackMode = (plan.rollback_mode ?: 'automatic') as String
                     if (mutating && !params.KAI_OPS_APPROVAL_ID?.trim()) { error('A persisted KaiOps approval id is required for a mutating resolution') }
-                    if (mutating && !commands) { error('The governed plan contains no remediation commands') }
+                    if (mutating && !commands && !scripts) { error('The governed plan contains no remediation command or script') }
+                    writeFile file: 'kaiops-approved-plan.json', text: params.KAI_OPS_EXECUTION_PLAN
+                    def calculatedPlanDigest = "sha256:${sha256(file: 'kaiops-approved-plan.json')}"
+                    if (calculatedPlanDigest != params.KAI_OPS_PLAN_DIGEST) { error('The submitted execution plan digest does not match the approved plan') }
                     if (mutating && !params.KAI_OPS_DRY_RUN && (!preflight || !validation)) { error('Live self-healing requires executable preflight and validation commands') }
                     if (mutating && !params.KAI_OPS_DRY_RUN && rollbackMode == 'automatic' && !rollback) { error('An automatic rollback mode requires executable rollback commands') }
                     def rejected = [*commands, *preflight, *validation, *rollback].findAll { !approvedCommand(it as String) }
                     if (rejected) { error("Plan contains commands outside the allowlist: ${rejected.join(', ')}") }
-                    env.KAI_OPS_PLAN_JSON = writeJSON(json: [commands: commands, preflight: preflight, validation: validation, rollback: rollback, rollback_mode: rollbackMode], returnText: true)
+                    def rejectedScripts = scripts.findAll { !approvedScript(it as String) }
+                    if (rejectedScripts) { error("Plan contains scripts outside the reviewed catalog: ${rejectedScripts.join(', ')}") }
+                    env.KAI_OPS_PLAN_JSON = writeJSON(json: [commands: commands, scripts: scripts, preflight: preflight, validation: validation, rollback: rollback, rollback_mode: rollbackMode], returnText: true)
                     currentBuild.description = "${params.KAI_OPS_RESOLUTION_ID} | ${params.KAI_OPS_INCIDENT_ID} | ${params.KAI_OPS_TARGET}"
                     writeJSON file: 'kaiops-request.json', json: [schema_version:'kaiops.remediation.audit.v2', incident_id:params.KAI_OPS_INCIDENT_ID, approval_id:params.KAI_OPS_APPROVAL_ID, application_id:params.KAI_OPS_APPLICATION_ID, target:params.KAI_OPS_TARGET, environment:params.KAI_OPS_ENVIRONMENT, namespace:params.KAI_OPS_NAMESPACE, resolution_id:params.KAI_OPS_RESOLUTION_ID, policy_version:params.KAI_OPS_POLICY_VERSION, dry_run:params.KAI_OPS_DRY_RUN, build_url:env.BUILD_URL]
                 }
@@ -81,6 +116,7 @@ pipeline {
                 script {
                     def plan = readJSON text: env.KAI_OPS_PLAN_JSON, returnPojo: true
                     try {
+                        plan.scripts.each { runGovernedScript(it as String, params.KAI_OPS_DRY_RUN) }
                         plan.commands.each { runGovernedCommand('Approved remediation', it as String, params.KAI_OPS_DRY_RUN) }
                         env.KAI_OPS_EXECUTED = 'true'
                         retry(3) { plan.validation.each { runGovernedCommand('Recovery validation', it as String, params.KAI_OPS_DRY_RUN) } }
@@ -100,13 +136,13 @@ pipeline {
         stage('Publish recovery evidence') {
             steps {
                 milestone ordinal: 30, label: 'validated-recovery'
-                script { writeJSON file: 'kaiops-result.json', json: [schema_version:'kaiops.remediation.result.v2', incident_id:params.KAI_OPS_INCIDENT_ID, approval_id:params.KAI_OPS_APPROVAL_ID, resolution_id:params.KAI_OPS_RESOLUTION_ID, target:params.KAI_OPS_TARGET, dry_run:params.KAI_OPS_DRY_RUN, preflight_passed:env.KAI_OPS_PREFLIGHT_PASSED == 'true', executed:env.KAI_OPS_EXECUTED == 'true', recovery_validated:env.KAI_OPS_VALIDATED == 'true', rollback_attempted:env.KAI_OPS_ROLLBACK_ATTEMPTED == 'true', rollback_succeeded:env.KAI_OPS_ROLLBACK_SUCCEEDED == 'true', result:'SUCCESS', completed_at:new Date().format("yyyy-MM-dd'T'HH:mm:ssXXX")] }
+                script { def plan = readJSON text: env.KAI_OPS_PLAN_JSON, returnPojo: true; writeJSON file: 'kaiops-result.json', json: [schema_version:'kaiops.remediation.result.v2', incident_id:params.KAI_OPS_INCIDENT_ID, approval_id:params.KAI_OPS_APPROVAL_ID, resolution_id:params.KAI_OPS_RESOLUTION_ID, target:params.KAI_OPS_TARGET, plan_digest:params.KAI_OPS_PLAN_DIGEST, executed_script_count:(plan.scripts instanceof List ? plan.scripts.size() : 0), dry_run:params.KAI_OPS_DRY_RUN, preflight_passed:env.KAI_OPS_PREFLIGHT_PASSED == 'true', executed:env.KAI_OPS_EXECUTED == 'true', recovery_validated:env.KAI_OPS_VALIDATED == 'true', rollback_attempted:env.KAI_OPS_ROLLBACK_ATTEMPTED == 'true', rollback_succeeded:env.KAI_OPS_ROLLBACK_SUCCEEDED == 'true', result:'SUCCESS', completed_at:new Date().format("yyyy-MM-dd'T'HH:mm:ssXXX")] }
             }
         }
     }
     post {
         always { script {
-            if (!fileExists('kaiops-result.json')) { writeJSON file: 'kaiops-result.json', json: [schema_version:'kaiops.remediation.result.v2', incident_id:params.KAI_OPS_INCIDENT_ID, approval_id:params.KAI_OPS_APPROVAL_ID, resolution_id:params.KAI_OPS_RESOLUTION_ID, target:params.KAI_OPS_TARGET, dry_run:params.KAI_OPS_DRY_RUN, preflight_passed:env.KAI_OPS_PREFLIGHT_PASSED == 'true', executed:env.KAI_OPS_EXECUTED == 'true', recovery_validated:false, rollback_attempted:env.KAI_OPS_ROLLBACK_ATTEMPTED == 'true', rollback_succeeded:env.KAI_OPS_ROLLBACK_SUCCEEDED == 'true', result:currentBuild.currentResult, failure:env.KAI_OPS_FAILURE ?: ''] }
+            if (!fileExists('kaiops-result.json')) { writeJSON file: 'kaiops-result.json', json: [schema_version:'kaiops.remediation.result.v2', incident_id:params.KAI_OPS_INCIDENT_ID, approval_id:params.KAI_OPS_APPROVAL_ID, resolution_id:params.KAI_OPS_RESOLUTION_ID, target:params.KAI_OPS_TARGET, plan_digest:params.KAI_OPS_PLAN_DIGEST, executed_script_count:0, dry_run:params.KAI_OPS_DRY_RUN, preflight_passed:env.KAI_OPS_PREFLIGHT_PASSED == 'true', executed:env.KAI_OPS_EXECUTED == 'true', recovery_validated:false, rollback_attempted:env.KAI_OPS_ROLLBACK_ATTEMPTED == 'true', rollback_succeeded:env.KAI_OPS_ROLLBACK_SUCCEEDED == 'true', result:currentBuild.currentResult, failure:env.KAI_OPS_FAILURE ?: ''] }
             archiveArtifacts artifacts: 'kaiops-request.json,kaiops-result.json', fingerprint: true, allowEmptyArchive: false
         } }
     }

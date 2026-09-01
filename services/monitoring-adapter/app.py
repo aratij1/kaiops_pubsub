@@ -5527,8 +5527,13 @@ def _jira_payload_to_alert_payload(payload: dict[str, Any]) -> tuple[dict[str, A
     reporter = fields.get("reporter", {}) if isinstance(fields.get("reporter"), dict) else {}
     assignee = fields.get("assignee", {}) if isinstance(fields.get("assignee"), dict) else {}
     webhook_event = str(payload.get("webhookEvent") or "").strip()
-    jira_labels = fields.get("labels") if isinstance(fields.get("labels"), list) else []
-    managed = "managed_by_kaiops" in jira_labels
+    jira_labels = [str(label) for label in (fields.get("labels") if isinstance(fields.get("labels"), list) else [])]
+    managed = (
+        "managed_by_kaiops" in jira_labels
+        or "kaiops-auto-created" in jira_labels
+        or "kaiops-managed-by-kaiops" in jira_labels
+        or any(lbl.startswith(("kaiops_incident_", "kaiops-candidate-")) for lbl in jira_labels)
+    )
     kaiops_incident_label = next(
         (str(label) for label in jira_labels if str(label).startswith("kaiops_incident_")),
         "",
@@ -5565,10 +5570,18 @@ def _jira_payload_to_alert_payload(payload: dict[str, Any]) -> tuple[dict[str, A
 def _is_kaiops_managed_jira_update(payload: dict[str, Any]) -> bool:
     issue = payload.get("issue", {}) if isinstance(payload, dict) else {}
     fields = issue.get("fields", {}) if isinstance(issue, dict) and isinstance(issue.get("fields"), dict) else {}
-    labels = fields.get("labels") if isinstance(fields.get("labels"), list) else []
-    comment = payload.get("comment", {}) if isinstance(payload.get("comment"), dict) else {}
+    labels = [str(lbl) for lbl in (fields.get("labels") if isinstance(fields.get("labels"), list) else [])]
+    comment = payload.get("comment", {}) if isinstance(payload, dict) else {}
     comment_body = str(comment.get("body") or "")
-    return "managed_by_kaiops" in labels and (
+    is_managed_label = (
+        "managed_by_kaiops" in labels
+        or "kaiops-auto-created" in labels
+        or "kaiops-managed-by-kaiops" in labels
+        or any(lbl.startswith(("kaiops_incident_", "kaiops-candidate-")) for lbl in labels)
+    )
+    if is_managed_label:
+        return True
+    return (
         "[kaiops-managed-update]" in comment_body
         or str(payload.get("event_origin") or "").lower() == "kaiops"
     )

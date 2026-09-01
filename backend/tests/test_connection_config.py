@@ -5,7 +5,7 @@ import json
 from common.config import Settings
 from common.connection_config import connector_catalog_from_connection_config, load_connection_config
 from common.models import Alert, AlertSeverity
-from common.orchestration.execution_plan import resolve_execution_plan
+from common.orchestration.execution_plan import _match_playbook, resolve_execution_plan
 
 
 def test_connection_config_expands_env_and_normalizes_connectors(tmp_path, monkeypatch) -> None:
@@ -50,6 +50,7 @@ def test_connection_config_expands_env_and_normalizes_connectors(tmp_path, monke
 
 def test_execution_plan_includes_standard_connection_architecture() -> None:
     alert = Alert(
+        tenant_id="tenant-a",
         source="prometheus",
         name="DatabaseReplicaLag",
         service="orders-db",
@@ -71,3 +72,247 @@ def test_execution_plan_includes_standard_connection_architecture() -> None:
     assert connection["connector"]["timeout_seconds"] == 10
     assert "read_status" in connection["connector"]["allowed_operations"]
     assert connection["platform"]["message_bus"]["provider"]
+
+
+def _resolve(alert: Alert) -> dict:
+    alert = alert.model_copy(update={"tenant_id": "tenant-a"})
+    return resolve_execution_plan(
+        alert=alert,
+        workflow_name="critical-auto-remediation",
+        requires_approval=True,
+        risk_tier="high",
+        execution_mode="human-approval",
+    )
+
+
+def test_catalog_plan_matches_alert_without_requiring_alert_type() -> None:
+    plan = _resolve(
+        Alert(
+            source="prometheus",
+            name="KaiOpsServiceDown",
+            service="api-gateway",
+            severity=AlertSeverity.CRITICAL,
+            description="API endpoint is unreachable",
+        )
+    )
+
+    assert plan["playbook"]["id"] == "kaiops-service-down-playbook"
+    assert plan["execution_ready"] is True
+    assert plan["commands"]
+    assert plan["validation_commands"]
+    assert plan["rollback_commands"]
+    assert plan["plan_fingerprint"].startswith("sha256:")
+    assert not any("${" in command for command in plan["preflight_commands"] + plan["commands"])
+
+
+def test_unknown_alert_is_diagnostic_only_and_never_invents_mutation() -> None:
+    plan = _resolve(
+        Alert(
+            source="prometheus",
+            name="NovelSubsystemSignal",
+            service="unknown-worker",
+            severity=AlertSeverity.WARNING,
+            description="unclassified symptom",
+        )
+    )
+
+    assert plan["playbook"]["id"] == "generic-kaiops-triage-playbook"
+    assert plan["plan_kind"] == "diagnostic"
+    assert plan["execution_ready"] is False
+    assert plan["commands"] == []
+
+
+def test_reusable_playbook_matches_new_service_by_reviewed_alert_signature() -> None:
+    playbook = _match_playbook(
+        alert=Alert(
+            source="prometheus",
+            name="ServiceDown",
+            service="newly-discovered-service",
+            severity=AlertSeverity.CRITICAL,
+            description="endpoint is unreachable",
+        ),
+        playbooks={
+            "playbooks": [
+                {
+                    "id": "reviewed-service-down",
+                    "match": {
+                        "services": ["known-service"],
+                        "alert_keywords": ["service down", "unreachable"],
+                        "allow_unlisted_services": True,
+                    },
+                    "steps": [],
+                }
+            ]
+        },
+    )
+
+    assert playbook["id"] == "reviewed-service-down"
+
+
+def test_service_boundary_remains_closed_without_explicit_reuse() -> None:
+    playbook = _match_playbook(
+        alert=Alert(
+            source="prometheus",
+            name="ServiceDown",
+            service="unreviewed-service",
+            severity=AlertSeverity.CRITICAL,
+            description="endpoint is unreachable",
+        ),
+        playbooks={
+            "playbooks": [
+                {
+                    "id": "restricted-service-down",
+                    "match": {
+                        "services": ["known-service"],
+                        "alert_keywords": ["service down", "unreachable"],
+                    },
+                    "steps": [],
+                }
+            ]
+        },
+    )
+
+    assert playbook["id"] == "generic-triage-playbook"
+
+
+def test_reusable_playbook_auto_onboards_only_policy_allowed_operations(monkeypatch) -> None:
+    import common.orchestration.execution_plan as execution_plan_module
+
+    catalogs = execution_plan_module._execution_catalogs()
+    execution_plan_module._execution_catalogs.cache_clear()
+    connectors, actions, playbooks, connectivity, connection_config = catalogs
+    monkeypatch.setattr(
+        execution_plan_module,
+        "_execution_catalogs",
+        lambda: (connectors, actions, playbooks, connectivity, connection_config),
+    )
+    plan = _resolve(
+        Alert(
+            source="prometheus",
+            name="ServiceDown",
+            service="new-runtime-service",
+            severity=AlertSeverity.CRITICAL,
+            description="endpoint is unreachable",
+        )
+    )
+
+    connector = plan["connection"]["connector"]
+    assert connector["connector_id"] == "auto-new-runtime-service"
+    assert connector["onboarding"]["mode"] == "automatic"
+    assert connector["onboarding"]["playbook_id"] == "kaiops-service-down-playbook"
+    assert set(connector["allowed_operations"]) == {
+        "read_status",
+        "read_metrics",
+        "script_execution",
+        "restart_service",
+        "verify_slo",
+    }
+    assert plan["execution_ready"] is True
+
+
+def test_policy_engine_alert_uses_reviewed_target_connector_not_detector_connector(monkeypatch) -> None:
+    import common.orchestration.execution_plan as execution_plan_module
+
+    catalogs = execution_plan_module._execution_catalogs()
+    execution_plan_module._execution_catalogs.cache_clear()
+    connectors, actions, playbooks, connectivity, connection_config = catalogs
+    monkeypatch.setattr(
+        execution_plan_module,
+        "_execution_catalogs",
+        lambda: (connectors, actions, playbooks, connectivity, connection_config),
+    )
+
+    plan = _resolve(
+        Alert(
+            source="prometheus",
+            name="PolicyEngineUnavailable",
+            service="orchestrator",
+            environment="prod",
+            severity=AlertSeverity.CRITICAL,
+            description="No orchestrator event-processing metric is present.",
+        )
+    )
+
+    assert plan["playbook"]["id"] == "policy-engine-unavailable-playbook"
+    assert plan["remediation_target"] == "policy-engine"
+    assert plan["connection"]["connector"]["connector_id"] == "policy-engine-runtime"
+    assert plan["commands"] == [
+        "kubectl rollout restart deployment/policy-engine -n default"
+    ]
+    assert plan["rollback_commands"] == [
+        "kubectl rollout undo deployment/policy-engine -n default"
+    ]
+    assert plan["validation_commands"]
+    assert plan["execution_ready"] is True
+    assert plan["readiness_blocks"] == []
+
+
+def test_alternative_or_incomplete_mutations_require_operator_resolution() -> None:
+    latency = _resolve(
+        Alert(
+            source="prometheus",
+            name="KaiOpsHighLatencyP95",
+            service="api-gateway",
+            severity=AlertSeverity.CRITICAL,
+            description="p95 latency is above the SLO",
+        )
+    )
+    mysql = _resolve(
+        Alert(
+            source="prometheus",
+            name="KaiOpsMysqlAlertsTableRowsHigh",
+            service="mysql",
+            severity=AlertSeverity.WARNING,
+            description="alerts table row count is above threshold",
+        )
+    )
+
+    assert latency["execution_ready"] is False
+    assert any("operator selection" in reason for reason in latency["readiness_blocks"])
+    assert mysql["execution_ready"] is False
+    assert any("rollback is a procedure" in reason for reason in mysql["readiness_blocks"])
+
+
+def test_docker_compose_restart_without_rollback_is_not_execution_ready(monkeypatch) -> None:
+    monkeypatch.setenv("REMEDIATION_EXECUTION_PLATFORM", "docker-compose")
+    monkeypatch.setenv("REMEDIATION_COMPOSE_PROJECT", "kaiops_azure")
+
+    plan = _resolve(
+        Alert(
+            source="prometheus",
+            name="KaiOpsServiceDown",
+            service="api-gateway",
+            severity=AlertSeverity.CRITICAL,
+            description="API endpoint is unreachable",
+        )
+    )
+
+    assert plan["execution_ready"] is False
+    assert plan["remediation_target"] == "api-gateway"
+    assert plan["commands"] == []
+    assert "com.docker.compose.service%3Dapi-gateway" in plan["preflight_commands"][0]
+    assert plan["validation_commands"] == [
+        "curl --fail --silent --show-error --retry 15 --retry-all-errors --retry-connrefused "
+        "--retry-delay 2 http://api-gateway:8000/healthz"
+    ]
+    assert plan["rollback_commands"] == []
+    assert plan["rollback_mode"] == "not_applicable"
+    assert "mutating plan has no executable rollback" in plan["readiness_blocks"]
+
+
+def test_docker_compose_does_not_emit_unsupported_scale_commands(monkeypatch) -> None:
+    monkeypatch.setenv("REMEDIATION_EXECUTION_PLATFORM", "docker-compose")
+
+    plan = _resolve(
+        Alert(
+            source="prometheus",
+            name="KaiOpsHighLatencyP95",
+            service="api-gateway",
+            severity=AlertSeverity.CRITICAL,
+            description="p95 latency is above the SLO",
+        )
+    )
+
+    assert plan["execution_ready"] is False
+    assert plan["commands"] == []
+    assert any("does not implement catalog operations" in reason for reason in plan["readiness_blocks"])

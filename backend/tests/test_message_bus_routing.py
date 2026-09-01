@@ -17,6 +17,7 @@ class CapturePublisher:
 
 def make_alert(stream_count: int) -> Alert:
     return Alert(
+        tenant_id="tenant-a",
         source="prometheus",
         name="PaymentLatencyHigh",
         service="payments",
@@ -28,6 +29,7 @@ def make_alert(stream_count: int) -> Alert:
 
 def make_incident() -> Incident:
     return Incident(
+        tenant_id="tenant-a",
         service="payments",
         severity=AlertSeverity.CRITICAL,
         title="payments: latency",

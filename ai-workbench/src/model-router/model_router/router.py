@@ -10,12 +10,13 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
-from common.config import Settings, get_settings
 from ai_workbench_common.model_evaluation import VertexEvaluationClient
-from common.models import AlertSeverity
 from ai_workbench_common.prompts import SYSTEM_PROMPT_SRE, render_task_payload_prompt
+from common.config import Settings, get_settings
+from common.models import AlertSeverity
 from common.resilience import CircuitBreaker
 from common.telemetry import (
     LLM_CACHE_REQUESTS,
@@ -33,6 +34,27 @@ _SENSITIVE_KEY_PARTS = (
     "api_key", "apikey", "authorization", "credential", "password", "private_key",
     "secret", "session_cookie", "token",
 )
+
+
+def normalize_azure_openai_endpoint(value: str) -> str:
+    endpoint = str(value or "").strip()
+    if not endpoint:
+        return ""
+    parsed = urlsplit(endpoint)
+    hostname = str(parsed.hostname or "").lower()
+    if parsed.scheme != "https" or not hostname.endswith((".openai.azure.com", ".openai.azure.us", ".openai.azure.cn")):
+        raise ValueError("AZURE_OPENAI_ENDPOINT must be an HTTPS Azure OpenAI resource root")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError("AZURE_OPENAI_ENDPOINT must not contain credentials, query parameters, or fragments")
+    if parsed.path not in {"", "/"}:
+        raise ValueError("AZURE_OPENAI_ENDPOINT must not contain deployment or chat-completion paths")
+    return urlunsplit(("https", parsed.netloc.lower(), "", "", ""))
+
+
+def is_azure_openai_endpoint(value: str) -> bool:
+    parsed = urlsplit(str(value or "").strip())
+    hostname = str(parsed.hostname or "").lower()
+    return hostname.endswith((".openai.azure.com", ".openai.azure.us", ".openai.azure.cn"))
 
 
 def _sanitize_model_payload(value: Any) -> Any:
@@ -897,11 +919,37 @@ class ModelRouter:
 
 
 def build_default_providers(settings: Settings) -> dict[str, ModelProvider]:
+    # Some existing installations stored an Azure OpenAI endpoint/key in the
+    # legacy OPENAI_* variables. Detect the endpoint rather than sending an
+    # Azure key to api.openai.com with Bearer authentication. This keeps the
+    # migration backward compatible and selects the adapter with the correct
+    # deployment URL and api-key header.
+    legacy_openai_is_azure = is_azure_openai_endpoint(settings.openai_base_url)
+    configured_azure_endpoint = settings.azure_openai_endpoint or (
+        settings.openai_base_url if legacy_openai_is_azure else ""
+    )
+    azure_endpoint = normalize_azure_openai_endpoint(configured_azure_endpoint)
+    azure_api_key = settings.azure_openai_api_key or (
+        settings.openai_api_key if legacy_openai_is_azure else None
+    )
+    azure_deployment = settings.azure_openai_chat_deployment or settings.openai_gpt4o_model
+    azure_selected = bool(azure_endpoint) or (
+        settings.model_router_reasoning_backend.strip().lower() == "azure-openai"
+        or settings.model_router_default_provider.strip().lower() == "azure-openai"
+    )
+    standard_azure_deployment = (
+        settings.azure_openai_reasoning_standard_deployment or azure_deployment
+    )
+    critical_azure_deployment = (
+        settings.azure_openai_reasoning_critical_deployment or azure_deployment
+    )
+
     local_llama_provider: ModelProvider
     if settings.local_llm_enabled:
         local_llama_provider = OllamaModelProvider(
             name="local-llama",
             endpoint=settings.local_llm_endpoint,
+            model=settings.local_llm_model,
             timeout_seconds=settings.llm_request_timeout_seconds,
         )
     else:
@@ -910,15 +958,15 @@ def build_default_providers(settings: Settings) -> dict[str, ModelProvider]:
             reason="set LOCAL_LLM_ENABLED=true and LOCAL_LLM_ENDPOINT to use Ollama",
         )
 
-    if settings.model_router_reasoning_backend.strip().lower() == "azure-openai":
+    if azure_selected:
         standard_reasoning: ModelProvider = AzureOpenAIModelProvider(
-            name="reasoning-standard", model=settings.reasoning_standard_model,
-            api_key=settings.azure_openai_api_key, base_url=settings.azure_openai_endpoint,
+            name="reasoning-standard", model=standard_azure_deployment,
+            api_key=azure_api_key, base_url=azure_endpoint,
             api_version=settings.azure_openai_api_version, timeout_seconds=settings.llm_request_timeout_seconds,
         )
         critical_reasoning: ModelProvider = AzureOpenAIModelProvider(
-            name="reasoning-critical", model=settings.reasoning_critical_model,
-            api_key=settings.azure_openai_api_key, base_url=settings.azure_openai_endpoint,
+            name="reasoning-critical", model=critical_azure_deployment,
+            api_key=azure_api_key, base_url=azure_endpoint,
             api_version=settings.azure_openai_api_version, timeout_seconds=settings.llm_request_timeout_seconds,
         )
     else:
@@ -942,29 +990,33 @@ def build_default_providers(settings: Settings) -> dict[str, ModelProvider]:
         "reasoning-critical": critical_reasoning,
         "azure-openai": AzureOpenAIModelProvider(
             name="azure-openai",
-            model=settings.azure_openai_chat_deployment,
-            api_key=settings.azure_openai_api_key,
-            base_url=settings.azure_openai_endpoint,
+            model=azure_deployment,
+            api_key=azure_api_key,
+            base_url=azure_endpoint,
             api_version=settings.azure_openai_api_version,
             timeout_seconds=settings.llm_request_timeout_seconds,
         ),
-        "gpt-5": OpenAIModelProvider(
+        "gpt-5": (AzureOpenAIModelProvider if azure_selected else OpenAIModelProvider)(
             name="gpt-5",
-            model=settings.openai_gpt5_model,
-            api_key=settings.openai_api_key,
-            base_url=settings.openai_base_url,
+            model=azure_deployment if azure_selected else settings.openai_gpt5_model,
+            api_key=azure_api_key if azure_selected else settings.openai_api_key,
+            base_url=azure_endpoint if azure_selected else settings.openai_base_url,
+            **({"api_version": settings.azure_openai_api_version} if azure_selected else {
+                "input_cost_per_million": settings.openai_gpt5_input_cost_per_million,
+                "output_cost_per_million": settings.openai_gpt5_output_cost_per_million,
+            }),
             timeout_seconds=settings.llm_request_timeout_seconds,
-            input_cost_per_million=settings.openai_gpt5_input_cost_per_million,
-            output_cost_per_million=settings.openai_gpt5_output_cost_per_million,
         ),
-        "gpt-4o": OpenAIModelProvider(
+        "gpt-4o": (AzureOpenAIModelProvider if azure_selected else OpenAIModelProvider)(
             name="gpt-4o",
-            model=settings.openai_gpt4o_model,
-            api_key=settings.openai_api_key,
-            base_url=settings.openai_base_url,
+            model=azure_deployment if azure_selected else settings.openai_gpt4o_model,
+            api_key=azure_api_key if azure_selected else settings.openai_api_key,
+            base_url=azure_endpoint if azure_selected else settings.openai_base_url,
+            **({"api_version": settings.azure_openai_api_version} if azure_selected else {
+                "input_cost_per_million": settings.openai_gpt4o_input_cost_per_million,
+                "output_cost_per_million": settings.openai_gpt4o_output_cost_per_million,
+            }),
             timeout_seconds=settings.llm_request_timeout_seconds,
-            input_cost_per_million=settings.openai_gpt4o_input_cost_per_million,
-            output_cost_per_million=settings.openai_gpt4o_output_cost_per_million,
         ),
         "claude": AnthropicModelProvider(
             name="claude",

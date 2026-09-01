@@ -450,8 +450,8 @@ context-agent -> context-events
     "agent": "context-agent",
     "topic": "context-events",
     "trace_id": "setup-trace-003",
-    "confidence": 0.8,
-    "citations": ["rag://mysql", "cmdb://dependencies"],
+    "confidence": 0.84,
+    "citations": ["alert://79ac836d-2d50-49eb-b8da-74b938a0c476"],
     "evidence_ids": ["alert:79ac836d-2d50-49eb-b8da-74b938a0c476", "incident:f1b3df97-2604-4df2-9a31-d3f866bb4871"]
   }
 }

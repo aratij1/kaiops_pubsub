@@ -4,6 +4,7 @@ import { createBrowserRouter, Navigate } from "react-router-dom";
 import { LegacyApplicationShell } from "./LegacyApplicationShell";
 import { LEGACY_REDIRECTS, NAVIGATION_ITEMS, type NavigationId } from "./navigation";
 import { resilientLazy } from "./resilientLazy";
+import { RouteErrorBoundary } from "./RouteErrorBoundary";
 
 const DashboardRoute = resilientLazy(() => import("../routes/dashboard/DashboardRoute"));
 const AlertsRoute = resilientLazy(() => import("../routes/alerts/AlertsRoute"));
@@ -19,6 +20,11 @@ const ExecutiveRoute = resilientLazy(() => import("../routes/executive/Executive
 const AdminRoute = resilientLazy(() => import("../routes/admin/AdminRoute"));
 const AuditRoute = resilientLazy(() => import("../routes/audit/AuditRoute"));
 const ApplicationsRoute = resilientLazy(() => import("../routes/applications/ApplicationsRoute"));
+const OperationsCockpitRoute = resilientLazy(() => import("../routes/cloud-ops/OperationsCockpitRoute"));
+const CloudConnectionsRoute = resilientLazy(() => import("../routes/cloud-ops/CloudConnectionsRoute"));
+const CloudResourcesRoute = resilientLazy(() => import("../routes/cloud-ops/CloudResourcesRoute"));
+const ServiceOnboardingRoute = resilientLazy(() => import("../routes/cloud-ops/ServiceOnboardingRoute"));
+const Service360Route = resilientLazy(() => import("../routes/cloud-ops/Service360Route"));
 const IntegrationsRoute = resilientLazy(() => import("../routes/integrations/IntegrationsRoute"));
 const PlatformSettingsRoute = resilientLazy(() => import("../features/administration/PlatformSettings"));
 
@@ -42,7 +48,13 @@ const ROUTE_COMPONENTS: Readonly<Record<NavigationId, ComponentType>> = {
   audit: AuditRoute,
   closed: ClosedIncidentsRoute,
   applications: ApplicationsRoute,
+  operationsCockpit: OperationsCockpitRoute,
+  cloudConnections: CloudConnectionsRoute,
+  cloudResources: CloudResourcesRoute,
+  serviceOnboarding: ServiceOnboardingRoute,
+  services: Service360Route,
   integrations: IntegrationsRoute,
+  platformOverview: PlatformSettingsRoute,
   admin: AdminRoute,
   settings: PlatformSettingsRoute,
   executive: ExecutiveRoute,
@@ -51,8 +63,10 @@ const ROUTE_COMPONENTS: Readonly<Record<NavigationId, ComponentType>> = {
 export const router = createBrowserRouter([
   {
     element: <LegacyApplicationShell />,
+    errorElement: <RouteErrorBoundary />,
     children: [
       { path: "/incidents/:incidentId", element: routeElement(IncidentCommandRoute) },
+      { path: "/incidents/*", element: routeElement(IncidentCommandRoute) },
       { path: "/applications/:applicationId", element: routeElement(ApplicationsRoute) },
       ...NAVIGATION_ITEMS.map((item) => ({ path: item.path, element: routeElement(ROUTE_COMPONENTS[item.id]) })),
       ...LEGACY_REDIRECTS.map((redirect) => ({ path: redirect.from, element: <Navigate to={redirect.to} replace /> })),

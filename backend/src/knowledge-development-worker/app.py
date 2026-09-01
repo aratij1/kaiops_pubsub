@@ -10,7 +10,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 from common.config import get_settings
 from common.continuous_learning import FailurePattern, FailurePatternAnalyzer, IncidentEvidence, issue_signature
-from common.database import ActionRecord, FailurePatternRecord, IncidentEvidenceRecord, IncidentRecord, KnowledgeBaseRecord, LearningAuditRecord, RcaReportRecord, RunbookVersionRecord
+from common.database import ActionRecord, FailurePatternRecord, IncidentEvidenceRecord, IncidentRecord, KnowledgeBaseRecord, LearningAuditRecord, RcaReportRecord, RunbookOutcomeRecord, RunbookVersionRecord
 from common.learning_workflows import Mode02Worker
 from common.models import EvidenceReference
 from common.service import create_app
@@ -349,11 +349,20 @@ async def update_configuration(configuration: ScheduleConfig) -> dict[str, Any]:
 
 
 @app.get("/report")
-async def report() -> dict[str, Any]:
+async def report(tenant_id: str = "default") -> dict[str, Any]:
     if not settings.database_enabled:
         return {"status": "disabled", "summary": last_result, "patterns": [], "drafts": []}
     async with app.state.session_factory() as session:
-        patterns = (await session.execute(select(FailurePatternRecord).order_by(FailurePatternRecord.analyzed_at.desc()).limit(50))).scalars().all()
-        drafts = (await session.execute(select(RunbookVersionRecord).order_by(RunbookVersionRecord.created_at.desc()).limit(50))).scalars().all()
-        evidence = (await session.execute(select(IncidentEvidenceRecord).order_by(IncidentEvidenceRecord.collected_at.desc()).limit(100))).scalars().all()
-    return {"status": "ok", "summary": (await _load_state(app)) or last_result, "evidence_count": len(evidence), "patterns": [{"id": str(row.pattern_id), "service": row.service, "environment": row.environment, "issue_signature": row.issue_signature, "confidence": float(row.confidence), "analyzed_at": _iso(row.analyzed_at), "quality_gate": (row.analysis or {}).get("quality_gate", {})} for row in patterns], "drafts": [{"runbook_id": str(row.runbook_id), "version": row.version, "status": row.approval_status, "owner": row.owner, "risk_level": row.risk_level, "created_at": _iso(row.created_at), "quality_gate": (row.content or {}).get("knowledge_quality", {})} for row in drafts], "recent_evidence": [{"incident_id": row.incident_id, "service": row.service, "environment": row.environment, "alert_type": row.alert_type, "reviewed": row.reviewed, "collected_at": _iso(row.collected_at)} for row in evidence[:20]]}
+        tenant = str(tenant_id or "default").strip() or "default"
+        patterns = (await session.execute(select(FailurePatternRecord).where(FailurePatternRecord.tenant_id == tenant).order_by(FailurePatternRecord.analyzed_at.desc()).limit(50))).scalars().all()
+        drafts = (await session.execute(select(RunbookVersionRecord).where(RunbookVersionRecord.tenant_id == tenant).order_by(RunbookVersionRecord.created_at.desc()).limit(50))).scalars().all()
+        evidence = (await session.execute(select(IncidentEvidenceRecord).where(IncidentEvidenceRecord.tenant_id == tenant).order_by(IncidentEvidenceRecord.collected_at.desc()).limit(100))).scalars().all()
+        outcomes = (await session.execute(select(RunbookOutcomeRecord).where(RunbookOutcomeRecord.tenant_id == tenant).order_by(RunbookOutcomeRecord.created_at.desc()).limit(100))).scalars().all()
+        audit_rows = (await session.execute(select(LearningAuditRecord).where(LearningAuditRecord.tenant_id == tenant).order_by(LearningAuditRecord.occurred_at.desc()).limit(100))).scalars().all()
+    audits = []
+    for row in audit_rows:
+        canonical = json.dumps(row.payload or {}, sort_keys=True, separators=(",", ":"), default=str)
+        audits.append({"event_id": str(row.event_id), "action": row.action, "actor": row.actor, "resource_type": row.resource_type, "resource_id": row.resource_id, "occurred_at": _iso(row.occurred_at), "payload_sha256": row.payload_sha256, "hash_verified": hashlib.sha256(canonical.encode()).hexdigest() == row.payload_sha256})
+    reviewed = sum(bool(row.reviewed) for row in outcomes)
+    successful = sum(bool(row.successful) for row in outcomes)
+    return {"status": "ok", "summary": (await _load_state(app)) or last_result, "evidence_count": len(evidence), "outcome_summary": {"total": len(outcomes), "reviewed": reviewed, "successful": successful, "failed": len(outcomes) - successful, "success_rate": round(successful / len(outcomes), 4) if outcomes else None}, "patterns": [{"id": str(row.pattern_id), "service": row.service, "environment": row.environment, "issue_signature": row.issue_signature, "confidence": float(row.confidence), "analyzed_at": _iso(row.analyzed_at), "quality_gate": (row.analysis or {}).get("quality_gate", {})} for row in patterns], "drafts": [{"runbook_id": str(row.runbook_id), "version": row.version, "status": row.approval_status, "owner": row.owner, "risk_level": row.risk_level, "created_at": _iso(row.created_at), "content": row.content or {}, "quality_gate": (row.content or {}).get("knowledge_quality", {})} for row in drafts], "outcomes": [{"outcome_id": str(row.outcome_id), "incident_id": row.incident_id, "runbook_id": str(row.runbook_id), "runbook_version": row.runbook_version, "reviewed": row.reviewed, "successful": row.successful, "created_at": _iso(row.created_at)} for row in outcomes[:50]], "learning_audit": audits[:50], "recent_evidence": [{"incident_id": row.incident_id, "service": row.service, "environment": row.environment, "alert_type": row.alert_type, "reviewed": row.reviewed, "collected_at": _iso(row.collected_at)} for row in evidence[:20]]}

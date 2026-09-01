@@ -15,8 +15,10 @@ const rows = Array.from({ length: 12 }, (_, index) => ({
 
 test("all alert views render, switch, and reflow without page overflow", async ({ page }) => {
   test.setTimeout(90_000);
+  const processedResultRequests = [];
   await page.route("**/api-gateway/**", async (route) => {
     const path = new URL(route.request().url()).pathname.replace(/^\/api-gateway/, "");
+    if (path.endsWith("/processed-result")) processedResultRequests.push(path);
     const body = path === "/auth/login"
       ? { access_token: "alerts-token", refresh_token: "refresh", user: { id: 1, username: "admin", role_name: "Administrator" } }
       : path === "/healthz" ? { status: "ok" }
@@ -31,12 +33,24 @@ test("all alert views render, switch, and reflow without page overflow", async (
   await page.getByLabel("Password").fill("Admin@123456");
   await page.getByRole("button", { name: "Sign In" }).click();
   await expect(page.getByRole("heading", { name: "Operations Feed" })).toBeVisible();
+  await expect.poll(() => processedResultRequests.length).toBeGreaterThan(0);
+  expect(new Set(processedResultRequests).size).toBe(1);
   const heroStyle = await page.locator(".operations-feed-hero").evaluate((element) => {
     const style = getComputedStyle(element);
     return { color: style.color, backgroundImage: style.backgroundImage };
   });
   expect(heroStyle.color).toBe("rgb(23, 32, 51)");
   expect(heroStyle.backgroundImage).toContain("rgb(255, 255, 255)");
+  const lightShell = await page.evaluate(() => ({
+    sidebar: getComputedStyle(document.querySelector(".kai-navigation")).backgroundColor,
+    operationsBar: getComputedStyle(document.querySelector(".kai-operations-bar")).backgroundColor,
+    activeNavigation: getComputedStyle(document.querySelector(".kai-navigation-groups button")).color,
+    title: getComputedStyle(document.querySelector(".kai-route-context h1")).color,
+  }));
+  expect(lightShell.sidebar).toBe("rgb(11, 31, 52)");
+  expect(lightShell.operationsBar).not.toBe("rgba(0, 0, 0, 0)");
+  expect(lightShell.activeNavigation).not.toBe("rgba(0, 0, 0, 0)");
+  expect(lightShell.title).not.toBe("rgba(0, 0, 0, 0)");
 
   await page.evaluate(() => document.documentElement.setAttribute("data-ui-theme", "dark"));
   const darkStyle = await page.locator(".operations-feed-hero").evaluate((element) => {
@@ -51,6 +65,14 @@ test("all alert views render, switch, and reflow without page overflow", async (
   expect(darkStyle.color).toBe("rgb(231, 237, 247)");
   expect(darkStyle.backgroundImage).toContain("rgb(17, 30, 50)");
   expect(darkStyle.bodyBackground).toContain("rgb(8, 15, 27)");
+  const darkShell = await page.evaluate(() => ({
+    sidebar: getComputedStyle(document.querySelector(".kai-navigation")).backgroundColor,
+    activeNavigation: getComputedStyle(document.querySelector(".kai-navigation-groups button")).color,
+    title: getComputedStyle(document.querySelector(".kai-route-context h1")).color,
+  }));
+  expect(darkShell.sidebar).toBe("rgb(11, 31, 52)");
+  expect(darkShell.activeNavigation).not.toBe("rgba(0, 0, 0, 0)");
+  expect(darkShell.title).not.toBe("rgba(0, 0, 0, 0)");
 
   for (const name of [/Unified Signal Inbox/, /Alert \+ Stream/, /Correlation Timeline/]) {
     const radio = page.getByRole("radio", { name });

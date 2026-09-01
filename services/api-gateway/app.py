@@ -17,7 +17,7 @@ import aio_pika
 import pymysql
 from redis.asyncio import Redis
 from api_gateway import SafetyAnalyzer
-from api_gateway.auth_policy import route_auth_rule
+from api_gateway.auth_policy import DOCUMENT_PROVIDER_ROLES, route_auth_rule
 from api_gateway.control_routes import build_control_router
 from api_gateway.modules.users.models import SystemRole
 from api_gateway.modules.users.permissions import AuthContext, current_auth_context, current_tenant_id, require_roles
@@ -354,6 +354,11 @@ ALERTS_TABLE_ROWS = _get_or_create_gauge(
     "kaiops_mysql_alerts_table_rows",
     "Current number of records in MySQL alerts table",
     ["database", "table"],
+)
+SSE_CONNECTIONS = _get_or_create_gauge(
+    "kaiops_gateway_sse_connections",
+    "Current active Server-Sent Event connections by role",
+    ["role"],
 )
 
 
@@ -2038,32 +2043,32 @@ async def delete_observed_alert_application(
 
 
 @app.get("/knowledge-development/status")
-async def knowledge_development_status(request: Request, x_trace_id: str | None = Header(default=None)) -> dict[str, Any]:
+async def knowledge_development_status(request: Request, x_trace_id: str | None = Header(default=None), _: AuthContext = Depends(require_roles(*DOCUMENT_PROVIDER_ROLES))) -> dict[str, Any]:
     return await guarded_proxy(request=request, method="GET", path="/status", target_base=settings.knowledge_development_url, payload={}, trace_id=trace_id_from_header(x_trace_id))
 
 
 @app.get("/knowledge-development/configuration")
-async def knowledge_development_configuration(request: Request, x_trace_id: str | None = Header(default=None)) -> dict[str, Any]:
+async def knowledge_development_configuration(request: Request, x_trace_id: str | None = Header(default=None), _: AuthContext = Depends(require_roles(*DOCUMENT_PROVIDER_ROLES))) -> dict[str, Any]:
     return await guarded_proxy(request=request, method="GET", path="/configuration", target_base=settings.knowledge_development_url, payload={}, trace_id=trace_id_from_header(x_trace_id))
 
 
 @app.put("/knowledge-development/configuration")
-async def update_knowledge_development_configuration(request: Request, payload: dict[str, Any] = REQUEST_BODY, x_trace_id: str | None = Header(default=None)) -> dict[str, Any]:
+async def update_knowledge_development_configuration(request: Request, payload: dict[str, Any] = REQUEST_BODY, x_trace_id: str | None = Header(default=None), _: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value))) -> dict[str, Any]:
     return await guarded_proxy(request=request, method="PUT", path="/configuration", target_base=settings.knowledge_development_url, payload=payload, trace_id=trace_id_from_header(x_trace_id))
 
 
 @app.post("/knowledge-development/run")
-async def run_knowledge_development(request: Request, x_trace_id: str | None = Header(default=None)) -> dict[str, Any]:
+async def run_knowledge_development(request: Request, x_trace_id: str | None = Header(default=None), _: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value, SystemRole.L3_ENGINEER.value))) -> dict[str, Any]:
     return await guarded_proxy(request=request, method="POST", path="/run", target_base=settings.knowledge_development_url, payload={}, trace_id=trace_id_from_header(x_trace_id), timeout_seconds=180)
 
 
 @app.get("/knowledge-development/report")
-async def knowledge_development_report(request: Request, x_trace_id: str | None = Header(default=None)) -> dict[str, Any]:
-    return await guarded_proxy(request=request, method="GET", path="/report", target_base=settings.knowledge_development_url, payload={}, trace_id=trace_id_from_header(x_trace_id), timeout_seconds=30)
+async def knowledge_development_report(request: Request, x_trace_id: str | None = Header(default=None), auth: AuthContext = Depends(require_roles(*DOCUMENT_PROVIDER_ROLES))) -> dict[str, Any]:
+    return await guarded_proxy(request=request, method="GET", path=f"/report?{urlencode({'tenant_id': auth.tenant_id})}", target_base=settings.knowledge_development_url, payload={}, trace_id=trace_id_from_header(x_trace_id), timeout_seconds=30)
 
 
 @app.get("/operations/queue-health")
-async def get_queue_health() -> dict[str, Any]:
+async def get_queue_health(auth: AuthContext = Depends(require_roles(*DOCUMENT_PROVIDER_ROLES))) -> dict[str, Any]:
     """Return live RabbitMQ readiness and backlog data for the command center.
 
     Broker telemetry is intentionally bounded and read-only. A failed management

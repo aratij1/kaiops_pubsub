@@ -3,7 +3,6 @@
 .pytest_cache
 .ruff_cache
 .venv
-.tmp
 **/node_modules
 **/dist
 **/storybook-static
@@ -21,3 +20,4 @@ frontend/react/test-results
 frontend/react/playwright-report
 backend/ingested_alerts
 backend/rag/changes
+backend/rag/_review

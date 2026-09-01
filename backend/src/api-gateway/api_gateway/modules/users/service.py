@@ -9,6 +9,7 @@ import jwt
 from fastapi import HTTPException
 
 from api_gateway.modules.users.models import SystemRole
+from common.authorization import OperationalRole
 from api_gateway.oidc import OidcTokenValidator
 from api_gateway.modules.users.repository import UserRepository, run_in_session
 from api_gateway.modules.users.schemas import UserCreate, UserUpdate
@@ -156,6 +157,8 @@ class UserService:
     async def bootstrap_defaults(self) -> None:
         is_local_demo = self.settings.environment.strip().lower() in {"local", "demo", "test"}
         role_descriptions = {
+            OperationalRole.ADMIN.value: "Platform administration and governance",
+            OperationalRole.HITL_APPROVER.value: "Human review, approval, modification, and escalation",
             SystemRole.ADMINISTRATOR.value: "Full platform administration",
             SystemRole.EXECUTIVE.value: "Read-only executive analytics",
             SystemRole.L3_ENGINEER.value: "Advanced investigation and approvals",

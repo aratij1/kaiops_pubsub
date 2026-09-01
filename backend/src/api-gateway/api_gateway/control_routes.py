@@ -20,6 +20,7 @@ from api_gateway.copilot import (
     extract_incident_id,
 )
 from api_gateway.modules.users.models import SystemRole
+from common.authorization import OperationalRole, role_is_allowed
 
 GuardedProxy = Callable[..., Awaitable[dict[str, Any]]]
 RawProxy = Callable[..., Awaitable[tuple[int, dict[str, Any]]]]
@@ -36,6 +37,7 @@ def build_control_router(
     load_recent_events: Callable[[int], Awaitable[list[Any]]],
     build_audit_contract: Callable[[Any], dict[str, Any]],
     load_audit_summary: Callable[[], Awaitable[dict[str, Any]]],
+    auth_context_from_request: Callable[[Request], Awaitable[Any]] | None = None,
 ) -> APIRouter:
     """Gateway control routes with dependencies injected by the composition root."""
     router = APIRouter()
@@ -99,13 +101,29 @@ def build_control_router(
 
     @router.get("/model/providers/status")
     async def model_providers_status(request: Request, x_trace_id: str | None = Header(default=None)) -> dict[str, Any]:
+        auth = getattr(request.state, "auth", None)
+        if auth is None:
+            if auth_context_from_request is None:
+                raise HTTPException(status_code=500, detail="Gateway authentication resolver is not configured")
+            auth = await auth_context_from_request(request)
+        allowed_roles = {OperationalRole.ADMIN.value, OperationalRole.HITL_APPROVER.value}
+        if not role_is_allowed(auth.role, allowed_roles):
+            raise HTTPException(status_code=403, detail="Forbidden: engineering role required")
         return await forward(request, "GET", "/providers/status", settings.model_router_url, {}, x_trace_id)
 
     @router.get("/approval/incident/{incident_id}")
     async def get_incident(
         incident_id: str, request: Request, x_trace_id: str | None = Header(default=None)
     ) -> dict[str, Any]:
-        return await forward(request, "GET", f"/incident/{incident_id}", settings.approval_service_url, {}, x_trace_id)
+        auth = getattr(request.state, "auth", None)
+        if auth is None:
+            if auth_context_from_request is None:
+                raise HTTPException(status_code=500, detail="Gateway authentication resolver is not configured")
+            auth = await auth_context_from_request(request)
+        return await forward(
+            request, "GET", f"/incident/{quote(incident_id, safe='')}", settings.approval_service_url,
+            {}, x_trace_id, params={"tenant_id": auth.tenant_id},
+        )
 
     @router.get("/knowledge-graph")
     async def get_knowledge_graph(request: Request, x_trace_id: str | None = Header(default=None)) -> dict[str, Any]:
@@ -155,8 +173,16 @@ def build_control_router(
 
     @router.get("/approval/capacity")
     async def get_approval_capacity(request: Request, x_trace_id: str | None = Header(default=None)) -> dict[str, Any]:
+        auth = getattr(request.state, "auth", None)
+        if auth is None:
+            # Local/demo middleware intentionally skips global auth state, but
+            # tenant-scoped reads still require and can validate the bearer
+            # token here just like approval incident reads and mutations do.
+            if auth_context_from_request is None:
+                raise HTTPException(status_code=500, detail="Gateway authentication resolver is not configured")
+            auth = await auth_context_from_request(request)
         return await forward(
-            request, "GET", "/capacity", settings.approval_service_url, {}, x_trace_id, timeout_seconds=8.0
+            request, "GET", f"/capacity?{urlencode({'tenant_id': auth.tenant_id})}", settings.approval_service_url, {}, x_trace_id, timeout_seconds=8.0
         )
 
     @router.post("/incidents/{incident_id}/manual-close")
@@ -166,9 +192,34 @@ def build_control_router(
         payload: dict[str, Any] = REQUEST_BODY,
         x_trace_id: str | None = Header(default=None),
     ) -> dict[str, Any]:
+        auth = getattr(request.state, "auth", None)
+        if auth is None:
+            if auth_context_from_request is None:
+                raise HTTPException(status_code=500, detail="Gateway authentication resolver is not configured")
+            auth = await auth_context_from_request(request)
+        allowed_roles = {OperationalRole.ADMIN.value, OperationalRole.HITL_APPROVER.value}
+        if not role_is_allowed(auth.role, allowed_roles):
+            raise HTTPException(status_code=403, detail="Manual closure requires ADMIN or HITL_APPROVER")
+        forbidden_identity_fields = {"closed_by", "actor_id", "actor_role", "tenant_id"}.intersection(payload)
+        if forbidden_identity_fields:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Operator identity fields are server-derived: {', '.join(sorted(forbidden_identity_fields))}",
+            )
+        comment = str(payload.get("comment") or "").strip()
+        if len(comment) < 10 or len(comment) > 4000:
+            raise HTTPException(status_code=422, detail="Manual closure comment must contain 10 to 4000 characters")
+        actor_id = str(auth.email or auth.username or auth.user_id).strip()
         return await forward(
-            request, "POST", f"/incidents/{incident_id}/manual-close", settings.closure_service_url,
-            payload, x_trace_id, timeout_seconds=25.0,
+            request, "POST", f"/incidents/{quote(incident_id, safe='')}/manual-close", settings.closure_service_url,
+            {
+                "comment": comment,
+                "actor_id": actor_id,
+                "actor_role": auth.role,
+                "tenant_id": auth.tenant_id,
+                "auth_jti": auth.jwt_id,
+            },
+            x_trace_id, timeout_seconds=25.0,
         )
 
     @router.post("/remediation/execute")
@@ -212,6 +263,26 @@ def build_control_router(
             settings.remediation_engine_url, {}, x_trace_id, timeout_seconds=30.0,
         )
 
+    @router.post("/remediation/actions/{action_id}/emergency-stop")
+    async def remediation_emergency_stop(
+        action_id: str,
+        request: Request,
+        payload: dict[str, Any] = REQUEST_BODY,
+        x_trace_id: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        auth = getattr(request.state, "auth", None)
+        if auth is None:
+            raise HTTPException(status_code=401, detail="Authenticated operator identity is required")
+        stop_payload = {
+            "tenant_id": auth.tenant_id,
+            "actor": auth.username or auth.email,
+            "reason": str(payload.get("reason") or "").strip(),
+        }
+        return await forward(
+            request, "POST", f"/actions/{quote(action_id, safe='')}/emergency-stop",
+            settings.remediation_engine_url, stop_payload, x_trace_id, timeout_seconds=30.0,
+        )
+
     @router.get("/remediation/reconciliation/terminal-actions")
     async def remediation_reconciliation_preview(
         request: Request,
@@ -235,12 +306,17 @@ def build_control_router(
         payload: dict[str, Any] = REQUEST_BODY,
         x_trace_id: str | None = Header(default=None),
     ) -> dict[str, Any]:
+        auth = getattr(request.state, "auth", None)
+        if auth is None:
+            if auth_context_from_request is None:
+                raise HTTPException(status_code=500, detail="Gateway authentication resolver is not configured")
+            auth = await auth_context_from_request(request)
         return await forward(
             request,
             "PUT",
             f"/capacity/{username}",
             settings.approval_service_url,
-            payload,
+            {**payload, "tenant_id": auth.tenant_id},
             x_trace_id,
             timeout_seconds=8.0,
         )
@@ -249,16 +325,22 @@ def build_control_router(
     async def get_approval_assignments(
         request: Request, x_trace_id: str | None = Header(default=None)
     ) -> dict[str, Any]:
+        auth = getattr(request.state, "auth", None)
+        if auth is None:
+            raise HTTPException(status_code=401, detail="Authenticated tenant identity is required")
         return await forward(
-            request, "GET", "/assignments", settings.approval_service_url, {}, x_trace_id, timeout_seconds=8.0
+            request, "GET", f"/assignments?{urlencode({'tenant_id': auth.tenant_id})}", settings.approval_service_url, {}, x_trace_id, timeout_seconds=8.0
         )
 
     @router.post("/approval/auto-assign")
     async def post_approval_auto_assign(
         request: Request, payload: dict[str, Any] = REQUEST_BODY, x_trace_id: str | None = Header(default=None)
     ) -> dict[str, Any]:
+        auth = getattr(request.state, "auth", None)
+        if auth is None:
+            raise HTTPException(status_code=401, detail="Authenticated tenant identity is required")
         return await forward(
-            request, "POST", "/auto-assign", settings.approval_service_url, payload, x_trace_id, timeout_seconds=12.0
+            request, "POST", "/auto-assign", settings.approval_service_url, {**payload, "tenant_id": auth.tenant_id}, x_trace_id, timeout_seconds=12.0
         )
 
     @router.post("/copilot/query")

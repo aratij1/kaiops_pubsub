@@ -1,0 +1,22 @@
+kind: runbook
+title: stress-onboard-20260720053305 Alert Knowledge Onboarding
+alert_type: availability
+severity: high
+services: stress-onboard-20260720053305
+recommended_action: Review generated draft and finalize onboarding knowledge.
+
+# stress-onboard-20260720053305 Alert Knowledge Onboarding
+
+## Summary
+Auto-generated from 1 uploaded source document(s).
+
+## Description
+Auto-generated alert onboarding for stress-onboard-20260720053305.
+
+Source evidence:
+- [Service Knowledge] MySQL-Exporter-Availability-Baseline (2).md: # MySQL Exporter Availability Baseline Kind: incident # MySQL Exporter Availability Baseline ## Summary Real Prometheus-based MySQL exporter and DB signal monitoring ## Description If mysql-exporter is down or MySQL conn
+
+Derived requirements:
+- MySQL-Exporter-Availability-Baseline (2).md: MySQL Exporter Availability Baseline
+
+Use this draft to refine final triage and remediation guidance.

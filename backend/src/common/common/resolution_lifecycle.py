@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-import hashlib
-import json
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
+
+from common.orchestration.execution_plan_contract import canonical_plan_fingerprint
+from common.tenant_identity import require_tenant_id
 
 SCHEMA_VERSION = "kaims.resolution-lifecycle.v4"
 
@@ -17,6 +18,7 @@ class ResolutionState(StrEnum):
     EXECUTING = "executing"
     BLOCKED_RETRYABLE = "blocked_retryable"
     VALIDATING = "validating"
+    PENDING_STABILITY = "pending_stability"
     RECOVERED = "recovered"
     ROLLED_BACK = "rolled_back"
     FAILED_RETRYABLE = "failed_retryable"
@@ -52,7 +54,7 @@ class LifecycleTransitionError(ValueError):
 
 
 CONTROL_SCHEMA_VERSION = "kaims.resolution-control.v1"
-_WATCH_ONLY_TOKENS = {"watch_only", "monitor_only", "observation_only", "observe_only", "no_action"}
+_WATCH_ONLY_TOKENS = {"watch_only", "monitor_only", "observation_only", "observe_only"}
 
 
 def _explicit_watch_only(*sources: Any) -> bool:
@@ -61,7 +63,9 @@ def _explicit_watch_only(*sources: Any) -> bool:
             continue
         if source.get("watch_only") is True:
             return True
-        for key in ("disposition", "resolution_mode", "handling_mode", "action_mode", "outcome"):
+        # A generic model outcome such as "no_action" is not authorization to
+        # close. Only dedicated policy/mode fields can opt into watch-only.
+        for key in ("disposition", "resolution_mode", "handling_mode", "action_mode"):
             token = str(source.get(key) or "").strip().lower().replace("-", "_").replace(" ", "_")
             if token in _WATCH_ONLY_TOKENS:
                 return True
@@ -105,7 +109,11 @@ def decide_resolution_control(plan: dict[str, Any] | None, *, requires_approval:
         # Diagnostic completion may close the workflow without execution. The
         # closure report must still distinguish that outcome from validated
         # alert clearance and service recovery.
-        "auto_close": state == ResolutionState.DIAGNOSTIC_ONLY and not conflicts,
+        # A missing corrective capability means "investigate", not "resolved".
+        # Only an explicit watch-only policy may authorize closure without
+        # execution and recovery validation.
+        "auto_close": disposition == ResolutionDisposition.WATCH_ONLY and not conflicts,
+        "watch_only_authorized": disposition == ResolutionDisposition.WATCH_ONLY and not conflicts,
         "approval_required": disposition == ResolutionDisposition.APPROVAL_REQUIRED,
         "execution_allowed": disposition == ResolutionDisposition.EXECUTION_READY,
         "conflicts": conflicts,
@@ -113,18 +121,19 @@ def decide_resolution_control(plan: dict[str, Any] | None, *, requires_approval:
 
 
 PERMITTED_ACTIONS = {
-    ResolutionState.ANALYZING: ["generate_plan"],
-    ResolutionState.DIAGNOSTIC_ONLY: ["regenerate_plan", "escalate"],
-    ResolutionState.AWAITING_APPROVAL: ["approve", "reject", "edit_plan"],
-    ResolutionState.READY_TO_EXECUTE: ["execute", "edit_plan"],
+    ResolutionState.ANALYZING: ["generate_plan", "operator_close"],
+    ResolutionState.DIAGNOSTIC_ONLY: ["regenerate_plan", "escalate", "operator_close"],
+    ResolutionState.AWAITING_APPROVAL: ["approve", "reject", "edit_plan", "operator_close"],
+    ResolutionState.READY_TO_EXECUTE: ["execute", "edit_plan", "operator_close"],
     ResolutionState.EXECUTING: ["observe", "cancel"],
-    ResolutionState.BLOCKED_RETRYABLE: ["retry", "edit_plan", "escalate"],
+    ResolutionState.BLOCKED_RETRYABLE: ["retry", "edit_plan", "escalate", "operator_close"],
     ResolutionState.VALIDATING: ["validate", "rollback"],
-    ResolutionState.RECOVERED: ["close", "revalidate"],
-    ResolutionState.ROLLED_BACK: ["regenerate_plan", "escalate"],
-    ResolutionState.FAILED_RETRYABLE: ["retry", "regenerate_plan", "rollback", "escalate"],
-    ResolutionState.FAILED_TERMINAL: ["escalate"],
-    ResolutionState.REJECTED: ["regenerate_plan"],
+    ResolutionState.PENDING_STABILITY: ["observe", "rollback"],
+    ResolutionState.RECOVERED: ["close", "revalidate", "operator_close"],
+    ResolutionState.ROLLED_BACK: ["regenerate_plan", "escalate", "operator_close"],
+    ResolutionState.FAILED_RETRYABLE: ["retry", "regenerate_plan", "rollback", "escalate", "operator_close"],
+    ResolutionState.FAILED_TERMINAL: ["escalate", "operator_close"],
+    ResolutionState.REJECTED: ["regenerate_plan", "operator_close"],
     ResolutionState.CLOSED: [],
 }
 
@@ -138,6 +147,7 @@ ALLOWED_TRANSITIONS: dict[ResolutionState, frozenset[ResolutionState]] = {
         ResolutionState.DIAGNOSTIC_ONLY,
         ResolutionState.AWAITING_APPROVAL,
         ResolutionState.READY_TO_EXECUTE,
+        ResolutionState.CLOSED,
     }),
     ResolutionState.DIAGNOSTIC_ONLY: frozenset({ResolutionState.ANALYZING, ResolutionState.CLOSED}),
     ResolutionState.AWAITING_APPROVAL: frozenset({
@@ -145,8 +155,13 @@ ALLOWED_TRANSITIONS: dict[ResolutionState, frozenset[ResolutionState]] = {
         ResolutionState.REJECTED,
         ResolutionState.ANALYZING,
         ResolutionState.BLOCKED_RETRYABLE,
+        ResolutionState.CLOSED,
     }),
-    ResolutionState.READY_TO_EXECUTE: frozenset({ResolutionState.EXECUTING, ResolutionState.BLOCKED_RETRYABLE}),
+    ResolutionState.READY_TO_EXECUTE: frozenset({
+        ResolutionState.EXECUTING,
+        ResolutionState.BLOCKED_RETRYABLE,
+        ResolutionState.CLOSED,
+    }),
     ResolutionState.EXECUTING: frozenset({
         ResolutionState.VALIDATING,
         ResolutionState.FAILED_RETRYABLE,
@@ -158,23 +173,36 @@ ALLOWED_TRANSITIONS: dict[ResolutionState, frozenset[ResolutionState]] = {
         ResolutionState.AWAITING_APPROVAL,
         ResolutionState.READY_TO_EXECUTE,
         ResolutionState.ANALYZING,
+        ResolutionState.CLOSED,
     }),
     ResolutionState.VALIDATING: frozenset({
+        ResolutionState.PENDING_STABILITY,
+        ResolutionState.RECOVERED,
+        ResolutionState.FAILED_RETRYABLE,
+        ResolutionState.ROLLED_BACK,
+    }),
+    ResolutionState.PENDING_STABILITY: frozenset({
+        ResolutionState.PENDING_STABILITY,
         ResolutionState.RECOVERED,
         ResolutionState.FAILED_RETRYABLE,
         ResolutionState.ROLLED_BACK,
     }),
     ResolutionState.RECOVERED: frozenset({ResolutionState.CLOSED}),
-    ResolutionState.ROLLED_BACK: frozenset({ResolutionState.VALIDATING, ResolutionState.FAILED_TERMINAL}),
+    ResolutionState.ROLLED_BACK: frozenset({
+        ResolutionState.VALIDATING,
+        ResolutionState.FAILED_TERMINAL,
+        ResolutionState.CLOSED,
+    }),
     ResolutionState.FAILED_RETRYABLE: frozenset({
         ResolutionState.READY_TO_EXECUTE,
         ResolutionState.EXECUTING,
         ResolutionState.ROLLED_BACK,
         ResolutionState.ANALYZING,
         ResolutionState.BLOCKED_RETRYABLE,
+        ResolutionState.CLOSED,
     }),
-    ResolutionState.FAILED_TERMINAL: frozenset({ResolutionState.ANALYZING}),
-    ResolutionState.REJECTED: frozenset({ResolutionState.ANALYZING}),
+    ResolutionState.FAILED_TERMINAL: frozenset({ResolutionState.ANALYZING, ResolutionState.CLOSED}),
+    ResolutionState.REJECTED: frozenset({ResolutionState.ANALYZING, ResolutionState.CLOSED}),
     ResolutionState.CLOSED: frozenset(),
 }
 
@@ -187,14 +215,17 @@ TRANSITION_ACTORS: dict[tuple[ResolutionState, ResolutionState], frozenset[Lifec
     (ResolutionState.ANALYZING, ResolutionState.DIAGNOSTIC_ONLY): frozenset({LifecycleActor.RESOLUTION}),
     (ResolutionState.ANALYZING, ResolutionState.AWAITING_APPROVAL): frozenset({LifecycleActor.RESOLUTION}),
     (ResolutionState.ANALYZING, ResolutionState.READY_TO_EXECUTE): frozenset({LifecycleActor.RESOLUTION}),
+    (ResolutionState.ANALYZING, ResolutionState.CLOSED): frozenset({LifecycleActor.OPERATOR}),
     (ResolutionState.DIAGNOSTIC_ONLY, ResolutionState.ANALYZING): frozenset({LifecycleActor.RESOLUTION, LifecycleActor.OPERATOR}),
-    (ResolutionState.DIAGNOSTIC_ONLY, ResolutionState.CLOSED): frozenset({LifecycleActor.CLOSURE, LifecycleActor.RECONCILER}),
+    (ResolutionState.DIAGNOSTIC_ONLY, ResolutionState.CLOSED): frozenset({LifecycleActor.CLOSURE, LifecycleActor.OPERATOR, LifecycleActor.RECONCILER}),
     (ResolutionState.AWAITING_APPROVAL, ResolutionState.READY_TO_EXECUTE): frozenset({LifecycleActor.APPROVAL}),
     (ResolutionState.AWAITING_APPROVAL, ResolutionState.REJECTED): frozenset({LifecycleActor.APPROVAL}),
     (ResolutionState.AWAITING_APPROVAL, ResolutionState.ANALYZING): frozenset({LifecycleActor.RESOLUTION, LifecycleActor.OPERATOR}),
     (ResolutionState.AWAITING_APPROVAL, ResolutionState.BLOCKED_RETRYABLE): frozenset({LifecycleActor.REMEDIATION}),
+    (ResolutionState.AWAITING_APPROVAL, ResolutionState.CLOSED): frozenset({LifecycleActor.OPERATOR}),
     (ResolutionState.READY_TO_EXECUTE, ResolutionState.EXECUTING): frozenset({LifecycleActor.REMEDIATION}),
     (ResolutionState.READY_TO_EXECUTE, ResolutionState.BLOCKED_RETRYABLE): frozenset({LifecycleActor.REMEDIATION}),
+    (ResolutionState.READY_TO_EXECUTE, ResolutionState.CLOSED): frozenset({LifecycleActor.OPERATOR}),
     (ResolutionState.EXECUTING, ResolutionState.VALIDATING): frozenset({LifecycleActor.REMEDIATION}),
     (ResolutionState.EXECUTING, ResolutionState.FAILED_RETRYABLE): frozenset({LifecycleActor.REMEDIATION}),
     (ResolutionState.EXECUTING, ResolutionState.FAILED_TERMINAL): frozenset({LifecycleActor.REMEDIATION}),
@@ -203,25 +234,34 @@ TRANSITION_ACTORS: dict[tuple[ResolutionState, ResolutionState], frozenset[Lifec
     (ResolutionState.BLOCKED_RETRYABLE, ResolutionState.AWAITING_APPROVAL): frozenset({LifecycleActor.APPROVAL, LifecycleActor.REMEDIATION}),
     (ResolutionState.BLOCKED_RETRYABLE, ResolutionState.READY_TO_EXECUTE): frozenset({LifecycleActor.APPROVAL, LifecycleActor.REMEDIATION}),
     (ResolutionState.BLOCKED_RETRYABLE, ResolutionState.ANALYZING): frozenset({LifecycleActor.RESOLUTION, LifecycleActor.OPERATOR}),
+    (ResolutionState.BLOCKED_RETRYABLE, ResolutionState.CLOSED): frozenset({LifecycleActor.OPERATOR}),
     (ResolutionState.VALIDATING, ResolutionState.RECOVERED): frozenset({LifecycleActor.CLOSURE, LifecycleActor.RECONCILER}),
+    (ResolutionState.VALIDATING, ResolutionState.PENDING_STABILITY): frozenset({LifecycleActor.CLOSURE, LifecycleActor.RECONCILER}),
+    (ResolutionState.PENDING_STABILITY, ResolutionState.PENDING_STABILITY): frozenset({LifecycleActor.CLOSURE, LifecycleActor.RECONCILER}),
+    (ResolutionState.PENDING_STABILITY, ResolutionState.RECOVERED): frozenset({LifecycleActor.CLOSURE, LifecycleActor.RECONCILER}),
+    (ResolutionState.PENDING_STABILITY, ResolutionState.FAILED_RETRYABLE): frozenset({LifecycleActor.CLOSURE, LifecycleActor.RECONCILER}),
+    (ResolutionState.PENDING_STABILITY, ResolutionState.ROLLED_BACK): frozenset({LifecycleActor.CLOSURE}),
     (ResolutionState.VALIDATING, ResolutionState.FAILED_RETRYABLE): frozenset({LifecycleActor.CLOSURE, LifecycleActor.RECONCILER}),
     (ResolutionState.VALIDATING, ResolutionState.ROLLED_BACK): frozenset({LifecycleActor.CLOSURE}),
-    (ResolutionState.RECOVERED, ResolutionState.CLOSED): frozenset({LifecycleActor.CLOSURE, LifecycleActor.RECONCILER}),
+    (ResolutionState.RECOVERED, ResolutionState.CLOSED): frozenset({LifecycleActor.CLOSURE, LifecycleActor.OPERATOR, LifecycleActor.RECONCILER}),
     (ResolutionState.ROLLED_BACK, ResolutionState.VALIDATING): frozenset({LifecycleActor.CLOSURE, LifecycleActor.REMEDIATION}),
     (ResolutionState.ROLLED_BACK, ResolutionState.FAILED_TERMINAL): frozenset({LifecycleActor.CLOSURE, LifecycleActor.REMEDIATION}),
+    (ResolutionState.ROLLED_BACK, ResolutionState.CLOSED): frozenset({LifecycleActor.OPERATOR}),
     (ResolutionState.FAILED_RETRYABLE, ResolutionState.READY_TO_EXECUTE): frozenset({LifecycleActor.APPROVAL, LifecycleActor.REMEDIATION}),
     (ResolutionState.FAILED_RETRYABLE, ResolutionState.EXECUTING): frozenset({LifecycleActor.REMEDIATION}),
     (ResolutionState.FAILED_RETRYABLE, ResolutionState.ROLLED_BACK): frozenset({LifecycleActor.REMEDIATION}),
     (ResolutionState.FAILED_RETRYABLE, ResolutionState.ANALYZING): frozenset({LifecycleActor.RESOLUTION, LifecycleActor.OPERATOR}),
     (ResolutionState.FAILED_RETRYABLE, ResolutionState.BLOCKED_RETRYABLE): frozenset({LifecycleActor.REMEDIATION}),
+    (ResolutionState.FAILED_RETRYABLE, ResolutionState.CLOSED): frozenset({LifecycleActor.OPERATOR}),
     (ResolutionState.FAILED_TERMINAL, ResolutionState.ANALYZING): frozenset({LifecycleActor.OPERATOR}),
+    (ResolutionState.FAILED_TERMINAL, ResolutionState.CLOSED): frozenset({LifecycleActor.OPERATOR}),
     (ResolutionState.REJECTED, ResolutionState.ANALYZING): frozenset({LifecycleActor.RESOLUTION, LifecycleActor.OPERATOR}),
+    (ResolutionState.REJECTED, ResolutionState.CLOSED): frozenset({LifecycleActor.OPERATOR}),
 }
 
 
 def plan_fingerprint(plan: dict[str, Any] | None) -> str:
-    canonical = json.dumps(plan or {}, sort_keys=True, separators=(",", ":"), default=str)
-    return hashlib.sha256(canonical.encode()).hexdigest()
+    return canonical_plan_fingerprint(plan or {})
 
 
 def create_lifecycle(*, tenant_id: str, incident_id: Any, recommendation_id: Any,
@@ -230,8 +270,9 @@ def create_lifecycle(*, tenant_id: str, incident_id: Any, recommendation_id: Any
                      control: dict[str, Any] | None = None) -> dict[str, Any]:
     state = ResolutionState(state)
     now = datetime.now(UTC).isoformat()
+    verified_tenant_id = require_tenant_id(tenant_id, source="resolution lifecycle identity")
     return {
-        "schema_version": SCHEMA_VERSION, "tenant_id": tenant_id or "default",
+        "schema_version": SCHEMA_VERSION, "tenant_id": verified_tenant_id,
         "incident_id": str(incident_id), "recommendation_id": str(recommendation_id),
         "plan_fingerprint": plan_fingerprint(plan), "state": state.value, "state_version": 1,
         "reason_code": reason_code, "retryable": state in {ResolutionState.BLOCKED_RETRYABLE, ResolutionState.FAILED_RETRYABLE},
@@ -384,6 +425,12 @@ def transition_lifecycle(lifecycle: dict[str, Any], state: ResolutionState | str
 
 def initial_plan_state(plan: dict[str, Any], *, requires_approval: bool) -> ResolutionState:
     executable = [*(plan.get("commands") or []), *(plan.get("scripts") or [])]
-    if not any(str(item).strip() for item in executable):
+    if (
+        plan.get("execution_ready") is not True
+        or plan.get("mutating") is not True
+        or plan.get("diagnostic_only") is True
+        or str(plan.get("plan_kind") or "").lower() == "diagnostic"
+        or not any(str(item).strip() for item in executable)
+    ):
         return ResolutionState.DIAGNOSTIC_ONLY
     return ResolutionState.AWAITING_APPROVAL if requires_approval else ResolutionState.READY_TO_EXECUTE

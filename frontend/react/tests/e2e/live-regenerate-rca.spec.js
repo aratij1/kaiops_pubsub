@@ -1,41 +1,48 @@
 import { expect, test } from "@playwright/test";
 
-test.skip(!process.env.KAIOPS_LIVE_E2E, "Set KAIOPS_LIVE_E2E=1 to run against a live API stack");
+const liveAlertId = String(process.env.KAIOPS_LIVE_ALERT_ID || "").trim();
 
-test("live RCA regenerates context, impact, and resolution", async ({ page }) => {
-  test.setTimeout(180_000);
-  await page.goto("/");
+test.skip(!process.env.KAIOPS_LIVE_E2E || !liveAlertId, "Set KAIOPS_LIVE_E2E=1 and KAIOPS_LIVE_ALERT_ID to run against a live API stack");
+
+test("live fresh RCA stays authenticated and renders the persisted analysis", async ({ page }) => {
+  test.setTimeout(360_000);
+  const analysisRequests = [];
+  const analysisResponses = [];
+  page.on("request", (request) => {
+    if (request.url().includes("/api-gateway/analysis/")) {
+      analysisRequests.push({ url: request.url(), authorization: request.headers().authorization || "" });
+    }
+  });
+  page.on("response", (response) => {
+    if (response.url().includes("/api-gateway/analysis/")) {
+      analysisResponses.push({ url: response.url(), status: response.status() });
+    }
+  });
+
+  await page.goto(`/?workspace=alert&alert_id=${encodeURIComponent(liveAlertId)}`);
   const username = page.getByLabel("Username");
-  if (await username.isVisible().catch(() => false)) {
-    await username.fill(process.env.KAIOPS_E2E_USERNAME || "admin");
-    await page.getByLabel("Password").fill(process.env.KAIOPS_E2E_PASSWORD || "Admin@123456");
-    await page.getByRole("button", { name: "Sign in securely" }).click();
-    await expect(page.getByRole("heading", { name: "Operations Overview" })).toBeVisible({ timeout: 30_000 });
-  }
-  await page.getByRole("button", { name: "Unified Inbox" }).click();
-  await expect(page.getByRole("heading", { name: "Unified Inbox" })).toBeVisible({ timeout: 30_000 });
-  const incident = page.locator(".unified-inbox-card.is-incident").first();
-  await expect(incident).toBeVisible({ timeout: 30_000 });
-  await incident.getByRole("button", { name: "Open incident" }).click();
-  await page.getByRole("tab", { name: "Evidence, RCA, and impact" }).click();
-  await expect(page.getByRole("heading", { name: "Evidence & Understanding" })).toBeVisible({ timeout: 30_000 });
-  const button = page.getByRole("button", { name: "Rerun RCA" });
-  await expect(button).toBeVisible({ timeout: 30_000 });
-  const contextResponse = page.waitForResponse(
-    (response) => response.url().includes("/context-agent/collect") && response.request().method() === "POST",
-    { timeout: 180_000 },
-  );
-  const resolutionResponse = page.waitForResponse(
-    (response) => response.url().includes("/resolution-agent/resolve") && response.request().method() === "POST",
-    { timeout: 180_000 },
-  );
-  await button.click();
-  expect((await contextResponse).ok()).toBeTruthy();
-  expect((await resolutionResponse).ok()).toBeTruthy();
-  await expect(page.getByText(/Smart analysis completed|Fresh context and RCA analysis completed|Verified cached context and RCA loaded/)).toBeVisible({ timeout: 180_000 });
-  await expect(page.getByText("What happened", { exact: false }).first()).toBeVisible();
-  await expect(page.getByText("Why it matters", { exact: false }).first()).toBeVisible();
-  await expect(page.getByText("What to do next", { exact: false }).first()).toBeVisible();
-  await page.getByRole("tab", { name: "Resolve incident" }).click();
-  await expect(page.getByText("Recommended response", { exact: true })).toBeVisible({ timeout: 30_000 });
+  await expect(username).toBeVisible({ timeout: 30_000 });
+  await username.fill(process.env.KAIOPS_E2E_USERNAME || "admin");
+  await page.getByLabel("Password").fill(process.env.KAIOPS_E2E_PASSWORD || "Admin@123456");
+  const loginResponsePromise = page.waitForResponse((response) => response.url().includes("/api-gateway/auth/login"));
+  await page.getByRole("button", { name: /sign in/i }).click();
+  const loginResponse = await loginResponsePromise;
+  expect(loginResponse.ok(), `login returned HTTP ${loginResponse.status()}`).toBeTruthy();
+  await expect(page.locator(".app-layout")).toBeVisible({ timeout: 45_000 });
+
+  await expect(page.locator(".alert-details-cockpit")).toBeVisible({ timeout: 45_000 });
+  const tabs = page.getByRole("tablist", { name: "Incident workspace sections" });
+  await tabs.getByRole("tab", { name: "Evidence, RCA, and impact" }).click();
+  await page.getByRole("button", { name: /Fresh context/ }).click();
+  await page.getByRole("button", { name: "Run fresh analysis" }).click();
+
+  await expect(page.getByText(new RegExp(`Fresh context and RCA analysis completed for alert ${liveAlertId}|Analysis for alert ${liveAlertId} is still running in the backend`))).toBeVisible({ timeout: 330_000 });
+  await expect(page.getByText(/HTTP 401|Not authenticated/)).toHaveCount(0);
+  expect(analysisRequests.some(({ url }) => url.includes(`/analysis/alerts/${liveAlertId}/regenerate`))).toBeTruthy();
+  const orchestrationRequests = analysisRequests.filter(({ url }) => url.includes(`/analysis/alerts/${liveAlertId}/regenerate`)
+    || url.includes("/analysis/context/collect")
+    || url.includes("/analysis/resolution/resolve"));
+  expect(orchestrationRequests).toHaveLength(1);
+  expect(analysisRequests.every(({ authorization }) => authorization.startsWith("Bearer "))).toBeTruthy();
+  expect(analysisResponses.filter(({ url }) => url.includes(`/analysis/alerts/${liveAlertId}/regenerate`)).every(({ status }) => status >= 200 && status < 300)).toBeTruthy();
 });

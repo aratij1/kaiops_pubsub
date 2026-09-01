@@ -41,6 +41,7 @@ job.addProperty(new ParametersDefinitionProperty([
     new StringParameterDefinition('KAI_OPS_RESOLUTION_ID', 'investigate-first', 'Approved resolution'),
     new BooleanParameterDefinition('KAI_OPS_DRY_RUN', true, 'Validate without applying changes'),
     new TextParameterDefinition('KAI_OPS_EXECUTION_PLAN', '{"commands":[],"scripts":[],"queries":[]}', 'Approved execution plan'),
+    new StringParameterDefinition('KAI_OPS_PLAN_DIGEST', '', 'SHA-256 digest of the exact approved execution plan'),
 ]))
 job.save()
 jenkins.save()

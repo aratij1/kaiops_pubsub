@@ -1,26 +1,41 @@
-import { CheckCircle2, Clock3, FileSearch, RefreshCw, ScrollText, ShieldAlert } from "lucide-react";
-
+import { useEffect, useState } from "react";
+import { FileClock, Filter, LockKeyhole, RefreshCw, ScrollText } from "lucide-react";
+import { Link } from "react-router-dom";
 import { useRouteRuntimeSlice } from "../../app/routeRuntime";
-import { StatusBadge } from "../../components/design-system";
+import { durableIncidentPath } from "../../domain/incidentNavigation";
 import "./AuditRoute.css";
 
-const formatTime = (value?: string) => value
-  ? `${new Date(value).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })} IST`
-  : "Unavailable";
+type AuditRow = { id: number; actor: string; action: string; resource_type: string; resource_id: string; payload: Record<string, unknown>; created_at: string };
+type AuditPage = { rows: AuditRow[]; count: number; page: number; page_size: number };
+const PAGE_SIZE = 50;
+const relatedPath = (row: AuditRow) => row.resource_type === "incident" ? durableIncidentPath({ incident_id: row.resource_id }) : row.resource_type === "approval" ? `/approvals?approval_id=${encodeURIComponent(row.resource_id)}` : null;
 
 export default function AuditRoute() {
-  const audit = useRouteRuntimeSlice("safety");
-  const rows = audit.events;
-  const uniqueTraces = new Set(rows.map((row) => row.trace_id).filter(Boolean)).size;
-  const failedRequests = rows.filter((row) => Number(row.status_code || 0) >= 400).length;
-
+  const { accessToken } = useRouteRuntimeSlice("session");
+  const [page, setPage] = useState(1);
+  const [action, setAction] = useState("");
+  const [reload, setReload] = useState(0);
+  const [state, setState] = useState<{ loading: boolean; data: AuditPage; error: string }>({ loading: true, data: { rows: [], count: 0, page: 1, page_size: PAGE_SIZE }, error: "" });
+  useEffect(() => {
+    const controller = new AbortController();
+    const params = new URLSearchParams({ page: String(page), page_size: String(PAGE_SIZE) });
+    if (action.trim()) params.set("action", action.trim());
+    setState((current) => ({ ...current, loading: true, error: "" }));
+    fetch(`/api-gateway/audit-logs?${params}`, { headers: { Accept: "application/json", Authorization: `Bearer ${accessToken}` }, signal: controller.signal })
+      .then(async (response) => { if (!response.ok) throw new Error(`Audit service returned HTTP ${response.status}`); return response.json(); })
+      .then((data: AuditPage) => setState({ loading: false, data, error: "" }))
+      .catch((error) => { if (!controller.signal.aborted) setState((current) => ({ ...current, loading: false, error: String(error.message || error) })); });
+    return () => controller.abort();
+  }, [accessToken, action, page, reload]);
+  const pages = Math.max(1, Math.ceil(state.data.count / PAGE_SIZE));
   return <section className="audit-workspace">
-    <header className="audit-hero"><div className="audit-hero-icon"><ScrollText aria-hidden="true" /></div><div><span>Governance record</span><h2>Audit trail</h2><p>Chronological, immutable-facing records of gateway requests and policy decisions for investigation and compliance review.</p></div><button type="button" onClick={audit.refresh}><RefreshCw aria-hidden="true" /> Refresh records</button></header>
-
-    {audit.summaryError ? <div className="audit-warning" role="status"><ShieldAlert aria-hidden="true" /><span><strong>Audit summary is partially unavailable</strong><small>{audit.summaryError}</small></span></div> : null}
-
-    <section className="audit-metrics" aria-label="Audit summary"><article><FileSearch /><span><strong>{rows.length}</strong><small>records loaded</small></span></article><article><Clock3 /><span><strong>{uniqueTraces}</strong><small>unique traces</small></span></article><article><CheckCircle2 /><span><strong>{Number(audit.summary.allowed || 0)}</strong><small>allowed decisions</small></span></article><article><ShieldAlert /><span><strong>{failedRequests}</strong><small>HTTP failures</small></span></article></section>
-
-    <article className="audit-ledger"><header><div><span>Event ledger</span><h3>Recorded gateway activity</h3></div><small>Latest trace: {audit.summary.latest_trace_id || "Unavailable"}</small></header><div className="table-wrap"><table><thead><tr><th>Time</th><th>Request path</th><th>HTTP</th><th>Policy decision</th><th>Score</th><th>Trace ID</th></tr></thead><tbody>{rows.map((row, index) => { const decision = String(row.safety?.decision || "unavailable").toLowerCase(); const tone = decision.includes("block") ? "critical" : decision.includes("review") ? "warning" : decision.includes("allow") ? "success" : "inactive"; return <tr key={`${row.id || row.trace_id || "audit"}-${index}`}><td>{formatTime(row.created_at)}</td><td><code>{row.path || "-"}</code></td><td>{row.status_code ?? "-"}</td><td><StatusBadge tone={tone}>{decision}</StatusBadge></td><td>{row.safety?.score ?? "-"}</td><td><code>{row.trace_id || "-"}</code></td></tr>; })}{!rows.length ? <tr><td colSpan={6}><div className="audit-empty"><ScrollText /><span><strong>No audit records returned</strong><small>Gateway activity will appear here after requests are evaluated.</small></span></div></td></tr> : null}</tbody></table></div></article>
+    <header className="audit-hero"><ScrollText aria-hidden="true" /><div><span>Governance record</span><h2>Audit trail</h2><p>Tenant-scoped, immutable records returned in deterministic newest-first order.</p></div><button type="button" onClick={() => setReload((value) => value + 1)} disabled={state.loading}><RefreshCw aria-hidden="true" />Refresh</button></header>
+    <section className="audit-controls"><label><Filter aria-hidden="true" />Filter by exact action<input value={action} onChange={(event) => { setPage(1); setAction(event.target.value); }} placeholder="recommendation.generated" /></label><span><LockKeyhole aria-hidden="true" />Read only</span></section>
+    {state.error ? <p className="error" role="alert">{state.error}</p> : null}
+    <div className="table-wrap"><table><caption className="sr-only">Immutable tenant audit history</caption><thead><tr><th>Recorded</th><th>Actor</th><th>Action</th><th>Resource</th><th>Reference</th></tr></thead><tbody>
+      {state.data.rows.map((row) => { const path = relatedPath(row); return <tr key={row.id}><td>{new Date(row.created_at).toLocaleString()}</td><td>{row.actor}</td><td><code>{row.action}</code></td><td>{row.resource_type}</td><td>{path ? <Link to={path}>{row.resource_id}</Link> : <code>{row.resource_id}</code>}</td></tr>; })}
+      {!state.loading && !state.data.rows.length ? <tr><td colSpan={5}><div className="table-empty-state"><FileClock aria-hidden="true" /><strong>No audit records match this scope</strong><span>Change the action filter or refresh.</span></div></td></tr> : null}
+    </tbody></table></div>
+    <footer className="audit-pagination"><span>{state.data.count} immutable record(s)</span><div><button type="button" disabled={page <= 1 || state.loading} onClick={() => setPage((value) => value - 1)}>Previous</button><span>{page} / {pages}</span><button type="button" disabled={page >= pages || state.loading} onClick={() => setPage((value) => value + 1)}>Next</button></div></footer>
   </section>;
 }

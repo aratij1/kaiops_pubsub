@@ -1,6 +1,7 @@
 from __future__ import annotations
+
 import asyncio
-from collections import deque
+import base64
 import hashlib
 import heapq
 import json
@@ -8,36 +9,39 @@ import os
 import re
 import sys
 import uuid
-from datetime import datetime, timedelta, timezone
-from functools import lru_cache
+from collections import deque
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Literal
-from urllib.parse import quote, urlparse
+from urllib.parse import quote
 from uuid import UUID
 
-from common.config import get_settings
+import httpx
+from ai_workbench_common.model_evaluation import build_quality_evaluation
+from ai_workbench_common.prompts import PROMPT_SUMMARIZE_RCA
 from common.ai_layer_client import AiLayerClient
+from common.config import get_settings
 from common.database import create_engine, create_schema, create_session_factory
 from common.event_publishers import build_agent_event_contract, build_event_envelope
 from common.logging import get_logger
-from ai_workbench_common.model_evaluation import build_quality_evaluation
 from common.models import (
     Alert,
     AlertSeverity,
-    EvidenceReference,
-    RawAlert,
-    Incident,
-    IncidentStatus,
     Approval,
     ApprovalDecision,
+    EvidenceReference,
+    Incident,
+    IncidentStatus,
+    RawAlert,
     Recommendation,
     RemediationAction,
     RemediationStatus,
     ResolutionReport,
 )
-from common.repository import IncidentRepository, ObjectStorageRepository
 from common.object_storage import build_object_storage
+from common.orchestration.execution_plan import resolve_execution_plan
+from common.repository import IncidentRepository, ObjectStorageRepository
 from common.service import _sanitize_url_credentials, create_app
 from common.telemetry import EVENT_CONTRACTS_EMITTED, EVENT_PUBLISH_LATENCY
 from common.topics import (
@@ -47,53 +51,13 @@ from common.topics import (
     ALERT_RECEIVED,
     APPROVAL_REQUESTED,
     AUTOMATION_EXECUTED,
-    JIRA_INVESTIGATIONS,
     RAW_ALERTS,
     RESOLUTION_GENERATED,
 )
-from ai_workbench_common.prompts import PROMPT_SUMMARIZE_RCA
-import httpx
 from fastapi import BackgroundTasks, Body, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field, model_validator
-from monitoring_adapter.state import (
-    ALERT_SEVERITY_OVERRIDES_FILE,
-    FLOW_CATALOG_FILE,
-    ONBOARDING_CONNECTIVITY_FILE,
-    SCENARIOS,
-    SCENARIOS_TEXT_FILE,
-    alert_severity_overrides_path,
-    default_flow_catalog_entries,
-    ensure_flow_catalog_exists,
-    flow_catalog_path,
-    load_alert_severity_overrides,
-    list_scenarios,
-    load_onboarding_connectivity,
-    load_scenarios_from_text_file,
-    merged_scenarios,
-    onboarding_connectivity_path,
-    rag_root_path,
-    remove_alert_severity_override,
-    resolve_flow_id,
-    save_alert_severity_overrides,
-    save_onboarding_connectivity,
-    scenario_source_rows,
-    scenarios_text_path,
-    severity_from_string,
-    slugify,
-    upsert_alert_severity_override,
-)
-from monitoring_adapter.onboarding_pipelines import (
-    ExistingRulePipelineRequest,
-    NewRuleOnboardingRequest,
-    build_prometheus_rules_yaml,
-    capabilities_catalog,
-    find_pipeline_rows,
-    run_existing_rule_pipeline,
-    run_new_rule_pipeline,
-)
-from monitoring_adapter.project_inventory import activation_readiness_blockers, collect_alert_applications, record_successful_test_alert
-from monitoring_adapter.onboarding_sources import OnboardingMonitoringSource, normalize_email_endpoint, normalize_http_endpoint
+from monitoring_adapter.dedup import compute_fingerprint
+from monitoring_adapter.email_ingestion import EmailPollState, ImapConfig, email_to_alert_payload, fetch_unseen_emails
 from monitoring_adapter.existing_monitoring import (
     apply_field_mapping,
     build_webhook_path,
@@ -104,12 +68,10 @@ from monitoring_adapter.existing_monitoring import (
     normalize_provider_name,
     verify_hmac_signature,
 )
+from monitoring_adapter.jira_admission import JiraAdmissionState
+from monitoring_adapter.jira_client import JiraClient, JiraClientError
 from monitoring_adapter.landing_pad_normalizer import normalize_landing_pad_alert
 from monitoring_adapter.landing_pad_sources import SUPPORTED_SUFFIXES, load_landing_pad_file
-from monitoring_adapter.email_ingestion import EmailPollState, ImapConfig, email_to_alert_payload, fetch_unseen_emails
-from monitoring_adapter.dedup import compute_fingerprint
-from monitoring_adapter.jira_client import JiraClient, JiraClientError
-from monitoring_adapter.jira_admission import JiraAdmissionState
 from monitoring_adapter.log_ingestion import (
     LogWatchState,
     OpenSearchLogState,
@@ -117,6 +79,45 @@ from monitoring_adapter.log_ingestion import (
     fetch_opensearch_error_logs,
     log_line_to_alert_payload,
 )
+from monitoring_adapter.onboarding_pipelines import (
+    ExistingRulePipelineRequest,
+    NewRuleOnboardingRequest,
+    build_prometheus_rules_yaml,
+    capabilities_catalog,
+    find_pipeline_rows,
+    run_existing_rule_pipeline,
+    run_new_rule_pipeline,
+)
+from monitoring_adapter.onboarding_sources import (
+    OnboardingMonitoringSource,
+    normalize_email_endpoint,
+    normalize_http_endpoint,
+)
+from monitoring_adapter.project_inventory import (
+    activation_readiness_blockers,
+    collect_alert_applications,
+    record_successful_test_alert,
+)
+from monitoring_adapter.state import (
+    ALERT_SEVERITY_OVERRIDES_FILE,
+    alert_severity_overrides_path,
+    flow_catalog_path,
+    list_scenarios,
+    load_alert_severity_overrides,
+    load_onboarding_connectivity,
+    merged_scenarios,
+    rag_root_path,
+    remove_alert_severity_override,
+    resolve_flow_id,
+    save_onboarding_connectivity,
+    scenario_source_rows,
+    scenarios_text_path,
+    severity_from_string,
+    slugify,
+    upsert_alert_severity_override,
+)
+from monitoring_adapter.workflow_routes import build_workflow_router
+from pydantic import BaseModel, Field, model_validator
 
 ALERT_BODY = Body(...)
 
@@ -468,7 +469,7 @@ def _recent_date_partition_dirs(base: Path, *, days: int) -> list[Path]:
     Bounds directory scans (dedup checks, recent-file listings) to a fixed
     number of small partitions instead of walking a growing multi-year archive.
     """
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     directories: list[Path] = []
     seen: set[Path] = set()
     for offset in range(days):
@@ -509,7 +510,7 @@ def _persist_alert_to_landing_pad(
 ) -> str | None:
     try:
         base_dir = LANDING_PAD_PROCESSED_DIR if status == "processed" else LANDING_PAD_FAILED_DIR
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         # Must match the YYYY/MM/DD scheme every reader scans
         # (_collect_partitioned_json_files / _recent_date_partition_dirs /
         # the dedup check / GET /landing-pad/recent) — a prior source-named
@@ -518,10 +519,12 @@ def _persist_alert_to_landing_pad(
         target_dir = _date_partition_dir(base_dir, now)
         target_dir.mkdir(parents=True, exist_ok=True)
         # Preserve the title in the payload while bounding the filesystem path.
-        alert_name = slugify(str(mapped_payload.get("name") or "prometheus-alert"))[:50] or "alert"
+        # Keep the complete path below legacy Windows MAX_PATH even when the
+        # landing-pad root itself is deeply nested (CI workspaces commonly are).
+        alert_name = slugify(str(mapped_payload.get("name") or "prometheus-alert"))[:32] or "alert"
         labels = mapped_payload.get("labels", {}) if isinstance(mapped_payload.get("labels"), dict) else {}
         fingerprint = str(labels.get("alert_fingerprint") or "no-fingerprint").strip() or "no-fingerprint"
-        safe_fingerprint = re.sub(r"[^a-zA-Z0-9_-]", "-", fingerprint)[:24]
+        safe_fingerprint = re.sub(r"[^a-zA-Z0-9_-]", "-", fingerprint)[:16]
         file_name = f"{now.strftime('%Y%m%dT%H%M%S%fZ')}_{alert_name}_{safe_fingerprint}.json"
         out_path = target_dir / file_name
         payload = {
@@ -577,7 +580,7 @@ def _record_live_stream_event(
     to the same in-memory buffer GET /landing-pad/recent serves, so it shows
     up in the Live Stream UI. These actions have their own system of record
     (jira_ticket_links, SMTP) and don't need a landing-pad file — only visibility."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     RECENT_INGESTION_EVENTS.appendleft(
         {
             "file": None,
@@ -607,7 +610,7 @@ def _record_live_stream_event(
 
 def _write_alert_to_landing_pad_input(mapped_payload: dict[str, Any], raw_alert: dict[str, Any]) -> Path:
     LANDING_PAD_INPUT_DIR.mkdir(parents=True, exist_ok=True)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     alert_name = slugify(str(mapped_payload.get("name") or "prometheus-alert"))
     labels = mapped_payload.get("labels", {}) if isinstance(mapped_payload.get("labels"), dict) else {}
     fingerprint = str(labels.get("alert_fingerprint") or uuid.uuid4().hex).strip() or uuid.uuid4().hex
@@ -658,7 +661,7 @@ def _landing_pad_file_rows(source_dir: Path, limit: int, *, partitioned: bool = 
         entry: dict[str, Any] = {
             "file": path.name,
             "path": str(path),
-            "modified_at": datetime.fromtimestamp(stat_info.st_mtime, tz=timezone.utc).isoformat(),
+            "modified_at": datetime.fromtimestamp(stat_info.st_mtime, tz=UTC).isoformat(),
             "size_bytes": int(stat_info.st_size),
         }
         try:
@@ -814,7 +817,7 @@ def _mapped_alerts_from_landing_pad_payload(payload: dict[str, Any]) -> list[tup
 
 
 def _archive_landing_pad_input_file(path: Path, target_dir: Path) -> str:
-    partition_dir = _date_partition_dir(target_dir, datetime.now(timezone.utc))
+    partition_dir = _date_partition_dir(target_dir, datetime.now(UTC))
     partition_dir.mkdir(parents=True, exist_ok=True)
     original_name = path.name.split("_", 1)[1] if path.parent.name == ".claiming" and "_" in path.name else path.name
     target_path = partition_dir / original_name
@@ -836,8 +839,8 @@ def _landing_pad_input_is_stale(path: Path, *, original_parent: Path) -> bool:
         return False
     if original_parent.resolve() != LANDING_PAD_INPUT_DIR.resolve():
         return False
-    modified_at = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
-    age_seconds = (datetime.now(timezone.utc) - modified_at).total_seconds()
+    modified_at = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
+    age_seconds = (datetime.now(UTC) - modified_at).total_seconds()
     return age_seconds > LANDING_PAD_FILE_WATCHER_STALE_HOURS * 3600
 
 
@@ -900,7 +903,7 @@ def _recover_stale_claims() -> int:
     parent dir, never `.claiming/`). This sweep recovers those orphans.
     """
     recovered = 0
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     for directory in [LANDING_PAD_INPUT_DIR, *LANDING_PAD_ADDITIONAL_INPUT_DIRS]:
         claim_dir = directory / ".claiming"
         if not claim_dir.is_dir():
@@ -909,7 +912,7 @@ def _recover_stale_claims() -> int:
             if not claimed_path.is_file():
                 continue
             try:
-                modified_at = datetime.fromtimestamp(claimed_path.stat().st_mtime, tz=timezone.utc)
+                modified_at = datetime.fromtimestamp(claimed_path.stat().st_mtime, tz=UTC)
                 age_seconds = (now - modified_at).total_seconds()
                 if age_seconds <= LANDING_PAD_CLAIM_STALE_MINUTES * 60:
                     continue
@@ -1413,6 +1416,7 @@ def _build_local_metadata_envelope(
     severity = str(incident.get("severity") or alert.get("severity") or "warning").strip().lower()
     correlation_id = str(alert.get("correlation_id") or "").strip() or None
     provider = str(transport_provider or decision.get("message_bus_provider") or "rabbitmq").strip().lower() or "rabbitmq"
+    tenant_id = str(incident.get("tenant_id") or alert.get("tenant_id") or "").strip()
 
     return build_event_envelope(
         event_type=event_type,
@@ -1425,7 +1429,7 @@ def _build_local_metadata_envelope(
             "parent_event_id": None,
         },
         scope={
-            "tenant_id": "default",
+            "tenant_id": tenant_id,
             "service": service,
             "environment": environment,
             "region": None,
@@ -1537,7 +1541,7 @@ def _sweep_landing_pad_archive_once() -> dict[str, int]:
     counter dict so callers (worker loop or the manual trigger endpoint) can
     report how much was moved.
     """
-    cutoff = datetime.now(timezone.utc).timestamp() - (LANDING_PAD_ARCHIVE_AFTER_DAYS * 86400)
+    cutoff = datetime.now(UTC).timestamp() - (LANDING_PAD_ARCHIVE_AFTER_DAYS * 86400)
     moved = 0
     errors = 0
     for base_dir in (LANDING_PAD_PROCESSED_DIR, LANDING_PAD_FAILED_DIR):
@@ -1763,7 +1767,7 @@ async def _opensearch_log_poll_worker() -> None:
                 document_id = str(record.get("document_id") or "")
                 if document_id:
                     seen = state.load()
-                    seen[document_id] = str(record.get("timestamp") or datetime.now(timezone.utc).isoformat())
+                    seen[document_id] = str(record.get("timestamp") or datetime.now(UTC).isoformat())
                     state.save(seen)
             logger.info(
                 "opensearch_log_batch_complete fetched=%s batch_limit=%s next_poll_seconds=%s",
@@ -1796,6 +1800,20 @@ async def _jira_poll_worker() -> None:
                 fields = issue.get("fields") if isinstance(issue.get("fields"), dict) else {}
                 version = f"{issue.get('key')}:{fields.get('updated') or fields.get('created') or ''}"
                 if version in _JIRA_SESSION_VERSIONS:
+                    continue
+                if _latest_comment_is_from_kaiops(fields):
+                    # "updated" bumps every time *anyone* (including us)
+                    # comments on the issue. Without this check, KaiOps
+                    # posting its own evidence-request/status comment makes
+                    # the ticket look like it changed again next poll,
+                    # re-ingesting it as a brand-new alert forever -- a
+                    # self-sustaining feedback loop confirmed in production
+                    # data (single tickets ingested 30+ times). Once the
+                    # last actor on the issue was KaiOps itself, remember
+                    # this version as seen without re-ingesting; a real
+                    # external reply/edit after ours still bumps "updated"
+                    # again and is still picked up normally.
+                    _JIRA_SESSION_VERSIONS.add(version)
                     continue
                 payload = {"webhookEvent": "jira:poll", "issue": issue, "event_origin": "jira"}
                 mapped_payload, _ = _jira_payload_to_alert_payload(payload)
@@ -1944,6 +1962,7 @@ def build_sample_alert(flow_id: str = "payment-latency", trace_id: str | None = 
     scenarios = merged_scenarios()
     scenario = scenarios.get(flow_id, scenarios["payment-latency"])
     return Alert(
+        tenant_id="local-demo",
         source=scenario["source"],
         name=str(scenario.get("alert_name") or scenario["name"]),
         service=scenario["service"],
@@ -2516,7 +2535,7 @@ async def persist_onboarding_connectivity(payload: dict[str, Any]) -> None:
         "active_provider": _normalize_provider_name(str(payload.get("active_provider", ""))) if payload.get("active_provider") else None,
     }
     selected_provider = _normalize_provider_name(str(payload.get("active_provider", "project")))
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
 
     async with session_factory() as session:
         repo = IncidentRepository(session)
@@ -2583,7 +2602,7 @@ async def persist_onboarding_pipeline_result(result: dict[str, Any]) -> None:
         "summary": result.get("summary") or result.get("approval_package") or {},
         "event_contract": result.get("event_contract") or {},
         "result": result,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(UTC).isoformat(),
     }
 
     async with session_factory() as session:
@@ -2599,7 +2618,7 @@ async def persist_onboarding_pipeline_result(result: dict[str, Any]) -> None:
             test_message=f"{provider_name} workflow persisted",
             project_payload=project,
             connectivity_payload=payload,
-            last_tested_at=datetime.now(timezone.utc),
+            last_tested_at=datetime.now(UTC),
         )
         await session.commit()
 
@@ -2708,7 +2727,7 @@ async def run_local_payment_workflow(
     enriched_alert, incident = await AlertIntelligenceAgent().process(alert)
     incident.trace_id = trace_id
     await persist_step(lambda repo: repo.save_alert(enriched_alert), lambda repo: repo.save_incident(incident))
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     await persist_step(
         *[
             track_agent_work_operation(
@@ -2767,7 +2786,7 @@ async def run_local_payment_workflow(
                 "metrics": alert_event["metrics"],
             },
             started_at=now,
-            completed_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(UTC),
         )
     )
     context_task = asyncio.create_task(ai_client.collect_context(alert=enriched_alert, incident=incident))
@@ -2819,7 +2838,7 @@ async def run_local_payment_workflow(
                 "metrics": orchestrator_event["metrics"],
             },
             started_at=now,
-            completed_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(UTC),
         )
     )
     orchestration_envelope = _build_local_metadata_envelope(
@@ -2883,7 +2902,7 @@ async def run_local_payment_workflow(
                 "metrics": context_event["metrics"],
             },
             started_at=now,
-            completed_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(UTC),
         )
     )
     model_errors: list[dict[str, str]] = []
@@ -2896,6 +2915,7 @@ async def run_local_payment_workflow(
         recommendation = await ai_client.resolve(context=context)
     except Exception as exc:
         recommendation = Recommendation(
+            tenant_id=alert.tenant_id,
             incident_id=incident.id,
             root_cause=cleaned_resolution["root_cause"],
             confidence=0.72,
@@ -2957,6 +2977,25 @@ async def run_local_payment_workflow(
         "stream_count": decision.stream_count,
         "stream_threshold": decision.stream_threshold,
     }
+    execution_plan = resolve_execution_plan(
+        alert=enriched_alert,
+        workflow_name=decision.workflow,
+        requires_approval=True,
+        risk_tier=decision.risk_tier,
+        execution_mode="human-approval",
+        resolution_hints=" ".join((recommendation.root_cause, recommendation.recommended_action)),
+        evidence_basis=list(recommendation.metadata.get("evidence_ids", [])),
+        incident_id=incident.id,
+        root_cause=recommendation.root_cause,
+        confidence=recommendation.confidence,
+    )
+    recommendation.metadata["execution_plan"] = execution_plan
+    recommendation.metadata["remediation_target"] = execution_plan.get("remediation_target", "")
+    recommendation.metadata["runbook_id"] = execution_plan.get("runbook_governance_id") or ""
+    recommendation.metadata["runbook_slug"] = execution_plan.get("playbook_id") or ""
+    recommendation.metadata["runbook_version"] = execution_plan.get("playbook_version")
+    recommendation.metadata["runbook_status"] = execution_plan.get("runbook_status") or ""
+    recommendation.metadata["runbook_checksum"] = execution_plan.get("runbook_checksum") or ""
     recommendation.metadata["evaluation"] = build_quality_evaluation(
         prediction={
             "root_cause": recommendation.root_cause,
@@ -3074,7 +3113,7 @@ async def run_local_payment_workflow(
                 "llm_errors": resolution_event.get("llm_errors", []),
             },
             started_at=now,
-            completed_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(UTC),
         )
     )
     requires_human_approval = enriched_alert.severity in {AlertSeverity.HIGH, AlertSeverity.CRITICAL}
@@ -3083,7 +3122,10 @@ async def run_local_payment_workflow(
         incident=incident.model_dump(mode="json"),
         alert=enriched_alert.model_dump(mode="json"),
         decision=decision.__dict__,
-        status="awaiting_approval" if (requires_human_approval and not auto_approve) else "remediating",
+        # Producing an RCA recommendation does not mean an executor has started.
+        # Execution state is advanced to remediating only by the remediation
+        # engine after a durable action has been dispatched.
+        status="awaiting_approval" if (requires_human_approval and not auto_approve) else "approved",
         payload={
             "recommendation_id": str(recommendation.id),
             "flow_id": str(getattr(decision, "flow_id", "") or ""),
@@ -3104,6 +3146,7 @@ async def run_local_payment_workflow(
 
     if requires_human_approval and not auto_approve:
         pending_approval = Approval(
+            tenant_id=context.tenant_id,
             incident_id=incident.id,
             recommendation_id=recommendation.id,
             decision=ApprovalDecision.PENDING,
@@ -3115,6 +3158,7 @@ async def run_local_payment_workflow(
                 "policy_version": decision.policy_version,
                 "policy_reason": decision.policy_reason,
                 "orchestration_decision": recommendation.metadata.get("orchestration_decision", {}),
+                "execution_plan": execution_plan,
             },
         )
         approval_event = {
@@ -3233,11 +3277,20 @@ async def run_local_payment_workflow(
             "next_step": "Awaiting user approval for high-risk action. Approve in Approval tab to continue workflow.",
         }
 
+    local_execution_ready = bool(
+        execution_plan.get("execution_ready") is True
+        and isinstance(execution_plan.get("actions"), list)
+        and len(execution_plan["actions"]) == 1
+    )
     approval = Approval(
+        tenant_id=context.tenant_id,
         incident_id=incident.id,
         recommendation_id=recommendation.id,
-        decision=ApprovalDecision.APPROVED,
-        approver="kaiops-demo",
+        plan_id=execution_plan.get("plan_id"),
+        plan_fingerprint=execution_plan.get("plan_fingerprint"),
+        approval_expires_at=execution_plan.get("expiry"),
+        decision=ApprovalDecision.APPROVED if local_execution_ready else ApprovalDecision.PENDING,
+        approver="kaiops-demo" if local_execution_ready else None,
         channel="web",
         comment=scenario["remediation_comment"],
         trace_id=trace_id,
@@ -3252,6 +3305,11 @@ async def run_local_payment_workflow(
             "target": recommendation.metadata.get("remediation_target") or context.alert.service,
             "recommended_action": recommendation.recommended_action,
             "recommended_commands": recommendation.commands,
+            "execution_plan": execution_plan,
+            "runbook_id": recommendation.metadata.get("runbook_id", ""),
+            "runbook_version": recommendation.metadata.get("runbook_version"),
+            "runbook_status": recommendation.metadata.get("runbook_status", ""),
+            "runbook_checksum": recommendation.metadata.get("runbook_checksum", ""),
         },
     )
     await persist_step(lambda repo: repo.save_approval(approval))
@@ -3290,13 +3348,35 @@ async def run_local_payment_workflow(
                 "metrics": approval_event["metrics"],
             },
             started_at=now,
-            completed_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(UTC),
         )
     )
     engine = RemediationEngine()
-    action = engine.build_action(approval)
-    action.parameters.update({"root_cause": recommendation.root_cause, "impact": recommendation.impact})
-    action = await engine.execute(action)
+    if local_execution_ready:
+        action = engine.build_action(approval)
+        action.parameters.update({"root_cause": recommendation.root_cause, "impact": recommendation.impact})
+        action = await engine.execute(action)
+    else:
+        action = RemediationAction(
+            tenant_id=context.tenant_id,
+            incident_id=incident.id,
+            approval_id=approval.id,
+            action_type="diagnostic_completion",
+            target=str(execution_plan.get("remediation_target") or context.alert.service),
+            status=RemediationStatus.SKIPPED,
+            output="Execution was not performed because the governed plan is not execution-ready.",
+            parameters={
+                "policy_version": decision.policy_version,
+                "policy_reason": decision.policy_reason,
+                "root_cause": recommendation.root_cause,
+                "impact": recommendation.impact,
+                "diagnostic_closure": True,
+                "diagnostic_details": {
+                    "readiness_blocks": list(execution_plan.get("readiness_blocks") or []),
+                },
+                "execution_plan": execution_plan,
+            },
+        )
     action.trace_id = trace_id
     await persist_step(
         lambda repo: repo.save_action(action),
@@ -3336,7 +3416,7 @@ async def run_local_payment_workflow(
                 "metrics": remediation_event["metrics"],
             },
             started_at=now,
-            completed_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(UTC),
         )
     )
     closure_report = await ClosureValidationAgent().validate(action)
@@ -3381,7 +3461,7 @@ async def run_local_payment_workflow(
                 "metrics": closure_event["metrics"],
             },
             started_at=now,
-            completed_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(UTC),
         )
     )
     metrics = {
@@ -3498,9 +3578,12 @@ async def continue_pending_workflow(
         "approved": ApprovalDecision.APPROVED,
         "reject": ApprovalDecision.REJECTED,
         "rejected": ApprovalDecision.REJECTED,
-        "modify": ApprovalDecision.MODIFIED,
-        "modified": ApprovalDecision.MODIFIED,
     }
+    if token in {"modify", "modified"}:
+        raise HTTPException(
+            status_code=409,
+            detail="Free-text approval modifications are disabled; generate and approve a new typed plan.",
+        )
     approval_decision = decision_map.get(token)
     if approval_decision is None:
         raise HTTPException(status_code=400, detail="Invalid approval decision")
@@ -3559,10 +3642,20 @@ async def continue_pending_workflow(
 
     incident_data = pending.get("incident", {}) if isinstance(pending.get("incident"), dict) else {}
     recommendation_metadata = recommendation_data.get("metadata", {}) if isinstance(recommendation_data.get("metadata"), dict) else {}
+    approved_plan = recommendation_metadata.get("execution_plan") if isinstance(recommendation_metadata.get("execution_plan"), dict) else {}
     recommended_commands = recommendation_data.get("commands") if isinstance(recommendation_data.get("commands"), list) else []
     approval = Approval(
+        tenant_id=str(
+            approved_plan.get("tenant_id")
+            or recommendation_data.get("tenant_id")
+            or incident_data.get("tenant_id")
+            or ""
+        ),
         incident_id=incident_uuid,
         recommendation_id=recommendation_uuid,
+        plan_id=approved_plan.get("plan_id"),
+        plan_fingerprint=approved_plan.get("plan_fingerprint"),
+        approval_expires_at=approved_plan.get("expiry"),
         decision=approval_decision,
         approver=(approver or "sre@example.com").strip() or "sre@example.com",
         channel=(channel or "web").strip() or "web",
@@ -3609,10 +3702,15 @@ async def continue_pending_workflow(
             "recommended_commands": [
                 str(item).strip() for item in recommended_commands if str(item).strip()
             ],
+            "execution_plan": approved_plan,
+            "runbook_id": str(recommendation_metadata.get("runbook_id") or ""),
+            "runbook_version": recommendation_metadata.get("runbook_version"),
+            "runbook_status": str(recommendation_metadata.get("runbook_status") or ""),
+            "runbook_checksum": str(recommendation_metadata.get("runbook_checksum") or ""),
         },
     )
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     await persist_step(
         lambda repo: repo.save_approval(approval),
         track_agent_work_operation(
@@ -3625,7 +3723,7 @@ async def continue_pending_workflow(
             ticket_id=str(pending.get("ticket_id") or "") or None,
             details={"decision": approval.decision.value, "channel": approval.channel},
             started_at=now,
-            completed_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(UTC),
         ),
     )
 
@@ -3633,6 +3731,7 @@ async def continue_pending_workflow(
 
     if approval.decision == ApprovalDecision.REJECTED:
         action = RemediationAction(
+            tenant_id=approval.tenant_id,
             incident_id=incident_uuid,
             approval_id=approval.id,
             action_type="manual-review",
@@ -3642,6 +3741,7 @@ async def continue_pending_workflow(
             trace_id=approval_trace_id,
         )
         closure_report = ResolutionReport(
+            tenant_id=str(action.tenant_id),
             incident_id=incident_uuid,
             recommendation_id=recommendation_uuid,
             remediation_action_id=action.id,
@@ -3664,8 +3764,6 @@ async def continue_pending_workflow(
                 "impact": str(recommendation_data.get("impact", "N/A")),
             }
         )
-        if approval.decision == ApprovalDecision.MODIFIED and approval.modified_action:
-            action.action_type = approval.modified_action
         action = await engine.execute(action)
         action.trace_id = approval_trace_id
 
@@ -3690,7 +3788,7 @@ async def continue_pending_workflow(
             ticket_id=str(pending.get("ticket_id") or "") or None,
             details={"status": action.status.value, "target": action.target},
             started_at=now,
-            completed_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(UTC),
         ),
         track_agent_work_operation(
             incident_id_value=incident_uuid,
@@ -3705,7 +3803,7 @@ async def continue_pending_workflow(
                 "alerts_cleared": closure_report.alerts_cleared,
             },
             started_at=now,
-            completed_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(UTC),
         ),
     )
 
@@ -3764,7 +3862,7 @@ async def continue_pending_workflow(
     final_incident_payload = {
         **incident_data,
         "status": final_incident_status.value,
-        "closed_at": datetime.now(timezone.utc).isoformat() if closure_report.health_restored else incident_data.get("closed_at"),
+        "closed_at": datetime.now(UTC).isoformat() if closure_report.health_restored else incident_data.get("closed_at"),
     }
     final_incident = Incident.model_validate(final_incident_payload)
     metrics = {
@@ -3893,7 +3991,7 @@ def _record_closed_incident(
             "root_cause": str(closure_report.get("root_cause") or "N/A"),
             "impact": str(closure_report.get("impact") or "N/A"),
             "trace_id": str(trace_id or closure_report.get("trace_id") or ""),
-            "closed_at": datetime.now(timezone.utc).isoformat(),
+            "closed_at": datetime.now(UTC).isoformat(),
         }
     )
 
@@ -4102,7 +4200,7 @@ async def _publish_lifecycle_events(normalized: dict[str, Any], trace_id: str | 
         "labels": normalized.get("labels", {}),
         "annotations": normalized.get("annotations", {}),
         "normalized": normalized,
-        "ts": datetime.now(timezone.utc).isoformat(),
+        "ts": datetime.now(UTC).isoformat(),
     }
     for topic in (
         ALERT_RECEIVED,
@@ -4211,7 +4309,7 @@ def _integration_health_snapshot(
         "provider": provider,
         "validation": validation,
         "detail": detail or {},
-        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(UTC).isoformat(),
     }
     return {
         "status": "healthy" if test_ok and bool(validation.get("valid", False)) else "degraded",
@@ -4322,7 +4420,7 @@ async def create_monitoring_integration(payload: dict[str, Any] = ALERT_BODY) ->
             authentication_ok=health["authentication_ok"],
             webhook_ok=health["webhook_ok"],
             last_received_alert_at=None,
-            last_successful_test_at=datetime.now(timezone.utc),
+            last_successful_test_at=datetime.now(UTC),
             rate_limit_remaining=None,
             payload=health["payload"],
         )
@@ -4446,7 +4544,7 @@ async def validate_monitoring_integration(integration_id: str, payload: dict[str
             authentication_ok=health["authentication_ok"],
             webhook_ok=health["webhook_ok"],
             last_received_alert_at=None,
-            last_successful_test_at=datetime.now(timezone.utc),
+            last_successful_test_at=datetime.now(UTC),
             rate_limit_remaining=None,
             payload=health["payload"],
         )
@@ -5527,8 +5625,13 @@ def _jira_payload_to_alert_payload(payload: dict[str, Any]) -> tuple[dict[str, A
     reporter = fields.get("reporter", {}) if isinstance(fields.get("reporter"), dict) else {}
     assignee = fields.get("assignee", {}) if isinstance(fields.get("assignee"), dict) else {}
     webhook_event = str(payload.get("webhookEvent") or "").strip()
-    jira_labels = fields.get("labels") if isinstance(fields.get("labels"), list) else []
-    managed = "managed_by_kaiops" in jira_labels
+    jira_labels = [str(label) for label in (fields.get("labels") if isinstance(fields.get("labels"), list) else [])]
+    managed = (
+        "managed_by_kaiops" in jira_labels
+        or "kaiops-auto-created" in jira_labels
+        or "kaiops-managed-by-kaiops" in jira_labels
+        or any(lbl.startswith(("kaiops_incident_", "kaiops-candidate-")) for lbl in jira_labels)
+    )
     kaiops_incident_label = next(
         (str(label) for label in jira_labels if str(label).startswith("kaiops_incident_")),
         "",
@@ -5562,13 +5665,40 @@ def _jira_payload_to_alert_payload(payload: dict[str, Any]) -> tuple[dict[str, A
     return mapped_payload, issue_key
 
 
+def _latest_comment_is_from_kaiops(fields: dict[str, Any]) -> bool:
+    """True when the most recent comment on a polled Jira issue was posted
+    by the KaiOps API account (JIRA_API_EMAIL). Used by _jira_poll_worker to
+    tell "this issue's `updated` timestamp moved because KaiOps itself just
+    commented on it" apart from a genuine external update, so KaiOps's own
+    comments don't make the ticket look freshly changed to the next poll.
+    """
+    if not JIRA_API_EMAIL:
+        return False
+    comment_field = fields.get("comment") if isinstance(fields.get("comment"), dict) else {}
+    comments = comment_field.get("comments") if isinstance(comment_field.get("comments"), list) else []
+    if not comments:
+        return False
+    last_comment = comments[-1] if isinstance(comments[-1], dict) else {}
+    author = last_comment.get("author") if isinstance(last_comment.get("author"), dict) else {}
+    author_email = str(author.get("emailAddress") or "").strip().lower()
+    return bool(author_email) and author_email == JIRA_API_EMAIL.strip().lower()
+
+
 def _is_kaiops_managed_jira_update(payload: dict[str, Any]) -> bool:
     issue = payload.get("issue", {}) if isinstance(payload, dict) else {}
     fields = issue.get("fields", {}) if isinstance(issue, dict) and isinstance(issue.get("fields"), dict) else {}
-    labels = fields.get("labels") if isinstance(fields.get("labels"), list) else []
-    comment = payload.get("comment", {}) if isinstance(payload.get("comment"), dict) else {}
+    labels = [str(lbl) for lbl in (fields.get("labels") if isinstance(fields.get("labels"), list) else [])]
+    comment = payload.get("comment", {}) if isinstance(payload, dict) else {}
     comment_body = str(comment.get("body") or "")
-    return "managed_by_kaiops" in labels and (
+    is_managed_label = (
+        "managed_by_kaiops" in labels
+        or "kaiops-auto-created" in labels
+        or "kaiops-managed-by-kaiops" in labels
+        or any(lbl.startswith(("kaiops_incident_", "kaiops-candidate-")) for lbl in labels)
+    )
+    if is_managed_label:
+        return True
+    return (
         "[kaiops-managed-update]" in comment_body
         or str(payload.get("event_origin") or "").lower() == "kaiops"
     )
@@ -5823,14 +5953,14 @@ async def suppress_observed_alert_application(project_name: str, tenant_id: str 
 
 
 @app.get("/alerts/{alert_id}/processed-result")
-async def get_processed_result(alert_id: str) -> dict[str, Any]:
+async def get_processed_result(alert_id: str, tenant_id: str) -> dict[str, Any]:
     session_factory = getattr(app.state, "session_factory", None)
     if not settings.database_enabled or session_factory is None:
         raise HTTPException(status_code=503, detail="Database is not enabled for processed results")
 
     async with session_factory() as session:
         repo = IncidentRepository(session)
-        result = await repo.get_processed_result_by_alert_id(alert_id)
+        result = await repo.get_processed_result_by_alert_id(alert_id, tenant_id=tenant_id)
 
     if not result:
         raise HTTPException(status_code=404, detail="No processed result found for alert")
@@ -6023,10 +6153,10 @@ async def get_landing_pad_recent(limit: int = 20, include_archive: bool = False)
     rows: list[dict[str, Any]] = []
     for path in files:
         try:
-            filename_timestamp = datetime.strptime(path.name[:22], "%Y%m%dT%H%M%S%fZ").replace(tzinfo=timezone.utc)
+            filename_timestamp = datetime.strptime(path.name[:22], "%Y%m%dT%H%M%S%fZ").replace(tzinfo=UTC)
             modified_at = filename_timestamp.isoformat()
         except ValueError:
-            modified_at = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat()
+            modified_at = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC).isoformat()
         entry: dict[str, Any] = {
             "file": path.name,
             "path": str(path),
@@ -6267,13 +6397,13 @@ async def get_agent_work_items(limit: int = 100) -> dict[str, Any]:
 
 
 @app.get("/incidents/closed")
-async def get_closed_incidents(limit: int = 100) -> dict[str, Any]:
+async def get_closed_incidents(tenant_id: str, limit: int = 100) -> dict[str, Any]:
     safe_limit = max(1, min(int(limit), 500))
     session_factory = getattr(app.state, "session_factory", None)
     if settings.database_enabled and session_factory is not None:
         async with session_factory() as session:
             repo = IncidentRepository(session)
-            rows = await repo.list_closed_incidents(limit=safe_limit)
+            rows = await repo.list_closed_incidents(limit=safe_limit, tenant_id=tenant_id)
         return {"rows": rows, "count": len(rows)}
 
     rows = list(CLOSED_INCIDENTS)[:safe_limit]
@@ -6282,6 +6412,7 @@ async def get_closed_incidents(limit: int = 100) -> dict[str, Any]:
 
 @app.get("/incidents/metadata")
 async def get_incident_metadata(
+    tenant_id: str,
     limit: int = 100,
     include_enrichment: bool = True,
     risk_tier: str | None = None,
@@ -6289,6 +6420,7 @@ async def get_incident_metadata(
     transport_provider: str | None = None,
     status: str | None = None,
     service: str | None = None,
+    incident_id: str | None = None,
 ) -> dict[str, Any]:
     safe_limit = max(1, min(int(limit), 1000))
     session_factory = getattr(app.state, "session_factory", None)
@@ -6303,6 +6435,8 @@ async def get_incident_metadata(
                 transport_provider=transport_provider,
                 status=status,
                 service=service,
+                incident_id=incident_id,
+                tenant_id=tenant_id,
             )
         return {"rows": rows, "count": len(rows)}
 
@@ -6323,6 +6457,13 @@ async def get_incident_metadata(
         ]
     if status:
         rows = [row for row in rows if str(row.get("status") or "").strip().lower() == str(status).strip().lower()]
+    if incident_id:
+        rows = [
+            row
+            for row in rows
+            if str(row.get("incident_id") or row.get("id") or "").strip().lower()
+            == str(incident_id).strip().lower()
+        ]
     if service:
         rows = [row for row in rows if str(row.get("service") or "").strip() == str(service).strip()]
     rows = rows[:safe_limit]
@@ -6341,15 +6482,96 @@ async def get_lowest_confidence_recommendations(limit: int = 5) -> dict[str, Any
     return {"rows": rows, "count": len(rows)}
 
 
+@app.get("/incidents/groups")
+async def get_incident_groups(
+    tenant_id: str,
+    limit: int = 25,
+    cursor: str | None = None,
+    risk_tier: str | None = None,
+    execution_mode: str | None = None,
+    status: str | None = None,
+    service: str | None = None,
+) -> dict[str, Any]:
+    session_factory = getattr(app.state, "session_factory", None)
+    if not settings.database_enabled or session_factory is None:
+        raise HTTPException(status_code=503, detail="Incident group read model is unavailable")
+    async with session_factory() as session:
+        repo = IncidentRepository(session)
+        try:
+            return await repo.list_incident_groups(
+                tenant_id=tenant_id,
+                limit=limit,
+                cursor=cursor,
+                risk_tier=risk_tier,
+                execution_mode=execution_mode,
+                status=status,
+                service=service,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/incidents/{incident_id}")
+async def get_incident_by_id(incident_id: str, tenant_id: str) -> dict[str, Any]:
+    session_factory = getattr(app.state, "session_factory", None)
+    if not settings.database_enabled or session_factory is None:
+        raise HTTPException(status_code=503, detail="Incident read model is unavailable")
+    async with session_factory() as session:
+        repo = IncidentRepository(session)
+        rows = await repo.list_incident_projections(
+            limit=1,
+            tenant_id=tenant_id,
+            include_enrichment=True,
+            incident_id=incident_id,
+        )
+        if rows:
+            return rows[0]
+        legacy = await repo.get_incident(incident_id, tenant_id=tenant_id)
+        if legacy is None:
+            raise HTTPException(status_code=404, detail="Incident not found")
+        return legacy
+
+
+@app.get("/incidents/inbox/feed")
+async def get_unified_incident_inbox(
+    tenant_id: str,
+    limit: int = 25,
+    cursor: str | None = None,
+    project_id: str | None = None,
+    risk_tier: str | None = None,
+    execution_mode: str | None = None,
+    transport_provider: str | None = None,
+    status: str | None = None,
+    service: str | None = None,
+    inbox_view: str = "all",
+    record_type: str = "all",
+    severity: str | None = None,
+) -> dict[str, Any]:
+    session_factory = getattr(app.state, "session_factory", None)
+    if not settings.database_enabled or session_factory is None:
+        raise HTTPException(status_code=503, detail="Unified incident inbox is unavailable")
+    async with session_factory() as session:
+        repo = IncidentRepository(session)
+        try:
+            return await repo.list_unified_inbox(
+                tenant_id=tenant_id, limit=limit, cursor=cursor, project_id=project_id,
+                risk_tier=risk_tier, execution_mode=execution_mode,
+                transport_provider=transport_provider, status=status, service=service,
+                inbox_view=inbox_view, record_type=record_type, severity=severity,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
 @app.get("/incidents/{incident_id}/stage-completeness")
-async def get_incident_stage_completeness(incident_id: str) -> dict[str, Any]:
+async def get_incident_stage_completeness(incident_id: str, tenant_id: str) -> dict[str, Any]:
     session_factory = getattr(app.state, "session_factory", None)
     if not settings.database_enabled or session_factory is None:
         raise HTTPException(status_code=503, detail="Database is not enabled for incident stage completeness")
 
     async with session_factory() as session:
         repo = IncidentRepository(session)
-        result = await repo.get_incident_stage_completeness(incident_id)
+        result = await repo.get_incident_stage_completeness(incident_id, tenant_id=tenant_id)
 
     if not result:
         raise HTTPException(status_code=404, detail="No incident stage completeness found for incident")
@@ -6772,7 +6994,7 @@ async def update_onboarding_rules_pipeline(workflow_id: str, payload: dict[str, 
                 "pipeline": str(connectivity_payload.get("pipeline") or latest.get("provider_name") or "onboarding_pipeline"),
                 "summary": payload.get("summary") if isinstance(payload.get("summary"), dict) else connectivity_payload.get("summary", {}),
                 "result": merged_result,
-                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "updated_at": datetime.now(UTC).isoformat(),
             }
         )
 
@@ -6787,7 +7009,7 @@ async def update_onboarding_rules_pipeline(workflow_id: str, payload: dict[str, 
             test_message=str(payload.get("test_message") or latest.get("test_message") or "Workflow updated by admin"),
             project_payload=project_payload,
             connectivity_payload=connectivity_payload,
-            last_tested_at=datetime.now(timezone.utc),
+            last_tested_at=datetime.now(UTC),
         )
         await session.commit()
 
@@ -6825,42 +7047,9 @@ async def delete_onboarding_rules_pipeline(workflow_id: str) -> dict[str, Any]:
     return {"workflow_id": workflow_id, "deleted": deleted_total}
 
 
-@app.post("/sample/payment-latency/workflow")
-async def sample_payment_latency_workflow(
-    fast_mode: bool = False,
-    x_trace_id: str | None = Header(default=None),
-) -> dict[str, Any]:
-    return await run_local_payment_workflow(trace_id=x_trace_id, run_comparison=not fast_mode, auto_approve=False)
-
-
-@app.post("/sample/{flow_id}/workflow")
-async def sample_flow_workflow(
-    flow_id: str,
-    fast_mode: bool = False,
-    x_trace_id: str | None = Header(default=None),
-) -> dict[str, Any]:
-    return await run_local_payment_workflow(
-        trace_id=x_trace_id,
-        flow_id=flow_id,
-        run_comparison=not fast_mode,
-        auto_approve=False,
+app.include_router(
+    build_workflow_router(
+        run_workflow=run_local_payment_workflow,
+        continue_workflow=continue_pending_workflow,
     )
-
-
-@app.post("/sample/{flow_id}/workflow/continue")
-async def continue_flow_workflow(
-    flow_id: str,
-    payload: dict[str, Any] = ALERT_BODY,
-    x_trace_id: str | None = Header(default=None),
-) -> dict[str, Any]:
-    return await continue_pending_workflow(
-        flow_id=flow_id,
-        incident_id=str(payload.get("incident_id") or ""),
-        recommendation_id=str(payload.get("recommendation_id") or ""),
-        decision_token=str(payload.get("decision") or ""),
-        approver=str(payload.get("approver") or "").strip() or None,
-        channel=str(payload.get("channel") or "").strip() or None,
-        comment=str(payload.get("comment") or "").strip() or None,
-        modified_action=str(payload.get("modified_action") or "").strip() or None,
-        trace_id=x_trace_id,
-    )
+)

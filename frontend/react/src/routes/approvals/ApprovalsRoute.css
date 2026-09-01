@@ -1,0 +1,208 @@
+/* Approval hero owns a dark command surface in every theme. Keep its foreground
+   contract local so global light-surface compatibility rules cannot override it. */
+.approval-workspace .panel.approval-hero {
+  color: #f7fbff !important;
+  border-color: rgba(103, 232, 249, .24) !important;
+  background:
+    radial-gradient(circle at 88% 8%, rgba(69, 227, 168, .24), transparent 29%),
+    linear-gradient(135deg, #071a33 0%, #103d5d 57%, #146474 100%) !important;
+  box-shadow: 0 18px 40px rgba(7, 26, 51, .18) !important;
+}
+
+.approval-workspace .panel.approval-hero h2 {
+  color: #fff !important;
+}
+
+.approval-workspace .panel.approval-hero p {
+  color: #d7e9f1 !important;
+}
+
+.approval-workspace .panel.approval-hero .eyebrow {
+  color: #67e8f9 !important;
+}
+
+.approval-workspace .approval-hero .approval-summary > div {
+  color: #fff;
+  border-color: rgba(255, 255, 255, .22);
+  background: rgba(255, 255, 255, .1);
+  backdrop-filter: blur(8px);
+}
+
+.approval-workspace .approval-hero .approval-summary strong,
+.approval-workspace .approval-hero .approval-summary span {
+  color: #fff !important;
+}
+
+.approval-workspace button,
+.approval-workspace select,
+.approval-workspace textarea {
+  min-height: 44px;
+}
+
+/* The queue is a fixed-height scrolling grid. Explicit max-content rows keep a
+   large result set from shrinking every ticket to fit the viewport. */
+.approval-workspace .approval-compact-filter label {
+  display: grid;
+  gap: 6px;
+}
+
+.approval-workspace .approval-card-list {
+  grid-auto-rows: max-content;
+}
+
+.approval-workspace .approval-ticket {
+  min-height: 76px;
+  height: auto;
+  overflow: visible;
+  line-height: 1.3;
+}
+
+.approval-workspace .approval-ticket > * {
+  min-width: 0;
+}
+
+.approval-workspace .approval-ticket > span:not(.pill) {
+  display: grid;
+  gap: 4px;
+}
+
+.approval-workspace .approval-ticket b,
+.approval-workspace .approval-ticket strong {
+  overflow-wrap: anywhere;
+}
+
+.approval-workspace .approval-ticket > strong {
+  justify-self: end;
+  white-space: nowrap;
+}
+
+.approval-readiness {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  margin: 16px 0;
+  padding: 16px;
+  border: 1px solid #b45309;
+  border-radius: 12px;
+  background: #fffbeb;
+  color: #78350f;
+}
+
+.approval-readiness.status-dry_run_eligible,
+.approval-readiness.status-execution_eligible {
+  border-color: #15803d;
+  background: #f0fdf4;
+  color: #14532d;
+}
+
+.approval-readiness svg {
+  flex: 0 0 24px;
+}
+
+.approval-readiness p {
+  margin: 4px 0 0;
+  color: inherit;
+  font-size: 14px;
+}
+
+.decision-packet-list {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+}
+
+.approval-decision-story {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin: 16px 0;
+}
+
+.approval-decision-story article,
+.approval-safety-plan article {
+  padding: 14px;
+  border: 1px solid var(--k-color-border);
+  border-radius: var(--k-radius-md);
+  background: var(--k-color-surface-subtle);
+}
+
+.approval-decision-story span {
+  color: var(--kai-intelligence);
+  font-size: .72rem;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.approval-decision-story p { min-height: 2.5em; margin: 8px 0; line-height: 1.45; }
+.approval-decision-story strong { font-size: .78rem; overflow-wrap: anywhere; }
+.approval-safety-plan { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+.approval-safety-plan h4 { margin: 0 0 8px; }
+.approval-safety-plan p,.approval-safety-plan ol { margin: 0; color: var(--k-color-text-muted); line-height: 1.5; }
+.approval-evidence li { margin-block: 6px; overflow-wrap: anywhere; }
+.approval-modify-plan { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.approval-modify-plan > p,.approval-modify-plan label:last-of-type,.approval-modify-plan button { grid-column: 1 / -1; }
+
+.decision-packet-list div {
+  padding: 12px;
+  border: 1px solid var(--border, #d7dee8);
+  border-radius: 10px;
+}
+
+.decision-packet-list dt {
+  margin-bottom: 4px;
+  color: var(--muted, #52606d);
+  font-size: 14px;
+}
+
+.decision-packet-list dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-size: 16px;
+  font-weight: 650;
+}
+
+.approval-review details {
+  margin: 16px 0;
+}
+
+.approval-review summary {
+  min-height: 44px;
+  cursor: pointer;
+  font-weight: 650;
+}
+
+.approval-review pre {
+  max-height: 320px;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+
+.approval-receipt {
+  display: flex;
+  gap: 12px;
+  margin-top: 16px;
+  padding: 16px;
+  border: 1px solid #15803d;
+  border-radius: 12px;
+  background: #f0fdf4;
+  color: #14532d;
+}
+
+.approval-receipt svg {
+  flex: 0 0 24px;
+}
+
+@media (max-width: 720px) {
+  .approval-decision-story,
+  .approval-safety-plan,
+  .approval-modify-plan { grid-template-columns: 1fr; }
+  .approval-workspace .approval-ticket {
+    grid-template-columns: 1fr;
+    min-height: 0;
+    text-align: left;
+  }
+
+  .approval-workspace .approval-ticket > strong {
+    justify-self: start;
+  }
+}

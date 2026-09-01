@@ -97,7 +97,9 @@ function Invoke-Scp {
 
 function Get-HealthUrl {
     param([Parameter(Mandatory = $true)][string]$Target)
-    return "http://${Target}:8010/healthz"
+    # The gateway is intentionally private on Azure. Probe it through the
+    # public UI reverse proxy, which validates both nginx and gateway routing.
+    return "http://${Target}:8501/api-gateway/healthz"
 }
 
 function New-SourceArchive {
@@ -118,6 +120,8 @@ function New-SourceArchive {
         "--exclude=.venv",
         "--exclude=.tmp",
         "--exclude=.tmp/**",
+        "--exclude=.runtime",
+        "--exclude=.runtime/**",
         "--exclude=logs",
         "--exclude=backend/runtime",
         "--exclude=backend/runtime/**",

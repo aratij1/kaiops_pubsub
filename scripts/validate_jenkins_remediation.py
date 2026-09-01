@@ -48,6 +48,9 @@ def validate(catalog: dict[str, Any], jenkinsfile: str) -> list[str]:
         "audit artifact": "kaiops-result.json",
         "artifact fingerprint": "fingerprint: true",
         "live safety contract": "Live self-healing requires executable preflight and validation commands",
+        "approved script catalog": "approvedScript",
+        "immutable plan digest": "KAI_OPS_PLAN_DIGEST",
+        "script execution proof": "executed_script_count",
     }
     for capability, token in required_tokens.items():
         if token not in jenkinsfile:

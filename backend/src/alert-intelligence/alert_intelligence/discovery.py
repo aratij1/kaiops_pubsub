@@ -79,6 +79,13 @@ def _fallback_actionability(alert: Alert) -> tuple[bool, str]:
             "error scraping",
             "cannot scrape",
             "failed",
+            "failure",
+            "latency",
+            "degraded",
+            "above threshold",
+            "row count is high",
+            "disk space low",
+            "saturation",
         )
     )
     # Keyword matching alone misses common, clearly-actionable operational

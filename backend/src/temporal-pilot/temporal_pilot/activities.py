@@ -15,7 +15,9 @@ settings = get_settings()
 
 async def _post(base: str, path: str, payload: dict[str, Any], params: dict[str, Any] | None = None, extra_headers: dict[str, str] | None = None) -> dict[str, Any]:
     info = activity.info()
-    headers = {"Idempotency-Key": str(info.activity_id)}
+    # Activity IDs are only unique inside a workflow. Include the workflow ID
+    # so retries are idempotent without colliding with unrelated executions.
+    headers = {"Idempotency-Key": f"{info.workflow_id}:{info.activity_id}"}
     if settings.ai_layer_auth_token:
         headers["Authorization"] = f"Bearer {settings.ai_layer_auth_token}"
     headers.update(extra_headers or {})
@@ -76,7 +78,7 @@ async def execute_remediation_action(approval: dict[str, Any]) -> dict[str, Any]
         result = await _post(
             settings.remediation_engine_url,
             "/execution-failed",
-            {"approval": approval, "error": error, "http_status": exc.response.status_code},
+            {"approval": approval, "error": error, "http_status": exc.response.status_code, "policy_blocked": exc.response.status_code == 409},
             extra_headers={"X-KaiOps-Internal-Token": settings.remediation_internal_token},
         )
     activity.heartbeat({"stage": "terminal", "status": result.get("status")})
@@ -86,12 +88,35 @@ async def execute_remediation_action(approval: dict[str, Any]) -> dict[str, Any]
 @activity.defn(name="dispatch_remediation_action")
 async def dispatch_remediation_action(approval: dict[str, Any]) -> dict[str, Any]:
     activity.heartbeat({"stage": "dispatching", "incident_id": approval.get("incident_id")})
-    return await _post(
-        settings.remediation_engine_url,
-        "/dispatch-direct",
-        approval,
-        extra_headers={"X-KaiOps-Internal-Token": settings.remediation_internal_token},
-    )
+    try:
+        return await _post(
+            settings.remediation_engine_url,
+            "/dispatch-direct",
+            approval,
+            extra_headers={"X-KaiOps-Internal-Token": settings.remediation_internal_token},
+        )
+    except httpx.HTTPStatusError as exc:
+        # 4xx responses are deterministic policy/contract decisions. Retrying
+        # them cannot succeed and previously left the UI apparently hanging.
+        if 400 <= exc.response.status_code < 500:
+            try:
+                body = exc.response.json()
+                detail = str(body.get("detail") or body)
+            except (ValueError, AttributeError):
+                detail = str(exc.response.text or "").strip()
+            return await _post(
+                settings.remediation_engine_url,
+                "/execution-failed",
+                {
+                    "approval": approval,
+                    "error": detail or f"Dispatch rejected with HTTP {exc.response.status_code}.",
+                    "http_status": exc.response.status_code,
+                    "phase": "dispatch",
+                    "policy_blocked": exc.response.status_code == 409,
+                },
+                extra_headers={"X-KaiOps-Internal-Token": settings.remediation_internal_token},
+            )
+        raise
 
 
 @activity.defn(name="reconcile_remediation_action")
@@ -107,10 +132,44 @@ async def reconcile_remediation_action(approval: dict[str, Any]) -> dict[str, An
 
 @activity.defn(name="timeout_remediation_action")
 async def timeout_remediation_action(approval: dict[str, Any]) -> dict[str, Any]:
+    profile = approval.get("metadata", {}).get("connection_profile", {})
+    timeout_seconds = int(profile.get("timeout_seconds") or 1200) if isinstance(profile, dict) else 1200
+    timeout_seconds = max(60, min(timeout_seconds, 3600))
     return await _post(
         settings.remediation_engine_url,
         "/timeout-direct",
-        {"approval": approval, "error": "Executor did not reach a terminal state within 25 minutes."},
+        {"approval": approval, "error": f"Executor did not reach a terminal state within {timeout_seconds} seconds."},
+        extra_headers={"X-KaiOps-Internal-Token": settings.remediation_internal_token},
+    )
+
+
+@activity.defn(name="rollback_remediation_action")
+async def rollback_remediation_action(approval: dict[str, Any]) -> dict[str, Any]:
+    activity.heartbeat({"stage": "rolling_back", "incident_id": approval.get("incident_id")})
+    action = await _post(
+        settings.remediation_engine_url,
+        "/rollback-direct",
+        {"approval": approval},
+        extra_headers={"X-KaiOps-Internal-Token": settings.remediation_internal_token},
+    )
+    terminal = {"rolled_back", "rollback_failed", "manual_intervention_required"}
+    if str(action.get("status") or "").lower() in terminal:
+        return action
+    for attempt in range(60):
+        await asyncio.sleep(10)
+        activity.heartbeat({"stage": "rollback_reconciling", "incident_id": approval.get("incident_id"), "attempt": attempt + 1})
+        action = await _post(
+            settings.remediation_engine_url,
+            "/rollback-reconcile-direct",
+            {"approval": approval},
+            extra_headers={"X-KaiOps-Internal-Token": settings.remediation_internal_token},
+        )
+        if str(action.get("status") or "").lower() in terminal:
+            return action
+    return await _post(
+        settings.remediation_engine_url,
+        "/rollback-timeout-direct",
+        {"approval": approval},
         extra_headers={"X-KaiOps-Internal-Token": settings.remediation_internal_token},
     )
 

@@ -1,5 +1,6 @@
 import importlib.util
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -60,7 +61,9 @@ async def test_knowledge_pack_approval_writes_rag_document(tmp_path) -> None:
         service="checkout-api",
         environment="prod",
         owner_team="platform-ops",
+        tenant_id="tenant-a",
         approved_by="administrator",
+        approval_expires_at=datetime(2099, 1, 1, tzinfo=UTC),
         documents=[
             module.KnowledgePackSourceDocument(
                 name="checkout-triage.md",
@@ -80,6 +83,6 @@ async def test_knowledge_pack_approval_writes_rag_document(tmp_path) -> None:
     assert response["status"] == "approved"
     assert response["rag_document"]["document_count"] == 1
     assert Path(response["rag_document"]["path"]).exists()
-    matches = connector.search("checkout 5xx mysql recovery", limit=3)
+    matches = connector.search("checkout 5xx mysql recovery", limit=3, tenant_id="tenant-a")
     assert matches[0]["title"] == "checkout-api Knowledge Pack"
     assert matches[0]["source_system"] == "knowledge-pack"

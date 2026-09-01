@@ -57,7 +57,12 @@ class JiraClient:
         labels: dict[str, str] | None = None,
     ) -> str:
         """Creates a new Jira issue and returns its key (e.g. "KAI-123")."""
-        jira_labels = [f"kaiops-severity-{severity}", "kaiops-auto-created"]
+        jira_labels = [
+            f"kaiops-severity-{severity}",
+            "kaiops-auto-created",
+            "managed_by_kaiops",
+            "kaiops-managed-by-kaiops",
+        ]
         for key, value in (labels or {}).items():
             safe = re.sub(r"[^a-zA-Z0-9_.-]", "-", f"kaiops-{key}-{value}")[:255]
             if safe:

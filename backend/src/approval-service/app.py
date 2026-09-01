@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
+import json
 from collections.abc import Awaitable, Callable, Coroutine
 import logging
 from datetime import datetime, timedelta, timezone
@@ -14,12 +17,15 @@ from common.database import ApprovalAssignmentRecord, ApprovalCapacityRecord
 from common.event_publishers import build_agent_event_contract, build_event_envelope
 from common.kafka import KafkaConsumer, consume_forever as consume_kafka_forever
 from common.models import Approval, ApprovalDecision
+from common.orchestration.execution_plan_contract import verify_plan_fingerprint
 from common.rabbitmq import RabbitMQConsumer, consume_forever as consume_rabbitmq_forever
 from common.repository import IncidentRepository
 from common.service import create_app
 from common.topics import APPROVAL_EVENTS, RESOLUTION_EVENTS
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from common.tenant_identity import require_tenant_id
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, select
 
 settings = get_settings()
@@ -33,6 +39,10 @@ PENDING_INCIDENTS: dict[str, dict] = {}
 _HIGH_RISK_SEVERITIES = {"high", "critical"}
 _NON_HUMAN_APPROVERS = {"", "system", "rca-agent", "automation-agent", "orchestrator"}
 logger = logging.getLogger("kaiops.approval_service")
+
+
+def _pending_key(tenant_id: str, incident_id: Any) -> str:
+    return f"{require_tenant_id(tenant_id, source='approval cache identity')}:{str(incident_id)}"
 
 
 def _looks_like_uuid(value: Any) -> bool:
@@ -96,6 +106,75 @@ def _recommendation_id_from_repository_payload(payload: Any) -> str:
     return ""
 
 
+def _signed_approval_readiness(context: dict[str, Any]) -> dict[str, Any]:
+    recommendation = context.get("recommendation") if isinstance(context.get("recommendation"), dict) else {}
+    metadata = recommendation.get("metadata") if isinstance(recommendation.get("metadata"), dict) else {}
+    plan = metadata.get("execution_plan") if isinstance(metadata.get("execution_plan"), dict) else {}
+    quality = metadata.get("evidence_quality") if isinstance(metadata.get("evidence_quality"), dict) else {}
+    policy = plan.get("policy_decision") if isinstance(plan.get("policy_decision"), dict) else {}
+    profile = metadata.get("connection_profile") if isinstance(metadata.get("connection_profile"), dict) else {}
+    rollback = plan.get("rollback_commands") if isinstance(plan.get("rollback_commands"), list) else []
+    validators = plan.get("validators") if isinstance(plan.get("validators"), list) else []
+    credential_reference = str(
+        profile.get("secret_ref")
+        or profile.get("credential_ref")
+        or metadata.get("secret_ref")
+        or metadata.get("credential_ref")
+        or ""
+    ).strip()
+    opaque_credential = credential_reference.startswith((
+        "vault://", "secret://", "managed-identity://", "azure-keyvault://",
+        "aws-secretsmanager://", "gcp-secretmanager://",
+    ))
+    checks = {
+        "rca_version_binding": bool(plan.get("rca_version")),
+        "evidence_snapshot_binding": bool(plan.get("evidence_snapshot_id")),
+        "recommendation_version_binding": bool(plan.get("recommendation_version")),
+        "approved_runbook": str(metadata.get("runbook_status") or plan.get("runbook_status") or "").lower() == "approved",
+        "valid_plan": bool(plan.get("plan_id") and plan.get("plan_fingerprint") and verify_plan_fingerprint(plan)),
+        "execution_ready": (
+            plan.get("execution_ready") is True
+            and plan.get("diagnostic_only") is not True
+            and str(plan.get("plan_kind") or "").lower() != "diagnostic"
+        ),
+        "governed_target": bool(plan.get("target_resource_id") or plan.get("remediation_target")),
+        "available_connector": bool(plan.get("connector_id") or profile.get("connector_id") or profile.get("executor_type")),
+        "current_credentials": opaque_credential,
+        "required_validators": bool(validators),
+        "rollback_readiness": str(plan.get("rollback_mode") or "").lower() == "not_applicable" or bool(rollback),
+        "policy_acceptance": str(policy.get("decision") or metadata.get("policy_decision") or "").lower() in {"allow", "approved", "accept", "hitl"},
+        "evidence_threshold": (
+            float(quality.get("evidence_coverage") or 0.0) >= 0.85
+            and float(quality.get("citation_coverage") or 0.0) > 0.0
+            and quality.get("evidence_fresh") is not False
+            and int(quality.get("conflict_count") or quality.get("contradiction_count") or 0) == 0
+        ),
+    }
+    signing_key = str(settings.service_internal_token or "").strip()
+    if not signing_key:
+        checks["readiness_signing_key"] = False
+    missing = [name for name, passed in checks.items() if not passed]
+    issued_at = datetime.now(timezone.utc).isoformat()
+    material = {
+        "tenant_id": str(context.get("tenant_id") or recommendation.get("tenant_id") or ""),
+        "incident_id": str(context.get("incident_id") or recommendation.get("incident_id") or ""),
+        "recommendation_id": _first_recommendation_id(context, recommendation),
+        "rca_version": str(plan.get("rca_version") or ""),
+        "evidence_snapshot_id": str(plan.get("evidence_snapshot_id") or ""),
+        "recommendation_version": str(plan.get("recommendation_version") or ""),
+        "plan_id": str(plan.get("plan_id") or ""),
+        "plan_fingerprint": str(plan.get("plan_fingerprint") or ""),
+        "state": "execution_eligible" if not missing else "blocked",
+        "checks": checks,
+        "missing": missing,
+        "issued_at": issued_at,
+    }
+    canonical = json.dumps(material, sort_keys=True, separators=(",", ":"))
+    decision_id = hashlib.sha256(canonical.encode()).hexdigest()
+    signature = hmac.new(signing_key.encode(), canonical.encode(), hashlib.sha256).hexdigest() if signing_key else ""
+    return {**material, "decision_id": decision_id, "signature": f"hmac-sha256:{signature}" if signature else ""}
+
+
 async def startup(app: FastAPI) -> None:
     workers = max(1, int(getattr(settings, "message_bus_worker_count", 1) or 1))
     consumers: list[tuple[str, Any, ConsumeRunner]] = []
@@ -112,7 +191,18 @@ async def startup(app: FastAPI) -> None:
 
     async def handle(payload: dict) -> None:
         incident_id = str(payload["recommendation"]["incident_id"])
-        PENDING_INCIDENTS[incident_id] = payload
+        recommendation = payload.get("recommendation", {}) if isinstance(payload.get("recommendation"), dict) else {}
+        tenant_id = require_tenant_id(
+            recommendation.get("tenant_id") or payload.get("tenant_id") or (payload.get("incident") or {}).get("tenant_id"),
+            source="resolution approval event",
+        )
+        cache_key = _pending_key(tenant_id, incident_id)
+        metadata = recommendation.get("metadata", {}) if isinstance(recommendation.get("metadata"), dict) else {}
+        control = metadata.get("resolution_control", {}) if isinstance(metadata.get("resolution_control"), dict) else {}
+        if control.get("disposition") in {"watch_only", "investigate", "execution_ready"}:
+            PENDING_INCIDENTS.pop(cache_key, None)
+            return
+        PENDING_INCIDENTS[cache_key] = payload
 
     for source, consumer, consume_forever in consumers:
         task = asyncio.create_task(consume_forever(consumer, handle), name=f"approval-service-{source}-consumer")
@@ -127,12 +217,35 @@ async def shutdown(_: FastAPI) -> None:
 app = create_app(title="KaiMS Approval Service", settings=settings, startup=startup, shutdown=shutdown)
 
 
+@app.middleware("http")
+async def require_internal_mutation_auth(request: Request, call_next):
+    if request.method.upper() not in {"POST", "PUT", "PATCH", "DELETE"}:
+        return await call_next(request)
+    expected_token = settings.service_internal_token
+    if not expected_token:
+        return JSONResponse(status_code=503, content={"detail": "Internal service authentication is not configured"})
+    supplied_token = str(request.headers.get("x-kaiops-internal-token") or "")
+    if not hmac.compare_digest(supplied_token, expected_token):
+        return JSONResponse(status_code=403, content={"detail": "Internal service authentication failed"})
+    return await call_next(request)
+
+
 class ApprovalRequest(BaseModel):
     incident_id: UUID
     recommendation_id: UUID | None = None
+    tenant_id: str = Field(min_length=1, max_length=128)
+    plan_id: UUID | None = None
+    plan_fingerprint: str | None = Field(default=None, pattern=r"^sha256:[0-9a-f]{64}$")
     approver: str
+    approver_role: str = Field(default="hitl-reviewer", pattern="^(admin|hitl-reviewer)$")
+    authorization_scope: str = Field(default="execution", pattern="^(dry_run|execution)$")
     channel: str = Field(default="web", pattern="^(slack|teams|email|web)$")
     comment: str | None = None
+
+    @field_validator("tenant_id")
+    @classmethod
+    def tenant_must_be_explicit(cls, value: str) -> str:
+        return require_tenant_id(value, source="approval request identity")
 
 
 class ModifyRequest(ApprovalRequest):
@@ -140,6 +253,7 @@ class ModifyRequest(ApprovalRequest):
 
 
 class CapacityRequest(BaseModel):
+    tenant_id: str = Field(min_length=1, max_length=128)
     username: str = Field(min_length=1, max_length=255)
     resource_names: list[str] = Field(min_length=1, max_length=50)
     weekly_hours: int = Field(ge=1, le=168)
@@ -159,6 +273,7 @@ class AssignmentTicket(BaseModel):
 
 
 class AutoAssignRequest(BaseModel):
+    tenant_id: str = Field(min_length=1, max_length=128)
     tickets: list[AssignmentTicket] = Field(min_length=1, max_length=500)
 
 
@@ -187,13 +302,15 @@ def _current_week_start() -> datetime:
 
 
 @app.get("/capacity")
-async def list_capacity() -> dict[str, Any]:
+async def list_capacity(tenant_id: str = Query(min_length=1, max_length=128)) -> dict[str, Any]:
+    tenant_id = require_tenant_id(tenant_id, source="capacity query")
     async with app.state.session_factory() as session:
-        capacities = list((await session.scalars(select(ApprovalCapacityRecord).order_by(ApprovalCapacityRecord.username))).all())
+        capacities = list((await session.scalars(select(ApprovalCapacityRecord).where(ApprovalCapacityRecord.tenant_id == tenant_id).order_by(ApprovalCapacityRecord.username))).all())
         allocated = dict((await session.execute(
             select(ApprovalAssignmentRecord.assignee, func.coalesce(func.sum(ApprovalAssignmentRecord.estimated_hours), 0))
             .where(
                 ApprovalAssignmentRecord.status.in_(["assigned", "in_progress"]),
+                ApprovalAssignmentRecord.tenant_id == tenant_id,
                 ApprovalAssignmentRecord.created_at >= _current_week_start(),
             )
             .group_by(ApprovalAssignmentRecord.assignee)
@@ -203,6 +320,7 @@ async def list_capacity() -> dict[str, Any]:
 
 @app.put("/capacity/{username}")
 async def upsert_capacity(username: str, request: CapacityRequest) -> dict[str, Any]:
+    tenant_id = require_tenant_id(request.tenant_id, source="capacity request")
     if username.strip().lower() != request.username.strip().lower():
         raise HTTPException(status_code=422, detail="Path username must match payload username")
     if any(day < 0 or day > 6 for day in request.working_days) or request.work_start >= request.work_end:
@@ -215,7 +333,7 @@ async def upsert_capacity(username: str, request: CapacityRequest) -> dict[str, 
     if not resources:
         raise HTTPException(status_code=422, detail="At least one resource name is required")
     async with app.state.session_factory() as session:
-        row = await session.scalar(select(ApprovalCapacityRecord).where(func.lower(ApprovalCapacityRecord.username) == request.username.strip().lower()))
+        row = await session.scalar(select(ApprovalCapacityRecord).where(ApprovalCapacityRecord.tenant_id == tenant_id, func.lower(ApprovalCapacityRecord.username) == request.username.strip().lower()))
         values = request.model_dump()
         values["username"] = request.username.strip()
         values["resource_names"] = resources
@@ -232,23 +350,26 @@ async def upsert_capacity(username: str, request: CapacityRequest) -> dict[str, 
 
 
 @app.get("/assignments")
-async def list_assignments() -> dict[str, Any]:
+async def list_assignments(tenant_id: str = Query(min_length=1, max_length=128)) -> dict[str, Any]:
+    tenant_id = require_tenant_id(tenant_id, source="assignment query")
     async with app.state.session_factory() as session:
-        rows = list((await session.scalars(select(ApprovalAssignmentRecord).order_by(ApprovalAssignmentRecord.created_at.desc()).limit(250))).all())
+        rows = list((await session.scalars(select(ApprovalAssignmentRecord).where(ApprovalAssignmentRecord.tenant_id == tenant_id).order_by(ApprovalAssignmentRecord.created_at.desc()).limit(250))).all())
     return {"rows": [{"incident_id": row.incident_id, "assignee": row.assignee, "service": row.service, "estimated_hours": row.estimated_hours, "status": row.status, "assignment_reason": row.assignment_reason, "created_at": row.created_at.isoformat() if row.created_at else None} for row in rows]}
 
 
 @app.post("/auto-assign")
 async def auto_assign(request: AutoAssignRequest) -> dict[str, Any]:
+    tenant_id = require_tenant_id(request.tenant_id, source="auto-assignment request")
     severity_hours = {"critical": 4, "high": 3, "medium": 2, "low": 1}
     results: list[dict[str, Any]] = []
     async with app.state.session_factory() as session:
-        capacities = list((await session.scalars(select(ApprovalCapacityRecord).where(ApprovalCapacityRecord.active.is_(True)))).all())
-        existing = {row.incident_id for row in (await session.scalars(select(ApprovalAssignmentRecord))).all()}
+        capacities = list((await session.scalars(select(ApprovalCapacityRecord).where(ApprovalCapacityRecord.tenant_id == tenant_id, ApprovalCapacityRecord.active.is_(True)))).all())
+        existing = {row.incident_id for row in (await session.scalars(select(ApprovalAssignmentRecord).where(ApprovalAssignmentRecord.tenant_id == tenant_id))).all()}
         allocated = dict((await session.execute(
             select(ApprovalAssignmentRecord.assignee, func.coalesce(func.sum(ApprovalAssignmentRecord.estimated_hours), 0))
             .where(
                 ApprovalAssignmentRecord.status.in_(["assigned", "in_progress"]),
+                ApprovalAssignmentRecord.tenant_id == tenant_id,
                 ApprovalAssignmentRecord.created_at >= _current_week_start(),
             )
             .group_by(ApprovalAssignmentRecord.assignee)
@@ -271,7 +392,7 @@ async def auto_assign(request: AutoAssignRequest) -> dict[str, Any]:
                 continue
             _, _, _, selected = max(eligible)
             reason = f"Matched {ticket.service} resources; {selected.weekly_hours - int(allocated.get(selected.username, 0))}h capacity available before assignment."
-            session.add(ApprovalAssignmentRecord(incident_id=ticket.incident_id, assignee=selected.username, service=ticket.service, estimated_hours=hours, assignment_reason=reason))
+            session.add(ApprovalAssignmentRecord(tenant_id=tenant_id, incident_id=ticket.incident_id, assignee=selected.username, service=ticket.service, estimated_hours=hours, assignment_reason=reason))
             allocated[selected.username] = int(allocated.get(selected.username, 0)) + hours
             existing.add(ticket.incident_id)
             results.append({"incident_id": ticket.incident_id, "status": "assigned", "assignee": selected.username, "estimated_hours": hours, "reason": reason})
@@ -293,12 +414,23 @@ async def reject(request: ApprovalRequest) -> Approval:
     return approval
 
 
+@app.post("/request-evidence", response_model=Approval)
+async def request_evidence(request: ApprovalRequest) -> Approval:
+    if not str(request.comment or "").strip():
+        raise HTTPException(status_code=422, detail="An evidence request reason is required.")
+    approval = await _approval_from_request(request, ApprovalDecision.EVIDENCE_REQUESTED)
+    await _store_and_publish(approval)
+    return approval
+
+
 @app.post("/modify", response_model=Approval)
 async def modify(request: ModifyRequest) -> Approval:
-    approval = await _approval_from_request(
-        request,
-        ApprovalDecision.MODIFIED,
-        modified_action=request.modified_action,
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            "Free-text approval modifications are disabled. Generate a new typed execution plan "
+            "with a new plan_id and plan_fingerprint, then submit a new approval."
+        ),
     )
     await _store_and_publish(approval)
     return approval
@@ -310,22 +442,177 @@ async def _approval_from_request(
     *,
     modified_action: str | None = None,
 ) -> Approval:
-    recommendation_id = request.recommendation_id or await _resolve_recommendation_id(request.incident_id)
+    pending = (
+        await _load_approval_context(request.incident_id, tenant_id=request.tenant_id)
+        if decision == ApprovalDecision.APPROVED
+        else {}
+    )
+    recommendation_id = request.recommendation_id or await _resolve_recommendation_id(
+        request.incident_id,
+        tenant_id=request.tenant_id,
+    )
+    recommendation = pending.get("recommendation", {}) if isinstance(pending, dict) else {}
+    metadata = recommendation.get("metadata", {}) if isinstance(recommendation, dict) else {}
+    plan = metadata.get("execution_plan", {}) if isinstance(metadata, dict) else {}
+    if decision == ApprovalDecision.MODIFIED:
+        raise HTTPException(status_code=409, detail="Modified approvals cannot authorize execution.")
+    if decision == ApprovalDecision.APPROVED:
+        pending_recommendation_id = (
+            _first_recommendation_id(pending, recommendation)
+            or str(plan.get("recommendation_version") or "").strip()
+        )
+        if not pending_recommendation_id or str(recommendation_id) != pending_recommendation_id:
+            raise HTTPException(
+                status_code=409,
+                detail="Approval recommendation is stale and does not match the current governed plan.",
+            )
+        if not plan:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Approval blocked: this recommendation has no governed execution plan. "
+                    "Regenerate incident analysis to compile a current plan before approval."
+                ),
+            )
+        expected_tenant = str(plan.get("tenant_id") or "").strip()
+        expected_incident = str(plan.get("incident_id") or "").strip()
+        expected_plan_id = str(plan.get("plan_id") or "").strip()
+        expected_fingerprint = str(plan.get("plan_fingerprint") or "").strip()
+        if not expected_plan_id or not expected_fingerprint:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Approval blocked: the governed execution plan is incomplete. "
+                    "Regenerate incident analysis before approval."
+                ),
+            )
+        if str(plan.get("recommendation_version") or "") != pending_recommendation_id:
+            raise HTTPException(
+                status_code=409,
+                detail="Approval recommendation version does not match the current governed recommendation.",
+            )
+        readiness = _signed_approval_readiness(pending)
+        if readiness.get("state") != "execution_eligible":
+            missing = [str(item).replace("_", " ") for item in readiness.get("missing", []) if str(item).strip()]
+            missing_detail = f" Missing controls: {', '.join(missing)}." if missing else ""
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Approval blocked: the current execution plan is not execution-eligible."
+                    f"{missing_detail} Refresh evidence or regenerate analysis before approval."
+                ),
+            )
+        if not verify_plan_fingerprint(plan):
+            raise HTTPException(status_code=409, detail="Approval blocked: execution plan fingerprint is invalid.")
+        if not expected_tenant or (expected_tenant.lower() == "default" and settings.auth_mode != "local"):
+            raise HTTPException(status_code=409, detail="Approval blocked: execution plan has no verified tenant.")
+        if request.tenant_id != expected_tenant:
+            raise HTTPException(status_code=403, detail="Approval tenant does not match the execution plan tenant.")
+        if str(request.incident_id) != expected_incident:
+            raise HTTPException(status_code=409, detail="Approval incident does not match the execution plan incident.")
+        if str(request.plan_id or "") != expected_plan_id or request.plan_fingerprint != expected_fingerprint:
+            raise HTTPException(status_code=409, detail="Approval is not bound to the current execution plan fingerprint.")
+        expiry = datetime.fromisoformat(str(plan.get("expiry") or "").replace("Z", "+00:00"))
+        if expiry <= datetime.now(timezone.utc):
+            raise HTTPException(status_code=409, detail="Approval blocked: execution plan has expired.")
+    else:
+        expected_plan_id = str(request.plan_id or "") or None
+        expected_fingerprint = request.plan_fingerprint
+        expiry = None
     return Approval(
+        tenant_id=request.tenant_id,
         incident_id=request.incident_id,
         recommendation_id=recommendation_id,
+        plan_id=expected_plan_id,
+        plan_fingerprint=expected_fingerprint,
+        approval_expires_at=expiry,
+        approver_role=request.approver_role,
+        authorization_scope=request.authorization_scope,
         decision=decision,
         approver=request.approver,
         channel=request.channel,
         comment=request.comment,
         modified_action=modified_action,
-        metadata={"execution_confirmation_required": True},
+        metadata={
+            "execution_confirmation_required": True,
+            "authorization_scope": request.authorization_scope,
+            "rca_version": plan.get("rca_version") if decision == ApprovalDecision.APPROVED else None,
+            "evidence_snapshot_id": plan.get("evidence_snapshot_id") if decision == ApprovalDecision.APPROVED else None,
+            "recommendation_version": plan.get("recommendation_version") if decision == ApprovalDecision.APPROVED else None,
+            "target_resource_id": (
+                plan.get("target_resource_id") or plan.get("remediation_target")
+                if decision == ApprovalDecision.APPROVED else None
+            ),
+            "connector_id": plan.get("connector_id") if decision == ApprovalDecision.APPROVED else None,
+            "rollback_plan": (
+                plan.get("rollback") or plan.get("rollback_commands")
+                if decision == ApprovalDecision.APPROVED else None
+            ),
+            **({"execution_plan": plan} if decision == ApprovalDecision.APPROVED else {}),
+        },
     )
 
 
-async def _resolve_recommendation_id(incident_id: UUID) -> UUID:
+async def _load_approval_context(incident_id: UUID, *, tenant_id: str) -> dict[str, Any]:
     normalized_incident_id = str(incident_id)
-    memory_payload = PENDING_INCIDENTS.get(normalized_incident_id)
+    normalized_tenant = require_tenant_id(tenant_id, source="approval request identity")
+    cache_key = _pending_key(normalized_tenant, normalized_incident_id)
+    memory_payload = PENDING_INCIDENTS.get(cache_key)
+    if isinstance(memory_payload, dict):
+        recommendation = memory_payload.get("recommendation")
+        metadata = recommendation.get("metadata") if isinstance(recommendation, dict) else {}
+        plan = metadata.get("execution_plan") if isinstance(metadata, dict) else {}
+        if isinstance(plan, dict):
+            plan_tenant = str(plan.get("tenant_id") or "").strip()
+            if plan_tenant == normalized_tenant:
+                return memory_payload
+            if plan_tenant:
+                raise HTTPException(status_code=403, detail="Approval tenant does not match the execution plan tenant.")
+    elif any(key.endswith(f":{normalized_incident_id}") for key in PENDING_INCIDENTS):
+        # Deliberately indistinguishable from a missing incident for callers in
+        # another tenant.
+        raise HTTPException(status_code=404, detail="No tenant-scoped incident exists for this approval.")
+
+    if not settings.database_enabled:
+        return memory_payload if isinstance(memory_payload, dict) else {}
+
+    try:
+        async with app.state.session_factory() as session:
+            repo = IncidentRepository(session)
+            incident = await repo.get_incident(normalized_incident_id, tenant_id=normalized_tenant)
+            if not isinstance(incident, dict):
+                raise HTTPException(status_code=404, detail="No tenant-scoped incident exists for this approval.")
+            recommendation = await repo.get_latest_recommendation_for_incident(
+                normalized_incident_id,
+                tenant_id=normalized_tenant,
+            )
+            pending = await repo.get_pending_workflow(normalized_incident_id)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception(
+            "failed to restore durable approval context",
+            extra={"incident_id": normalized_incident_id, "tenant_id": normalized_tenant},
+        )
+        raise HTTPException(status_code=503, detail="Durable approval context is temporarily unavailable.") from exc
+
+    restored = _build_incident_context(
+        {
+            **incident,
+            **({"recommendation": recommendation} if isinstance(recommendation, dict) else {}),
+        },
+        pending,
+    )
+    if isinstance(recommendation, dict):
+        restored["recommendation"] = recommendation
+    PENDING_INCIDENTS[cache_key] = restored
+    return restored
+
+
+async def _resolve_recommendation_id(incident_id: UUID, *, tenant_id: str) -> UUID:
+    normalized_incident_id = str(incident_id)
+    normalized_tenant = require_tenant_id(tenant_id, source="approval recommendation identity")
+    memory_payload = PENDING_INCIDENTS.get(_pending_key(normalized_tenant, normalized_incident_id))
     token = _first_recommendation_id(memory_payload)
     if token:
         return UUID(token)
@@ -334,7 +621,10 @@ async def _resolve_recommendation_id(incident_id: UUID) -> UUID:
         try:
             async with app.state.session_factory() as session:
                 repo = IncidentRepository(session)
-                recommendation = await repo.get_latest_recommendation_for_incident(normalized_incident_id)
+                recommendation = await repo.get_latest_recommendation_for_incident(
+                    normalized_incident_id,
+                    tenant_id=tenant_id,
+                )
                 pending = await repo.get_pending_workflow(normalized_incident_id)
                 token = _recommendation_id_from_repository_payload(recommendation) or _first_recommendation_id(pending)
                 if token:
@@ -352,12 +642,13 @@ async def _resolve_recommendation_id(incident_id: UUID) -> UUID:
 
 
 @app.get("/incident/{incident_id}")
-async def get_incident(incident_id: str) -> dict:
+async def get_incident(incident_id: str, tenant_id: str = Query(min_length=1, max_length=128)) -> dict:
     normalized_incident_id = str(incident_id or "").strip()
+    normalized_tenant = require_tenant_id(tenant_id, source="approval incident query")
     if not normalized_incident_id:
         return {"incident_id": incident_id, "status": "unknown"}
 
-    memory_payload = PENDING_INCIDENTS.get(normalized_incident_id)
+    memory_payload = PENDING_INCIDENTS.get(_pending_key(normalized_tenant, normalized_incident_id))
     if isinstance(memory_payload, dict):
         memory_payload.setdefault("incident_id", normalized_incident_id)
 
@@ -365,9 +656,9 @@ async def get_incident(incident_id: str) -> dict:
         try:
             async with app.state.session_factory() as session:
                 repo = IncidentRepository(session)
-                incident = await repo.get_incident(normalized_incident_id)
+                incident = await repo.get_incident(normalized_incident_id, tenant_id=normalized_tenant)
                 pending = await repo.get_pending_workflow(normalized_incident_id)
-                recommendation = await repo.get_latest_recommendation_for_incident(normalized_incident_id)
+                recommendation = await repo.get_latest_recommendation_for_incident(normalized_incident_id, tenant_id=normalized_tenant)
                 if isinstance(recommendation, dict):
                     memory_payload = {
                         **(memory_payload if isinstance(memory_payload, dict) else {}),
@@ -439,6 +730,8 @@ def _build_incident_context(base_payload: dict[str, Any], pending_workflow: dict
     if incident_id:
         context["incident_id"] = incident_id
 
+    context["approval_readiness"] = _signed_approval_readiness(context)
+
     return context
 
 
@@ -446,10 +739,11 @@ async def _store_and_publish(approval: Approval) -> None:
     _attach_policy_metadata(approval)
     _enforce_high_risk_human_gate(approval)
     incident_id = str(approval.incident_id)
-    pending_context = PENDING_INCIDENTS.get(incident_id, {})
+    cache_key = _pending_key(approval.tenant_id, incident_id)
+    pending_context = PENDING_INCIDENTS.get(cache_key, {})
     if not isinstance(pending_context, dict):
         pending_context = {}
-    PENDING_INCIDENTS[incident_id] = {
+    PENDING_INCIDENTS[cache_key] = {
         **pending_context,
         "approval": approval.model_dump(mode="json"),
     }
@@ -457,15 +751,17 @@ async def _store_and_publish(approval: Approval) -> None:
         async with app.state.session_factory() as session:
             repo = IncidentRepository(session)
             await repo.save_approval(approval)
-            pending = PENDING_INCIDENTS.get(incident_id, {})
+            pending = PENDING_INCIDENTS.get(cache_key, {})
             recommendation = pending.get("recommendation", {}) if isinstance(pending.get("recommendation"), dict) else {}
             decision = pending.get("decision", {}) if isinstance(pending.get("decision"), dict) else {}
             recommendation_id = str(approval.recommendation_id)
             status = "awaiting_approval"
-            if approval.decision == ApprovalDecision.APPROVED or approval.decision == ApprovalDecision.MODIFIED:
+            if approval.decision == ApprovalDecision.APPROVED:
                 status = "approved"
             elif approval.decision == ApprovalDecision.REJECTED:
                 status = "failed"
+            elif approval.decision == ApprovalDecision.EVIDENCE_REQUESTED:
+                status = "investigating"
             await repo.update_incident_approval_status(
                 approval.incident_id,
                 status=status,
@@ -483,7 +779,7 @@ async def _store_and_publish(approval: Approval) -> None:
                         "parent_event_id": None,
                     },
                     scope={
-                        "tenant_id": "default",
+                        "tenant_id": approval.tenant_id,
                         "service": str(pending.get("incident", {}).get("service") if isinstance(pending.get("incident"), dict) else "unknown") or "unknown",
                         "environment": str(pending.get("incident", {}).get("environment") if isinstance(pending.get("incident"), dict) else "prod") or "prod",
                         "region": None,
@@ -510,11 +806,19 @@ async def _store_and_publish(approval: Approval) -> None:
                     },
                     payload={
                         "recommendation_id": recommendation_id,
+                        "plan_id": str(approval.plan_id or "") or None,
+                        "plan_fingerprint": approval.plan_fingerprint,
+                        "rca_version": approval.metadata.get("rca_version"),
+                        "evidence_snapshot_id": approval.metadata.get("evidence_snapshot_id"),
+                        "recommendation_version": approval.metadata.get("recommendation_version"),
+                        "target_resource_id": approval.metadata.get("target_resource_id"),
+                        "connector_id": approval.metadata.get("connector_id"),
                         "decision": approval.decision.value,
                         "approver": approval.approver,
                         "channel": approval.channel,
                         "comment": approval.comment,
                         "modified_action": approval.modified_action,
+                        "authorization_scope": approval.authorization_scope,
                     },
                 )
             )
@@ -562,7 +866,7 @@ def _publish_evaluation_feedback(approval: Approval) -> None:
 
 def _build_approval_event_payload(approval: Approval) -> dict[str, Any]:
     incident_id = str(approval.incident_id)
-    pending = PENDING_INCIDENTS.get(incident_id, {})
+    pending = PENDING_INCIDENTS.get(_pending_key(approval.tenant_id, incident_id), {})
     recommendation = pending.get("recommendation", {}) if isinstance(pending.get("recommendation"), dict) else {}
     decision = pending.get("decision", {}) if isinstance(pending.get("decision"), dict) else {}
     incident = pending.get("incident", {}) if isinstance(pending.get("incident"), dict) else {}
@@ -579,6 +883,14 @@ def _build_approval_event_payload(approval: Approval) -> dict[str, Any]:
             "decision": approval.decision.value,
             "approver": approval.approver,
             "channel": approval.channel,
+            "authorization_scope": approval.authorization_scope,
+            "plan_id": str(approval.plan_id or "") or None,
+            "plan_fingerprint": approval.plan_fingerprint,
+            "rca_version": approval.metadata.get("rca_version"),
+            "evidence_snapshot_id": approval.metadata.get("evidence_snapshot_id"),
+            "recommendation_version": approval.metadata.get("recommendation_version"),
+            "target_resource_id": approval.metadata.get("target_resource_id"),
+            "connector_id": approval.metadata.get("connector_id"),
             "topic": APPROVAL_EVENTS,
         },
         metadata={
@@ -591,17 +903,45 @@ def _build_approval_event_payload(approval: Approval) -> dict[str, Any]:
         citations=[f"recommendation://{recommendation_id}"],
         evidence_ids=[f"incident:{incident_id}"],
     )
+    signed_envelope = build_event_envelope(
+        event_type="incident.approval.decided",
+        identity={
+            "incident_id": incident_id,
+            "alert_id": None,
+            "trace_id": str(recommendation.get("trace_id") or ""),
+            "correlation_id": str(recommendation.get("correlation_id") or "") or None,
+            "causation_id": None,
+            "parent_event_id": None,
+        },
+        scope={
+            "tenant_id": approval.tenant_id,
+            "service": str(incident.get("service") or "unknown"),
+            "environment": str(incident.get("environment") or "unknown"),
+        },
+        state={"status": approval.decision.value},
+        policy={"requires_approval": True},
+        transport={"provider": "message-bus", "channel": APPROVAL_EVENTS},
+        payload={
+            "approval_id": str(approval.id),
+            "recommendation_id": recommendation_id,
+            "plan_id": str(approval.plan_id or ""),
+            "plan_fingerprint": str(approval.plan_fingerprint or ""),
+            "decision": approval.decision.value,
+            "authorization_scope": approval.authorization_scope,
+        },
+    )
     return {
         "approval": approval,
         "recommendation": recommendation,
         "decision": decision,
         "incident": incident,
         "event_contract": event_contract,
+        "signed_envelope": signed_envelope,
     }
 
 
-def _pending_severity_for_incident(incident_id: str) -> str:
-    payload = PENDING_INCIDENTS.get(incident_id, {})
+def _pending_severity_for_incident(tenant_id: str, incident_id: str) -> str:
+    payload = PENDING_INCIDENTS.get(_pending_key(tenant_id, incident_id), {})
     if not isinstance(payload, dict):
         return ""
 
@@ -619,7 +959,7 @@ def _pending_severity_for_incident(incident_id: str) -> str:
 
 
 def _attach_policy_metadata(approval: Approval) -> None:
-    payload = PENDING_INCIDENTS.get(str(approval.incident_id), {})
+    payload = PENDING_INCIDENTS.get(_pending_key(approval.tenant_id, approval.incident_id), {})
     if not isinstance(payload, dict):
         return
 
@@ -649,7 +989,7 @@ def _attach_policy_metadata(approval: Approval) -> None:
 
 
 def _enforce_high_risk_human_gate(approval: Approval) -> None:
-    severity = _pending_severity_for_incident(str(approval.incident_id))
+    severity = _pending_severity_for_incident(approval.tenant_id, str(approval.incident_id))
     if severity not in _HIGH_RISK_SEVERITIES:
         return
 

@@ -1,18 +1,66 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 import httpx
-from common.models import Approval, ApprovalDecision, RemediationStatus
-from remediation_engine.plugins import AzureContainerAppsJobPlugin, JenkinsRollbackPlugin, RemediationEngine
+from common.models import ApprovalDecision, RemediationAction, RemediationStatus
+from remediation_test_helpers import governed_approval as Approval
+from remediation_engine.plugins import AzureContainerAppsJobPlugin, FakeCapabilityAdapter, JenkinsRollbackPlugin, RemediationEngine
+
+
+@pytest.mark.asyncio
+async def test_fake_capability_adapter_requires_onboarded_resource_and_credential() -> None:
+    adapter = FakeCapabilityAdapter()
+    action = RemediationAction(
+        tenant_id="tenant-a",
+        incident_id="11111111-1111-1111-1111-111111111111",
+        action_type="fake_test",
+        target="display-name-is-not-an-identity",
+    )
+
+    with pytest.raises(ValueError, match="target_resource_id"):
+        await adapter.preflight(action)
+
+    action.parameters["target_resource_id"] = "azure:/subscriptions/sub-a/resourceGroups/rg-a/apps/api"
+    with pytest.raises(ValueError, match="credential reference"):
+        await adapter.preflight(action)
+
+
+@pytest.mark.asyncio
+async def test_fake_capability_adapter_implements_full_lifecycle_contract() -> None:
+    adapter = FakeCapabilityAdapter()
+    action = RemediationAction(
+        tenant_id="tenant-a",
+        incident_id="11111111-1111-1111-1111-111111111111",
+        action_type="fake_test",
+        target="api",
+        parameters={
+            "target_resource_id": "k8s:/clusters/prod/namespaces/payments/deployments/api",
+            "credential_ref": "vault://tenant-a/k8s/prod-remediator",
+            "required_permissions": ["deployments.patch"],
+        },
+    )
+
+    assert (await adapter.discover(action))["discovered"] is True
+    assert (await adapter.diagnose(action))["diagnostic_only"] is True
+    assert (await adapter.preflight(action))["required_permissions"] == ["deployments.patch"]
+    completed = await adapter.execute(action)
+    assert completed.status == RemediationStatus.SUCCEEDED
+    assert (await adapter.validate(completed))["passed"] is True
+    assert (await adapter.health())["live_execution"] is False
 
 
 def _jenkins_result(submitted: dict[str, str]) -> dict:
     dry_run = submitted.get("KAI_OPS_DRY_RUN") == "true"
+    plan = json.loads(submitted.get("KAI_OPS_EXECUTION_PLAN") or "{}")
     return {
         "schema_version": "kaiops.remediation.result.v2",
         "incident_id": submitted["KAI_OPS_INCIDENT_ID"],
         "approval_id": submitted["KAI_OPS_APPROVAL_ID"],
         "target": submitted["KAI_OPS_TARGET"],
+        "plan_digest": submitted["KAI_OPS_PLAN_DIGEST"],
+        "executed_script_count": len(plan.get("scripts") or []),
         "dry_run": dry_run,
         "preflight_passed": True,
         "executed": not dry_run,
@@ -73,7 +121,7 @@ def test_default_jenkins_profile_is_applied_to_alerts_without_connector(
     assert action.parameters["connection_profile"]["credential_ref"].startswith("vault://")
 
 
-def test_jenkins_script_only_plan_receives_governed_commands(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_jenkins_preserves_the_exact_approved_script_without_substitution(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("REMEDIATION_DEFAULT_EXECUTOR", "jenkins")
     monkeypatch.setenv("REMEDIATION_EXECUTION_PLATFORM", "docker-compose")
     action = RemediationEngine().build_action(
@@ -82,25 +130,29 @@ def test_jenkins_script_only_plan_receives_governed_commands(monkeypatch: pytest
             recommendation_id="22222222-2222-2222-2222-222222222222",
             decision=ApprovalDecision.APPROVED,
             approver="sre-user",
-            comment="rollback deployment",
+            comment="run the approved health remediation script",
             metadata={
                 "service": "api-gateway",
                 "environment": "prod",
                 "execution_plan": {
                     "commands": [],
-                    "scripts": ["scripts/remediation/rollback_deployment.ps1 -Service api-gateway -Namespace prod"],
+                    "scripts": [
+                        "bash scripts/remediation/kaiops_alert_health_triage.sh "
+                        "--service api-gateway --environment prod --dry-run false"
+                    ],
                     "queries": [],
                 },
             },
         )
     )
 
-    assert action.parameters["execution_plan"]["commands"]
-    commands = action.parameters["execution_plan"]["commands"]
-    assert "--retry 3 --retry-all-errors --retry-delay 1" in commands[0]
-    assert commands[0].endswith("/containers/kaiops_azure-api-gateway-1/restart?t=30")
-    assert commands[1].endswith("http://api-gateway:8000/healthz")
-    assert action.parameters["execution_plan"]["queries"] == ["http://api-gateway:8000/healthz"]
+    plan = action.parameters["execution_plan"]
+    assert plan["commands"] == []
+    assert plan["scripts"] == [
+        "bash scripts/remediation/kaiops_alert_health_triage.sh "
+        "--service api-gateway --environment prod --dry-run false"
+    ]
+    assert plan["queries"] == []
 
 
 @pytest.mark.asyncio
@@ -192,7 +244,7 @@ async def test_jenkins_rollback_requires_runtime_secret_injection(monkeypatch: p
 
 
 @pytest.mark.asyncio
-async def test_jenkins_authorizes_governed_restart_intent_for_triage_script(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_jenkins_does_not_infer_restart_intent_from_triage_script(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("JENKINS_USERNAME", raising=False)
     monkeypatch.delenv("JENKINS_API_TOKEN", raising=False)
     action = RemediationEngine().build_action(Approval(
@@ -228,10 +280,9 @@ async def test_jenkins_authorizes_governed_restart_intent_for_triage_script(monk
     ]
     result = await JenkinsRollbackPlugin().execute(action)
 
-    assert result.parameters["connector_operation"] == "restart_service"
+    assert result.parameters["connector_operation"] == "script_execution"
     assert result.status == RemediationStatus.SKIPPED
-    assert "runtime secret provider" in str(result.error)
-    assert "does not allow operation" not in str(result.error)
+    assert "does not allow operation script_execution" in str(result.error)
 
 
 def test_jenkins_fills_missing_safety_envelope_from_governed_template(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -252,12 +303,67 @@ def test_jenkins_fills_missing_safety_envelope_from_governed_template(monkeypatc
 
     plan = action.parameters["execution_plan"]
     assert plan["commands"] == ["curl http://approved-command"]
-    assert plan["preflight"]
-    assert plan["validation_commands"]
+    assert plan["preflight"] == []
+    assert plan["validation_commands"] == []
     assert plan["rollback_commands"] == []
     assert plan["rollback_mode"] == "not_applicable"
-    assert "kaiops_pubsub-remediation-engine-1" in plan["preflight"][0]
-    assert "--output /dev/null" in plan["preflight"][0]
+
+
+def test_jenkins_adapts_catalog_ansible_plan_to_local_docker_executor(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("REMEDIATION_EXECUTION_PLATFORM", "docker-compose")
+    monkeypatch.setenv("REMEDIATION_COMPOSE_PROJECT", "kaiops_azure")
+    action = RemediationEngine().build_action(Approval(
+        incident_id="11111111-1111-1111-1111-111111111111",
+        recommendation_id="22222222-2222-2222-2222-222222222222",
+        decision=ApprovalDecision.APPROVED,
+        approver="sre-user",
+        comment="restart service",
+        metadata={
+            "service": "kaiops-discovery-mcp",
+            "execution_plan": {
+                "commands": [
+                    "ansible-playbook playbooks/restart-service.yml "
+                    "-e service=kaiops-discovery-mcp -e env=e2e"
+                ],
+                "queries": ["promql: up{job=\"kaiops-discovery-mcp\"}"],
+            },
+            "connection_profile": {"executor_type": "jenkins"},
+        },
+    ))
+
+    plan = action.parameters["execution_plan"]
+    assert plan["commands"] == [
+        "ansible-playbook playbooks/restart-service.yml -e service=kaiops-discovery-mcp -e env=e2e"
+    ]
+    assert plan["queries"] == ['promql: up{job="kaiops-discovery-mcp"}']
+    assert plan["validation_commands"] == []
+
+
+def test_jenkins_does_not_attach_invented_container_checks_to_approved_script(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("REMEDIATION_EXECUTION_PLATFORM", "docker-compose")
+    monkeypatch.setenv("REMEDIATION_COMPOSE_PROJECT", "kaiops_azure")
+    action = RemediationEngine().build_action(Approval(
+        incident_id="11111111-1111-1111-1111-111111111111",
+        recommendation_id="22222222-2222-2222-2222-222222222222",
+        decision=ApprovalDecision.APPROVED,
+        approver="sre-user",
+        metadata={
+            "service": "external-monitoring-service",
+            "execution_plan": {
+                "scripts": [
+                    "bash scripts/remediation/kaiops_alert_health_triage.sh "
+                    "--service external-monitoring-service --dry-run false"
+                ],
+            },
+            "connection_profile": {"executor_type": "jenkins"},
+        },
+    ))
+
+    plan = action.parameters["execution_plan"]
+    assert plan["scripts"]
+    assert plan["preflight"] == []
+    assert plan["validation_commands"] == []
+    assert plan["rollback_commands"] == []
 
 
 @pytest.mark.asyncio
@@ -302,6 +408,9 @@ async def test_jenkins_submits_application_resolution_contract(monkeypatch: pyte
     assert submitted["KAI_OPS_NAMESPACE"] == "prod-payments"
     assert submitted["KAI_OPS_RESOLUTION_ID"] == "restart-workload"
     assert submitted["KAI_OPS_DRY_RUN"] == "true"
+    assert submitted["KAI_OPS_PLAN_DIGEST"].startswith("sha256:")
+    assert result.parameters["execution_result"]["approved_plan_digest"] == submitted["KAI_OPS_PLAN_DIGEST"]
+    assert result.parameters["execution_result"]["executed_plan_digest"] == submitted["KAI_OPS_PLAN_DIGEST"]
     assert result.parameters["execution_result"]["build_result"] == "SUCCESS"
     assert build_polls == 2
 

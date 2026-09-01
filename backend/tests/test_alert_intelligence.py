@@ -31,6 +31,22 @@ async def test_alert_intelligence_deduplicates_and_classifies() -> None:
 
 
 @pytest.mark.asyncio
+async def test_same_alert_from_replaced_pod_is_an_exact_duplicate() -> None:
+    agent = AlertIntelligenceAgent(deduplication_window_minutes=60)
+    first = make_alert()
+    first.labels["pod"] = "payments-api-7f44b7d6dd-abc12"
+    first, _ = await agent.process(first)
+
+    replacement = make_alert()
+    replacement.labels["pod"] = "payments-api-7f44b7d6dd-xyz89"
+    replacement, _ = await agent.process(replacement)
+
+    assert replacement.fingerprint == first.fingerprint
+    assert replacement.metadata["deduplication"]["disposition"] == "duplicate"
+    assert replacement.metadata["deduplication"]["match_type"] == "exact"
+
+
+@pytest.mark.asyncio
 async def test_alert_intelligence_uses_embedding_correlation() -> None:
     agent = AlertIntelligenceAgent(correlation_threshold=0.2)
     first, _ = await agent.process(make_alert("checkout payment latency high"))
@@ -200,3 +216,49 @@ async def test_similar_alert_outside_configured_hour_is_new() -> None:
     enriched = await agent.deduplicate_alerts(similar, [original])
 
     assert enriched.metadata["deduplication"]["disposition"] == "new_incident"
+
+
+@pytest.mark.asyncio
+async def test_active_e2e_runs_share_one_incident_family() -> None:
+    agent = AlertIntelligenceAgent(deduplication_window_minutes=60)
+    first = Alert(
+        source="prometheus",
+        name="KaiOps discovery unavailable 20260819085345",
+        service="kaiops-discovery-mcp",
+        environment="e2e-20260819085345",
+        severity=AlertSeverity.CRITICAL,
+        description="discovery endpoint is unreachable",
+        ends_at=make_alert().starts_at + timedelta(minutes=10),
+    )
+    first, _ = await agent.process(first)
+    second = Alert(
+        source="prometheus",
+        name="KaiOps discovery unavailable 20260819085721",
+        service="kaiops-discovery-mcp",
+        environment="e2e-20260819085721",
+        severity=AlertSeverity.CRITICAL,
+        description="discovery endpoint is unreachable",
+        starts_at=first.starts_at + timedelta(minutes=4),
+        ends_at=first.starts_at + timedelta(minutes=14),
+    )
+
+    second, _ = await agent.process(second)
+
+    assert second.metadata["deduplication"]["disposition"] == "duplicate"
+    assert second.metadata["deduplication"]["match_type"] == "exact"
+    assert second.correlation_id == first.correlation_id
+
+
+@pytest.mark.asyncio
+async def test_environment_family_does_not_cross_production_and_staging() -> None:
+    agent = AlertIntelligenceAgent(deduplication_window_minutes=60)
+    production = make_alert()
+    production.environment = "production"
+    production, _ = await agent.process(production)
+    staging = make_alert()
+    staging.environment = "staging"
+
+    staging, _ = await agent.process(staging)
+
+    assert staging.metadata["deduplication"]["disposition"] == "new_incident"
+    assert staging.correlation_id != production.correlation_id

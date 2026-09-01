@@ -99,7 +99,7 @@ class ResolutionIntelligenceAgent(BaseAgent):
         # builders below; making two additional remote calls serialized every
         # alert added 30-90 seconds without being required to persist an RCA.
         self.deep_analysis_enabled = str(
-            os.getenv("RESOLUTION_DEEP_ANALYSIS_ENABLED", "true")
+            os.getenv("RESOLUTION_DEEP_ANALYSIS_ENABLED", "false")
         ).strip().lower() in {"1", "true", "yes", "on"}
         # Keeps strong references to fire-and-forget evaluation-publish tasks so they
         # aren't garbage-collected mid-flight; discarded automatically once done.
@@ -109,6 +109,38 @@ class ResolutionIntelligenceAgent(BaseAgent):
     @staticmethod
     def _norm(value: Any) -> str:
         return str(value or "").strip().lower()
+
+    @staticmethod
+    def _model_call_audit(
+        *,
+        task: ModelTask,
+        response: dict[str, Any],
+        prompt: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Return traceable model-call metadata without operational content."""
+
+        prompt_bytes = prompt.encode("utf-8")
+        payload_bytes = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+        response_bytes = str(response.get("content") or "").encode("utf-8")
+        usage = dict(response.get("usage") or {})
+        return {
+            "task": task.value,
+            "provider": str(response.get("model") or usage.get("provider") or "unknown"),
+            "model": str(usage.get("model") or "unknown"),
+            "prompt_sha256": hashlib.sha256(prompt_bytes).hexdigest(),
+            "prompt_bytes": len(prompt_bytes),
+            "payload_sha256": hashlib.sha256(payload_bytes).hexdigest(),
+            "payload_bytes": len(payload_bytes),
+            "response_sha256": hashlib.sha256(response_bytes).hexdigest(),
+            "response_bytes": len(response_bytes),
+            "usage": usage,
+        }
 
     @staticmethod
     def _extract_runbook_commands(runbook: str, *, max_items: int = 4) -> list[str]:
@@ -275,7 +307,16 @@ class ResolutionIntelligenceAgent(BaseAgent):
             return []
         accepted: list[str] = []
         for value in values:
-            raw = str(value or "").strip()
+            if isinstance(value, dict):
+                raw = str(
+                    value.get("evidence_id")
+                    or value.get("evidenceId")
+                    or value.get("id")
+                    or value.get("citation")
+                    or ""
+                ).strip()
+            else:
+                raw = str(value or "").strip()
             match = raw if raw in valid_ids else next(
                 (
                     evidence_id
@@ -334,7 +375,7 @@ class ResolutionIntelligenceAgent(BaseAgent):
         analysis = self._discovery_report_analysis(context)
         hypotheses = analysis.get("hypotheses") if isinstance(analysis.get("hypotheses"), list) else []
         primary = hypotheses[0] if hypotheses and isinstance(hypotheses[0], dict) else {}
-        cause = str(primary.get("cause") or primary.get("summary") or analysis.get("summary") or "").strip()
+        cause = str(primary.get("claim") or primary.get("cause") or primary.get("summary") or analysis.get("summary") or "").strip()
         confidence_raw = primary.get("confidence")
         try:
             confidence = max(0.0, min(0.6, float(confidence_raw)))
@@ -874,6 +915,11 @@ class ResolutionIntelligenceAgent(BaseAgent):
                 "labels": context.alert.labels,
             },
             "observability": context.observability,
+            "context_quality": (
+                context.metadata.get("context_quality")
+                if isinstance(context.metadata.get("context_quality"), dict)
+                else {}
+            ),
             "discovery_evidence": relevant_evidence,
             "knowledge_evidence_count": len(knowledge_evidence),
             "knowledge_role": "historical_guidance_not_current_observation",
@@ -972,9 +1018,9 @@ class ResolutionIntelligenceAgent(BaseAgent):
         candidates: list[dict[str, Any]] = []
         iterative = gathered.get("iterative_investigation", {})
         for item in iterative.get("hypotheses", []) if isinstance(iterative, dict) and isinstance(iterative.get("hypotheses"), list) else []:
-            if isinstance(item, dict) and str(item.get("cause") or item.get("summary") or "").strip():
+            if isinstance(item, dict) and str(item.get("claim") or item.get("cause") or item.get("summary") or "").strip():
                 candidates.append({
-                    "cause": str(item.get("cause") or item.get("summary"))[:500],
+                    "claim": str(item.get("claim") or item.get("cause") or item.get("summary"))[:500],
                     "confidence": float(item.get("confidence") or 0.0),
                     "evidence_ids": list(item.get("evidence_ids") or item.get("supporting_evidence") or []),
                     "source": "iterative_investigation",
@@ -985,7 +1031,7 @@ class ResolutionIntelligenceAgent(BaseAgent):
         for item in discovery.get("hypotheses", []) if isinstance(discovery.get("hypotheses"), list) else []:
             if isinstance(item, dict):
                 candidates.append({
-                    "cause": str(item.get("cause") or item.get("summary") or "").strip(),
+                    "claim": str(item.get("claim") or item.get("cause") or item.get("summary") or "").strip(),
                     "confidence": float(item.get("confidence") or 0.45),
                     "evidence_ids": list(item.get("evidence_ids") or item.get("evidence_used") or []),
                     "source": "discovery",
@@ -1027,11 +1073,21 @@ class ResolutionIntelligenceAgent(BaseAgent):
     async def generate_rca(self, state: ResolutionState) -> ResolutionState:
         context = state["context"]
         prompt = PROMPT_IDENTIFY_ROOT_CAUSE
+        ordered_valid_ids = [
+            str(row.get("evidence_id"))
+            for row in state["gathered_context"].get("discovery_evidence", [])
+            if isinstance(row, dict) and row.get("evidence_id")
+        ]
         payload = {
             "summary": context.alert.description,
             **state["gathered_context"],
             "investigation_report": state.get("investigation_report", {}),
             "ranked_hypotheses": state.get("hypothesis_analysis", {}).get("ranked", []),
+            "available_evidence_ids": ordered_valid_ids,
+            "evidence_citation_contract": (
+                "Return evidence_used as an array containing only exact values from available_evidence_ids. "
+                "Do not return descriptions or source names in that array."
+            ),
         }
         response = await self._generate_with_fallback(
             context=context,
@@ -1045,7 +1101,7 @@ class ResolutionIntelligenceAgent(BaseAgent):
         rca_fallback_text = f"Evidence is insufficient to determine the root cause of {context.alert.service} degradation."
         content = self._extract_model_text(
             response["content"],
-            keys=("root_cause", "cause", "summary"),
+            keys=("root_cause", "claim", "cause", "summary"),
             fallback_text=rca_fallback_text,
         )
         if model_fallback:
@@ -1070,11 +1126,6 @@ class ResolutionIntelligenceAgent(BaseAgent):
             service=str(context.alert.service or ""),
         ) and bool(external_rca_meta.get("used"))
         state["root_cause"] = external_rca_text if use_external_rca else inferred_root_cause
-        ordered_valid_ids = [
-            str(row.get("evidence_id"))
-            for row in state["gathered_context"].get("discovery_evidence", [])
-            if isinstance(row, dict) and row.get("evidence_id")
-        ]
         valid_ids = set(ordered_valid_ids)
         cited = self._validated_evidence_ids(parsed.get("evidence_used"), valid_ids)
         code_review = state["gathered_context"].get("code_review")
@@ -1137,6 +1188,20 @@ class ResolutionIntelligenceAgent(BaseAgent):
             reference_time=context.alert.created_at,
         )
         model_confidence = min(model_confidence, evidence_quality.confidence_ceiling)
+        context_quality = state["gathered_context"].get("context_quality", {})
+        discovery_degraded = bool(
+            context_quality.get("discovery_degraded")
+            or context_quality.get("execution_ready") is False
+        )
+        if discovery_degraded:
+            model_confidence = min(model_confidence, 0.49)
+            missing_evidence = state["rca_analysis"].get("missing_evidence")
+            if not isinstance(missing_evidence, list):
+                missing_evidence = []
+            if "discovery_evidence" not in missing_evidence:
+                missing_evidence.append("discovery_evidence")
+            state["rca_analysis"]["missing_evidence"] = missing_evidence
+            state["rca_analysis"]["context_degraded"] = True
         state["rca_analysis"]["confidence_score"] = model_confidence
         state["rca_analysis"]["evidence_quality"] = {
             "accepted_evidence": evidence_quality.accepted_evidence,
@@ -1159,22 +1224,7 @@ class ResolutionIntelligenceAgent(BaseAgent):
             )
         state.setdefault("model_usage", []).append(response["usage"])
         state.setdefault("model_calls", []).append(
-            {
-                "task": ModelTask.RCA.value,
-                "provider": response["model"],
-                "model": response["usage"].get("model"),
-                "prompt": prompt,
-                "payload": payload,
-                "response": {
-                    "text": response["content"],
-                    "parameters": {
-                        "provider": response["model"],
-                        "model": response["usage"].get("model"),
-                        "task": ModelTask.RCA.value,
-                    },
-                },
-                "usage": response["usage"],
-            }
+            self._model_call_audit(task=ModelTask.RCA, response=response, prompt=prompt, payload=payload)
         )
         return state
 
@@ -1296,22 +1346,7 @@ class ResolutionIntelligenceAgent(BaseAgent):
         }
         state.setdefault("model_usage", []).append(response["usage"])
         state.setdefault("model_calls", []).append(
-            {
-                "task": ModelTask.IMPACT.value,
-                "provider": response["model"],
-                "model": response["usage"].get("model"),
-                "prompt": prompt,
-                "payload": payload,
-                "response": {
-                    "text": response["content"],
-                    "parameters": {
-                        "provider": response["model"],
-                        "model": response["usage"].get("model"),
-                        "task": ModelTask.IMPACT.value,
-                    },
-                },
-                "usage": response["usage"],
-            }
+            self._model_call_audit(task=ModelTask.IMPACT, response=response, prompt=prompt, payload=payload)
         )
         return state
 
@@ -1373,22 +1408,7 @@ class ResolutionIntelligenceAgent(BaseAgent):
         state["remediation_target"] = remediation_target
         state.setdefault("model_usage", []).append(response["usage"])
         state.setdefault("model_calls", []).append(
-            {
-                "task": ModelTask.FIX.value,
-                "provider": response["model"],
-                "model": response["usage"].get("model"),
-                "prompt": prompt,
-                "payload": payload,
-                "response": {
-                    "text": response["content"],
-                    "parameters": {
-                        "provider": response["model"],
-                        "model": response["usage"].get("model"),
-                        "task": ModelTask.FIX.value,
-                    },
-                },
-                "usage": response["usage"],
-            }
+            self._model_call_audit(task=ModelTask.FIX, response=response, prompt=prompt, payload=payload)
         )
         state["recommended_action"] = action
         state["commands"] = commands
@@ -1432,10 +1452,15 @@ class ResolutionIntelligenceAgent(BaseAgent):
             readiness_blocks.append("No rollback or explicit non-reversible recovery strategy is defined.")
         investigation = state.get("investigation_report", {})
         evidence_quality = state.get("rca_analysis", {}).get("evidence_quality", {})
+        context_quality = state.get("gathered_context", {}).get("context_quality", {})
         if mutating and not investigation.get("application_evidence_available"):
             readiness_blocks.append("No application runtime, log, telemetry, or code evidence supports this corrective action.")
         if mutating and evidence_quality.get("sufficiency") != "sufficient":
             readiness_blocks.append("The causal hypothesis is not independently corroborated by sufficient evidence.")
+        if context_quality.get("discovery_degraded") or context_quality.get("execution_ready") is False:
+            readiness_blocks.append(
+                "Discovery evidence is degraded or unavailable; collect fresh diagnostics before execution."
+            )
         state["remediation_analysis"] = {
             # Deterministic defaults first, so a real model answer (when
             # RESOLUTION_DEEP_ANALYSIS_ENABLED=true) always wins if it supplies its
@@ -1500,11 +1525,36 @@ class ResolutionIntelligenceAgent(BaseAgent):
         if fallback_hits >= max(1, len(state.get("model_usage", []))):
             score = min(score, 0.49)
 
-        state["confidence"] = round(max(0.05, min(score, 0.99)), 4)
+        # Missing accepted citations makes the result ungrounded and blocks
+        # execution, but it does not mean the model/investigation expressed
+        # literally zero certainty.  The evidence ceiling and policy gates
+        # above already keep this below the actionable threshold. Preserve the
+        # bounded diagnostic score so the aggregate confidence agrees with the
+        # structured RCA confidence shown to operators.
+        state["confidence"] = round(max(0.0, min(score, 0.99)), 4)
         return state
 
     async def resolve(self, context: Context) -> Recommendation:
         state = await self.graph.ainvoke({"context": context})
+        rca_analysis = state.get("rca_analysis", {}) if isinstance(state.get("rca_analysis"), dict) else {}
+        rca_confidence = float(rca_analysis.get("confidence_score") or 0.0)
+        diagnostic_confidence = float(state.get("confidence") or 0.0)
+        existing_rationale = str(state.get("rationale") or "").strip()
+        rationale_prefix = re.match(
+            r"^(Model .*? proposed the RCA with \d+ validated evidence citation\(s\))",
+            existing_rationale,
+        )
+        prefix = rationale_prefix.group(1) if rationale_prefix else "The resolution agent evaluated the RCA"
+        external_note = (
+            " External knowledge fallback was used because grounded RCA text was insufficient."
+            if "External knowledge fallback was used" in existing_rationale
+            else ""
+        )
+        state["rationale"] = (
+            f"{prefix}; RCA evidence confidence={rca_confidence:.2f}; "
+            f"overall diagnostic confidence={diagnostic_confidence:.2f}."
+            f"{external_note}"
+        )
         runbook_present = bool((context.runbook or "").strip())
         discovery_evidence = state.get("gathered_context", {}).get("discovery_evidence") or []
         evidence = [
@@ -1550,6 +1600,7 @@ class ResolutionIntelligenceAgent(BaseAgent):
         model_risk = str(state.get("remediation_analysis", {}).get("risk_level") or "").strip().lower()
         risk = model_risk if model_risk in {"low", "medium", "high", "critical"} else severity_risk
         recommendation = Recommendation(
+            tenant_id=context.tenant_id,
             incident_id=context.incident_id,
             root_cause=state["root_cause"],
             confidence=state["confidence"],
@@ -1575,11 +1626,31 @@ class ResolutionIntelligenceAgent(BaseAgent):
             for value in state.get("rca_analysis", {}).get("evidence_used", [])
             if str(value or "").strip()
         ]
-        recommendation.metadata["evidence_ids"] = list(
-            dict.fromkeys([*accepted_evidence_ids, *(item.id for item in evidence)])
+        recommendation.metadata["evidence_ids"] = list(dict.fromkeys(accepted_evidence_ids))
+        recommendation.metadata["descriptive_artifacts"] = [item.model_dump(mode="json") for item in evidence]
+        recommendation.metadata["rca_status"] = (
+            "grounded" if accepted_evidence_ids else "insufficient_evidence"
         )
         recommendation.metadata["reasoning"] = state.get("rationale", "")
         recommendation.metadata["rca_analysis"] = state.get("rca_analysis", {})
+        evidence_quality = (
+            recommendation.metadata["rca_analysis"].get("evidence_quality", {})
+            if isinstance(recommendation.metadata["rca_analysis"], dict)
+            else {}
+        )
+        available_evidence_count = int(
+            (recommendation.metadata["rca_analysis"].get("evidence_validation") or {}).get("available_count") or 0
+        )
+        accepted_count = int(evidence_quality.get("accepted_evidence") or 0)
+        recommendation.metadata["evidence_quality"] = {
+            "evidence_coverage": min(1.0, accepted_count / 2.0),
+            "citation_coverage": min(1.0, accepted_count / max(1, available_evidence_count)),
+            "evidence_fresh": int(evidence_quality.get("fresh_direct_evidence") or 0) > 0,
+            "conflict_count": 1 if evidence_quality.get("contradictory") else 0,
+            "independent_source_count": int(evidence_quality.get("independent_sources") or 0),
+            "direct_observation_count": int(evidence_quality.get("direct_evidence") or 0),
+            "sufficiency": str(evidence_quality.get("sufficiency") or "insufficient"),
+        }
         recommendation.metadata["impact_analysis"] = state.get("impact_analysis", {})
         recommendation.metadata["remediation_analysis"] = state.get("remediation_analysis", {})
         recommendation.metadata["investigation_report"] = state.get("investigation_report", {})
@@ -1780,10 +1851,17 @@ class ResolutionIntelligenceAgent(BaseAgent):
     async def validate(self, result: Any) -> bool:
         if not isinstance(result, Recommendation):
             return False
-        if result.confidence <= 0:
-            raise ValidationError("confidence must be greater than zero")
+        if result.confidence < 0 or result.confidence > 1:
+            raise ValidationError("confidence must be between zero and one")
         evidence_ids = result.metadata.get("evidence_ids", [])
-        if not isinstance(evidence_ids, list) or not evidence_ids:
+        rca_status = str(result.metadata.get("rca_status") or "").strip().lower()
+        if result.confidence == 0 and rca_status != "insufficient_evidence":
+            raise ValidationError("zero confidence requires explicit insufficient_evidence status")
+        if (
+            result.confidence > 0
+            and (not isinstance(evidence_ids, list) or not evidence_ids)
+            and rca_status != "insufficient_evidence"
+        ):
             raise ValidationError("recommendation must include evidence_ids")
         return True
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 from pathlib import Path
 
@@ -9,6 +10,7 @@ SPEC = importlib.util.spec_from_file_location("discovery_mcp_app", MODULE_PATH)
 assert SPEC and SPEC.loader
 module = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(module)
+module.MCPRequest.model_rebuild(_types_namespace=vars(module))
 
 
 def test_mcp_lists_read_only_discovery_tools() -> None:
@@ -19,8 +21,53 @@ def test_mcp_lists_read_only_discovery_tools() -> None:
         "code.search",
         "mysql.search",
         "telemetry.search",
+        "traces.search",
+        "topology.search",
+        "dependency-health.search",
+        "changes.search",
+        "runbooks.search",
         "external.search",
     }
+
+
+def test_mcp_tools_call_dispatches_every_local_listed_tool_without_unknown_tool_error(monkeypatch, tmp_path) -> None:
+    # Regression test: every tool advertised by tools/list that does not
+    # depend on live external infrastructure (mysql, docker, jaeger, jira,
+    # etc.) must still be routable through the tools/call JSON-RPC dispatch
+    # in mcp(), rather than raising "unknown MCP tool". Previously
+    # "changes.search" and "runbooks.search" were listed as available tools
+    # but were not wired into the explicit if/elif chain in mcp() and only
+    # worked via the catch-all _call_tool() branch -- correct on disk, but a
+    # stale deployed container running an older pairing of mcp()/_call_tool()
+    # silently raised "unknown MCP tool" for these two names, which zeroed
+    # out every hypothesis's supporting evidence and, in turn, RCA
+    # confidence. This exercises the real HTTP-facing mcp() coroutine
+    # end-to-end so a similar omission is caught by the suite instead of
+    # only surfacing as a silent zero-confidence RCA investigation.
+    monkeypatch.setenv("DISCOVERY_MCP_PLAYBOOKS_FILE", str(Path(__file__).resolve()))
+    monkeypatch.setenv("DISCOVERY_MCP_CODE_ROOTS", str(tmp_path))
+    monkeypatch.setenv("DISCOVERY_MCP_TICKET_ROOTS", str(tmp_path))
+    local_tools = {"code.search", "tickets.search", "changes.search", "runbooks.search"}
+
+    for row in module.TOOLS:
+        name = row["name"]
+        if name not in local_tools:
+            continue
+        request = module.MCPRequest(id="1", method="tools/call", params={"name": name, "arguments": {"terms": ["payment"], "limit": 2}})
+        response = asyncio.run(module.mcp(request))
+        assert "error" not in response, f"{name} tools/call dispatch failed: {response.get('error')}"
+        assert response["result"].get("tool", name) is not None
+
+
+def test_changes_and_runbooks_tools_call_resolve_via_call_tool_fallback() -> None:
+    # These two tool names are intentionally NOT given an explicit elif
+    # branch in mcp(); they must fall through to the generic _call_tool()
+    # dispatcher rather than raising "unknown MCP tool".
+    for name in ("changes.search", "runbooks.search"):
+        request = module.MCPRequest(id="1", method="tools/call", params={"name": name, "arguments": {"terms": ["payment"], "limit": 2}})
+        response = asyncio.run(module.mcp(request))
+        assert "error" not in response, f"{name} incorrectly raised: {response.get('error')}"
+        assert response["result"]["tool"] == name
 
 
 def test_code_tool_returns_cited_redacted_evidence(tmp_path: Path, monkeypatch) -> None:

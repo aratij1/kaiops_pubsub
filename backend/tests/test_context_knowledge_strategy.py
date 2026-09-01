@@ -30,11 +30,13 @@ class CountingContextAgent:
     async def collect_with_runtime(self, alert: Alert, incident: Incident) -> Context:
         self.calls += 1
         return Context(
+            tenant_id=alert.tenant_id,
             incident_id=incident.id,
             alert=alert,
             deployment="release-42",
             runbook="Restart the worker and verify queue recovery.",
             dependency_services=["redis"],
+            observability={"queue_lag": 42, "source": "test-metric"},
             metadata={
                 "collector_call": self.calls,
                 "discovery_report": {
@@ -46,6 +48,7 @@ class CountingContextAgent:
 
 def make_alert() -> Alert:
     return Alert(
+        tenant_id="tenant-a",
         source="prometheus",
         name="WorkerQueueLagHigh",
         service="worker",
@@ -59,6 +62,7 @@ def make_alert() -> Alert:
 
 def make_incident(alert: Alert) -> Incident:
     return Incident(
+        tenant_id=alert.tenant_id,
         alert_ids=[alert.id],
         service=alert.service,
         environment=alert.environment,
@@ -101,11 +105,12 @@ async def test_auto_mode_collects_once_then_reuses_complete_durable_context(sqli
     assert second.metadata["context_knowledge_id"] == first.metadata["context_knowledge_id"]
     assert second.metadata["prior_resolution"]["root_cause"].startswith("A blocked worker")
     assert second.metadata["alert_type_known"] is True
-    assert second.metadata["knowledge_route"] == "reuse_periodic_knowledge"
+    assert second.metadata["knowledge_route"] == "reuse_validated_context_snapshot"
+    assert second.metadata["context_quality"]["reusable"] is True
 
 
 @pytest.mark.asyncio
-async def test_same_alert_type_reuses_knowledge_across_volatile_labels(sqlite_session_factory) -> None:
+async def test_same_alert_family_refreshes_when_subject_scope_changes(sqlite_session_factory) -> None:
     module = load_context_app_module()
     collector = CountingContextAgent()
     module.agent = collector
@@ -133,14 +138,14 @@ async def test_same_alert_type_reuses_knowledge_across_volatile_labels(sqlite_se
         module.app, repeated_alert, make_incident(repeated_alert)
     )
 
-    assert collector.calls == 1
-    assert repeated.metadata["context_reused"] is True
-    assert repeated.metadata["context_source"] == "periodic_knowledge"
-    assert repeated.metadata["realtime_collection_performed"] is False
+    assert collector.calls == 2
+    assert repeated.metadata["context_reused"] is False
+    assert repeated.metadata["context_source"] == "realtime_collection"
+    assert repeated.metadata["context_subject_fingerprint"] != first.metadata["context_subject_fingerprint"]
 
 
 @pytest.mark.asyncio
-async def test_auto_mode_refreshes_when_prior_rca_score_does_not_exceed_threshold(sqlite_session_factory) -> None:
+async def test_auto_mode_reuses_good_context_but_not_low_quality_prior_rca(sqlite_session_factory) -> None:
     module = load_context_app_module()
     collector = CountingContextAgent()
     module.agent = collector
@@ -163,9 +168,11 @@ async def test_auto_mode_refreshes_when_prior_rca_score_does_not_exceed_threshol
     second_alert = make_alert()
     second = await module._collect_context_with_strategy(module.app, second_alert, make_incident(second_alert))
 
-    assert collector.calls == 2
-    assert second.metadata["context_reused"] is False
-    assert second.metadata["context_source"] == "realtime_collection"
+    assert collector.calls == 1
+    assert second.metadata["context_reused"] is True
+    assert second.metadata["context_source"] == "periodic_knowledge"
+    assert second.metadata["prior_resolution_reusable"] is False
+    assert second.metadata["prior_resolution"] == {}
 
 
 @pytest.mark.asyncio
@@ -224,55 +231,55 @@ def test_identity_normalization_and_failure_families() -> None:
     module = load_context_app_module()
     
     # 1. Timestamped alert names produce the same identity
-    alert1 = Alert(source="prometheus", description="Payment latency alert", name="payment-latency-critical-20260813T125502Z", service="rs-payment", environment="prod")
-    alert2 = Alert(source="prometheus", description="Payment latency alert", name="payment-latency-critical-2026-08-14T11:54:32Z", service="rs-payment", environment="prod")
+    alert1 = Alert(tenant_id="tenant-a", source="prometheus", description="Payment latency alert", name="payment-latency-critical-20260813T125502Z", service="rs-payment", environment="prod")
+    alert2 = Alert(tenant_id="tenant-a", source="prometheus", description="Payment latency alert", name="payment-latency-critical-2026-08-14T11:54:32Z", service="rs-payment", environment="prod")
     _, _, _, sig1 = module._context_identity(alert1)
     _, _, _, sig2 = module._context_identity(alert2)
     assert sig1 == sig2
 
     # 2. UUID/numeric/hex suffixes do not create unnecessary new identities
-    alert_uuid1 = Alert(source="prometheus", description="Database error alert", name="db-error-f47ac10b-58cc-4372-a567-0e02b2c3d479", service="rs-mysql", environment="prod")
-    alert_uuid2 = Alert(source="prometheus", description="Database error alert", name="db-error-e2024b1b-a3af-436e-aa23-3753be4d27f0", service="rs-mysql", environment="prod")
+    alert_uuid1 = Alert(tenant_id="tenant-a", source="prometheus", description="Database error alert", name="db-error-f47ac10b-58cc-4372-a567-0e02b2c3d479", service="rs-mysql", environment="prod")
+    alert_uuid2 = Alert(tenant_id="tenant-a", source="prometheus", description="Database error alert", name="db-error-e2024b1b-a3af-436e-aa23-3753be4d27f0", service="rs-mysql", environment="prod")
     _, _, _, sig_uuid1 = module._context_identity(alert_uuid1)
     _, _, _, sig_uuid2 = module._context_identity(alert_uuid2)
     assert sig_uuid1 == sig_uuid2
 
-    alert_hex1 = Alert(source="prometheus", description="Payment latency alert", name="payment-latency-ab12cd", service="rs-payment", environment="prod")
-    alert_hex2 = Alert(source="prometheus", description="Payment latency alert", name="payment-latency-9876ef", service="rs-payment", environment="prod")
+    alert_hex1 = Alert(tenant_id="tenant-a", source="prometheus", description="Payment latency alert", name="payment-latency-ab12cd", service="rs-payment", environment="prod")
+    alert_hex2 = Alert(tenant_id="tenant-a", source="prometheus", description="Payment latency alert", name="payment-latency-9876ef", service="rs-payment", environment="prod")
     _, _, _, sig_hex1 = module._context_identity(alert_hex1)
     _, _, _, sig_hex2 = module._context_identity(alert_hex2)
     assert sig_hex1 == sig_hex2
 
-    alert_num1 = Alert(source="prometheus", description="Worker lag alert", name="worker-lag-42", service="worker", environment="prod")
-    alert_num2 = Alert(source="prometheus", description="Worker lag alert", name="worker-lag-101", service="worker", environment="prod")
+    alert_num1 = Alert(tenant_id="tenant-a", source="prometheus", description="Worker lag alert", name="worker-lag-42", service="worker", environment="prod")
+    alert_num2 = Alert(tenant_id="tenant-a", source="prometheus", description="Worker lag alert", name="worker-lag-101", service="worker", environment="prod")
     _, _, _, sig_num1 = module._context_identity(alert_num1)
     _, _, _, sig_num2 = module._context_identity(alert_num2)
     assert sig_num1 == sig_num2
 
     # 3. Same service + environment + failure family reuses context
-    alert_fam1 = Alert(source="prometheus", description="High latency alert", name="HighRequestLatency", service="rs-payment", environment="prod")
-    alert_fam2 = Alert(source="prometheus", description="Catalogue latency alert", name="Catalogue latency degraded", service="rs-payment", environment="prod")
+    alert_fam1 = Alert(tenant_id="tenant-a", source="prometheus", description="High latency alert", name="HighRequestLatency", service="rs-payment", environment="prod")
+    alert_fam2 = Alert(tenant_id="tenant-a", source="prometheus", description="Catalogue latency alert", name="Catalogue latency degraded", service="rs-payment", environment="prod")
     _, _, _, sig_fam1 = module._context_identity(alert_fam1)
     _, _, _, sig_fam2 = module._context_identity(alert_fam2)
     assert sig_fam1 == sig_fam2
 
     # 4. Same service + environment but different failure families do NOT reuse context
-    alert_diff_fam1 = Alert(source="prometheus", description="High latency alert", name="HighRequestLatency", service="rs-payment", environment="prod")
-    alert_diff_fam2 = Alert(source="prometheus", description="Payment unavailable alert", name="Payment API unavailable", service="rs-payment", environment="prod")
+    alert_diff_fam1 = Alert(tenant_id="tenant-a", source="prometheus", description="High latency alert", name="HighRequestLatency", service="rs-payment", environment="prod")
+    alert_diff_fam2 = Alert(tenant_id="tenant-a", source="prometheus", description="Payment unavailable alert", name="Payment API unavailable", service="rs-payment", environment="prod")
     _, _, _, sig_diff_fam1 = module._context_identity(alert_diff_fam1)
     _, _, _, sig_diff_fam2 = module._context_identity(alert_diff_fam2)
     assert sig_diff_fam1 != sig_diff_fam2
 
     # 5. Different services do NOT reuse context
-    alert_diff_svc1 = Alert(source="prometheus", description="MySQL replica down alert", name="MySQL replica down", service="rs-mysql", environment="prod")
-    alert_diff_svc2 = Alert(source="prometheus", description="Service down alert", name="Service down", service="rs-user", environment="prod")
+    alert_diff_svc1 = Alert(tenant_id="tenant-a", source="prometheus", description="MySQL replica down alert", name="MySQL replica down", service="rs-mysql", environment="prod")
+    alert_diff_svc2 = Alert(tenant_id="tenant-a", source="prometheus", description="Service down alert", name="Service down", service="rs-user", environment="prod")
     _, _, _, sig_diff_svc1 = module._context_identity(alert_diff_svc1)
     _, _, _, sig_diff_svc2 = module._context_identity(alert_diff_svc2)
     assert sig_diff_svc1 != sig_diff_svc2
 
     # 6. Different environments do NOT reuse context
-    alert_diff_env1 = Alert(source="prometheus", description="High latency alert", name="HighRequestLatency", service="rs-payment", environment="prod")
-    alert_diff_env2 = Alert(source="prometheus", description="High latency alert", name="HighRequestLatency", service="rs-payment", environment="staging")
+    alert_diff_env1 = Alert(tenant_id="tenant-a", source="prometheus", description="High latency alert", name="HighRequestLatency", service="rs-payment", environment="prod")
+    alert_diff_env2 = Alert(tenant_id="tenant-a", source="prometheus", description="High latency alert", name="HighRequestLatency", service="rs-payment", environment="staging")
     _, _, _, sig_diff_env1 = module._context_identity(alert_diff_env1)
     _, _, _, sig_diff_env2 = module._context_identity(alert_diff_env2)
     assert sig_diff_env1 != sig_diff_env2
@@ -286,6 +293,7 @@ async def test_auto_mode_reuses_valid_cached_context_with_runbook_or_rag(sqlite_
     module.settings.database_enabled = True
     module.settings.context_strategy = "auto"
     module.settings.context_knowledge_ttl_seconds = 3600
+    module.settings.context_min_quality_score = 0.40
     module.app.state.session_factory = sqlite_session_factory
 
     alert = make_alert()
@@ -294,11 +302,16 @@ async def test_auto_mode_reuses_valid_cached_context_with_runbook_or_rag(sqlite_
     async with sqlite_session_factory() as session:
         tenant_id, service, environment, signature = module._context_identity(alert)
         payload = {
+            "tenant_id": tenant_id,
             "incident_id": str(incident.id),
             "alert": alert.model_dump(mode="json"),
             "runbook": "Custom recovery runbook",
-            "dependency_services": [],
-            "metadata": {"rag_documents": 0},
+            "observability": {"queue_lag": 42, "source": "test-metric"},
+            "dependency_services": ["redis"],
+            "metadata": {
+                "rag_documents": 0,
+                "context_subject_fingerprint": module.context_subject_fingerprint(alert, tenant_id),
+            },
         }
         from common.database import ContextKnowledgeRecord
         record = ContextKnowledgeRecord(
@@ -329,6 +342,7 @@ async def test_auto_mode_reuses_valid_cached_context_with_rag_documents(sqlite_s
     module.settings.database_enabled = True
     module.settings.context_strategy = "auto"
     module.settings.context_knowledge_ttl_seconds = 3600
+    module.settings.context_min_quality_score = 0.40
     module.app.state.session_factory = sqlite_session_factory
 
     alert = make_alert()
@@ -337,11 +351,16 @@ async def test_auto_mode_reuses_valid_cached_context_with_rag_documents(sqlite_s
     async with sqlite_session_factory() as session:
         tenant_id, service, environment, signature = module._context_identity(alert)
         payload = {
+            "tenant_id": tenant_id,
             "incident_id": str(incident.id),
             "alert": alert.model_dump(mode="json"),
-            "runbook": "",
-            "dependency_services": [],
-            "metadata": {"rag_documents": 3},
+            "runbook": "Remediation steps from RAG",
+            "observability": {"queue_lag": 42, "source": "test-metric"},
+            "dependency_services": ["redis"],
+            "metadata": {
+                "rag_documents": 3,
+                "context_subject_fingerprint": module.context_subject_fingerprint(alert, tenant_id),
+            },
         }
         from common.database import ContextKnowledgeRecord
         record = ContextKnowledgeRecord(

@@ -20,7 +20,6 @@ build/
 data/
 logs/local/*.log
 node_modules/
-node_modules/
 .tmp/
 storybook-static/
 test-results/
@@ -49,3 +48,5 @@ backend/rag/dependencies/*.md
 backend/rag/incidents/*-rule-onboarding.md
 backend/rag/runbooks/*-rule-runbook.md
 .env*
+# Runtime review packets are evidence awaiting governance, never source fixtures.
+backend/rag/_review/**/*.json
