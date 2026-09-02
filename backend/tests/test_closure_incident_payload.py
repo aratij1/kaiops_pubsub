@@ -274,7 +274,13 @@ class _JiraClient:
 
     async def get(self, url: str, **kwargs):
         self.calls.append(("GET", url, None))
+        if url.endswith("/user/assignable/search"):
+            return _JiraResponse(payload=[{"accountId": "acct-hitl", "emailAddress": "hitl@example.test"}])
         return _JiraResponse(payload={"transitions": self.transitions})
+
+    async def put(self, url: str, json: dict | None = None, **kwargs):
+        self.calls.append(("PUT", url, json))
+        return _JiraResponse(status_code=204)
 
     async def post(self, url: str, json: dict | None = None, **kwargs):
         self.calls.append(("POST", url, json))
@@ -302,6 +308,23 @@ async def test_jira_remains_open_when_recovery_validation_fails(monkeypatch) -> 
     assert len(_JiraClient.calls) == 1
     assert _JiraClient.calls[0][1].endswith("/comment")
     assert "remains open" in _JiraClient.calls[0][2]["body"]
+
+
+@pytest.mark.asyncio
+async def test_hitl_escalation_assigns_jira_and_keeps_ticket_open(monkeypatch) -> None:
+    module = load_closure_app_module()
+    _configure_jira(monkeypatch)
+    monkeypatch.setenv("JIRA_PROJECT_KEY", "KAN")
+    report = _report(health_restored=False)
+    report.metadata = {"closure_kind": "manual", "handoff_kind": "hitl_escalation", "hitl_assignee": "hitl@example.test"}
+
+    result = await module._sync_closure_to_jira(_existing_incident_payload(), report)
+
+    assert result["status"] == "validation_pending"
+    assert result["assigned"] is True
+    assert result["transitioned"] is False
+    assert [call[0] for call in _JiraClient.calls] == ["GET", "PUT", "POST"]
+    assert _JiraClient.calls[1][2] == {"accountId": "acct-hitl"}
 
 
 @pytest.mark.asyncio

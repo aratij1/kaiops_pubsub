@@ -431,6 +431,34 @@ async def _sync_closure_to_jira(incident_payload: dict[str, Any], report: Resolu
 
     try:
         async with httpx.AsyncClient(auth=auth, timeout=15.0) as client:
+            hitl_assignee = str(report.metadata.get("hitl_assignee") or "").strip()
+            assigned_to = ""
+            if hitl_assignee:
+                project_key = str(os.getenv("JIRA_PROJECT_KEY", "") or "").strip()
+                search_resp = await client.get(
+                    f"{base_url}/rest/api/3/user/assignable/search",
+                    params={"project": project_key, "query": hitl_assignee, "maxResults": 50},
+                    headers=headers,
+                )
+                candidates = search_resp.json() if search_resp.status_code < 400 else []
+                normalized = hitl_assignee.casefold()
+                match = next((item for item in candidates if normalized in {
+                    str(item.get("accountId") or "").casefold(),
+                    str(item.get("emailAddress") or "").casefold(),
+                    str(item.get("displayName") or "").casefold(),
+                }), candidates[0] if candidates else None)
+                account_id = str(match.get("accountId") or "").strip() if isinstance(match, dict) else ""
+                if not account_id:
+                    return {"status": "failed", "reason": "jira_assignee_not_found", "ticket_id": ticket_id,
+                            "transitioned": False, "commented": False, "requested_assignee": hitl_assignee}
+                assign_resp = await client.put(
+                    f"{base_url}/rest/api/3/issue/{ticket_id}/assignee",
+                    json={"accountId": account_id}, headers=headers,
+                )
+                if assign_resp.status_code >= 400:
+                    return {"status": "failed", "reason": "jira_assignment_failed", "ticket_id": ticket_id,
+                            "transitioned": False, "commented": False, "http_status": assign_resp.status_code}
+                assigned_to = account_id
             # Post Comment
             comment_resp = await client.post(
                 f"{base_url}/rest/api/2/issue/{ticket_id}/comment",
@@ -447,7 +475,9 @@ async def _sync_closure_to_jira(incident_payload: dict[str, Any], report: Resolu
             # and cleared alerts.
             if not recovery_validated:
                 logger.warning("Jira ticket %s remains open because recovery validation did not pass", ticket_id)
-                return {"status": "validation_pending", "reason": "recovery_not_validated", "ticket_id": ticket_id, "transitioned": False, "commented": comment_resp.status_code < 400}
+                return {"status": "validation_pending", "reason": "recovery_not_validated", "ticket_id": ticket_id,
+                        "transitioned": False, "commented": comment_resp.status_code < 400,
+                        "assigned": bool(assigned_to), "assignee_id": assigned_to or None}
 
             # 2. Transition Jira ticket to Resolved / Done
             trans_resp = await client.get(
@@ -898,6 +928,7 @@ class ManualClosureRequest(BaseModel):
     actor_role: str = Field(min_length=1, max_length=64)
     tenant_id: str = Field(min_length=1, max_length=255)
     auth_jti: str = Field(min_length=1, max_length=255)
+    hitl_assignee: str | None = Field(default=None, min_length=1, max_length=255)
 
 
 @app.post("/incidents/{incident_id}/manual-close")
@@ -944,6 +975,8 @@ async def manual_close_incident(
         health_restored=False,
         metadata={
             "closure_kind": "manual",
+            "handoff_kind": "hitl_escalation" if request.hitl_assignee else None,
+            "hitl_assignee": request.hitl_assignee,
             "operator_comment": request.comment,
             "actor_id": request.actor_id,
             "actor_role": request.actor_role,
@@ -952,7 +985,7 @@ async def manual_close_incident(
         },
     )
     jira_result = await _sync_closure_to_jira(incident_payload, report)
-    if incident_payload.get("ticket_id") and not jira_result.get("transitioned"):
+    if incident_payload.get("ticket_id") and not jira_result.get("commented"):
         raise HTTPException(status_code=502, detail={"message": "Jira update failed; incident was not closed.", "jira": jira_result})
     async with app.state.session_factory() as session:
         repo = IncidentRepository(session)

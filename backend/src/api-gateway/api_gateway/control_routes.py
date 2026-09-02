@@ -201,6 +201,60 @@ def build_control_router(
             x_trace_id, timeout_seconds=25.0,
         )
 
+    @router.post("/incidents/{incident_id}/escalate")
+    async def escalate_incident(
+        incident_id: str,
+        request: Request,
+        payload: dict[str, Any] = REQUEST_BODY,
+        x_trace_id: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        """Atomically hand an automation-blocked incident to an on-duty HITL responder."""
+        auth = getattr(request.state, "auth", None)
+        if auth is None:
+            if auth_context_from_request is None:
+                raise HTTPException(status_code=500, detail="Gateway authentication resolver is not configured")
+            auth = await auth_context_from_request(request)
+        allowed_roles = {OperationalRole.ADMIN.value, OperationalRole.HITL_APPROVER.value}
+        if not role_is_allowed(auth.role, allowed_roles):
+            raise HTTPException(status_code=403, detail="Escalation requires ADMIN or HITL_APPROVER")
+        comment = str(payload.get("comment") or "").strip()
+        if len(comment) < 10 or len(comment) > 4000:
+            raise HTTPException(status_code=422, detail="Escalation reason must contain 10 to 4000 characters")
+        assignment_response = await forward(
+            request, "POST", "/auto-assign", settings.approval_service_url,
+            {"tenant_id": auth.tenant_id, "tickets": [{
+                "incident_id": incident_id,
+                "service": str(payload.get("service") or "unknown"),
+                "severity": str(payload.get("severity") or "medium"),
+                "resource_names": payload.get("resource_names") if isinstance(payload.get("resource_names"), list) else [],
+            }]}, x_trace_id, timeout_seconds=12.0,
+        )
+        assignment_data = assignment_response.get("data", assignment_response)
+        rows = assignment_data.get("rows", []) if isinstance(assignment_data, dict) else []
+        assignment = rows[0] if rows and isinstance(rows[0], dict) else {}
+        if assignment.get("status") == "already_assigned":
+            existing_response = await forward(
+                request, "GET", f"/assignments?{urlencode({'tenant_id': auth.tenant_id})}",
+                settings.approval_service_url, {}, x_trace_id, timeout_seconds=8.0,
+            )
+            existing_data = existing_response.get("data", existing_response)
+            existing_rows = existing_data.get("rows", []) if isinstance(existing_data, dict) else []
+            assignment = next((row for row in existing_rows if str(row.get("incident_id")) == incident_id), assignment)
+        assignee = str(assignment.get("assignee") or "").strip()
+        if not assignee:
+            raise HTTPException(status_code=409, detail={
+                "message": "Escalation was not closed because no on-duty HITL resource could be assigned.",
+                "assignment": assignment,
+            })
+        actor_id = str(auth.email or auth.username or auth.user_id).strip()
+        closure = await forward(
+            request, "POST", f"/incidents/{quote(incident_id, safe='')}/manual-close", settings.closure_service_url,
+            {"comment": comment, "actor_id": actor_id, "actor_role": auth.role,
+             "tenant_id": auth.tenant_id, "auth_jti": auth.jwt_id, "hitl_assignee": assignee},
+            x_trace_id, timeout_seconds=30.0,
+        )
+        return {"status": "escalated", "assignment": assignment, "closure": closure}
+
     @router.post("/remediation/execute")
     async def remediation_execute(
         request: Request,

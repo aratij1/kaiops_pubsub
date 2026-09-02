@@ -8315,8 +8315,23 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       const recommendationId = await resolveRecommendationIdForIncident(incidentId, recommendationIdCandidate);
       const action = requestedAction;
       const response = await executeApprovalAction({ incidentId, recommendationId, action, approver, channel: approvalForm.channel, comment: approvalForm.comment, modifiedAction: "" });
+      let escalationResponse = null;
+      if (action === "reject") {
+        escalationResponse = await fetchJson(
+          `/api-gateway/incidents/${encodeURIComponent(incidentId)}/escalate`,
+          authenticatedOptions({
+            method: "POST",
+            body: JSON.stringify({
+              comment: String(approvalForm.comment || "").trim(),
+              service: String(selectedAlertRow?.service || selectedAlertWorkflow?.incident?.service || "unknown"),
+              severity: String(selectedAlertRow?.severity || selectedAlertWorkflow?.incident?.severity || "medium"),
+              resource_names: [String(selectedAlertRow?.service || "").trim()].filter(Boolean),
+            }),
+          }),
+        );
+      }
       setApprovalForm((current) => ({ ...current, action, incident_id: incidentId, recommendation_id: recommendationId, approver }));
-      applyApprovalResolutionToUi(incidentId, action === "reject" ? "failed" : "approved", approvalForm.comment);
+      applyApprovalResolutionToUi(incidentId, action === "reject" ? "closed" : "approved", approvalForm.comment);
       setApprovedExecutionSignature(executionPlanSignature);
       const approvalId = String(unwrap(response)?.id || "");
       setApprovedExecutionApprovalId(approvalId);
@@ -8349,7 +8364,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
           return;
         }
       }
-      setApprovalState({ loading: false, result: remediationResponse ? { approval: response, remediation: remediationResponse } : response, error: "" });
+      setApprovalState({ loading: false, result: escalationResponse ? { approval: response, escalation: escalationResponse } : remediationResponse ? { approval: response, remediation: remediationResponse } : response, error: "" });
       await refreshApprovalDrivenViews(incidentId);
     } catch (error) {
       setApprovalState({ loading: false, result: null, error: String(error?.message || error) });
