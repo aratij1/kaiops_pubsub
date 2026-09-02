@@ -1100,6 +1100,9 @@
 .context-enrichment-history > summary { display: flex; justify-content: space-between; gap: 1rem; cursor: pointer; font-weight: 750; }
 .context-enrichment-history > summary span { color: #64748b; font-size: .78rem; font-weight: 600; }
 .context-enrichment-history > p { color: #64748b; font-size: .82rem; }
+.context-enrichment-response-shell { margin-top: .7rem; border-top: 1px solid #e2e8f0; }
+.context-enrichment-response-shell > summary { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: .65rem .1rem .1rem; color: #1d4ed8; cursor: pointer; font-size: .78rem; font-weight: 750; list-style-position: inside; }
+.context-enrichment-response-shell > summary small { color: #64748b; font-size: .68rem; font-weight: 600; }
 .context-enrichment-response { display: grid; gap: .5rem; margin-top: .75rem; }
 .context-enrichment-response textarea { min-height: 5rem; padding: .65rem; border: 1px solid #cbd5e1; border-radius: 8px; }
 .context-enrichment-response input { padding: .65rem; border: 1px solid #cbd5e1; border-radius: 8px; }
