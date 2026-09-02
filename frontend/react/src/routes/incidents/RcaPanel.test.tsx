@@ -20,6 +20,14 @@ describe("RcaPanel canonical evidence gate", () => {
     expect(result).not.toContain("source_status");
   });
 
+  it("removes numbered connector payloads from impact and RCA summaries", () => {
+    const result = humanizeRcaHypothesis('Observed technical impact: elevated latency affected api-gateway. 5 | "alert": { 6 | "source": "prometheus", 11 | "description": "Service api-gateway operation /configuration p99 latency is above 3s." Customer and business impact are not established by the available evidence.');
+
+    expect(result).toContain("Observed technical impact: elevated latency affected api-gateway");
+    expect(result).toContain("Service api-gateway operation /configuration p99 latency is above 3s.");
+    expect(result).not.toContain('5 | "alert"');
+  });
+
   it("never substitutes the alert id for the canonical incident id", () => {
     const binding = resolutionBindingFor(
       { incident: { id: "incident-123" }, incident_investigation: { alert_id: "alert-456" } },
@@ -80,7 +88,7 @@ describe("RcaPanel canonical evidence gate", () => {
     />);
     expect(screen.getByText("No observations are bound to this RCA snapshot.")).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: /Summary/ })).toHaveAttribute("aria-selected", "true");
-    expect(screen.getByRole("button", { name: "Plan blocked by readiness" })).toBeDisabled();
+    expect(screen.queryByText("Decision brief", { exact: true })).not.toBeInTheDocument();
     expect(screen.getAllByText("0%").length).toBeGreaterThan(0);
     expect(screen.queryByText(/Investigation contract invalid at root/)).not.toBeInTheDocument();
     expect(screen.queryByText("Fresh context is required")).not.toBeInTheDocument();

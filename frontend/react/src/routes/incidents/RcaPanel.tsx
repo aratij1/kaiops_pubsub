@@ -4,10 +4,9 @@ import {
   GitCommit, Network, RotateCw, Search, ShieldAlert, Sparkles,
 } from "lucide-react";
 import { ContextRetrievalGraph, DiscoveryFlowView } from "../../components/investigation/InvestigationGraphs";
-import { normalizeAlertChannel } from "../../domain/alertChannel";
 import { canonicalIncidentAnalysis } from "../../domain/incidentAnalysis";
 import { routeJson as fetchJson } from "../../services/routeApi";
-import { formatQualityPercent, formatUtcTimestamp, qualityToneFromScore, sourceChannelLabel } from "../../utils/presentation";
+import { formatQualityPercent, formatUtcTimestamp, qualityToneFromScore } from "../../utils/presentation";
 import { useSession } from "../../app/SessionContext";
 import EvidenceDraftReview from "./EvidenceDraftReview";
 import DecisionReadinessPanel from "./DecisionReadinessPanel";
@@ -30,6 +29,17 @@ const EVIDENCE_SOURCE_DEFINITIONS = [
 export function humanizeRcaHypothesis(value: unknown) {
   const text = String(value || "").trim();
   if (!text) return "";
+  // Some connector/code-search payloads are stored as numbered excerpts
+  // (for example `5 | "alert": ...`). Never expose that serialization in a
+  // summary card. Retain the authored prefix and the useful description.
+  const numberedPayload = text.match(/(?:^|\s)\d+\s*\|\s*"(?:alert|source|name|service|environment|severity|description)"/i);
+  if (numberedPayload?.index != null) {
+    const prefix = text.slice(0, numberedPayload.index).trim().replace(/[,:;-]+$/, "");
+    const description = text.match(/"description"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/i)?.[1]
+      ?.replaceAll('\\"', '"').trim();
+    const customerBoundary = text.match(/Customer and business impact[^.]*\./i)?.[0];
+    return [prefix, description, customerBoundary].filter(Boolean).join(". ").replace(/\.\s*\./g, ".");
+  }
   const firstBrace = text.indexOf("{");
   const lastBrace = text.lastIndexOf("}");
   if (firstBrace < 0 || lastBrace <= firstBrace) return text;
@@ -232,7 +242,6 @@ export default function RcaPanel({
         ? Number(selectedAlertEvaluation.groundingScore)
         : null;
   const confidence = Number(selectedAiTrust?.confidence || 0);
-  const confidencePercent = Math.max(0, Math.min(100, Math.round(confidence * 100)));
   const confidenceLabel = String(selectedAiTrust?.confidenceLabel || "Leading hypothesis confidence");
   const reviewRequired = Boolean(
     selectedRcaDecision?.reviewRequired
@@ -242,11 +251,10 @@ export default function RcaPanel({
     || selectedAiTrust?.integrityVerified !== true
     || !investigationConclusive
     || investigationConfidence === null
-    || investigationConfidence < 0.85
+    || investigationConfidence < 0.65
     || groundingScore === null
     || groundingScore < 0.85
   );
-  const decisionTone = confidence >= 0.85 ? "high" : confidence >= 0.7 ? "medium" : "low";
   const decisionStatus = reviewRequired ? "Review required" : "Investigation conclusive";
   const analysisReused = Boolean(recommendationMetadata.analysis_reused);
   const analysisReuseScore = Number(recommendationMetadata.analysis_reuse_score || 0);
@@ -267,9 +275,6 @@ export default function RcaPanel({
     return { ...source, count, fresh };
   }), [evidenceRows]);
   const connectedEvidenceSources = evidenceSources.filter((source) => source.count).length;
-  const sourceChannel = Array.isArray(selectedAlertRow?.source_channels)
-    ? selectedAlertRow.source_channels.map(sourceChannelLabel).join(" + ")
-    : sourceChannelLabel(normalizeAlertChannel(selectedAlertRow));
   const canonicalEvidenceSummary = canonicalWorkspace?.evidence_summary || {};
   const linkedEvidenceCount = Number(canonicalEvidenceSummary.bound_snapshot_records ?? evidenceRows.length);
   const rcaReferencedEvidenceCount = Number(canonicalEvidenceSummary.rca_bound_records ?? supportingEvidenceRows.length);
@@ -282,7 +287,7 @@ export default function RcaPanel({
     { id: "conflicts", label: "Conflicts resolved", detail: conflictingEvidence.length ? `${conflictingEvidence.length} conflict(s) require operator review.` : "No conflicting evidence was declared.", passed: conflictingEvidence.length === 0, action: "resolve conflicting observations" },
     { id: "gaps", label: "Declared gaps addressed", detail: missingEvidence.length ? missingEvidence.join(", ") : "The analysis declares no missing evidence.", passed: missingEvidence.length === 0, action: "collect the declared missing evidence" },
     { id: "investigation", label: "Iterative investigation", detail: investigationConclusive ? "The bounded investigation reached a corroborated conclusion." : "The investigation is missing or inconclusive.", passed: investigationConclusive, action: "continue the read-only investigation" },
-    { id: "confidence", label: "Evidence confidence", detail: investigationConfidence === null ? "Investigation confidence was not published." : `${formatQualityPercent(investigationConfidence)} investigation confidence.`, passed: investigationConfidence !== null && investigationConfidence >= 0.85, action: "publish evidence-derived confidence of at least 85%" },
+    { id: "confidence", label: "Evidence confidence", detail: investigationConfidence === null ? "Investigation confidence was not published." : `${formatQualityPercent(investigationConfidence)} investigation confidence.`, passed: investigationConfidence !== null && investigationConfidence >= 0.65, action: "publish corroborated evidence-derived confidence of at least 65%" },
     { id: "grounding", label: "Grounding coverage", detail: groundingScore === null ? "Grounding coverage is unavailable from the canonical evidence read model." : `${formatQualityPercent(groundingScore)} grounding coverage.`, passed: groundingScore !== null && groundingScore >= 0.85, action: "raise grounding coverage to at least 85%" },
   ];
 
@@ -397,7 +402,7 @@ export default function RcaPanel({
       {requiresFreshRecovery ? <section className="context-contract-recovery" aria-label="Recover investigation contract"><div><strong>Fresh context is required</strong><p>KaiMS will collect a new immutable context snapshot and bind the replacement RCA to it.</p></div><button type="button" className="button-primary" disabled={selectedAlertRegeneration.loading} onClick={() => { onSetRcaAnalysisMode("fresh"); return onRerunRca("fresh"); }}><RotateCw size={15} aria-hidden="true" className={selectedAlertRegeneration.loading ? "is-spinning" : ""} />{selectedAlertRegeneration.loading ? "Collecting fresh context…" : "Collect fresh context now"}</button></section> : null}
       {canonicalWorkspace ? <header className="context-workspace-hero canonical-investigation-hero">
         <div className="context-workspace-title"><span className="discovery-eyebrow">Governed full investigation</span><h2>{canonicalWorkspace.rca?.status === "grounded" ? "Grounded RCA workspace" : "Evidence review required"}</h2><p>{canonicalWorkspace.operator_review?.message}</p><small>Snapshot v{canonicalWorkspace.binding?.snapshot_version || 0} · RCA v{canonicalWorkspace.binding?.rca_version || 0} · {canonicalWorkspace.binding?.snapshot_id || "snapshot unavailable"}</small></div>
-        <div className="canonical-investigation-gates"><article><span>Impact</span><strong>{["observed", "grounded", "established"].includes(String(canonicalWorkspace.impact?.status || "").toLowerCase()) ? (String(canonicalWorkspace.impact?.status).toLowerCase() === "observed" ? "Observed" : "Established") : "Not established"}</strong><p>{canonicalWorkspace.impact?.statement || "No accepted evidence establishes customer or business impact."}</p></article><article><span>Root cause</span><strong>{String(canonicalWorkspace.rca?.status || "not started").replaceAll("_", " ")}</strong><p>{humanizeRcaHypothesis(canonicalWorkspace.rca?.hypothesis) || "No falsifiable hypothesis has been published."}</p></article><article><span>Resolution</span><strong>{canonicalWorkspace.resolution?.status || "blocked"}</strong><p>{canonicalWorkspace.resolution?.status === "ready" ? "A governed plan is bound to this RCA." : (canonicalWorkspace.resolution?.blocking_reasons || []).join(", ") || "Grounded RCA required."}</p></article></div>
+        <div className="canonical-investigation-gates"><article><span>Impact</span><strong>{["observed", "grounded", "established"].includes(String(canonicalWorkspace.impact?.status || "").toLowerCase()) ? (String(canonicalWorkspace.impact?.status).toLowerCase() === "observed" ? "Observed" : "Established") : "Not established"}</strong><p>{humanizeRcaHypothesis(canonicalWorkspace.impact?.statement) || "No accepted evidence establishes customer or business impact."}</p></article><article><span>Root cause</span><strong>{String(canonicalWorkspace.rca?.status || "not started").replaceAll("_", " ")}</strong><p>{humanizeRcaHypothesis(canonicalWorkspace.rca?.hypothesis) || "No falsifiable hypothesis has been published."}</p></article><article><span>Resolution</span><strong>{canonicalWorkspace.resolution?.status || "blocked"}</strong><p>{canonicalWorkspace.resolution?.status === "ready" ? "A governed plan is bound to this RCA." : (canonicalWorkspace.resolution?.blocking_reasons || []).join(", ") || "Grounded RCA required."}</p></article></div>
         <div className="canonical-investigation-ledger"><span><strong>{canonicalWorkspace.evidence_summary?.latest_context_records ?? 0}</strong> latest context records</span><span><strong>{canonicalWorkspace.evidence_summary?.bound_snapshot_records ?? canonicalWorkspace.evidence?.length ?? 0}</strong> records frozen for this RCA</span><span><strong>{canonicalWorkspace.evidence_summary?.rca_bound_records ?? canonicalWorkspace.rca?.resolved_evidence_ids?.length ?? 0}</strong> RCA-bound records</span><span><strong>{canonicalWorkspace.evidence_summary?.traceable_citations ?? canonicalWorkspace.rca?.traceable_citation_count ?? 0}</strong> traceable citations</span></div>
       </header> : <header className="context-workspace-hero">
         <div className="context-workspace-title">
@@ -461,25 +466,6 @@ export default function RcaPanel({
           </div>
         </details>
       </div>
-
-      {rcaDetailView === "simple" ? <section className="decision-command-brief" aria-labelledby="decision-brief-title">
-        <div className="decision-command-main">
-          <header><div><span className="discovery-eyebrow">Decision brief</span><h3 id="decision-brief-title">Leading explanation</h3></div><span className={`rca-confidence is-${decisionTone}`}><strong>{formatQualityPercent(confidence)}</strong><span>{selectedRcaDecision?.confidenceLabel || "confidence"}</span></span></header>
-          <article className="leading-explanation"><span className="explainability-label is-inference">AI inference</span><h4>{selectedRcaDecision?.rootCause || "A probable cause has not been established."}</h4><p>{selectedRcaDecision?.causalDetails || "KaiMS needs more direct evidence before it can explain the causal mechanism."}</p><small>{selectedRcaDecision?.status === "hypothesis" ? "This is a hypothesis, not a confirmed cause." : selectedRcaDecision?.status === "insufficient-evidence" ? "The evidence is insufficient to confirm a cause." : "This explanation is grounded in the currently linked evidence."}</small></article>
-          <ol className="decision-process-list" aria-label="Cause to action explanation">
-            <li><span>1</span><div><small>Observed impact</small><strong>{selectedRcaDecision?.customerImpact || "Impact not established"}</strong><p>{selectedRcaDecision?.serviceImpact || "No measured service impact was supplied."}</p></div></li>
-            <li><span>2</span><div><small>Operational judgment</small><strong>{selectedRcaDecision?.urgency || "Priority requires review"}</strong><p>{selectedRcaDecision?.dependencyImpact || "No dependency impact was supplied."}</p></div></li>
-            <li><span>3</span><div><small>Recommended next action</small><strong>{selectedRcaDecision?.action || "Collect more evidence"}</strong><p>{reviewRequired ? "Resolve the evidence gaps, then review the exact target and plan." : "Review the exact target, safeguards, rollback, and recovery checks before execution."}</p></div></li>
-          </ol>
-        </div>
-        <aside className="decision-command-sidebar" aria-label="Decision readiness">
-          <div className={`decision-readiness-card is-${reviewRequired ? "review" : "ready"}`} role="status">{reviewRequired ? <ShieldAlert size={22} /> : <CheckCircle2 size={22} />}<div><strong>{decisionStatus}</strong><span>{reviewRequired ? (missingEvidence.length || conflictingEvidence.length ? `${missingEvidence.length} gap(s) and ${conflictingEvidence.length} conflict(s) need attention; ${supportingEvidenceRows.length} observation(s) currently support the RCA.` : "Confidence or grounding requires operator validation.") : `${supportingEvidenceRows.length} evidence record(s) support operator review.`}</span></div></div>
-          <div className="decision-confidence-meter"><div><span>{confidenceLabel}</span><strong>{confidencePercent}%</strong></div><div role="progressbar" aria-label={confidenceLabel} aria-valuemin={0} aria-valuemax={100} aria-valuenow={confidencePercent}><span style={{ width: `${confidencePercent}%` }} /></div><p>{selectedAiTrust?.confidenceActionable ? "The RCA is confirmed and still subject to policy gates." : "This is a diagnostic hypothesis score, not a confirmed RCA or execution permission."}</p></div>
-          <dl className="decision-context-facts"><div><dt>Signal source</dt><dd>{sourceChannel || "Unknown"}</dd></div><div><dt>Context package</dt><dd>{contextMetadata.context_reused ? "Validated reuse" : "Current incident"}</dd></div><div><dt>Evidence freshness</dt><dd>{freshEvidenceCount} live / {cachedEvidenceCount} cached</dd></div></dl>
-          <div className="decision-command-actions"><button type="button" className="button-secondary" onClick={() => onSetRcaDetailView("evidence")}>Inspect evidence</button><button type="button" className="button-primary" disabled={selectedAiTrust?.executionReady !== true} onClick={() => onSetHomeDetailTab("execution")}>{selectedAiTrust?.executionReady === true ? "Review remediation plan" : "Plan blocked by readiness"}</button></div>
-        </aside>
-        <footer className="explainability-legend" aria-label="Explainability legend"><span><i className="is-observed" />Observed: directly reported by a source</span><span><i className="is-inferred" />Inferred: generated from linked evidence</span><span><i className="is-action" />Action: requires policy and operator gates</span></footer>
-      </section> : null}
 
       {rcaDetailView === "detailed" ? <details className="investigation-section investigation-analysis" open>
         <summary><span><strong>Cause, impact, and next action</strong><small>Separate observed facts from AI inference and response options</small></span><b>Show or hide</b></summary>

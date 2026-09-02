@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
-import { act, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import ContextEnrichmentPanel from "./ContextEnrichmentPanel";
@@ -12,6 +12,7 @@ vi.mock("../../utils/presentation", () => ({ formatUtcTimestamp: (value: string)
 
 describe("ContextEnrichmentPanel polling", () => {
   afterEach(() => {
+    cleanup();
     vi.clearAllMocks();
     vi.useRealTimers();
   });
@@ -117,8 +118,52 @@ describe("ContextEnrichmentPanel polling", () => {
 
     view.rerender(<ContextEnrichmentPanel {...props} reviewRequestToken={1} />);
 
-    expect(await screen.findByLabelText("Response for traces")).toHaveValue(expect.stringContaining("Evidence requirement: Provide the incident-window trace"));
-    expect(screen.getByLabelText("Response for traces")).toHaveValue(expect.stringContaining("AI hypothesis to verify or correct"));
+    expect((await screen.findByLabelText("Response for traces") as HTMLTextAreaElement).value).toContain("Evidence requirement: Provide the incident-window trace");
+    expect((screen.getByLabelText("Response for traces") as HTMLTextAreaElement).value).toContain("AI hypothesis to verify or correct");
     expect(screen.getByLabelText("Source reference for traces")).toHaveValue("jaeger://trace/verified-trace-id");
+  });
+
+  it("allows direct evidence input when automated assignment is blocked", async () => {
+    const refresh = vi.fn().mockResolvedValue(undefined);
+    fetchJson.mockResolvedValueOnce({
+      schema_version: "kaiops.operations-state.v1",
+      lifecycle_state: "COLLECTION_BLOCKED",
+      context: { evidence_ids: [] },
+      requirements: [{
+        requirement_id: "runbook-gap", category: "runbook",
+        question: "Provide an approved incident runbook.",
+        reason: "A governed recovery procedure is required.",
+        suggested_source_reference: "runbook://payments/recovery/v3",
+        status: "blocked",
+        latest_job: { connector_id: "vector-db", status: "dead_letter", last_error: "NO_MATCHING_APPROVED_EVIDENCE" },
+        active_human_request: { request_id: "request-1", status: "assignment_blocked" },
+      }],
+      requirement_history: [],
+    }).mockResolvedValueOnce({
+      schema_version: "kaiops.operations-state.v1", lifecycle_state: "INVESTIGATING",
+      context: { evidence_ids: ["HUMAN-1"] }, requirements: [], requirement_history: [],
+    });
+
+    render(<ContextEnrichmentPanel
+      incidentId="incident-1" accessToken="token" declaredGaps={[{ category: "runbook" }]}
+      proposedRcaDraft="Payments dependency failed." onIncidentRefresh={refresh}
+    />);
+
+    const response = await screen.findByLabelText("Response for runbook");
+    expect((response as HTMLTextAreaElement).value).toContain("Evidence requirement: Provide an approved incident runbook.");
+    expect(screen.getByLabelText("Source reference for runbook")).toHaveValue("runbook://payments/recovery/v3");
+    fireEvent.change(response, { target: { value: "Runbook v3 was verified for the affected payments deployment." } });
+    fireEvent.click(screen.getByRole("button", { name: "Submit reviewed evidence and rerun RCA" }));
+
+    await waitFor(() => expect(fetchJson).toHaveBeenCalledWith(
+      "/api-gateway/incidents/incident-1/context-gaps/runbook-gap/responses",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          response: "Runbook v3 was verified for the affected payments deployment.",
+          source_reference: "runbook://payments/recovery/v3",
+        }),
+      }),
+    ));
   });
 });

@@ -166,6 +166,34 @@ export default function ContextEnrichmentPanel({ incidentId, alertId, accessToke
     setAnnouncement(`Review form opened for ${item.category.replaceAll("_", " ")} evidence.`);
   }, [current, declaredGaps, proposedRcaDraft, reviewRequestToken]);
 
+  useEffect(() => {
+    if (!current.length) return;
+    setAnswers((values) => {
+      const next = { ...values };
+      current.forEach((item) => {
+        if (!next[item.requirement_id]?.trim()) {
+          next[item.requirement_id] = [
+            `Evidence requirement: ${item.question}`,
+            item.reason ? `Why it is needed: ${item.reason}` : "",
+            proposedRcaDraft ? `AI hypothesis to verify or correct: ${proposedRcaDraft}` : "",
+            "",
+            `Verified ${item.category.replaceAll("_", " ")} observation: `,
+          ].filter(Boolean).join("\n");
+        }
+      });
+      return next;
+    });
+    setReferences((values) => {
+      const next = { ...values };
+      current.forEach((item) => {
+        if (!next[item.requirement_id]?.trim() && item.suggested_source_reference) {
+          next[item.requirement_id] = String(item.suggested_source_reference);
+        }
+      });
+      return next;
+    });
+  }, [current, proposedRcaDraft]);
+
   const card = (item: Requirement, historical = false) => {
     const request = item.active_human_request; const job = item.latest_job;
     const complete = ["collected", "answered", "satisfied"].includes(item.status.toLowerCase());
@@ -180,7 +208,7 @@ export default function ContextEnrichmentPanel({ incidentId, alertId, accessToke
       {job ? <small>Latest attempt {job.attempt_count || job.attempt || 1} · connector {job.connector_id} · {job.status.replaceAll("_", " ")}</small> : null}
       {item.evidence_ids?.length ? <small className="context-enrichment-evidence">Accepted evidence ({item.evidence_ids.length}): {item.evidence_ids.join(", ")}</small> : null}
       {failure ? <p className="context-enrichment-action" role="status">{failure}</p> : null}
-      {!historical && ["pending", "assignment_blocked"].includes(String(request?.status || "")) ? <div className="context-enrichment-response">
+      {!historical && !complete ? <div className="context-enrichment-response">
         <small>{request?.status === "assignment_blocked" ? "Automated assignment failed. An authorized operator may claim and answer this requirement." : `Assigned to ${request?.expected_responder || "an authorized responder"}${request?.due_at ? ` · due ${formatUtcTimestamp(request.due_at)}` : ""}`}</small>
         <div className="context-enrichment-ai-draft"><div><strong>Kai can prepare a draft</strong><p>The draft is an unverified hypothesis, not grounded evidence. Modify it to state only what you verified.</p></div><button type="button" className="button-secondary" onClick={() => startFromAiDraft(item.requirement_id, item.category)}>Insert editable AI draft</button></div>
         <textarea data-requirement-response={item.requirement_id} aria-label={`Response for ${item.category}`} value={answers[item.requirement_id] || ""} onChange={(event) => setAnswers((value) => ({ ...value, [item.requirement_id]: event.target.value }))} placeholder="State the verified factual observation. Remove any AI claim you could not confirm." />

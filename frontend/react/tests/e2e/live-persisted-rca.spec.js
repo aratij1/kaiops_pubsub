@@ -16,10 +16,10 @@ test("completed live analysis renders its persisted RCA", async ({ page }) => {
   await sections.getByRole("tab", { name: "Evidence, RCA, and impact" }).click();
   await page.getByRole("tab", { name: /Summary/ }).click();
 
-  const explanation = page.locator(".leading-explanation h4");
-  await expect(explanation).toBeVisible({ timeout: 45_000 });
-  await expect(explanation).not.toHaveText("A probable cause has not been established.");
-  await expect(explanation).not.toContainText("RCA pending");
+  await expect(page.getByText("Decision brief", { exact: true })).toHaveCount(0);
+  const workspace = page.locator(".canonical-investigation-hero");
+  await expect(workspace).toBeVisible({ timeout: 45_000 });
+  await expect(workspace).not.toContainText("RCA pending");
   await expect(page.getByText(/HTTP 401|Not authenticated/)).toHaveCount(0);
   await expect(page.getByText(/HTTP 502|All connection attempts failed/)).toHaveCount(0);
 });
