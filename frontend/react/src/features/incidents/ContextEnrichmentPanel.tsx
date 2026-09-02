@@ -63,6 +63,7 @@ export default function ContextEnrichmentPanel({ incidentId, alertId, accessToke
   const failureCount = useRef(0);
   const incidentRefresh = useRef(onIncidentRefresh);
   const panelRef = useRef<HTMLElement | null>(null);
+  const refreshButtonRef = useRef<HTMLButtonElement | null>(null);
   const handledReviewRequest = useRef(0);
   const headers = useMemo(() => ({ Authorization: `Bearer ${accessToken}` }), [accessToken]);
 
@@ -142,10 +143,23 @@ export default function ContextEnrichmentPanel({ incidentId, alertId, accessToke
   };
 
   useEffect(() => {
-    if (!reviewRequestToken || reviewRequestToken === handledReviewRequest.current || !current.length) return;
+    if (!reviewRequestToken || reviewRequestToken === handledReviewRequest.current) return;
+    if (!current.length) {
+      handledReviewRequest.current = reviewRequestToken;
+      panelRef.current?.scrollIntoView?.({ behavior: "smooth", block: "start" });
+      refreshButtonRef.current?.focus();
+      setAnnouncement("No active evidence input was published for this RCA. Refresh evidence or rerun analysis to project the missing requirement.");
+      return;
+    }
     const item = current.find((requirement) => ["pending", "assignment_blocked"].includes(String(requirement.active_human_request?.status || "")))
       || current.find((requirement) => !["collected", "answered", "satisfied"].includes(requirement.status.toLowerCase()));
-    if (!item) return;
+    if (!item) {
+      handledReviewRequest.current = reviewRequestToken;
+      panelRef.current?.scrollIntoView?.({ behavior: "smooth", block: "start" });
+      refreshButtonRef.current?.focus();
+      setAnnouncement("All published evidence requirements are already complete. Rerun analysis to reconcile the remaining readiness checks.");
+      return;
+    }
     handledReviewRequest.current = reviewRequestToken;
     const gap = declaredGaps.find((candidate) => candidate.category.toLowerCase() === item.category.toLowerCase());
     const draft = [
@@ -220,7 +234,8 @@ export default function ContextEnrichmentPanel({ incidentId, alertId, accessToke
 
   return <section ref={panelRef} className="context-enrichment-panel" aria-labelledby="context-enrichment-title">
     <div className="sr-only" aria-live="polite">{announcement}</div>
-    <header><div><span className="discovery-eyebrow">Evidence workbench</span><h3 id="context-enrichment-title">Close the evidence gap</h3><p>See exactly what was collected, what the current RCA used, and what needs attention next.</p></div><button type="button" className="button-secondary" onClick={() => void load(true)} disabled={loading}><RefreshCw size={15} className={loading ? "is-spinning" : ""} /> Refresh evidence</button></header>
+    <header><div><span className="discovery-eyebrow">Evidence workbench</span><h3 id="context-enrichment-title">Close the evidence gap</h3><p>See exactly what was collected, what the current RCA used, and what needs attention next.</p></div><button ref={refreshButtonRef} type="button" className="button-secondary" onClick={() => void load(true)} disabled={loading}><RefreshCw size={15} className={loading ? "is-spinning" : ""} /> Refresh evidence</button></header>
+    {announcement ? <p className="context-enrichment-action" role="status">{announcement}</p> : null}
     {state ? <section className="context-evidence-ledger" aria-labelledby="evidence-ledger-title">
       <div className="context-evidence-ledger-heading"><div><span>Evidence accounting</span><h4 id="evidence-ledger-title">Current RCA evidence funnel</h4></div><strong>{lifecycleLabel(state.lifecycle_state, latestContextCount)}</strong></div>
       <ol>

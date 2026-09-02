@@ -443,8 +443,7 @@
 .explainability-label.is-observed::before { background: #0c8b68; }
 .explainability-label.is-inference::before { background: var(--context-info); }
 
-.decision-process-list,
-.reasoning-trace ol {
+.decision-process-list {
   display: grid;
   gap: 0;
   margin: 0;
@@ -452,8 +451,7 @@
   list-style: none;
 }
 
-.decision-process-list li,
-.reasoning-trace li {
+.decision-process-list li {
   position: relative;
   display: grid;
   grid-template-columns: 40px minmax(0, 1fr);
@@ -461,13 +459,11 @@
   padding: 0 0 22px;
 }
 
-.decision-process-list li:last-child,
-.reasoning-trace li:last-child {
+.decision-process-list li:last-child {
   padding-bottom: 0;
 }
 
-.decision-process-list li::before,
-.reasoning-trace li::before {
+.decision-process-list li::before {
   position: absolute;
   top: 38px;
   bottom: 0;
@@ -477,13 +473,11 @@
   content: "";
 }
 
-.decision-process-list li:last-child::before,
-.reasoning-trace li:last-child::before {
+.decision-process-list li:last-child::before {
   display: none;
 }
 
-.decision-process-list li > span,
-.reasoning-trace li > span {
+.decision-process-list li > span {
   position: relative;
   z-index: 1;
   display: grid;
@@ -498,8 +492,7 @@
   font-weight: 900;
 }
 
-.decision-process-list li > div,
-.reasoning-trace li > div {
+.decision-process-list li > div {
   display: grid;
   gap: 4px;
   padding-top: 1px;
@@ -512,14 +505,12 @@
   text-transform: uppercase;
 }
 
-.decision-process-list strong,
-.reasoning-trace strong {
+.decision-process-list strong {
   font-size: .94rem;
   line-height: 1.4;
 }
 
-.decision-process-list p,
-.reasoning-trace p {
+.decision-process-list p {
   margin: 0;
   color: var(--muted, #526d82);
   font-size: .84rem;
@@ -710,21 +701,6 @@
   overflow-wrap: anywhere;
   font-size: .84rem;
   line-height: 1.5;
-}
-
-.reasoning-trace {
-  display: grid;
-  grid-template-columns: minmax(180px, .42fr) minmax(0, 1fr);
-  gap: 22px;
-  padding: 20px;
-  border: 1px solid #bdd8e8;
-  border-radius: 11px;
-  background: #f7fbfd;
-}
-
-.reasoning-trace h4 {
-  margin: 5px 0;
-  font-size: 1rem;
 }
 
 .resolution-catalog {
@@ -1031,7 +1007,6 @@
   .decision-command-brief { grid-template-columns: 1fr; }
   .decision-command-sidebar { border-top: 1px solid var(--line, #d7e2ea); border-left: 0; }
   .decision-command-actions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .reasoning-trace { grid-template-columns: 1fr; }
   .combined-analysis-grid { grid-template-columns: 1fr; }
 }
 
