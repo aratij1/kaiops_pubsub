@@ -70,6 +70,13 @@ def _hash(payload: dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
+def _in_application_scope(scope: str, *, service: str, application: str = "") -> bool:
+    normalized = scope.strip().lower()
+    # KaiMS is the aggregate platform workspace in the UI, not a literal
+    # service name. Treat it as the tenant-wide operational scope.
+    return normalized in {"", "all", "kaims"} or normalized in {service.lower(), application.lower()}
+
+
 def _quality_gate(pattern: FailurePattern, evidence_by_id: dict[str, IncidentEvidence]) -> dict[str, Any]:
     rows = [evidence_by_id[item] for item in pattern.incident_ids if item in evidence_by_id]
     reviewed = sum(row.reviewed for row in rows)
@@ -106,18 +113,51 @@ async def _save_state(session: Any, payload: dict[str, Any]) -> None:
 
 
 async def _draft_candidate(session: Any, pattern: FailurePattern, quality: dict[str, Any]) -> bool:
-    if not quality["passed"]:
+    checks = quality.get("checks") or {}
+    diagnostic_only = not quality["passed"]
+    # Cold-start candidates may describe read-only diagnostics, but never a
+    # production mutation. Two independent sources and no known conflicts are
+    # still mandatory so the catalog is not populated from a lone alert.
+    if diagnostic_only and not (checks.get("independent_sources") and checks.get("no_conflicts")):
         return False
     runbook_id = uuid5(NAMESPACE_URL, f"kaims:runbook:default:{pattern.issue_signature}")
     latest = (await session.execute(select(RunbookVersionRecord).where(RunbookVersionRecord.runbook_id == runbook_id).order_by(RunbookVersionRecord.version.desc()).limit(1))).scalar_one_or_none()
-    draft = Mode02Worker._draft_runbook(pattern)
-    payload = draft.model_dump(mode="json", exclude={"runbook_id", "created_at", "version"})
+    if diagnostic_only:
+        payload = {
+            "issue_signature": pattern.issue_signature,
+            "service_scope": [pattern.service],
+            "prerequisites": ["Confirm the live incident matches the observed failure signature."],
+            "diagnostic_steps": [
+                *([f"Verify symptom: {item}" for item in pattern.common_symptoms]
+                  or ["Collect incident-window logs, metrics, traces, changes, and ticket evidence."]),
+                "Compare the affected target with a healthy peer and the last known-good baseline.",
+                "Record the verified causal mechanism or explicitly record that it remains unknown.",
+            ],
+            "remediation_steps": [],
+            "validation_steps": [],
+            "rollback_steps": [],
+            "risk_level": "low",
+            "required_approval": "mandatory",
+            "evidence_references": [item.model_dump(mode="json") for item in pattern.evidence_references[:50]],
+            "owner": "unassigned",
+        }
+    else:
+        draft = Mode02Worker._draft_runbook(pattern)
+        payload = draft.model_dump(mode="json", exclude={"runbook_id", "created_at", "version"})
     payload.update({
         "runbook_id": str(runbook_id), "name": f"Resolve {pattern.alert_type} for {pattern.service}",
         "application": pattern.service, "environment": pattern.environment,
         "matching_conditions": {"issue_signature": pattern.issue_signature},
         "supporting_evidence": [item.model_dump(mode="json") for item in pattern.evidence_references[:50]],
         "review_state": "awaiting_hitl_review", "knowledge_quality": quality,
+        "catalog_stage": "diagnostic_candidate" if diagnostic_only else "resolution_candidate",
+        "execution_eligible": False,
+        "promotion_requirements": ([] if not diagnostic_only else [
+            "Operator-confirmed causal mechanism",
+            "At least one reviewed successful resolution outcome",
+            "Complete remediation, validation, and rollback steps",
+            "Fresh human approval of the promoted version",
+        ]),
         "generation_policy": "immutable-challenger-v2",
     })
     candidate_hash = _hash(payload)
@@ -126,8 +166,8 @@ async def _draft_candidate(session: Any, pattern: FailurePattern, quality: dict[
         return False
     version = latest.version + 1 if latest else 1
     payload.update({"version": version, "content_sha256": candidate_hash})
-    session.add(RunbookVersionRecord(runbook_id=runbook_id, version=version, tenant_id="default", issue_signature=pattern.issue_signature, approval_status="draft", owner=draft.owner, risk_level=draft.risk_level, required_approval="mandatory", content=payload))
-    audit = {"status": "draft", "version": version, "issue_signature": pattern.issue_signature, "content_sha256": candidate_hash, "quality_gate": quality, "requires_human_approval": True}
+    session.add(RunbookVersionRecord(runbook_id=runbook_id, version=version, tenant_id="default", issue_signature=pattern.issue_signature, approval_status="draft", owner=str(payload.get("owner") or "unassigned"), risk_level=str(payload.get("risk_level") or "low"), required_approval="mandatory", content=payload))
+    audit = {"status": "draft", "version": version, "issue_signature": pattern.issue_signature, "content_sha256": candidate_hash, "quality_gate": quality, "catalog_stage": payload["catalog_stage"], "execution_eligible": False, "requires_human_approval": True}
     session.add(LearningAuditRecord(event_id=uuid5(NAMESPACE_URL, f"kaims:audit:runbook-drafted:{runbook_id}:{version}"), tenant_id="default", actor="knowledge-development-worker", action="runbook.challenger_drafted", resource_type="runbook", resource_id=str(runbook_id), payload=audit, payload_sha256=_hash(audit), occurred_at=datetime.now(timezone.utc)))
     return True
 
@@ -188,7 +228,7 @@ async def _analyze_locked(app: FastAPI, trigger: str) -> dict[str, Any]:
                 continue
             service = str(incident.service or "").lower()
             application = str((incident.payload or {}).get("application") or "").lower()
-            if scope != "all" and scope not in {service, application}:
+            if not _in_application_scope(scope, service=service, application=application):
                 continue
             action_rows = actions.get(str(report.incident_id), [])
             evidence = _build_evidence(report, incident, max(action_rows, key=lambda row: row.created_at) if action_rows else None)
@@ -211,7 +251,7 @@ async def _analyze_locked(app: FastAPI, trigger: str) -> dict[str, Any]:
                 evidence = IncidentEvidence.model_validate(row.evidence)
             except Exception:
                 continue
-            if scope == "all" or evidence.service == scope:
+            if _in_application_scope(scope, service=evidence.service):
                 evidence_rows.append(evidence)
         patterns = FailurePatternAnalyzer().analyze(evidence_rows)
         evidence_by_id = {row.incident_id: row for row in evidence_rows}

@@ -55,6 +55,10 @@ const ObjectResponse = z.object({}).passthrough();
 const GatewayCollectedContext = z.object({ data: CollectedContext }).passthrough();
 const GatewayResolutionRecommendation = z.object({ data: ResolutionRecommendation }).passthrough();
 const GatewayObjectResponse = z.object({ data: ObjectResponse }).passthrough();
+const KnowledgeDevelopmentResponse = z.union([
+  z.object({ data: ObjectResponse }).passthrough().transform((payload) => payload.data),
+  ObjectResponse,
+]);
 const AnalysisRegenerationAccepted = z.object({
   request_id: z.string().uuid(),
   status: z.literal("accepted"),
@@ -184,6 +188,7 @@ const contracts: readonly Contract[] = [
   { method: "POST", path: /^\/api-gateway\/analysis\/context\/collect$/, schema: GatewayCollectedContext, name: "gateway-collected-context" },
   { method: "POST", path: /^\/api-gateway\/analysis\/resolution\/resolve$/, schema: GatewayResolutionRecommendation, name: "gateway-resolution-recommendation" },
   { method: "POST", path: /^\/api-gateway\/analysis\/resolution-catalog\/(?:relevant|select)$/, schema: GatewayObjectResponse, name: "gateway-resolution-catalog" },
+  { path: /^\/api-gateway\/knowledge-development(?:\/|$)/, schema: KnowledgeDevelopmentResponse, name: "knowledge-development" },
   { path: /^\/(?:api-gateway|monitoring-adapter)\/alerts(?:\/|$)/, schema: ObjectOrList, name: "alerts" },
   { path: /^\/api-gateway\/landing-pad(?:\/|$)/, schema: RowsEnvelope, name: "landing-pad" },
   { path: /^\/api-gateway\/incidents(?:\/|$)/, schema: ObjectOrList, name: "incidents" },

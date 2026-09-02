@@ -7,7 +7,10 @@ from uuid import uuid4
 
 import pytest
 
-from common.database import LearningAuditRecord, RunbookOutcomeRecord
+from common.continuous_learning import FailurePattern
+from common.database import LearningAuditRecord, RunbookOutcomeRecord, RunbookVersionRecord
+from common.models import EvidenceReference
+from sqlalchemy import select
 
 
 def load_module():
@@ -25,6 +28,43 @@ def load_module():
 def digest(payload: dict) -> str:
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def test_kaims_workspace_is_the_tenant_wide_development_scope() -> None:
+    module = load_module()
+    assert module._in_application_scope("KaiMS", service="api-gateway") is True
+    assert module._in_application_scope("payments", service="api-gateway") is False
+
+
+@pytest.mark.asyncio
+async def test_cold_start_creates_non_executable_diagnostic_candidate(sqlite_session_factory) -> None:
+    module = load_module()
+    pattern = FailurePattern(
+        pattern_id="pattern-1", issue_signature="a" * 64, service="api-gateway",
+        environment="prod", alert_type="latency", incident_ids=["incident-1"],
+        occurrence_frequency=1, common_symptoms=["p99 latency exceeded 3 seconds"],
+        evidence_references=[
+            EvidenceReference(evidence_id="METRIC-1", source="prometheus", uri="prometheus://query/1", summary="p99 high"),
+            EvidenceReference(evidence_id="LOG-1", source="opensearch", uri="opensearch://logs/1", summary="request timeout"),
+        ], confidence=.57,
+    )
+    quality = {
+        "passed": False,
+        "checks": {"independent_sources": True, "no_conflicts": True},
+        "metrics": {"independent_sources": 2, "confidence": .57},
+    }
+    async with sqlite_session_factory() as session:
+        assert await module._draft_candidate(session, pattern, quality) is True
+        # SQLite does not autoincrement BigInteger primary keys; production MySQL does.
+        next(item for item in session.new if isinstance(item, LearningAuditRecord)).sequence_id = 1
+        await session.commit()
+        row = (await session.execute(select(RunbookVersionRecord))).scalar_one()
+
+    assert row.approval_status == "draft"
+    assert row.content["catalog_stage"] == "diagnostic_candidate"
+    assert row.content["execution_eligible"] is False
+    assert row.content["remediation_steps"] == []
+    assert row.content["promotion_requirements"]
 
 
 @pytest.mark.asyncio
