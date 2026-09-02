@@ -226,6 +226,7 @@ _BY_ID = {row["id"]: row for row in RESOLUTION_CATALOG}
 _KNOWLEDGE: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
 _KNOWLEDGE_TTL_SECONDS = 300.0
 _KNOWLEDGE_MAX_ENTRIES = 256
+_LEARNED: dict[tuple[str, str], dict[str, Any]] = {}
 
 
 def _tokens(value: str) -> set[str]:
@@ -331,8 +332,71 @@ def register_global_knowledge(*, tenant_id: str, matches: list[dict[str, Any]]) 
     return rows
 
 
+def register_learned_runbooks(
+    *, tenant_id: str, runbooks: list[dict[str, Any]], issue: str, service: str,
+) -> list[dict[str, Any]]:
+    """Expose approved, outcome-backed runbooks as tenant-local catalog options.
+
+    Discovery and model output can create drafts, but cannot enter this path.
+    Automatic eligibility requires an approved immutable version, a verified
+    prior success, no failures, low risk, and complete recovery controls.
+    """
+    query_tokens = _tokens(f"{issue} {service}")
+    registered: list[dict[str, Any]] = []
+    for record in runbooks:
+        content = record.get("content") if isinstance(record.get("content"), dict) else {}
+        remediation = [str(value) for value in content.get("remediation_steps", []) if str(value).strip()]
+        validation = [str(value) for value in content.get("validation_steps", []) if str(value).strip()]
+        rollback = [str(value) for value in content.get("rollback_steps", []) if str(value).strip()]
+        scopes = [str(value).lower() for value in content.get("service_scope", []) if str(value).strip()]
+        risk = str(record.get("risk_level") or content.get("risk_level") or "high").lower()
+        successes = int(record.get("success_count") or 0)
+        failures = int(record.get("failure_count") or 0)
+        approved = str(record.get("approval_status") or "").lower() == "approved"
+        complete = bool(remediation and validation and rollback)
+        self_heal = bool(approved and successes >= 1 and failures == 0 and risk == "low" and complete)
+        corpus = " ".join([str(content.get("name") or ""), *scopes, *content.get("diagnostic_steps", []), *remediation])
+        overlap = query_tokens & _tokens(corpus)
+        exact_service = service.lower() in scopes
+        relevance = min(0.99, (0.65 if exact_service else 0.0) + min(0.3, len(overlap) * 0.06))
+        if not exact_service and relevance < 0.35:
+            continue
+        option_id = f"learned-{record['runbook_id']}-v{record['version']}"
+        option = {
+            "id": option_id,
+            "title": str(content.get("name") or f"Learned recovery for {service}"),
+            "family": "learned-recovery",
+            "platform": str(content.get("platform") or "discovered"),
+            "strategy": "recover",
+            "patterns": sorted(overlap),
+            "risk": risk,
+            "applicability": "Matched from a previously reviewed and validated recovery for this service.",
+            "prerequisites": list(content.get("prerequisites") or []),
+            "diagnostics": list(content.get("diagnostic_steps") or []),
+            "steps": remediation,
+            "validation": validation,
+            "rollback": rollback,
+            "source": "tenant-learned-resolution-catalog",
+            "runbook_id": str(record["runbook_id"]),
+            "runbook_version": int(record["version"]),
+            "success_count": successes,
+            "failure_count": failures,
+            "execution_eligible": self_heal,
+            "self_heal_eligible": self_heal,
+            "requires_evidence": True,
+            "requires_operator_review": not self_heal,
+            "match_reasons": ["exact service scope", "reviewed successful recovery", *sorted(overlap)][:8],
+            "relevance": round(relevance, 3),
+        }
+        _LEARNED[(tenant_id, option_id)] = option
+        registered.append(option)
+    return sorted(registered, key=lambda row: (-float(row["relevance"]), not row["self_heal_eligible"]))
+
+
 def prepare_resolution_plan(*, tenant_id: str, option_id: str, issue: str, service: str) -> dict[str, Any]:
     option = _BY_ID.get(option_id)
+    if option is None:
+        option = _LEARNED.get((tenant_id, option_id))
     cached = _KNOWLEDGE.get((tenant_id, option_id))
     if cached is not None:
         registered_at, candidate = cached
@@ -343,6 +407,7 @@ def prepare_resolution_plan(*, tenant_id: str, option_id: str, issue: str, servi
     if option is None:
         raise ValueError(f"Unknown resolution option: {option_id}")
     external = option.get("source") == "global-knowledge-repository"
+    learned = option.get("source") == "tenant-learned-resolution-catalog"
     return {
         **option,
         "issue": issue,
@@ -352,6 +417,6 @@ def prepare_resolution_plan(*, tenant_id: str, option_id: str, issue: str, servi
             *({"phase": "remediate", "instruction": x} for x in option["steps"]),
             *({"phase": "validate", "instruction": x} for x in option["validation"]),
         ],
-        "agent_status": "knowledge_candidate_requires_validation" if external else "prepared_for_operator_review",
-        "execution_eligible": False,
+        "agent_status": "self_heal_candidate" if learned and option.get("self_heal_eligible") else "knowledge_candidate_requires_validation" if external else "prepared_for_operator_review",
+        "execution_eligible": bool(learned and option.get("self_heal_eligible")),
     }

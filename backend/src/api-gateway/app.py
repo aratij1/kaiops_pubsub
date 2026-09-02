@@ -3354,6 +3354,26 @@ async def knowledge_development_incident_status(
     )
 
 
+@app.post("/knowledge-development/catalog/{runbook_id}/versions/{version}/review")
+async def review_knowledge_catalog_candidate(
+    runbook_id: str,
+    version: int,
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path=f"/catalog/{quote(runbook_id, safe='')}/versions/{version}/review",
+        target_base=settings.knowledge_development_url,
+        payload={**payload, "tenant_id": auth.tenant_id, "actor": auth.username or str(auth.user_id)},
+        trace_id=trace_id_from_header(x_trace_id),
+        timeout_seconds=30,
+    )
+
+
 @app.get("/operations/queue-health")
 async def get_queue_health() -> dict[str, Any]:
     """Return live RabbitMQ readiness and backlog data for the command center.

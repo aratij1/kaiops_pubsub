@@ -5,7 +5,7 @@ import hashlib
 import json
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Literal
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from common.config import get_settings
@@ -15,7 +15,7 @@ from common.learning_workflows import Mode02Worker
 from common.models import EvidenceReference
 from common.service import create_app
 from common.tenant_identity import require_tenant_id
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, func, or_, select, text
 
@@ -59,6 +59,30 @@ class IncidentBootstrapRequest(BaseModel):
     incident: dict[str, Any]
     context: dict[str, Any]
     recommendation: dict[str, Any] = Field(default_factory=dict)
+
+
+class CatalogPromotionRequest(BaseModel):
+    tenant_id: str
+    actor: str = Field(min_length=1, max_length=255)
+    decision: Literal["approve", "reject"]
+    expected_content_sha256: str = Field(min_length=64, max_length=64)
+    risk_level: Literal["low", "medium", "high"] = "medium"
+    reason: str = Field(default="", max_length=2000)
+
+
+def _promotion_readiness(content: dict[str, Any], *, reviewed_success: bool) -> list[str]:
+    quality = content.get("knowledge_quality") if isinstance(content.get("knowledge_quality"), dict) else {}
+    reasons = []
+    if quality.get("passed") is not True:
+        reasons.append("knowledge quality gate has not passed")
+    if content.get("catalog_stage") != "resolution_candidate":
+        reasons.append("candidate has not reached resolution stage")
+    if not reviewed_success:
+        reasons.append("a reviewed successful recovery is required")
+    for field in ("remediation_steps", "validation_steps", "rollback_steps"):
+        if not isinstance(content.get(field), list) or not any(str(value).strip() for value in content[field]):
+            reasons.append(f"{field.replace('_', ' ')} are incomplete")
+    return reasons
 
 
 def _utc(value: datetime | None) -> datetime | None:
@@ -601,6 +625,69 @@ async def incident_catalog_status(incident_id: str, tenant_id: str) -> dict[str,
         "execution_eligible": bool(content.get("execution_eligible", False)),
         "evidence_sources": (quality.get("metrics") or {}).get("independent_sources", 0),
         "promotion_requirements": content.get("promotion_requirements", []),
+    }
+
+
+@app.post("/catalog/{runbook_id}/versions/{version}/review")
+async def review_catalog_candidate(
+    runbook_id: UUID, version: int, request: CatalogPromotionRequest,
+) -> dict[str, Any]:
+    """Promote or reject one immutable learned recovery version."""
+    tenant_id = require_tenant_id(request.tenant_id, source="catalog promotion")
+    async with app.state.session_factory() as session:
+        candidate = (await session.execute(select(RunbookVersionRecord).where(
+            RunbookVersionRecord.tenant_id == tenant_id,
+            RunbookVersionRecord.runbook_id == runbook_id,
+            RunbookVersionRecord.version == version,
+        ).limit(1))).scalar_one_or_none()
+        if candidate is None:
+            raise HTTPException(status_code=404, detail="catalog candidate was not found")
+        content = dict(candidate.content or {})
+        if str(content.get("content_sha256") or "") != request.expected_content_sha256:
+            raise HTTPException(status_code=409, detail="catalog candidate changed; refresh before reviewing")
+        if request.decision == "reject":
+            candidate.approval_status = "suspended"
+            content.update({"review_state": "rejected", "execution_eligible": False,
+                            "self_heal_eligible": False, "rejection_reason": request.reason or "rejected by reviewer"})
+            audit_action = "runbook.challenger_rejected"
+        else:
+            reviewed_success = bool(await session.scalar(select(func.count()).select_from(IncidentEvidenceRecord).where(
+                IncidentEvidenceRecord.tenant_id == tenant_id,
+                IncidentEvidenceRecord.issue_signature == candidate.issue_signature,
+                IncidentEvidenceRecord.reviewed.is_(True),
+            )))
+            blockers = _promotion_readiness(content, reviewed_success=reviewed_success)
+            if blockers:
+                raise HTTPException(status_code=409, detail={"code": "catalog_promotion_blocked", "blocking_reasons": blockers})
+            self_heal = request.risk_level == "low"
+            candidate.approval_status = "approved"
+            candidate.approved_by = request.actor
+            candidate.approved_at = datetime.now(timezone.utc)
+            candidate.risk_level = request.risk_level
+            content.update({
+                "review_state": "approved", "risk_level": request.risk_level,
+                "execution_eligible": self_heal, "self_heal_eligible": self_heal,
+                "promotion_requirements": [], "approved_by": request.actor,
+                "approved_at": candidate.approved_at.isoformat(),
+                "autonomy_policy": "repeat-match-auto" if self_heal else "repeat-match-hitl",
+            })
+            audit_action = "runbook.challenger_promoted"
+        candidate.content = content
+        audit = {
+            "decision": request.decision, "version": version, "risk_level": request.risk_level,
+            "self_heal_eligible": bool(content.get("self_heal_eligible")), "reason": request.reason,
+            "content_sha256": request.expected_content_sha256,
+        }
+        session.add(LearningAuditRecord(
+            tenant_id=tenant_id, actor=request.actor, action=audit_action,
+            resource_type="runbook", resource_id=str(runbook_id), payload=audit,
+            payload_sha256=_hash(audit), occurred_at=datetime.now(timezone.utc),
+        ))
+        await session.commit()
+    return {
+        "status": candidate.approval_status, "runbook_id": str(runbook_id), "version": version,
+        "self_heal_eligible": bool(content.get("self_heal_eligible")),
+        "autonomy_policy": content.get("autonomy_policy"),
     }
 
 

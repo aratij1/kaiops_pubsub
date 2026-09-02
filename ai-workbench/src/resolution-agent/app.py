@@ -20,6 +20,7 @@ from common.context_enrichment_contract import (
     build_evidence_requirements,
     next_authorized_enrichment_connector,
 )
+from common.database import RunbookVersionRecord
 from common.event_publishers import build_agent_event_contract, build_event_envelope
 from common.kafka import KafkaConsumer
 from common.kafka import consume_forever as consume_kafka_forever
@@ -44,11 +45,13 @@ from common.tenant_identity import require_tenant_id
 from common.topics import CONTEXT_EVENTS, RESOLUTION_EVENTS
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 from resolution_agent import ResolutionIntelligenceAgent
 from resolution_agent.catalog import (
     RESOLUTION_CATALOG,
     prepare_resolution_plan,
     register_global_knowledge,
+    register_learned_runbooks,
     relevant_resolutions,
 )
 from resolution_agent.contracts import ResolutionOption
@@ -1663,6 +1666,28 @@ async def resolution_catalog(request: ResolutionCatalogRequest) -> dict[str, Any
     rows = relevant_resolutions(
         issue=request.issue, service=request.service, recommended_action=request.recommended_action
     )
+    async with app.state.session_factory() as session:
+        learned_records = (await session.execute(
+            select(RunbookVersionRecord).where(
+                RunbookVersionRecord.tenant_id == tenant_id,
+                RunbookVersionRecord.approval_status == "approved",
+            ).order_by(RunbookVersionRecord.last_validated_at.desc()).limit(200)
+        )).scalars().all()
+    learned = register_learned_runbooks(
+        tenant_id=tenant_id,
+        issue=request.issue,
+        service=request.service,
+        runbooks=[{
+            "runbook_id": str(row.runbook_id), "version": row.version,
+            "approval_status": row.approval_status, "risk_level": row.risk_level,
+            "success_count": row.success_count, "failure_count": row.failure_count,
+            "content": row.content or {},
+        } for row in learned_records],
+    )
+    # A tenant-local recovery with a measured successful outcome is more
+    # relevant than a generic discovery template. It still passes the current
+    # incident readiness and execution-plan compilation gates below.
+    rows = [*learned, *rows]
     best_relevance = float(rows[0].get("relevance") or 0.0) if rows else 0.0
     fallback = {"used": False, "cache_hit": False, "reason": None, "repository": "context-agent-rag", "error": None}
     if best_relevance < 0.35:
@@ -1700,7 +1725,9 @@ async def resolution_catalog(request: ResolutionCatalogRequest) -> dict[str, Any
             fallback["error"] = str(exc)[:240]
     return {
         "rows": rows[:12],
-        "catalog_size": len(RESOLUTION_CATALOG),
+        "catalog_size": len(RESOLUTION_CATALOG) + len(learned),
+        "learned_matches": len(learned),
+        "self_heal_matches": sum(bool(row.get("self_heal_eligible")) for row in learned),
         "local_best_relevance": best_relevance,
         "global_knowledge_fallback": fallback,
     }

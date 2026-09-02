@@ -150,3 +150,17 @@ def test_platform_workspace_is_tenant_wide_scope() -> None:
     assert module._in_application_scope("Platform", service="api-gateway") is True
     assert module._in_application_scope("KaiMS", service="mysql") is True
     assert module._in_application_scope("api-gateway", service="mysql") is False
+
+
+def test_catalog_promotion_requires_success_and_complete_recovery_controls() -> None:
+    module = load_module()
+    content = {
+        "catalog_stage": "resolution_candidate",
+        "knowledge_quality": {"passed": True},
+        "remediation_steps": ["restart confirmed unhealthy replica"],
+        "validation_steps": ["verify latency recovers"],
+        "rollback_steps": ["restore previous replica"],
+    }
+    assert module._promotion_readiness(content, reviewed_success=True) == []
+    assert "a reviewed successful recovery is required" in module._promotion_readiness(content, reviewed_success=False)
+    assert "rollback steps are incomplete" in module._promotion_readiness({**content, "rollback_steps": []}, reviewed_success=True)
