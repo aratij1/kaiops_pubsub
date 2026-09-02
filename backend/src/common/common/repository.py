@@ -1272,26 +1272,36 @@ class IncidentRepository:
         incident_payload["jira_status"] = jira_status
 
 
-        bound_projection = (
-            await self.session.execute(
-                select(IncidentProjectionRecord).where(
-                    IncidentProjectionRecord.incident_id == incident_record.id,
-                    IncidentProjectionRecord.alert_id == alert_uuid,
-                    IncidentProjectionRecord.tenant_id == normalized_tenant_id,
-                )
-            )
-        ).scalar_one_or_none()
+        # RCA is canonical at incident scope. A duplicate occurrence has its
+        # own alert id but intentionally does not create another investigation
+        # binding. Resolve the newest incident binding first so every linked
+        # occurrence renders the same RCA, impact, and context snapshot.
         current_binding = (
             await self.session.execute(
                 select(IncidentInvestigationBindingRecord)
                 .where(
                     IncidentInvestigationBindingRecord.tenant_id == normalized_tenant_id,
                     IncidentInvestigationBindingRecord.incident_id == incident_record.id,
-                    IncidentInvestigationBindingRecord.alert_id == alert_uuid,
                 )
                 .order_by(
                     IncidentInvestigationBindingRecord.rca_version.desc(),
                     IncidentInvestigationBindingRecord.created_at.desc(),
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        canonical_alert_uuid = current_binding.alert_id if current_binding is not None else alert_uuid
+        bound_projection = (
+            await self.session.execute(
+                select(IncidentProjectionRecord)
+                .where(
+                    IncidentProjectionRecord.incident_id == incident_record.id,
+                    IncidentProjectionRecord.alert_id == canonical_alert_uuid,
+                    IncidentProjectionRecord.tenant_id == normalized_tenant_id,
+                )
+                .order_by(
+                    IncidentProjectionRecord.latest_event_at.desc(),
+                    IncidentProjectionRecord.updated_at.desc(),
                 )
                 .limit(1)
             )
@@ -1304,7 +1314,7 @@ class IncidentRepository:
         bound_investigation = await self.get_bound_incident_investigation(
             tenant_id=normalized_tenant_id,
             incident_id=incident_record.id,
-            alert_id=alert_uuid,
+            alert_id=canonical_alert_uuid,
             recommendation_id=current_recommendation_id,
         )
         recommendation = dict(bound_investigation.get("recommendation") or {})

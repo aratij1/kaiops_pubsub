@@ -262,6 +262,51 @@ async def test_processed_result_prefers_newest_binding_over_stale_projection(
 
 
 @pytest.mark.asyncio
+async def test_duplicate_occurrence_uses_canonical_incident_rca_binding(
+    sqlite_session_factory,
+) -> None:
+    incident_id, canonical_alert_id, duplicate_alert_id = uuid4(), uuid4(), uuid4()
+    snapshot_id, recommendation_id = uuid4(), uuid4()
+    now = datetime.now(UTC)
+    async with sqlite_session_factory() as session:
+        await _seed_pair(
+            session, tenant_id="tenant-a", incident_id=incident_id,
+            alert_id=canonical_alert_id, snapshot_id=snapshot_id,
+            recommendation_id=recommendation_id, fingerprint="3" * 64,
+            evidence_id="canonical-evidence", rca_version=3,
+        )
+        session.add(AlertRecord(
+            id=duplicate_alert_id, tenant_id="tenant-a", source="prometheus",
+            name="LatencyHigh", service="payments", environment="prod",
+            severity="critical", fingerprint="duplicate-fp",
+            payload={"id": str(duplicate_alert_id), "labels": {"kaiops_incident_id": str(incident_id)}},
+        ))
+        session.add(IncidentRecord(
+            id=incident_id, tenant_id="tenant-a", service="payments", environment="prod",
+            severity="critical", status="investigating", title="Payments latency",
+            payload={"id": str(incident_id), "alert_ids": [str(canonical_alert_id), str(duplicate_alert_id)]},
+        ))
+        session.add(IncidentProjectionRecord(
+            incident_id=incident_id, alert_id=canonical_alert_id,
+            recommendation_id=recommendation_id, tenant_id="tenant-a",
+            service="payments", environment="prod", severity="critical",
+            status="investigating", first_seen_at=now, projection_payload={},
+        ))
+        await session.commit()
+        result = await IncidentRepository(session).get_processed_result_by_alert_id(
+            str(duplicate_alert_id), tenant_id="tenant-a",
+        )
+
+    assert result is not None
+    assert result["alert"]["id"] == str(duplicate_alert_id)
+    assert result["incident"]["id"] == str(incident_id)
+    assert result["incident_investigation"]["recommendation_id"] == str(recommendation_id)
+    assert result["incident_investigation"]["context_snapshot_id"] == str(snapshot_id)
+    assert result["incident_investigation"]["rca_version"] == 3
+    assert result["investigation_integrity"]["status"] == "verified"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("mutation", "expected"),
     [

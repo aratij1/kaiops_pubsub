@@ -1235,7 +1235,10 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
         queryKey: ["alert-processed-result", normalized],
         queryFn: () => fetchJson(`/api-gateway/alerts/${normalized}/processed-result`, authenticatedOptions({
           timeoutMs: 12000,
-          maxAttempts: 1,
+          // This is a safe read. Absorb the brief connection-refused interval
+          // while Docker replaces monitoring-adapter without discarding the
+          // persisted cockpit snapshot already rendered above.
+          maxAttempts: 4,
         })),
         // Background hydration must bypass the query cache. Incident stages
         // can complete between polls, and returning a 15-second-old partial
@@ -1252,6 +1255,10 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       });
       return payload;
     } catch (error) {
+      const rawError = String(error?.message || "Unable to load processed alert details");
+      const displayError = /HTTP 502|All connection attempts failed|Bad Gateway/i.test(rawError)
+        ? "The latest processed analysis is temporarily unavailable. Showing the last persisted incident and RCA data; refresh to retry."
+        : rawError;
       setSelectedAlertData((prev) => {
         if (String(prev.alertId || "") !== normalized) {
           return prev;
@@ -1259,7 +1266,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
         return {
           loading: false,
           payload: prev.payload,
-          error: String(error?.message || "Unable to load processed alert details"),
+          error: displayError,
           alertId: normalized,
         };
       });
@@ -2199,7 +2206,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
           // Hydrate the full cockpit once, after the indexed completion signal.
           const payload = await fetchJson(`/api-gateway/alerts/${normalized}/processed-result`, authenticatedOptions({
             timeoutMs: 120000,
-            maxAttempts: 1,
+            maxAttempts: 4,
           }));
           latestPayload = payload;
           const data = unwrap(payload) || {};
@@ -4116,7 +4123,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       try {
         const payload = await fetchJson(
           `/api-gateway/alerts/${encodeURIComponent(alertId)}/processed-result`,
-          authenticatedOptions({ timeoutMs: 12000, maxAttempts: 1 }),
+          authenticatedOptions({ timeoutMs: 12000, maxAttempts: 4 }),
         );
         workflowPayload = payload?.data || payload;
       } catch (_error) {

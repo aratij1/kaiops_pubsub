@@ -770,12 +770,12 @@ async def proxy(
     else:
         request_timeout = 12.0 if is_fast_read else settings.gateway_request_timeout_seconds
     timeout = httpx.Timeout(request_timeout, connect=5.0, pool=5.0)
-    # A ConnectError/ConnectTimeout occurs while establishing the downstream
-    # connection, before an HTTP response exists. Retrying it once is safe for
-    # state-changing requests too and absorbs brief Docker DNS/service-start
-    # races. Read/pool timeouts and HTTP responses are deliberately not retried
-    # because the downstream may already have applied those requests.
-    max_attempts = 2
+    # A ConnectError/ConnectTimeout occurs before an HTTP response exists.
+    # Safe reads get a wider bounded recovery window because Docker can publish
+    # a replacement container before uvicorn has bound its socket. Mutations are
+    # retried only once: the connection was never established, but keeping that
+    # window narrow avoids surprising callers during a prolonged outage.
+    max_attempts = 4 if normalized_method == "GET" else 2
 
     for attempt in range(1, max_attempts + 1):
         try:
@@ -794,7 +794,7 @@ async def proxy(
         except (httpx.ConnectError, httpx.ConnectTimeout):
             if attempt >= max_attempts:
                 raise
-            await asyncio.sleep(0.2 * attempt)
+            await asyncio.sleep(0.25 * attempt)
         except httpx.HTTPError:
             # A read/pool timeout means the downstream is saturated. Retrying
             # immediately multiplies that load and prolongs the outage.

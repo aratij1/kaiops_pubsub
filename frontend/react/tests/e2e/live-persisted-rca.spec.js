@@ -14,11 +14,12 @@ test("completed live analysis renders its persisted RCA", async ({ page }) => {
   await expect(page.locator(".alert-details-cockpit")).toBeVisible({ timeout: 45_000 });
   const sections = page.getByRole("tablist", { name: "Incident workspace sections" });
   await sections.getByRole("tab", { name: "Evidence, RCA, and impact" }).click();
-  await page.getByRole("tab", { name: /Decision brief/ }).click();
+  await page.getByRole("tab", { name: /Summary/ }).click();
 
   const explanation = page.locator(".leading-explanation h4");
   await expect(explanation).toBeVisible({ timeout: 45_000 });
   await expect(explanation).not.toHaveText("A probable cause has not been established.");
   await expect(explanation).not.toContainText("RCA pending");
   await expect(page.getByText(/HTTP 401|Not authenticated/)).toHaveCount(0);
+  await expect(page.getByText(/HTTP 502|All connection attempts failed/)).toHaveCount(0);
 });

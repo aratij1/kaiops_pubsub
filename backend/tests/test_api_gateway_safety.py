@@ -41,6 +41,20 @@ class _ConnectOnceProxyClient:
         )
 
 
+class _ConnectThriceProxyClient(_ConnectOnceProxyClient):
+    async def request(self, *args, **kwargs):
+        import httpx
+
+        self.calls += 1
+        if self.calls < 4:
+            raise httpx.ConnectError("monitoring adapter is still starting")
+        return httpx.Response(
+            200,
+            json={"incident_id": "incident-1"},
+            request=httpx.Request("GET", "http://monitoring-adapter:8000/alerts/a/processed-result"),
+        )
+
+
 def load_api_gateway_app_module():
     existing = sys.modules.get("api_gateway_app")
     if existing is not None:
@@ -196,6 +210,30 @@ async def test_proxy_retries_post_after_connection_establishment_failure(monkeyp
     assert status == 200
     assert payload == {"decision": "approved"}
     assert client.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_proxy_gives_safe_reads_a_bounded_service_start_recovery_window(monkeypatch) -> None:
+    module = load_api_gateway_app_module()
+    client = _ConnectThriceProxyClient()
+    monkeypatch.setattr(module.app.state, "proxy_client", client, raising=False)
+
+    async def no_wait(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(module.asyncio, "sleep", no_wait)
+
+    status, payload = await module.proxy(
+        method="GET",
+        path="/alerts/a/processed-result",
+        target_base="http://monitoring-adapter:8000",
+        payload={},
+        trace_id="processed-result-startup-retry-test",
+    )
+
+    assert status == 200
+    assert payload == {"incident_id": "incident-1"}
+    assert client.calls == 4
 
 
 def test_triage_correction_contract_requires_governed_feedback() -> None:

@@ -582,6 +582,12 @@ services:
       mysql: { condition: service_healthy }
       redis: { condition: service_healthy }
       docker-socket-proxy: { condition: service_started }
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)\""]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
 
   monitoring-ingestion-worker:
     image: ${MONITORING_ADAPTER_IMAGE:-kaiops_pubsub-monitoring-adapter:latest}
