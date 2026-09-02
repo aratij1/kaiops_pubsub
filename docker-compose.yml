@@ -1004,7 +1004,10 @@ services:
       RESOLUTION_INVESTIGATION_MAX_TOOL_CALLS: ${RESOLUTION_INVESTIGATION_MAX_TOOL_CALLS:-12}
       RESOLUTION_INVESTIGATION_MAX_DURATION_SECONDS: ${RESOLUTION_INVESTIGATION_MAX_DURATION_SECONDS:-90}
       RESOLUTION_INVESTIGATION_MAX_EVIDENCE: ${RESOLUTION_INVESTIGATION_MAX_EVIDENCE:-40}
-      RESOLUTION_INVESTIGATION_CONCLUSIVE_THRESHOLD: ${RESOLUTION_INVESTIGATION_CONCLUSIVE_THRESHOLD:-0.85}
+      # Partial evidence may conclude RCA when two independent, current sources
+      # corroborate an actual causal mechanism. Missing optional planes remain
+      # visible as gaps and penalties; symptom-only observations never qualify.
+      RESOLUTION_INVESTIGATION_CONCLUSIVE_THRESHOLD: ${RESOLUTION_INVESTIGATION_CONCLUSIVE_THRESHOLD:-0.65}
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/ai-workbench/src/resolution-agent
     ports: ["8006:8000"]

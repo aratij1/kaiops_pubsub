@@ -1972,6 +1972,46 @@ async def _load_analysis_regeneration_subject(
                     )
                 ).scalar_one_or_none()
         if projection_record is None:
+            # Older deduplication records predate incident_occurrences. Their
+            # authoritative relation is the canonical incident's alert_ids
+            # payload. Processed-result already supports this legacy relation;
+            # regeneration must resolve it identically or the cockpit can show
+            # an RCA that its own Refresh action is unable to regenerate.
+            incident_rows = await session.execute(
+                select(IncidentRecord)
+                .where(IncidentRecord.tenant_id == tenant_id)
+                .order_by(IncidentRecord.updated_at.desc(), IncidentRecord.created_at.desc())
+                .limit(300)
+            )
+            linked_incident = next((
+                record
+                for record in incident_rows.scalars().all()
+                if str(alert_id) in {
+                    str(value)
+                    for value in (
+                        record.payload.get("alert_ids", [])
+                        if isinstance(record.payload, dict)
+                        and isinstance(record.payload.get("alert_ids"), list)
+                        else []
+                    )
+                }
+            ), None)
+            if linked_incident is not None:
+                projection_record = (
+                    await session.execute(
+                        select(IncidentProjectionRecord)
+                        .where(
+                            IncidentProjectionRecord.incident_id == linked_incident.id,
+                            IncidentProjectionRecord.tenant_id == tenant_id,
+                        )
+                        .order_by(
+                            IncidentProjectionRecord.latest_event_at.desc(),
+                            IncidentProjectionRecord.updated_at.desc(),
+                        )
+                        .limit(1)
+                    )
+                ).scalar_one_or_none()
+        if projection_record is None:
             raise HTTPException(
                 status_code=409,
                 detail="The alert does not have a persisted incident yet; refresh after correlation completes",

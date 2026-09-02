@@ -296,6 +296,55 @@ def test_structured_metric_evidence_is_summarized_without_raw_json() -> None:
     assert "source_status" not in summary
 
 
+def test_missing_optional_sources_do_not_cap_independently_corroborated_mechanism() -> None:
+    investigator = IterativeInvestigator(client=FakeDiscoveryClient({}))
+    context = make_context()
+    evidence = investigator._compile_evidence(context, [{
+        "evidence_id": "DEPENDENCY-DOWN",
+        "source": "dependency",
+        "uri": "docker://payments",
+        "observed_at": context.alert.starts_at.isoformat(),
+        "service": "payments",
+        "related_to": "checkout",
+        "runtime_state": "exited",
+        "healthy": False,
+        "summary": "payments dependency exited during the checkout incident",
+    }, {
+        "evidence_id": "TRACE-PAYMENTS",
+        "source": "trace",
+        "uri": "jaeger://trace/payments",
+        "observed_at": context.alert.starts_at.isoformat(),
+        "slowest_spans": [{"service": "payments", "operation": "POST /charge", "duration_ms": 1200}],
+        "dependency_edges": [{"upstream": "checkout", "downstream": "payments"}],
+        "summary": "checkout trace stalls at payments",
+    }])
+    hypotheses = investigator._revise_hypotheses([], evidence, context=context)
+    dependency = next(row for row in hypotheses if "dependency" in row["claim"].lower())
+
+    assert dependency["independent_sources"] == ["dependency", "traces"]
+    assert "required_sources_unavailable" not in dependency["confidence_breakdown"]["ceiling_reasons"]
+    assert dependency["status"] == "confirmed"
+
+
+def test_derived_observation_cannot_be_promoted_to_root_cause() -> None:
+    investigator = IterativeInvestigator(client=FakeDiscoveryClient({}))
+    context = make_context()
+    evidence = investigator._compile_evidence(context, [{
+        "evidence_id": "METRIC-1", "source": "telemetry",
+        "uri": "prometheus://checkout/latency", "observed_at": context.alert.starts_at.isoformat(),
+        "summary": "checkout latency timeout after deployment",
+    }, {
+        "evidence_id": "LOG-1", "source": "log",
+        "uri": "logs://checkout/timeout", "observed_at": context.alert.starts_at.isoformat(),
+        "summary": "checkout latency timeout after deployment",
+    }])
+    hypotheses = investigator._revise_hypotheses([], evidence, context=context)
+    observation = next(row for row in hypotheses if row.get("source") == "derived_observation")
+
+    assert observation["independent_source_count"] == 2
+    assert observation["status"] != "confirmed"
+
+
 def test_truncated_structured_metric_evidence_preserves_query_observation() -> None:
     summary = IterativeInvestigator._human_evidence_summary(
         '{"query": "histogram_quantile(0.95, rate(latency_bucket[5m])) > 2", "series": [{"metric":'

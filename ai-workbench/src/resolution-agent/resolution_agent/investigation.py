@@ -165,7 +165,7 @@ class IterativeInvestigator:
         self.max_tool_calls = max(1, min(int(os.getenv("RESOLUTION_INVESTIGATION_MAX_TOOL_CALLS", "12")), 100))
         self.max_duration_seconds = max(5, min(int(os.getenv("RESOLUTION_INVESTIGATION_MAX_DURATION_SECONDS", "120")), 3600))
         self.max_cost_usd = max(0.0, min(float(os.getenv("RESOLUTION_INVESTIGATION_MAX_COST_USD", "0.25")), 1000.0))
-        self.conclusive_threshold = max(0.6, min(float(os.getenv("RESOLUTION_INVESTIGATION_CONCLUSIVE_THRESHOLD", "0.85")), 0.98))
+        self.conclusive_threshold = max(0.6, min(float(os.getenv("RESOLUTION_INVESTIGATION_CONCLUSIVE_THRESHOLD", "0.65")), 0.98))
 
     def plan(self, context: Context, *, investigation_id: str) -> InvestigationPlan:
         required = sorted(self._required_sources(context))
@@ -804,7 +804,11 @@ class IterativeInvestigator:
                 contradiction_penalty=min(len(set(contradiction)) * 0.1, 0.35),
                 freshness_penalty=0.15 if supporting_rows and not fresh_support else 0.0,
                 missing_data_penalty=(1.0 - completeness) * 0.2,
-                sources_unavailable=any(coverage.get(source, 0) == 0 for source in required_sources),
+                # Missing optional planes are represented by the proportional
+                # missing-data penalty and explicit gaps. They must not impose
+                # a global ceiling once two independent sources corroborate the
+                # same mechanism. Fewer than two sources remains non-conclusive.
+                sources_unavailable=len(sources) < 2,
                 stale_evidence=bool(supporting_rows and not fresh_support),
                 model_fallback=bool(context.metadata.get("model_fallback")),
                 degraded_context=bool(context.metadata.get("degraded_context")),
@@ -846,8 +850,12 @@ class IterativeInvestigator:
                 "ceiling_reasons": list(scored.ceiling_reasons),
             }
             hypothesis["confidence_components"] = scored.components
+            # A derived observation is a symptom summary, never a causal
+            # mechanism. It remains useful context but cannot become a root
+            # cause merely through repeated/lexically similar evidence.
+            causally_eligible = hypothesis.get("source") != "derived_observation"
             hypothesis["status"] = (
-                "confirmed" if hypothesis["confidence"] >= self.conclusive_threshold and len(sources) >= 2
+                "confirmed" if causally_eligible and hypothesis["confidence"] >= self.conclusive_threshold and len(sources) >= 2
                 else "falsified" if hypothesis["confidence"] <= 0.15 and bool(contradiction)
                 else "leading" if hypothesis["confidence"] >= 0.55
                 else "candidate"
@@ -972,6 +980,14 @@ class IterativeInvestigator:
             steps.append(step)
             if persist:
                 await persist("step", {"investigation_id": investigation_id, **step})
+            leading = hypotheses[0] if hypotheses else None
+            if (
+                leading
+                and leading.get("status") == "confirmed"
+                and len(leading.get("supporting_evidence_ids") or []) >= 2
+            ):
+                status, stop_reason = InvestigationStatus.CONCLUSIVE, "corroborated_leading_hypothesis"
+                break
             if len(evidence) >= self.max_evidence:
                 status, stop_reason = InvestigationStatus.BUDGET_EXHAUSTED, "evidence_budget_exhausted"
                 break
