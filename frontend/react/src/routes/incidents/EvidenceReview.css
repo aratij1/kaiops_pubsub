@@ -359,3 +359,4 @@
   .ai-feedback-form { grid-template-columns: 1fr; }
   .ai-feedback-form label { grid-column: 1; }
 }
+.stale-evidence-warning{display:flex;align-items:center;justify-content:space-between;gap:12px}.stale-evidence-warning .button-secondary{flex:none}

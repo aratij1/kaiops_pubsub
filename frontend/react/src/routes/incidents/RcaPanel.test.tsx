@@ -9,11 +9,25 @@ import RcaPanel, {
   humanizeRcaHypothesis,
   resolutionBindingFor,
   resolutionSelectionPayload,
+  staleApprovalEvidence,
 } from "./RcaPanel";
 
 vi.mock("../../app/routeRuntime", () => ({ useRouteRuntimeSlice: () => ({ accessToken: "test-token" }) }));
 
 describe("RcaPanel canonical evidence gate", () => {
+  it("does not treat unbound historical context as an approval freshness error", () => {
+    expect(staleApprovalEvidence([
+      { id: "history-1", accepted: false, cached: true, freshness: "stale" },
+      { id: "metric-1", accepted: true, cached: false, freshness: "fresh" },
+    ])).toEqual([]);
+  });
+
+  it("requires refresh when stale evidence is actually bound to the RCA", () => {
+    expect(staleApprovalEvidence([
+      { id: "metric-1", accepted: true, cached: true, freshness: "stale" },
+    ])).toEqual([expect.objectContaining({ id: "metric-1" })]);
+  });
+
   it("summarizes legacy structured metric hypotheses without raw JSON", () => {
     const result = humanizeRcaHypothesis('Observed signal requiring causal confirmation: {"source_status":"completed","query":"sum(rate(http_requests_total[5m]))","series":[{"metric":{"service":"checkout"}}],"provenance":{"source":"onboarded-prometheus"}}');
     expect(result).toBe("Observed signal requiring causal confirmation: Prometheus returned 1 time series for query: sum(rate(http_requests_total[5m]))");
