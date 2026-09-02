@@ -457,7 +457,11 @@ export default function IncidentsRoute() {
   };
   const groupedIncidents = useMemo<GroupedIncidentRow[]>(() => {
     const alertsById = new Map(inboxAlertRows.map((alert) => [String(alert.id || (alert as typeof alert & { alert_id?: string }).alert_id || ""), alert]));
-    const canonicalRows = groupPage.rows.map((row) => ({
+    const feedRows = unifiedPage.rows
+      .filter((item) => item.record_type === "incident")
+      .map((item) => item.row as IncidentRow);
+    const sourceRows = focusedIncidentId ? groupPage.rows : feedRows;
+    const canonicalRows = sourceRows.map((row) => ({
       ...row,
       source_alert: row.source_alert || alertsById.get(String(row.alert_id || "")),
       duplicateIncidents: [],
@@ -466,7 +470,7 @@ export default function IncidentsRoute() {
     const focused = canonicalRows.find((row) => String(row.incident_id || row.id || "") === focusedIncidentId)
       || incidents.rows.find((row) => String(row.incident_id || row.id || "") === focusedIncidentId);
     return focused ? [{ ...focused, duplicateIncidents: [] }] : canonicalRows;
-  }, [focusedIncidentId, groupPage.rows, incidents.rows, inboxAlertRows]);
+  }, [focusedIncidentId, groupPage.rows, incidents.rows, inboxAlertRows, unifiedPage.rows]);
   const filteredIncidents = useMemo(
     () => groupedIncidents.filter((row) => isActionableInboxIncident(row) && belongsToInboxView(row, inboxView)),
     [groupedIncidents, inboxView],
@@ -491,7 +495,7 @@ export default function IncidentsRoute() {
   const unifiedRecords = useMemo(() => unifiedPage.rows.map((item) => item.record_type === "incident"
     ? { kind: "incident" as const, score: item.score, row: item.row as IncidentRow }
     : { kind: "alert" as const, score: item.score, row: item.row as AlertStreamRow }), [unifiedPage.rows]);
-  const totalRecords = recordType === "all" ? unifiedPage.filtered_count : recordType === "alerts" ? filteredAlerts.length : filteredIncidents.length;
+  const totalRecords = recordType === "all" ? unifiedPage.filtered_count : recordType === "alerts" ? filteredAlerts.length : unifiedPage.filtered_count;
   const pages = Math.max(1, Math.ceil(totalRecords / PAGE_SIZE));
   useEffect(() => {
     if (!focusedIncidentId) return;
@@ -518,10 +522,12 @@ export default function IncidentsRoute() {
     setSearchParams((current) => { const next = new URLSearchParams(current); next.delete("cursor"); if (value && value !== "all") next.set(name, value); else next.delete(name); return next; }, { replace: true });
   };
   const select = (label: string, name: keyof IncidentFilters, options: string[]) => <label>{label}<select value={restoredFilter(name)} onChange={(event) => updateIncidentFilter(name, event.target.value)}>{options.map((option) => <option value={option} key={option}>{option}</option>)}</select></label>;
-  const active = groupPage.active_count;
-  const needsAttention = groupPage.needs_attention_count;
+  const totalIncidents = Number(unifiedPage.record_counts.incidents || unifiedPage.view_counts.all || 0);
+  const resolvedIncidents = Number(unifiedPage.view_counts.resolved || 0);
+  const active = Math.max(0, totalIncidents - resolvedIncidents);
+  const needsAttention = Number(unifiedPage.view_counts.needs_me || 0);
   const viewCount = (view: InboxView) => {
-    const incidentCount = view === "all" ? groupPage.total_count : view === "needs_me" ? groupPage.needs_attention_count : view === "resolved" ? Math.max(0, groupPage.total_count - groupPage.active_count) : groupedIncidents.filter((row) => belongsToInboxView(row, view)).length;
+    const incidentCount = Number(unifiedPage.view_counts[view] ?? (view === "all" ? totalIncidents : 0));
     return recordType === "incidents" ? incidentCount : recordType === "alerts" ? inboxAlertRows.filter((row) => alertBelongsToInboxView(row, view)).length : Number(unifiedPage.view_counts[view] || 0);
   };
   const showUnified = recordType === "all";
@@ -532,7 +538,7 @@ export default function IncidentsRoute() {
     <OperationsWorkflowNav active="incidents" />
     <header className="incident-list-heading unified-inbox-heading">
       <div><span className="inbox-eyebrow"><Activity size={14} /> Incident command queue</span><h2>Unified Inbox</h2><p>Canonical incidents that require investigation, decisions, remediation, or validation.</p></div>
-      <div className="operations-kpis" aria-label="Incident totals"><span className={needsAttention ? "is-urgent" : ""}><small>Needs attention</small><strong>{needsAttention}</strong></span><span><small>Active incidents</small><strong>{active}</strong></span><span><small>Total incidents</small><strong>{unifiedPage.record_counts.incidents}</strong></span></div>
+      <div className="operations-kpis" aria-label="Incident totals"><span className={needsAttention ? "is-urgent" : ""}><small>Needs attention</small><strong>{needsAttention}</strong></span><span><small>Active incidents</small><strong>{active}</strong></span><span><small>Total incidents</small><strong>{totalIncidents}</strong></span></div>
     </header>
     <nav className="incident-inbox-views" aria-label="Incident inbox views">{([
       ["needs_me", "Needs me"], ["kai_handling", "Kai handling"], ["critical", "Critical"], ["watching", "Watching"], ["resolved", "Resolved recently"], ["all", "All"],
