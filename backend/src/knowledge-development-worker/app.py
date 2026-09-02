@@ -14,6 +14,7 @@ from common.database import ActionRecord, FailurePatternRecord, IncidentEvidence
 from common.learning_workflows import Mode02Worker
 from common.models import EvidenceReference
 from common.service import create_app
+from common.tenant_identity import require_tenant_id
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, or_, select, text
@@ -52,6 +53,12 @@ class ScheduleConfig(BaseModel):
     minimum_confidence: float = Field(default=0.70, ge=0.5, le=0.99)
     minimum_success_rate: float = Field(default=0.80, ge=0.5, le=1.0)
     minimum_reviewed_incidents: int = Field(default=2, ge=1, le=100)
+
+
+class IncidentBootstrapRequest(BaseModel):
+    incident: dict[str, Any]
+    context: dict[str, Any]
+    recommendation: dict[str, Any] = Field(default_factory=dict)
 
 
 def _utc(value: datetime | None) -> datetime | None:
@@ -112,16 +119,26 @@ async def _save_state(session: Any, payload: dict[str, Any]) -> None:
     await session.merge(KnowledgeBaseRecord(id=state_id, tenant_id="default", service="KaiMS", title="Periodic knowledge development durable state", content=json.dumps(payload, sort_keys=True), embedding_ref=None, payload=payload))
 
 
-async def _draft_candidate(session: Any, pattern: FailurePattern, quality: dict[str, Any]) -> bool:
+async def _draft_candidate(
+    session: Any,
+    pattern: FailurePattern,
+    quality: dict[str, Any],
+    *,
+    allow_evidence_work: bool = False,
+    tenant_id: str = "default",
+) -> bool:
     checks = quality.get("checks") or {}
     diagnostic_only = not quality["passed"]
     # Cold-start candidates may describe read-only diagnostics, but never a
     # production mutation. Two independent sources and no known conflicts are
     # still mandatory so the catalog is not populated from a lone alert.
-    if diagnostic_only and not (checks.get("independent_sources") and checks.get("no_conflicts")):
+    if diagnostic_only and not checks.get("no_conflicts"):
         return False
-    runbook_id = uuid5(NAMESPACE_URL, f"kaims:runbook:default:{pattern.issue_signature}")
-    latest = (await session.execute(select(RunbookVersionRecord).where(RunbookVersionRecord.runbook_id == runbook_id).order_by(RunbookVersionRecord.version.desc()).limit(1))).scalar_one_or_none()
+    if diagnostic_only and not allow_evidence_work and not checks.get("independent_sources"):
+        return False
+    tenant_id = require_tenant_id(tenant_id, source="knowledge development candidate")
+    runbook_id = uuid5(NAMESPACE_URL, f"kaims:runbook:{tenant_id}:{pattern.issue_signature}")
+    latest = (await session.execute(select(RunbookVersionRecord).where(RunbookVersionRecord.tenant_id == tenant_id, RunbookVersionRecord.runbook_id == runbook_id).order_by(RunbookVersionRecord.version.desc()).limit(1))).scalar_one_or_none()
     if diagnostic_only:
         payload = {
             "issue_signature": pattern.issue_signature,
@@ -150,7 +167,11 @@ async def _draft_candidate(session: Any, pattern: FailurePattern, quality: dict[
         "matching_conditions": {"issue_signature": pattern.issue_signature},
         "supporting_evidence": [item.model_dump(mode="json") for item in pattern.evidence_references[:50]],
         "review_state": "awaiting_hitl_review", "knowledge_quality": quality,
-        "catalog_stage": "diagnostic_candidate" if diagnostic_only else "resolution_candidate",
+        "catalog_stage": (
+            "evidence_work_candidate"
+            if diagnostic_only and allow_evidence_work and not checks.get("independent_sources")
+            else "diagnostic_candidate" if diagnostic_only else "resolution_candidate"
+        ),
         "execution_eligible": False,
         "promotion_requirements": ([] if not diagnostic_only else [
             "Operator-confirmed causal mechanism",
@@ -166,10 +187,65 @@ async def _draft_candidate(session: Any, pattern: FailurePattern, quality: dict[
         return False
     version = latest.version + 1 if latest else 1
     payload.update({"version": version, "content_sha256": candidate_hash})
-    session.add(RunbookVersionRecord(runbook_id=runbook_id, version=version, tenant_id="default", issue_signature=pattern.issue_signature, approval_status="draft", owner=str(payload.get("owner") or "unassigned"), risk_level=str(payload.get("risk_level") or "low"), required_approval="mandatory", content=payload))
+    session.add(RunbookVersionRecord(runbook_id=runbook_id, version=version, tenant_id=tenant_id, issue_signature=pattern.issue_signature, approval_status="draft", owner=str(payload.get("owner") or "unassigned"), risk_level=str(payload.get("risk_level") or "low"), required_approval="mandatory", content=payload))
     audit = {"status": "draft", "version": version, "issue_signature": pattern.issue_signature, "content_sha256": candidate_hash, "quality_gate": quality, "catalog_stage": payload["catalog_stage"], "execution_eligible": False, "requires_human_approval": True}
-    session.add(LearningAuditRecord(event_id=uuid5(NAMESPACE_URL, f"kaims:audit:runbook-drafted:{runbook_id}:{version}"), tenant_id="default", actor="knowledge-development-worker", action="runbook.challenger_drafted", resource_type="runbook", resource_id=str(runbook_id), payload=audit, payload_sha256=_hash(audit), occurred_at=datetime.now(timezone.utc)))
+    session.add(LearningAuditRecord(event_id=uuid5(NAMESPACE_URL, f"kaims:audit:runbook-drafted:{runbook_id}:{version}"), tenant_id=tenant_id, actor="knowledge-development-worker", action="runbook.challenger_drafted", resource_type="runbook", resource_id=str(runbook_id), payload=audit, payload_sha256=_hash(audit), occurred_at=datetime.now(timezone.utc)))
     return True
+
+
+def _reference_from_context(row: Any) -> EvidenceReference | None:
+    if not isinstance(row, dict):
+        return None
+    evidence_id = str(row.get("evidence_id") or row.get("id") or "").strip()
+    source = str(row.get("source") or row.get("provider") or row.get("type") or "").strip().lower()
+    uri = str(row.get("uri") or row.get("source_uri") or row.get("citation") or "").strip()
+    summary = str(row.get("summary") or row.get("observation") or row.get("content") or "").strip()
+    if not evidence_id or not source or not uri or not summary:
+        return None
+    try:
+        return EvidenceReference(
+            evidence_id=evidence_id,
+            source=source,
+            uri=uri,
+            summary=summary[:2000],
+            confidence=max(0.0, min(float(row.get("confidence", 1.0)), 1.0)),
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _bootstrap_evidence(request: IncidentBootstrapRequest) -> IncidentEvidence:
+    incident, context, recommendation = request.incident, request.context, request.recommendation
+    alert = context.get("alert") if isinstance(context.get("alert"), dict) else {}
+    metadata = context.get("metadata") if isinstance(context.get("metadata"), dict) else {}
+    discovery = metadata.get("discovery_report") if isinstance(metadata.get("discovery_report"), dict) else {}
+    raw_evidence = discovery.get("evidence") if isinstance(discovery.get("evidence"), list) else []
+    references = [ref for ref in (_reference_from_context(row) for row in raw_evidence) if ref is not None]
+    by_kind: dict[str, list[EvidenceReference]] = {key: [] for key in ("logs", "metrics", "traces", "tickets", "changes")}
+    for ref in references:
+        token = f"{ref.source} {ref.uri}".lower()
+        kind = "traces" if any(value in token for value in ("trace", "jaeger")) else "metrics" if any(value in token for value in ("metric", "prometheus")) else "tickets" if any(value in token for value in ("jira", "ticket", "itsm")) else "changes" if any(value in token for value in ("change", "git", "deploy")) else "logs"
+        by_kind[kind].append(ref)
+    observed_at = incident.get("created_at") or alert.get("starts_at")
+    try:
+        timestamp = datetime.fromisoformat(str(observed_at).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        timestamp = datetime.now(timezone.utc)
+    root_cause = str(recommendation.get("root_cause") or "").strip()
+    return IncidentEvidence(
+        incident_id=str(incident.get("id") or context.get("incident_id")),
+        service=str(incident.get("service") or alert.get("service") or "unknown"),
+        environment=str(incident.get("environment") or alert.get("environment") or "prod"),
+        alert_type=str(alert.get("name") or incident.get("title") or "unknown"),
+        symptoms=[value for value in [str(incident.get("summary") or "").strip(), str(alert.get("description") or "").strip()] if value],
+        timestamps=[timestamp],
+        logs=by_kind["logs"], metrics=by_kind["metrics"], traces=by_kind["traces"],
+        related_tickets=by_kind["tickets"], recent_changes=by_kind["changes"],
+        dependencies=[str(value) for value in context.get("dependency_services", []) if str(value).strip()],
+        resolution=str(recommendation.get("recommended_action") or "").strip() or None,
+        root_causes=[root_cause] if root_cause and root_cause.lower() not in {"unknown", "insufficient evidence"} else [],
+        reviewed=False,
+    )
 
 
 def _build_evidence(report: RcaReportRecord, incident: IncidentRecord, latest_action: ActionRecord | None) -> IncidentEvidence:
@@ -341,6 +417,72 @@ async def shutdown(_: FastAPI) -> None:
 
 
 app = create_app(title="KaiMS Knowledge Development Worker", settings=settings, startup=startup, shutdown=shutdown)
+
+
+@app.post("/incidents/bootstrap")
+async def bootstrap_incident_catalog(request: IncidentBootstrapRequest) -> dict[str, Any]:
+    """Persist current evidence and bootstrap an idempotent, non-executable candidate."""
+    if not settings.database_enabled:
+        return {"status": "disabled", "reason": "database is disabled"}
+    evidence = _bootstrap_evidence(request)
+    tenant_id = require_tenant_id(
+        str(request.context.get("tenant_id") or request.incident.get("tenant_id") or ""),
+        source="incident catalog bootstrap",
+    )
+    if not evidence.incident_id or evidence.incident_id.lower() == "none":
+        return {"status": "rejected", "reason": "incident identity is required"}
+    signature = issue_signature(evidence)
+    async with app.state.session_factory() as session:
+        evidence_id = uuid5(NAMESPACE_URL, f"kaims:incident-evidence:{tenant_id}:{evidence.incident_id}")
+        await session.merge(IncidentEvidenceRecord(
+            id=evidence_id, tenant_id=tenant_id, incident_id=evidence.incident_id,
+            issue_signature=signature, service=evidence.service, environment=evidence.environment,
+            alert_type=evidence.alert_type, evidence=evidence.model_dump(mode="json"), reviewed=False,
+            collected_at=max(evidence.timestamps) if evidence.timestamps else datetime.now(timezone.utc),
+        ))
+        await session.flush()
+        matching = (await session.execute(
+            select(IncidentEvidenceRecord).where(IncidentEvidenceRecord.tenant_id == tenant_id, IncidentEvidenceRecord.issue_signature == signature)
+            .order_by(IncidentEvidenceRecord.collected_at.desc()).limit(100)
+        )).scalars().all()
+        evidence_rows = []
+        for row in matching:
+            try:
+                evidence_rows.append(IncidentEvidence.model_validate(row.evidence))
+            except Exception:
+                continue
+        patterns = FailurePatternAnalyzer().analyze(evidence_rows)
+        pattern = next((item for item in patterns if item.issue_signature == signature), None)
+        if pattern is None:
+            return {"status": "rejected", "reason": "evidence could not be normalized"}
+        quality = _quality_gate(pattern, {row.incident_id: row for row in evidence_rows})
+        pattern_id = uuid5(NAMESPACE_URL, f"kaims:failure-pattern:{tenant_id}:{signature}")
+        pattern_payload = pattern.model_dump(mode="json")
+        pattern_payload.update({
+            "knowledge_status": "challenger" if quality["passed"] else "observed",
+            "requires_human_approval": True,
+            "source": "incident-event-bootstrap",
+            "quality_gate": quality,
+        })
+        await session.merge(FailurePatternRecord(
+            pattern_id=pattern_id, tenant_id=tenant_id, issue_signature=signature,
+            service=pattern.service, environment=pattern.environment, analysis=pattern_payload,
+            confidence=pattern.confidence, analyzed_at=pattern.analyzed_at,
+        ))
+        created = await _draft_candidate(session, pattern, quality, allow_evidence_work=True, tenant_id=tenant_id)
+        await session.commit()
+    return {
+        "status": "created" if created else "updated",
+        "incident_id": evidence.incident_id,
+        "issue_signature": signature,
+        "candidate_stage": (
+            "resolution_candidate" if quality["passed"]
+            else "diagnostic_candidate" if quality["checks"].get("independent_sources")
+            else "evidence_work_candidate"
+        ),
+        "execution_eligible": False,
+        "evidence_sources": quality["metrics"]["independent_sources"],
+    }
 
 
 @app.post("/run")

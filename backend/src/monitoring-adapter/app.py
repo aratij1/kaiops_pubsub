@@ -3191,6 +3191,37 @@ async def run_local_payment_workflow(
         transport_provider=decision.message_bus_provider,
     )
     await persist_step(track_metadata_event_operation(recommendation_envelope))
+    try:
+        catalog_result = await ai_client.bootstrap_resolution_catalog(
+            incident=incident,
+            context=context,
+            recommendation=recommendation,
+        )
+        await persist_step(
+            track_agent_work_operation(
+                incident_id=incident.id,
+                agent_name="Knowledge Development Agent",
+                work_item="Bootstrap evidence work and resolution catalog candidate",
+                status="completed",
+                sequence=5,
+                trace_id=trace_id,
+                ticket_id=incident.ticket_id,
+                details={
+                    "action": "Persist current evidence and create or update an immutable candidate",
+                    "input": {"incident_id": str(incident.id), "service": incident.service},
+                    "decision": catalog_result,
+                    "output": "Non-executable catalog candidate prepared for evidence development",
+                    "communicates_to": "Knowledge development queue",
+                    "metrics": {"evidence_sources": int(catalog_result.get("evidence_sources") or 0)},
+                },
+                started_at=now,
+                completed_at=datetime.now(UTC),
+            )
+        )
+    except Exception as exc:
+        # Incident processing remains available; the durable periodic learner
+        # will backfill the candidate from the persisted RCA history.
+        logger.warning("resolution catalog bootstrap deferred incident_id=%s error=%s", incident.id, str(exc)[:500])
     finops = build_finops_summary(model_usage, model_errors)
 
     if requires_human_approval and not auto_approve:

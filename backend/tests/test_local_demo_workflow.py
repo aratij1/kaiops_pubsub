@@ -93,6 +93,7 @@ class InProcessAiLayerClient:
             connectors[-1] = VectorDBConnector(rag_root=rag_root)
         self.context_agent = ContextIntelligenceAgent(connectors=connectors)
         self.resolution_agent = ResolutionIntelligenceAgent(model_router=router)
+        self.catalog_bootstraps = []
 
     async def collect_context(self, *, alert, incident, decision=None):
         return await self.context_agent.collect(alert, incident)
@@ -100,13 +101,22 @@ class InProcessAiLayerClient:
     async def resolve(self, *, context):
         return await self.resolution_agent.resolve(context)
 
+    async def bootstrap_resolution_catalog(self, *, incident, context, recommendation):
+        self.catalog_bootstraps.append({
+            "incident_id": str(incident.id),
+            "context_incident_id": str(context.incident_id),
+            "recommendation_id": str(recommendation.id),
+        })
+        return {"status": "created", "candidate_stage": "diagnostic_candidate", "evidence_sources": 2}
+
 
 @pytest.mark.asyncio
 async def test_local_payment_workflow_generates_recommendation(governed_rag_root) -> None:
     module = load_monitoring_app_module()
     module.settings.database_enabled = False
     router = static_router()
-    module.AiLayerClient = lambda _settings: InProcessAiLayerClient(router, governed_rag_root)
+    client = InProcessAiLayerClient(router, governed_rag_root)
+    module.AiLayerClient = lambda _settings: client
 
     workflow = await module.run_local_payment_workflow(trace_id="trace-123", model_router=router, run_comparison=False)
 
@@ -132,6 +142,11 @@ async def test_local_payment_workflow_generates_recommendation(governed_rag_root
     assert workflow["finops"]["totals"]["total_cost_usd"] > 0
     providers = {row["provider"] for row in workflow["finops"]["by_provider"]}
     assert "gpt-5" in providers or "gpt-4o" in providers
+    assert client.catalog_bootstraps == [{
+        "incident_id": workflow["incident"]["id"],
+        "context_incident_id": workflow["incident"]["id"],
+        "recommendation_id": workflow["recommendation"]["id"],
+    }]
     resolution_event = next(event for event in workflow["events"] if event["agent"] == "Resolution Intelligence Agent")
     assert resolution_event["llm_calls"]
     assert {"prompt_sha256", "payload_sha256", "response_sha256", "usage"}.issubset(

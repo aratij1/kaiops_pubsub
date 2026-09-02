@@ -53,6 +53,28 @@ class AiLayerClient:
             response.raise_for_status()
             return Recommendation.model_validate(response.json())
 
+    async def bootstrap_resolution_catalog(
+        self,
+        *,
+        incident: Incident,
+        context: Context,
+        recommendation: Recommendation,
+    ) -> dict[str, Any]:
+        """Start governed evidence/runbook development for a new incident."""
+        payload = {
+            "incident": incident.model_dump(mode="json"),
+            "context": context.model_dump(mode="json"),
+            "recommendation": recommendation.model_dump(mode="json"),
+        }
+        async with httpx.AsyncClient(timeout=self._timeout, headers=self._headers()) as client:
+            response = await client.post(
+                self._join(self._settings.knowledge_development_url, "/incidents/bootstrap"),
+                json=payload,
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data if isinstance(data, dict) else {}
+
     async def route_model(
         self,
         *,

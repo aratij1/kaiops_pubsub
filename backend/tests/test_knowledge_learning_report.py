@@ -68,6 +68,35 @@ async def test_cold_start_creates_non_executable_diagnostic_candidate(sqlite_ses
 
 
 @pytest.mark.asyncio
+async def test_new_incident_can_bootstrap_evidence_work_without_inventing_remediation(sqlite_session_factory) -> None:
+    module = load_module()
+    pattern = FailurePattern(
+        pattern_id="pattern-new", issue_signature="b" * 64, service="checkout",
+        environment="prod", alert_type="error-rate", incident_ids=["incident-new"],
+        occurrence_frequency=1, common_symptoms=["HTTP 5xx rate increased"],
+        evidence_references=[
+            EvidenceReference(evidence_id="METRIC-2", source="prometheus", uri="prometheus://query/2", summary="5xx high"),
+        ], confidence=.47,
+    )
+    quality = {
+        "passed": False,
+        "checks": {"independent_sources": False, "no_conflicts": True},
+        "metrics": {"independent_sources": 1, "confidence": .47},
+    }
+    async with sqlite_session_factory() as session:
+        assert await module._draft_candidate(session, pattern, quality, allow_evidence_work=True) is True
+        next(item for item in session.new if isinstance(item, LearningAuditRecord)).sequence_id = 1
+        await session.commit()
+        row = (await session.execute(select(RunbookVersionRecord))).scalar_one()
+
+    assert row.content["catalog_stage"] == "evidence_work_candidate"
+    assert row.content["execution_eligible"] is False
+    assert row.content["remediation_steps"] == []
+    assert row.content["validation_steps"] == []
+    assert row.content["rollback_steps"] == []
+
+
+@pytest.mark.asyncio
 async def test_learning_report_is_tenant_scoped_and_verifies_audit_hashes(sqlite_session_factory) -> None:
     module = load_module()
     module.app.state.session_factory = sqlite_session_factory
