@@ -23,6 +23,11 @@ test("resolution shows only governed execution or an explicit unavailable state"
     } else {
       await expect(page.getByText("Exact governed commands")).toBeVisible();
       await expect(page.locator(".resolution-script pre code")).not.toBeEmpty();
+      const commandStyle = await page.locator(".resolution-script pre code").first().evaluate((node) => ({
+        foreground: getComputedStyle(node).color,
+        background: getComputedStyle(node.closest("pre")).backgroundColor,
+      }));
+      expect(commandStyle).toEqual({ foreground: "rgb(241, 247, 255)", background: "rgb(16, 47, 74)" });
     }
   } else {
     await expect(page.getByRole("heading", { name: /No executable resolution is available|Resolution plan/ })).toBeVisible();

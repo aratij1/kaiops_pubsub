@@ -290,6 +290,12 @@
 .resolution-script h4 { margin: 0; font-size: .9rem; }
 .resolution-script small { color: var(--muted, #526d82); font-size: .7rem; }
 .resolution-script pre, .resolution-verification-grid pre { margin: 0; padding: 12px; overflow: auto; color: #e8f3ff; border-radius: 7px; background: #102f4a; font-size: .74rem; line-height: 1.55; white-space: pre-wrap; }
+.resolution-script pre code, .resolution-verification-grid pre code {
+  color: #f1f7ff !important;
+  background: transparent;
+  font: inherit;
+  line-height: inherit;
+}
 .resolution-script details { display: grid; gap: 8px; padding-top: 8px; border-top: 1px solid var(--line, #d7e2ea); }
 .resolution-script summary { cursor: pointer; font-size: .75rem; font-weight: 800; }
 .resolution-verification-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
