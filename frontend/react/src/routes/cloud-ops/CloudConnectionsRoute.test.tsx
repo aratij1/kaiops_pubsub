@@ -7,8 +7,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import CloudConnectionsRoute from "./CloudConnectionsRoute";
 import * as cloudApi from "./cloudOpsApi";
 
-vi.mock("../../app/routeRuntime", () => ({
-  useRouteRuntimeSlice: () => ({ accessToken: "session-token" }),
+vi.mock("../../app/SessionContext", () => ({
+  useSession: () => ({ accessToken: "session-token" }),
 }));
 
 vi.mock("./cloudOpsApi", async () => {

@@ -30,6 +30,13 @@ async def test_capacity_is_isolated_by_tenant(sqlite_session_factory, monkeypatc
 @pytest.mark.asyncio
 async def test_capacity_rejects_placeholder_tenant(sqlite_session_factory, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.setenv("AUTH_MODE", "oidc")
+    monkeypatch.setenv("OIDC_ISSUER", "https://identity.example.test")
+    monkeypatch.setenv("OIDC_AUDIENCE", "kaiops-tests")
+    monkeypatch.setenv("OIDC_CLIENT_ID", "kaiops-tests")
+    monkeypatch.setenv("EVENT_ENVELOPE_SIGNING_REQUIRED", "true")
+    monkeypatch.setenv("EVENT_ENVELOPE_SIGNING_KEY", "test-signing-key-that-is-at-least-32-characters")
+    monkeypatch.setenv("EVENT_ENVELOPE_SIGNING_ISSUER", "kaiops-tests")
     module = load_approval_app_module()
     module.app.state.session_factory = sqlite_session_factory
 

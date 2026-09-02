@@ -1,17 +1,17 @@
 from __future__ import annotations
 
+import os
 from collections.abc import AsyncIterator
 from functools import wraps
 from pathlib import Path
 
 import pytest
 import pytest_asyncio
-from common.config import Settings
+from common.config import Settings, get_settings
 from common.database import create_schema
 from common.rag_governance import content_checksum
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
-
 
 # Unit and contract tests must never inherit developer credentials, live
 # provider switches, or infrastructure addresses from the repository `.env`.
@@ -26,6 +26,26 @@ def _isolated_settings_init(self, *args, **kwargs):
 
 
 Settings.__init__ = _isolated_settings_init
+
+
+@pytest.fixture(autouse=True)
+def isolate_model_provider_environment(monkeypatch: pytest.MonkeyPatch):
+    """Keep unit tests independent from credentials in the developer shell."""
+    prefixes = (
+        "OPENAI_",
+        "AZURE_OPENAI_",
+        "REASONING_",
+        "MODEL_ROUTER_",
+        "GEMINI_",
+        "GROQ_",
+        "ANTHROPIC_",
+    )
+    for name in tuple(os.environ):
+        if name.startswith(prefixes):
+            monkeypatch.delenv(name, raising=False)
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
 
 
 @pytest.fixture

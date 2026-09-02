@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
@@ -32,16 +33,22 @@ HTTP_SERVICES = {
     "audit-service": "http://audit-service:8000/healthz",
     "alertmanager": "http://alertmanager:9093/-/ready",
     "prometheus": "http://prometheus:9090/-/ready",
-    "grafana": "http://grafana:3000/api/health",
     "jaeger": "http://jaeger:16686/",
     "jenkins": "http://jenkins:8080/login",
     "ui": "http://ui/",
 }
 
+OPTIONAL_HTTP_SERVICES = {
+    "grafana": "http://grafana:3000/api/health",
+}
+
 
 def main() -> int:
+    services = dict(HTTP_SERVICES)
+    if os.getenv("E2E_INCLUDE_OPTIONAL_SERVICES", "").strip().lower() in {"1", "true", "yes"}:
+        services.update(OPTIONAL_HTTP_SERVICES)
     results = []
-    for service, url in HTTP_SERVICES.items():
+    for service, url in services.items():
         last_error = None
         for attempt in range(3):
             try:

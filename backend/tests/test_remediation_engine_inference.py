@@ -27,7 +27,7 @@ def test_build_action_prefers_recommended_commands_for_action_type() -> None:
     assert action.target == "checkout-api"
 
 
-def test_build_action_rewrites_uuid_target_to_service() -> None:
+def test_build_action_rejects_uuid_target_instead_of_guessing_service() -> None:
     approval = Approval(
         incident_id="11111111-1111-1111-1111-111111111111",
         recommendation_id="22222222-2222-2222-2222-222222222222",
@@ -40,9 +40,8 @@ def test_build_action_rewrites_uuid_target_to_service() -> None:
         },
     )
 
-    action = RemediationEngine().build_action(approval)
-
-    assert action.target == "payments-api"
+    with pytest.raises(ValueError, match="catalog-bound resource"):
+        RemediationEngine().build_action(approval)
 
 
 def test_build_action_does_not_infer_action_type_from_command_text() -> None:

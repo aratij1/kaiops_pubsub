@@ -4,11 +4,11 @@ from dataclasses import dataclass
 from time import perf_counter
 from typing import Any
 
+from common.logging import get_logger
+from common.telemetry import AGENT_EXECUTIONS, AGENT_STAGE_LATENCY
 from opentelemetry import trace
 
 from ai_workbench_common.agentic import AgentContext, AgentState, BaseAgent
-from common.logging import get_logger
-from common.telemetry import AGENT_EXECUTIONS, AGENT_STAGE_LATENCY
 
 logger = get_logger(__name__)
 tracer = trace.get_tracer(__name__)
@@ -91,7 +91,7 @@ class AgentRuntime:
                 is_valid = await self._timed_stage(
                     agent.name,
                     "validate",
-                    lambda: agent.validate(result),
+                    lambda current_result=result: agent.validate(current_result),
                     state=state,
                 )
                 if not is_valid:
@@ -100,7 +100,7 @@ class AgentRuntime:
                 await self._timed_stage(
                     agent.name,
                     "publish",
-                    lambda: agent.publish(context, state, result),
+                    lambda current_result=result: agent.publish(context, state, current_result),
                     state=state,
                 )
                 failure = None

@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import json
 
-import pytest
 import httpx
+import pytest
 from common.models import ApprovalDecision, RemediationAction, RemediationStatus
+from remediation_engine.plugins import (
+    AzureContainerAppsJobPlugin,
+    FakeCapabilityAdapter,
+    JenkinsRollbackPlugin,
+    RemediationEngine,
+)
 from remediation_test_helpers import governed_approval as Approval
-from remediation_engine.plugins import AzureContainerAppsJobPlugin, FakeCapabilityAdapter, JenkinsRollbackPlugin, RemediationEngine
 
 
 @pytest.mark.asyncio
@@ -271,7 +276,7 @@ async def test_jenkins_does_not_infer_restart_intent_from_triage_script(monkeypa
         },
     ))
 
-    assert action.action_type == "script_execution"
+    assert action.action_type == "api_execution"
     assert action.parameters["execution_plan"]["preflight"] == [
         "curl http://docker-socket-proxy:2375/containers/kaiops_azure-closure-service-1/json"
     ]
@@ -280,9 +285,9 @@ async def test_jenkins_does_not_infer_restart_intent_from_triage_script(monkeypa
     ]
     result = await JenkinsRollbackPlugin().execute(action)
 
-    assert result.parameters["connector_operation"] == "script_execution"
+    assert result.parameters["connector_operation"] == "api_execution"
     assert result.status == RemediationStatus.SKIPPED
-    assert "does not allow operation script_execution" in str(result.error)
+    assert "does not allow operation api_execution" in str(result.error)
 
 
 def test_jenkins_fills_missing_safety_envelope_from_governed_template(monkeypatch: pytest.MonkeyPatch) -> None:

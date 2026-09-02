@@ -6,7 +6,6 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
-
 from common.continuous_learning import FailurePattern, IncidentEvidence
 from common.database import KnowledgeRagDraftRecord, LearningAuditRecord, RunbookOutcomeRecord, RunbookVersionRecord
 from common.models import EvidenceReference
@@ -76,7 +75,7 @@ async def test_cold_start_creates_non_executable_diagnostic_candidate(sqlite_ses
         "metrics": {"independent_sources": 2, "confidence": .57},
     }
     async with sqlite_session_factory() as session:
-        assert await module._draft_candidate(session, pattern, quality) is True
+        assert await module._draft_candidate(session, pattern, quality, tenant_id="tenant-a") is True
         # SQLite does not autoincrement BigInteger primary keys; production MySQL does.
         next(item for item in session.new if isinstance(item, LearningAuditRecord)).sequence_id = 1
         await session.commit()
@@ -106,7 +105,9 @@ async def test_new_incident_can_bootstrap_evidence_work_without_inventing_remedi
         "metrics": {"independent_sources": 1, "confidence": .47},
     }
     async with sqlite_session_factory() as session:
-        assert await module._draft_candidate(session, pattern, quality, allow_evidence_work=True) is True
+        assert await module._draft_candidate(
+            session, pattern, quality, allow_evidence_work=True, tenant_id="tenant-a"
+        ) is True
         next(item for item in session.new if isinstance(item, LearningAuditRecord)).sequence_id = 1
         await session.commit()
         row = (await session.execute(select(RunbookVersionRecord))).scalar_one()
