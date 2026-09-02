@@ -5603,6 +5603,21 @@ def _jira_issue_description(
     return "\n".join(lines)
 
 
+def _resolve_telemetry_project(mapped_payload: dict[str, Any]) -> str:
+    labels = mapped_payload.get("labels") if isinstance(mapped_payload.get("labels"), dict) else {}
+    return str(
+        labels.get("project_name")
+        or labels.get("project_id")
+        or labels.get("project")
+        or labels.get("application")
+        or mapped_payload.get("project_name")
+        or mapped_payload.get("project_id")
+        or mapped_payload.get("project")
+        or mapped_payload.get("application")
+        or "unassigned"
+    ).strip() or "unassigned"
+
+
 async def _route_and_trigger_investigation(
     mapped_payload: dict[str, Any],
     raw_item: dict[str, Any],
@@ -5641,13 +5656,11 @@ async def _route_and_trigger_investigation(
             "occurrence_count": decision.occurrence_count,
         }
     labels = dict(mapped_payload.get("labels") or {})
-    project_name = str(
-        labels.get("project_name")
-        or labels.get("application")
-        or mapped_payload.get("project_name")
-        or mapped_payload.get("application")
-        or ("KaiOps" if source in {"prometheus", "email"} else source)
-    )
+    # Project identity is a governance boundary. Never relabel an unattributed
+    # telemetry signal as KaiOps (or as its transport provider), because that
+    # cross-contaminates incident correlation, context, and RCA. Prometheus and
+    # Alertmanager may use any of these standard label spellings.
+    project_name = _resolve_telemetry_project(mapped_payload)
     labels.update(
         {
             "pipeline_outcome": str(result.get("action") or "failed"),

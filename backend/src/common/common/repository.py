@@ -9184,7 +9184,26 @@ class ContextEnrichmentRepository(EvaluationRepository):
             "human_request_history": human_history_by_requirement.get(row["requirement_id"], []),
         } for row in active_requirements]
 
+        snapshot_payload_for_evidence = (
+            dict(snapshot.payload or {})
+            if snapshot and isinstance(snapshot.payload, dict) else {}
+        )
+        snapshot_metadata_for_evidence = (
+            snapshot_payload_for_evidence.get("metadata")
+            if isinstance(snapshot_payload_for_evidence.get("metadata"), dict) else {}
+        )
+        snapshot_evidence_buckets = (
+            snapshot_metadata_for_evidence.get("context_evidence")
+            or snapshot_payload_for_evidence.get("context_evidence") or {}
+        )
         current_evidence_ids = list(snapshot.evidence_ids or []) if snapshot else []
+        for rows in snapshot_evidence_buckets.values() if isinstance(snapshot_evidence_buckets, dict) else []:
+            for item in rows if isinstance(rows, list) else []:
+                if not isinstance(item, dict):
+                    continue
+                evidence_id = str(item.get("evidence_id") or item.get("id") or "").strip()
+                if evidence_id and evidence_id not in current_evidence_ids:
+                    current_evidence_ids.append(evidence_id)
         evidence_rows = (
             (await self.session.execute(select(CanonicalEvidenceRecord).where(
                 CanonicalEvidenceRecord.tenant_id == tenant,
@@ -9428,7 +9447,7 @@ class ContextEnrichmentRepository(EvaluationRepository):
             "context": {
                 "snapshot_id": str(snapshot.snapshot_id) if snapshot else None,
                 "version": int(snapshot.snapshot_version) if snapshot else 0,
-                "evidence_ids": list(snapshot.evidence_ids or []) if snapshot else [],
+                "evidence_ids": current_evidence_ids,
                 "evidence_count_by_category": evidence_count_by_category,
                 "quality": dict(snapshot_metadata.get("context_quality") or {}),
                 "missing_requirements": [row["requirement_id"] for row in unresolved],
@@ -9546,7 +9565,7 @@ class ContextEnrichmentRepository(EvaluationRepository):
                 },
                 "evidence": workspace_evidence,
                 "evidence_summary": {
-                    "latest_context_records": len(snapshot.evidence_ids or []) if snapshot else 0,
+                    "latest_context_records": len(current_evidence_ids),
                     "bound_snapshot_records": len(workspace_evidence),
                     "rca_bound_records": len(resolved_accepted_evidence_ids),
                     "traceable_citations": traceable_citation_count,

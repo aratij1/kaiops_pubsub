@@ -137,6 +137,13 @@ monitoring_adapter_app = importlib.util.module_from_spec(_MONITORING_SPEC)
 _MONITORING_SPEC.loader.exec_module(monitoring_adapter_app)
 
 
+def test_telemetry_project_resolution_never_defaults_to_transport_or_kaiops() -> None:
+    assert monitoring_adapter_app._resolve_telemetry_project({"labels": {}}) == "unassigned"
+    assert monitoring_adapter_app._resolve_telemetry_project({
+        "labels": {"project": "telemetry-project", "application": "wrong-fallback"},
+    }) == "telemetry-project"
+
+
 def test_inconclusive_diagnostic_recommendation_cannot_await_approval() -> None:
     metadata = {
         "iterative_investigation": {"conclusive": False},
