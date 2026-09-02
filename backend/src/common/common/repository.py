@@ -6582,7 +6582,10 @@ class IncidentRepository:
         )
         if normalized["project_id"]:
             incident_query = incident_query.where(
-                func.lower(IncidentCorrelationOwnershipRecord.project_id) == normalized["project_id"]
+                or_(
+                    func.lower(IncidentCorrelationOwnershipRecord.project_id) == normalized["project_id"],
+                    func.lower(IncidentCorrelationOwnershipRecord.service) == normalized["project_id"],
+                )
             )
         if normalized["service"]:
             incident_query = incident_query.where(
@@ -6609,6 +6612,21 @@ class IncidentRepository:
             func.coalesce(
                 AlertRecord.payload["project_id"].as_string(),
                 AlertRecord.payload["project"].as_string(),
+                AlertRecord.payload["project_name"].as_string(),
+                AlertRecord.payload["application"].as_string(),
+                AlertRecord.payload["labels"]["project_id"].as_string(),
+                AlertRecord.payload["labels"]["project"].as_string(),
+                AlertRecord.payload["labels"]["project_name"].as_string(),
+                AlertRecord.payload["labels"]["application"].as_string(),
+                "",
+            )
+        )
+        alert_service_scope = func.lower(
+            func.coalesce(
+                AlertRecord.service,
+                AlertRecord.payload["service"].as_string(),
+                AlertRecord.payload["labels"]["service"].as_string(),
+                AlertRecord.payload["labels"]["job"].as_string(),
                 "",
             )
         )
@@ -6634,7 +6652,10 @@ class IncidentRepository:
             ).is_(None),
         )
         if normalized["project_id"]:
-            alert_query = alert_query.where(alert_project == normalized["project_id"])
+            alert_query = alert_query.where(or_(
+                alert_project == normalized["project_id"],
+                alert_service_scope == normalized["project_id"],
+            ))
         if normalized["service"]:
             alert_query = alert_query.where(func.lower(AlertRecord.service) == normalized["service"])
         if normalized["severity"]:

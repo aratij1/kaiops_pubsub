@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { capLatestAlertsPerSource, dedupeAndConsolidateAlertRows, ensureMinimumAlertsBySource, filterRowsForMonitor, shouldRetainAlertSelection, resolveCanonicalAlertForRow } from "./appHelpers.jsx";
+import { capLatestAlertsPerSource, dedupeAndConsolidateAlertRows, ensureMinimumAlertsBySource, filterAlertsForMonitor, filterRowsForMonitor, shouldRetainAlertSelection, resolveCanonicalAlertForRow } from "./appHelpers.jsx";
 
 describe("alert stream and inbox identity", () => {
   it("does not merge different Alertmanager fingerprints sharing name, service, and time", () => {
@@ -53,6 +53,13 @@ describe("alert stream and inbox identity", () => {
     const testRun = { title: "ServiceDown-E2E-20260826050115", service: "kaiops-discovery-mcp", environment: "review-20260826050115" };
     expect(filterRowsForMonitor([production, testRun], "real-usecases")).toEqual([production]);
     expect(filterRowsForMonitor([production, testRun], "test-usecases")).toEqual([testRun]);
+  });
+
+  it("scopes service-derived projects to that exact service in alerts and incidents", () => {
+    const rabbit = { title: "RobotShopServiceDown", service: "robot-shop-rabbitmq", environment: "prod" };
+    const redis = { title: "RobotShopServiceDown", service: "robot-shop-redis", environment: "prod" };
+    expect(filterAlertsForMonitor([rabbit, redis], "robot-shop-rabbitmq")).toEqual([rabbit]);
+    expect(filterRowsForMonitor([rabbit, redis], "robot-shop-rabbitmq")).toEqual([rabbit]);
   });
 
   it("does not backfill the raw landing occurrence after consolidation", () => {

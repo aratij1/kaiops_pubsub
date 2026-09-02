@@ -363,6 +363,9 @@ function filterAlertsForMonitor(rows, applicationToMonitor) {
       labels?.application,
       labels?.project,
       labels?.project_name,
+      row?.service,
+      labels?.service,
+      labels?.job,
     ]
       .map((value) => normalizeMonitorToken(value))
       .filter(Boolean);
@@ -402,6 +405,9 @@ function filterRowsForMonitor(rows, applicationToMonitor) {
       labels?.application,
       labels?.project,
       labels?.project_name,
+      row?.service,
+      labels?.service,
+      labels?.job,
     ]
       .map((value) => normalizeMonitorToken(value))
       .filter(Boolean);

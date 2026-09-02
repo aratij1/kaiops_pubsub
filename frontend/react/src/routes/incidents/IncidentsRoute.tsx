@@ -419,6 +419,8 @@ export default function IncidentsRoute() {
   useEffect(() => {
     if (!session.accessToken) return undefined;
     const params = new URLSearchParams({ limit: String(PAGE_SIZE), inbox_view: inboxView, record_type: "incidents" });
+    const selectedProject = String(incidents.application || "").trim();
+    if (selectedProject && selectedProject.toLowerCase() !== "all") params.set("project_id", selectedProject);
     if (cursor) params.set("cursor", cursor);
     for (const [key, filterValue] of Object.entries({
       risk_tier: restoredFilter("risk_tier"), execution_mode: restoredFilter("execution_mode"),
@@ -440,7 +442,7 @@ export default function IncidentsRoute() {
       setUnifiedError(String((error as Error).message || error));
     }).finally(() => { if (!controller.signal.aborted) setUnifiedLoading(false); });
     return () => controller.abort();
-  }, [cursor, inboxView, session.accessToken, incidents.filters.execution_mode, incidents.filters.risk_tier, incidents.filters.service, incidents.filters.status, incidents.filters.transport_provider]);
+  }, [cursor, inboxView, session.accessToken, incidents.application, incidents.filters.execution_mode, incidents.filters.risk_tier, incidents.filters.service, incidents.filters.status, incidents.filters.transport_provider]);
   const closeIncident = async (row: IncidentRow) => {
     const incidentId = String(row.incident_id || row.id || "").trim();
     const comment = closure.comment.trim();
