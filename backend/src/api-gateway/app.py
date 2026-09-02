@@ -3336,6 +3336,24 @@ async def knowledge_development_report(request: Request, x_trace_id: str | None 
     return await guarded_proxy(request=request, method="GET", path=f"/report?{urlencode({'tenant_id': auth.tenant_id})}", target_base=settings.knowledge_development_url, payload={}, trace_id=trace_id_from_header(x_trace_id), timeout_seconds=30)
 
 
+@app.get("/knowledge-development/incidents/{incident_id}/catalog-status")
+async def knowledge_development_incident_status(
+    incident_id: str,
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=f"/incidents/{quote(incident_id, safe='')}/catalog-status?{urlencode({'tenant_id': auth.tenant_id})}",
+        target_base=settings.knowledge_development_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+        timeout_seconds=15,
+    )
+
+
 @app.get("/operations/queue-health")
 async def get_queue_health() -> dict[str, Any]:
     """Return live RabbitMQ readiness and backlog data for the command center.

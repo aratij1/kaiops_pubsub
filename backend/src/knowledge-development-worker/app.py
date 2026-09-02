@@ -485,6 +485,41 @@ async def bootstrap_incident_catalog(request: IncidentBootstrapRequest) -> dict[
     }
 
 
+@app.get("/incidents/{incident_id}/catalog-status")
+async def incident_catalog_status(incident_id: str, tenant_id: str) -> dict[str, Any]:
+    tenant_id = require_tenant_id(tenant_id, source="incident catalog status")
+    async with app.state.session_factory() as session:
+        evidence = (await session.execute(
+            select(IncidentEvidenceRecord).where(
+                IncidentEvidenceRecord.tenant_id == tenant_id,
+                IncidentEvidenceRecord.incident_id == incident_id,
+            ).order_by(IncidentEvidenceRecord.collected_at.desc()).limit(1)
+        )).scalar_one_or_none()
+        if evidence is None:
+            return {"status": "awaiting_evidence", "incident_id": incident_id, "execution_eligible": False}
+        runbook_id = uuid5(NAMESPACE_URL, f"kaims:runbook:{tenant_id}:{evidence.issue_signature}")
+        candidate = (await session.execute(
+            select(RunbookVersionRecord).where(
+                RunbookVersionRecord.tenant_id == tenant_id,
+                RunbookVersionRecord.runbook_id == runbook_id,
+            ).order_by(RunbookVersionRecord.version.desc()).limit(1)
+        )).scalar_one_or_none()
+    if candidate is None:
+        return {"status": "analyzing_evidence", "incident_id": incident_id, "execution_eligible": False}
+    content = candidate.content if isinstance(candidate.content, dict) else {}
+    quality = content.get("knowledge_quality") if isinstance(content.get("knowledge_quality"), dict) else {}
+    return {
+        "status": candidate.approval_status,
+        "incident_id": incident_id,
+        "runbook_id": str(candidate.runbook_id),
+        "version": candidate.version,
+        "candidate_stage": content.get("catalog_stage"),
+        "execution_eligible": bool(content.get("execution_eligible", False)),
+        "evidence_sources": (quality.get("metrics") or {}).get("independent_sources", 0),
+        "promotion_requirements": content.get("promotion_requirements", []),
+    }
+
+
 @app.post("/run")
 async def run_now() -> dict[str, Any]:
     global last_result

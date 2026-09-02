@@ -1284,6 +1284,24 @@ async def _persist_resolution_event(
         CONTEXT_KNOWLEDGE_OPERATIONS.labels("attach_resolution", "error").inc()
 
 
+async def _bootstrap_resolution_catalog(
+    *, context: Context, incident: Incident, recommendation: Recommendation,
+) -> dict[str, Any]:
+    """Hand every completed analysis to the event-driven knowledge workflow."""
+    token = str(getattr(settings, "ai_layer_auth_token", "") or "").strip()
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    url = f"{str(settings.knowledge_development_url).rstrip('/')}/incidents/bootstrap"
+    async with httpx.AsyncClient(timeout=httpx.Timeout(20.0), headers=headers) as client:
+        response = await client.post(url, json={
+            "incident": incident.model_dump(mode="json"),
+            "context": context.model_dump(mode="json"),
+            "recommendation": recommendation.model_dump(mode="json"),
+        })
+        response.raise_for_status()
+        result = response.json()
+        return result if isinstance(result, dict) else {}
+
+
 async def startup(app: FastAPI) -> None:
     workers = max(1, int(getattr(settings, "message_bus_worker_count", 1) or 1))
     consumers: list[tuple[str, Any, ConsumeRunner]] = []
@@ -1352,6 +1370,17 @@ async def startup(app: FastAPI) -> None:
             recommendation=recommendation,
             decision_payload=decision_payload,
         )
+        try:
+            await _bootstrap_resolution_catalog(
+                context=context, incident=incident, recommendation=recommendation,
+            )
+        except Exception as exc:
+            # The recommendation is already durable. Periodic knowledge
+            # development provides recovery without failing the RCA request.
+            logger.warning(
+                "resolution catalog bootstrap deferred incident_id=%s error=%s",
+                incident.id, str(exc)[:500],
+            )
         payload_out = _build_resolution_event_payload(
             context=context,
             incident=incident,
@@ -1810,6 +1839,15 @@ async def resolve(context: Context, publish_events: bool = True) -> Recommendati
         recommendation=recommendation,
         decision_payload={},
     )
+    try:
+        await _bootstrap_resolution_catalog(
+            context=context, incident=synthetic_incident, recommendation=recommendation,
+        )
+    except Exception as exc:
+        logger.warning(
+            "resolution catalog bootstrap deferred incident_id=%s error=%s",
+            synthetic_incident.id, str(exc)[:500],
+        )
     if publish_events:
         await app.state.producer.publish(RESOLUTION_EVENTS, payload_out)
     return recommendation
