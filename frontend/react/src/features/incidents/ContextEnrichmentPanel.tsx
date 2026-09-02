@@ -57,6 +57,7 @@ export default function ContextEnrichmentPanel({ incidentId, alertId, accessToke
   const [answers, setAnswers] = useState<Record<string, string>>({});
   const [references, setReferences] = useState<Record<string, string>>({});
   const [expandedRequirements, setExpandedRequirements] = useState<Set<string>>(new Set());
+  const [activeRequirementId, setActiveRequirementId] = useState("");
   const [announcement, setAnnouncement] = useState("");
   const inFlight = useRef(false);
   const previousState = useRef("");
@@ -175,6 +176,7 @@ export default function ContextEnrichmentPanel({ incidentId, alertId, accessToke
 
   useEffect(() => {
     if (!current.length) return;
+    setActiveRequirementId((value) => current.some((item) => item.requirement_id === value) ? value : current[0].requirement_id);
     setExpandedRequirements((values) => values.size ? values : new Set([current[0].requirement_id]));
     setAnswers((values) => {
       const next = { ...values };
@@ -258,7 +260,13 @@ export default function ContextEnrichmentPanel({ incidentId, alertId, accessToke
     {error ? <p className="context-enrichment-error" role="alert"><CircleAlert size={17} />{error}</p> : null}
     {!alertId && declaredGaps.length ? <p className="context-enrichment-error" role="status"><CircleAlert size={17} />Canonical alert binding is missing. Backend orchestration will regenerate analysis after a governed snapshot is committed.</p> : null}
     {!error && state && !current.length ? <p className="context-enrichment-empty">{declaredGaps.length ? "Evidence requirements have not been projected yet. KaiMS will continue monitoring this incident." : "No unresolved evidence gaps are declared."}</p> : null}
-    {current.length ? <section className="context-enrichment-current" aria-labelledby="current-evidence-title"><div className="context-enrichment-group-heading"><div><span>Active evidence work</span><h4 id="current-evidence-title">{rcaVersion ? `Current RCA · v${rcaVersion}` : "Current investigation"}</h4></div><small>{current.length} requirement{current.length === 1 ? "" : "s"}</small></div><div className="context-enrichment-list">{current.map((item) => card(item))}</div></section> : null}
+    {current.length ? <section className="context-enrichment-current" aria-labelledby="current-evidence-title"><div className="context-enrichment-group-heading"><div><span>Active evidence work</span><h4 id="current-evidence-title">{rcaVersion ? `Current RCA · v${rcaVersion}` : "Current investigation"}</h4></div><small>{current.length} requirement{current.length === 1 ? "" : "s"}</small></div>
+      <div className="context-enrichment-tabs" role="tablist" aria-label="Evidence documents">{current.map((item) => <button key={item.requirement_id} type="button" role="tab" aria-selected={item.requirement_id === activeRequirementId} onClick={() => {
+        setActiveRequirementId(item.requirement_id);
+        setExpandedRequirements((values) => new Set([...values, item.requirement_id]));
+      }}><strong>{item.category.replaceAll("_", " ")}</strong><span>{(item.active_human_request?.status || item.latest_job?.status || item.status).replaceAll("_", " ")}</span></button>)}</div>
+      <div className="context-enrichment-list">{current.filter((item) => item.requirement_id === activeRequirementId).map((item) => card(item))}</div>
+    </section> : null}
     {history.length ? <details className="context-enrichment-history"><summary>Previous RCA versions <span>{history.length} archived requirement{history.length === 1 ? "" : "s"}</span></summary><p>Retained for audit history. Responses can only be submitted against active backend-projected work.</p><div className="context-enrichment-list">{history.map((item) => card(item, true))}</div></details> : null}
   </section>;
 }

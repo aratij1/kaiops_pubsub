@@ -117,6 +117,26 @@ def test_unapproved_rag_document_is_rejected_with_reason() -> None:
     assert result.rejected == [{"code": "KNOWLEDGE_NOT_APPROVED", "record_index": 0}]
 
 
+def test_cmdb_service_inventory_normalizes_as_topology_evidence() -> None:
+    incident = Incident(tenant_id="tenant-a", service="api-gateway", title="latency")
+    result = normalize_connector_response(
+        raw_response={
+            "owner_team": "platform-ops",
+            "tier": "tier-1",
+            "dependencies": ["identity", "payments"],
+            "provenance": {"source": "service-inventory", "grounded": True},
+        },
+        requirement=_requirement(incident, "topology"), incident=incident,
+        connector="cmdb", collected_at=datetime(2024, 8, 26, 13, 32, tzinfo=UTC),
+    )
+
+    assert result.rejected == []
+    assert len(result.records) == 1
+    assert result.records[0].category == "topology"
+    assert result.records[0].content["dependencies"] == ["identity", "payments"]
+    assert result.records[0].source_reference == "cmdb://cmdb/service/api-gateway"
+
+
 def test_governed_vector_search_match_normalizes_as_approved_runbook() -> None:
     incident = Incident(tenant_id="tenant-a", service="api-gateway", title="availability")
     payload = {

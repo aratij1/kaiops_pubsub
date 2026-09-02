@@ -26,7 +26,7 @@ EvidenceCategory = Literal[
     "validation",
 ]
 CanonicalEvidenceCategory = Literal[
-    "metrics", "logs", "traces", "changes", "source_code", "knowledge", "tickets",
+    "metrics", "logs", "traces", "topology", "changes", "source_code", "knowledge", "tickets",
 ]
 
 
@@ -122,6 +122,7 @@ class ConnectorNormalization(BaseModel):
 
 _CANONICAL_CATEGORY = {
     "metrics": "metrics", "logs": "logs", "traces": "traces",
+    "topology": "topology",
     "deployment": "changes", "change": "changes", "source_code": "source_code",
     "runbook": "knowledge", "ticket": "tickets",
 }
@@ -188,6 +189,14 @@ def normalize_connector_response(
     )
     if not isinstance(raw_records, list):
         raw_records = []
+    if category == "topology" and not raw_records and any(
+        wrapper.get(field) not in (None, "", [], {})
+        for field in ("dependencies", "owner_team", "tier", "service", "resource")
+    ):
+        # CMDB connectors commonly return one service-inventory document
+        # rather than a records envelope. Preserve that attributable response
+        # as a single topology observation.
+        raw_records = [wrapper]
     normalized: list[EvidenceRecord] = []
     rejected: list[dict[str, Any]] = []
     if category == "metrics":
@@ -243,6 +252,7 @@ def normalize_connector_response(
         required_fields = {
             "logs": ("message", "log"),
             "traces": ("trace_id", "span_id", "spans"),
+            "topology": ("dependencies", "owner_team", "tier", "service", "resource"),
             "changes": ("change_id", "deployment_id", "commit_sha"),
             "source_code": ("commit_sha", "path", "repository"),
             "knowledge": ("document_id", "version"),
@@ -271,6 +281,8 @@ def normalize_connector_response(
                 raw.get("source_reference") or raw.get("url") or raw.get("uri")
                 or raw.get("repository_url") or ""
             ).strip()
+            if category == "topology" and not source_reference:
+                source_reference = f"cmdb://{endpoint}/service/{incident.service}"
             if not source_reference:
                 rejected.append({"code": "EVIDENCE_SOURCE_REFERENCE_MISSING", "record_index": index})
                 continue

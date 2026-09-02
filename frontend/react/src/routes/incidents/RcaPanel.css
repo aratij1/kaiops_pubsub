@@ -1088,6 +1088,10 @@
 .context-enrichment-group-heading span { color: #2563eb; font-size: .72rem; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
 .context-enrichment-group-heading h4 { margin: .15rem 0 0; font-size: 1rem; }
 .context-enrichment-group-heading > small { color: #475569; }
+.context-enrichment-tabs { display: grid; grid-template-columns: repeat(auto-fit,minmax(150px,1fr)); gap: .45rem; margin-top: .8rem; padding: .35rem; border: 1px solid #dbe5ef; border-radius: 10px; background: #f8fafc; }
+.context-enrichment-tabs button { display: flex; align-items: center; justify-content: space-between; gap: .5rem; min-height: 42px; padding: .55rem .7rem; border: 1px solid transparent; border-radius: 7px; background: transparent; color: #334155; cursor: pointer; text-transform: capitalize; }
+.context-enrichment-tabs button[aria-selected="true"] { border-color: #93c5fd; background: #fff; color: #1d4ed8; box-shadow: 0 1px 3px rgba(15,23,42,.08); }
+.context-enrichment-tabs button span { padding: .15rem .4rem; border-radius: 999px; background: #e2e8f0; color: #475569; font-size: .64rem; font-weight: 700; }
 .context-enrichment-list { display: grid; gap: .75rem; margin-top: 1rem; }
 .context-enrichment-list article { padding: .85rem; border: 1px solid #dbe5ef; border-radius: 10px; }
 .context-enrichment-list article.is-historical { background: #f8fafc; color: #475569; }
