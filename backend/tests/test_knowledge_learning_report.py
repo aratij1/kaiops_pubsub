@@ -7,8 +7,8 @@ from uuid import uuid4
 
 import pytest
 
-from common.continuous_learning import FailurePattern
-from common.database import LearningAuditRecord, RunbookOutcomeRecord, RunbookVersionRecord
+from common.continuous_learning import FailurePattern, IncidentEvidence
+from common.database import KnowledgeRagDraftRecord, LearningAuditRecord, RunbookOutcomeRecord, RunbookVersionRecord
 from common.models import EvidenceReference
 from sqlalchemy import select
 
@@ -34,6 +34,28 @@ def test_kaims_workspace_is_the_tenant_wide_development_scope() -> None:
     module = load_module()
     assert module._in_application_scope("KaiMS", service="api-gateway") is True
     assert module._in_application_scope("payments", service="api-gateway") is False
+
+
+@pytest.mark.asyncio
+async def test_incident_evidence_creates_and_revises_complete_document_set(sqlite_session_factory) -> None:
+    module = load_module()
+    evidence = IncidentEvidence(
+        incident_id="incident-docs", service="checkout", environment="prod",
+        alert_type="HighErrorRate", symptoms=["HTTP 5xx exceeded threshold"],
+    )
+    async with sqlite_session_factory() as session:
+        first = await module._upsert_knowledge_documents(session, evidence, tenant_id="default")
+        await session.commit()
+        rows = (await session.execute(select(KnowledgeRagDraftRecord))).scalars().all()
+        assert first == {"created": 5, "updated": 0, "unchanged": 0}
+        assert {row.document_kind for row in rows} == {"runbook", "change", "deployment", "validation", "resolution_catalog"}
+        assert all((row.metadata_payload or {}).get("context_eligible") is False for row in rows)
+
+        revised = evidence.model_copy(update={"symptoms": ["HTTP 5xx exceeded threshold", "Checkout requests failed"]})
+        second = await module._upsert_knowledge_documents(session, revised, tenant_id="default")
+        await session.commit()
+        assert second["updated"] >= 2
+        assert (await session.execute(select(KnowledgeRagDraftRecord))).scalars().all()[0].row_version >= 1
 
 
 @pytest.mark.asyncio
@@ -121,3 +143,10 @@ async def test_learning_report_is_tenant_scoped_and_verifies_audit_hashes(sqlite
     assert [row["incident_id"] for row in result["outcomes"]] == ["incident-a"]
     assert {row["hash_verified"] for row in result["learning_audit"]} == {True, False}
     assert all(row["actor"] == "reviewer-a" for row in result["learning_audit"])
+
+
+def test_platform_workspace_is_tenant_wide_scope() -> None:
+    module = load_module()
+    assert module._in_application_scope("Platform", service="api-gateway") is True
+    assert module._in_application_scope("KaiMS", service="mysql") is True
+    assert module._in_application_scope("api-gateway", service="mysql") is False

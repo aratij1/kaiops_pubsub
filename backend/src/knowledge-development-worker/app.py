@@ -10,14 +10,14 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 from common.config import get_settings
 from common.continuous_learning import FailurePattern, FailurePatternAnalyzer, IncidentEvidence, issue_signature
-from common.database import ActionRecord, FailurePatternRecord, IncidentEvidenceRecord, IncidentRecord, KnowledgeBaseRecord, LearningAuditRecord, RcaReportRecord, RunbookOutcomeRecord, RunbookVersionRecord
+from common.database import ActionRecord, FailurePatternRecord, IncidentEvidenceRecord, IncidentRecord, KnowledgeBaseRecord, KnowledgeRagDraftRecord, LearningAuditRecord, RcaReportRecord, RunbookOutcomeRecord, RunbookVersionRecord
 from common.learning_workflows import Mode02Worker
 from common.models import EvidenceReference
 from common.service import create_app
 from common.tenant_identity import require_tenant_id
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, or_, select, text
+from sqlalchemy import and_, func, or_, select, text
 
 settings = get_settings()
 settings.service_name = "knowledge-development-worker"
@@ -79,9 +79,9 @@ def _hash(payload: dict[str, Any]) -> str:
 
 def _in_application_scope(scope: str, *, service: str, application: str = "") -> bool:
     normalized = scope.strip().lower()
-    # KaiMS is the aggregate platform workspace in the UI, not a literal
-    # service name. Treat it as the tenant-wide operational scope.
-    return normalized in {"", "all", "kaims"} or normalized in {service.lower(), application.lower()}
+    # KaiMS/Platform are aggregate workspace labels in the UI, not literal
+    # service names. Treat both as the tenant-wide operational scope.
+    return normalized in {"", "all", "kaims", "platform"} or normalized in {service.lower(), application.lower()}
 
 
 def _quality_gate(pattern: FailurePattern, evidence_by_id: dict[str, IncidentEvidence]) -> dict[str, Any]:
@@ -193,6 +193,79 @@ async def _draft_candidate(
     return True
 
 
+def _knowledge_documents(evidence: IncidentEvidence, signature: str) -> list[dict[str, Any]]:
+    """Build attributable, non-executable documents from observed incident evidence."""
+    references = [
+        reference
+        for collection in (evidence.logs, evidence.metrics, evidence.traces, evidence.related_tickets, evidence.recent_changes)
+        for reference in collection
+    ]
+    citations = [f"- [{ref.source}]({ref.uri}): {ref.summary}" for ref in references]
+    citation_text = "\n".join(citations) if citations else "- No attributable source was collected; this draft records an evidence gap."
+    symptoms = "\n".join(f"- {item}" for item in evidence.symptoms) or "- No verified symptom description was collected."
+    dependencies = "\n".join(f"- {item}" for item in evidence.dependencies) or "- No verified dependency inventory was collected."
+    changes = "\n".join(f"- [{ref.source}]({ref.uri}): {ref.summary}" for ref in evidence.recent_changes) or "- No verified change record was collected for the incident window."
+    resolution = evidence.resolution or "No verified corrective action has been recorded."
+    root_causes = "\n".join(f"- {item}" for item in evidence.root_causes) or "- Root cause is not established by the collected evidence."
+    common = {
+        "incident_id": evidence.incident_id, "service": evidence.service,
+        "environment": evidence.environment, "alert_type": evidence.alert_type,
+        "issue_signature": signature, "evidence_ids": [ref.evidence_id for ref in references],
+        "source_uris": [ref.uri for ref in references], "reviewed_source_incident": evidence.reviewed,
+    }
+    return [
+        {**common, "kind": "runbook", "title": f"Runbook draft · {evidence.alert_type} · {evidence.service}", "content": f"# Diagnostic runbook draft\n\n## Scope\nService: {evidence.service}\nEnvironment: {evidence.environment}\nAlert: {evidence.alert_type}\n\n## Verified symptoms\n{symptoms}\n\n## Evidence to inspect\n{citation_text}\n\n## Current causal status\n{root_causes}\n\n## Safety boundary\nThis draft contains no executable remediation. Add verified corrective, validation, and rollback steps during review."},
+        {**common, "kind": "change", "title": f"Change evidence · {evidence.service} · {evidence.incident_id}", "content": f"# Incident-window change record\n\n## Scope\nService: {evidence.service}\nEnvironment: {evidence.environment}\n\n## Verified changes\n{changes}\n\n## Interpretation\nA listed change is temporal evidence, not proof of causation. Confirm or reject its relationship to the incident during review."},
+        {**common, "kind": "deployment", "title": f"Deployment and topology · {evidence.service}", "content": f"# Deployment and topology context\n\n## Observed workload\nService: {evidence.service}\nEnvironment: {evidence.environment}\n\n## Known dependencies\n{dependencies}\n\n## Sources\n{citation_text}\n\nUnlisted deployment properties remain unknown until verified from an attributable source."},
+        {**common, "kind": "validation", "title": f"Validation evidence · {evidence.service} · {evidence.incident_id}", "content": f"# Recovery validation record\n\n## Recorded resolution\n{resolution}\n\n## Outcome\n{('Verified successful recovery' if evidence.resolution_successful is True else 'Recorded failed recovery' if evidence.resolution_successful is False else 'Recovery outcome has not been verified.')}\n\n## Supporting sources\n{citation_text}"},
+        {**common, "kind": "resolution_catalog", "title": f"Resolution catalog candidate · {evidence.alert_type} · {evidence.service}", "content": f"# Resolution catalog candidate\n\n## Matching signature\n{signature}\n\n## Verified symptoms\n{symptoms}\n\n## Causal findings\n{root_causes}\n\n## Recorded corrective action\n{resolution}\n\n## Promotion rule\nKeep as non-executable draft until causal mechanism, corrective steps, validation, rollback, and human approval are complete.\n\n## Sources\n{citation_text}"},
+    ]
+
+
+async def _upsert_knowledge_documents(session: Any, evidence: IncidentEvidence, *, tenant_id: str) -> dict[str, int]:
+    created = updated = unchanged = 0
+    now = datetime.now(timezone.utc)
+    signature = issue_signature(evidence)
+    for document in _knowledge_documents(evidence, signature):
+        kind = str(document["kind"])
+        source_ref = f"incident://{evidence.incident_id}/knowledge/{kind}"
+        content = str(document["content"])
+        checksum = f"sha256:{hashlib.sha256(content.encode()).hexdigest()}"
+        latest = (await session.execute(select(KnowledgeRagDraftRecord).where(
+            KnowledgeRagDraftRecord.tenant_id == tenant_id,
+            KnowledgeRagDraftRecord.source_ref == source_ref,
+            KnowledgeRagDraftRecord.document_kind == kind,
+        ).order_by(KnowledgeRagDraftRecord.document_version.desc()).limit(1))).scalar_one_or_none()
+        if latest is not None and latest.content_checksum == checksum:
+            unchanged += 1
+            continue
+        metadata = {key: value for key, value in document.items() if key not in {"kind", "title", "content"}}
+        metadata.update({"generated_by": "knowledge-development-worker", "trust_state": "draft_unverified", "context_eligible": False})
+        if latest is not None and latest.status == "draft" and latest.created_by == "knowledge-development-worker":
+            latest.title = str(document["title"])[:160]
+            latest.content = content
+            latest.content_checksum = checksum
+            latest.metadata_payload = metadata
+            latest.row_version = int(latest.row_version or 1) + 1
+            latest.updated_at = now
+            updated += 1
+            continue
+        version = int(await session.scalar(select(func.max(KnowledgeRagDraftRecord.document_version)).where(
+            KnowledgeRagDraftRecord.tenant_id == tenant_id,
+            KnowledgeRagDraftRecord.source_ref == source_ref,
+            KnowledgeRagDraftRecord.document_kind == kind,
+        )) or 0) + 1
+        session.add(KnowledgeRagDraftRecord(
+            tenant_id=tenant_id, document_kind=kind, document_version=version,
+            source_ref=source_ref, title=str(document["title"])[:160], content=content,
+            content_checksum=checksum, metadata_payload=metadata, status="draft",
+            created_by="knowledge-development-worker", row_version=1,
+            created_at=now, updated_at=now,
+        ))
+        created += 1
+    return {"created": created, "updated": updated, "unchanged": unchanged}
+
+
 def _reference_from_context(row: Any) -> EvidenceReference | None:
     if not isinstance(row, dict):
         return None
@@ -296,6 +369,7 @@ async def _analyze_locked(app: FastAPI, trigger: str) -> dict[str, Any]:
             for row in (await session.execute(select(ActionRecord).where(ActionRecord.incident_id.in_(incident_ids)))).scalars().all():
                 actions.setdefault(str(row.incident_id), []).append(row)
         collected = 0
+        document_changes = {"created": 0, "updated": 0, "unchanged": 0}
         max_checkpoint = checkpoint
         max_checkpoint_id = checkpoint_id or None
         for report in reports:
@@ -329,6 +403,14 @@ async def _analyze_locked(app: FastAPI, trigger: str) -> dict[str, Any]:
                 continue
             if _in_application_scope(scope, service=evidence.service):
                 evidence_rows.append(evidence)
+        # Develop documents from the retained evidence window, not only from
+        # reports newer than the checkpoint. This makes scheduled runs repair
+        # or backfill missing documents while checksum comparison keeps the
+        # operation idempotent.
+        for evidence in evidence_rows:
+            changes = await _upsert_knowledge_documents(session, evidence, tenant_id="default")
+            for key, value in changes.items():
+                document_changes[key] += value
         patterns = FailurePatternAnalyzer().analyze(evidence_rows)
         evidence_by_id = {row.incident_id: row for row in evidence_rows}
         drafts = gated = 0
@@ -346,7 +428,7 @@ async def _analyze_locked(app: FastAPI, trigger: str) -> dict[str, Any]:
         completed = datetime.now(timezone.utc)
         backlog_remaining = len(reports) >= batch_size
         next_delay = 30 if backlog_remaining else int(schedule_config["interval_seconds"])
-        result = {"status": "completed", "trigger": trigger, "started_at": started.isoformat(), "completed_at": completed.isoformat(), "duration_seconds": round((completed - started).total_seconds(), 3), "reports_scanned": len(reports), "evidence_collected": collected, "evidence_in_window": len(evidence_rows), "patterns": len(patterns), "quality_gated_patterns": gated, "reviewable_runbook_candidates": drafts, "checkpoint_at": _iso(max_checkpoint), "checkpoint_id": max_checkpoint_id, "backlog_remaining": backlog_remaining, "next_run_at": (completed + timedelta(seconds=next_delay)).isoformat(), "application_scope": schedule_config["application_scope"], "lookback_days": schedule_config["lookback_days"], "batch_size": batch_size, "quality_policy": "kaims.knowledge-quality.v2"}
+        result = {"status": "completed", "trigger": trigger, "started_at": started.isoformat(), "completed_at": completed.isoformat(), "duration_seconds": round((completed - started).total_seconds(), 3), "reports_scanned": len(reports), "evidence_collected": collected, "evidence_in_window": len(evidence_rows), "patterns": len(patterns), "quality_gated_patterns": gated, "reviewable_runbook_candidates": drafts, "knowledge_documents": document_changes, "checkpoint_at": _iso(max_checkpoint), "checkpoint_id": max_checkpoint_id, "backlog_remaining": backlog_remaining, "next_run_at": (completed + timedelta(seconds=next_delay)).isoformat(), "application_scope": schedule_config["application_scope"], "lookback_days": schedule_config["lookback_days"], "batch_size": batch_size, "quality_policy": "kaims.knowledge-quality.v2"}
         await _save_state(session, result)
         await session.commit()
         return result
@@ -470,6 +552,7 @@ async def bootstrap_incident_catalog(request: IncidentBootstrapRequest) -> dict[
             confidence=pattern.confidence, analyzed_at=pattern.analyzed_at,
         ))
         created = await _draft_candidate(session, pattern, quality, allow_evidence_work=True, tenant_id=tenant_id)
+        document_changes = await _upsert_knowledge_documents(session, evidence, tenant_id=tenant_id)
         await session.commit()
     return {
         "status": "created" if created else "updated",
@@ -482,6 +565,7 @@ async def bootstrap_incident_catalog(request: IncidentBootstrapRequest) -> dict[
         ),
         "execution_eligible": False,
         "evidence_sources": quality["metrics"]["independent_sources"],
+        "knowledge_documents": document_changes,
     }
 
 
@@ -576,10 +660,11 @@ async def report(tenant_id: str = "default") -> dict[str, Any]:
         evidence = (await session.execute(select(IncidentEvidenceRecord).where(IncidentEvidenceRecord.tenant_id == tenant).order_by(IncidentEvidenceRecord.collected_at.desc()).limit(100))).scalars().all()
         outcomes = (await session.execute(select(RunbookOutcomeRecord).where(RunbookOutcomeRecord.tenant_id == tenant).order_by(RunbookOutcomeRecord.created_at.desc()).limit(100))).scalars().all()
         audit_rows = (await session.execute(select(LearningAuditRecord).where(LearningAuditRecord.tenant_id == tenant).order_by(LearningAuditRecord.occurred_at.desc()).limit(100))).scalars().all()
+        documents = (await session.execute(select(KnowledgeRagDraftRecord).where(KnowledgeRagDraftRecord.tenant_id == tenant).order_by(KnowledgeRagDraftRecord.updated_at.desc()).limit(100))).scalars().all()
     audits = []
     for row in audit_rows:
         canonical = json.dumps(row.payload or {}, sort_keys=True, separators=(",", ":"), default=str)
         audits.append({"event_id": str(row.event_id), "action": row.action, "actor": row.actor, "resource_type": row.resource_type, "resource_id": row.resource_id, "occurred_at": _iso(row.occurred_at), "payload_sha256": row.payload_sha256, "hash_verified": hashlib.sha256(canonical.encode()).hexdigest() == row.payload_sha256})
     reviewed = sum(bool(row.reviewed) for row in outcomes)
     successful = sum(bool(row.successful) for row in outcomes)
-    return {"status": "ok", "summary": (await _load_state(app)) or last_result, "evidence_count": len(evidence), "outcome_summary": {"total": len(outcomes), "reviewed": reviewed, "successful": successful, "failed": len(outcomes) - successful, "success_rate": round(successful / len(outcomes), 4) if outcomes else None}, "patterns": [{"id": str(row.pattern_id), "service": row.service, "environment": row.environment, "issue_signature": row.issue_signature, "confidence": float(row.confidence), "analyzed_at": _iso(row.analyzed_at), "quality_gate": (row.analysis or {}).get("quality_gate", {})} for row in patterns], "drafts": [{"runbook_id": str(row.runbook_id), "version": row.version, "status": row.approval_status, "owner": row.owner, "risk_level": row.risk_level, "created_at": _iso(row.created_at), "content": row.content or {}, "quality_gate": (row.content or {}).get("knowledge_quality", {})} for row in drafts], "outcomes": [{"outcome_id": str(row.outcome_id), "incident_id": row.incident_id, "runbook_id": str(row.runbook_id), "runbook_version": row.runbook_version, "reviewed": row.reviewed, "successful": row.successful, "created_at": _iso(row.created_at)} for row in outcomes[:50]], "learning_audit": audits[:50], "recent_evidence": [{"incident_id": row.incident_id, "service": row.service, "environment": row.environment, "alert_type": row.alert_type, "reviewed": row.reviewed, "collected_at": _iso(row.collected_at)} for row in evidence[:20]]}
+    return {"status": "ok", "summary": (await _load_state(app)) or last_result, "evidence_count": len(evidence), "outcome_summary": {"total": len(outcomes), "reviewed": reviewed, "successful": successful, "failed": len(outcomes) - successful, "success_rate": round(successful / len(outcomes), 4) if outcomes else None}, "patterns": [{"id": str(row.pattern_id), "service": row.service, "environment": row.environment, "issue_signature": row.issue_signature, "confidence": float(row.confidence), "analyzed_at": _iso(row.analyzed_at), "quality_gate": (row.analysis or {}).get("quality_gate", {})} for row in patterns], "drafts": [{"runbook_id": str(row.runbook_id), "version": row.version, "status": row.approval_status, "owner": row.owner, "risk_level": row.risk_level, "created_at": _iso(row.created_at), "content": row.content or {}, "quality_gate": (row.content or {}).get("knowledge_quality", {})} for row in drafts], "documents": [{"draft_id": str(row.draft_id), "document_kind": row.document_kind, "document_version": row.document_version, "source_ref": row.source_ref, "title": row.title, "status": row.status, "row_version": row.row_version, "metadata": row.metadata_payload or {}, "updated_at": _iso(row.updated_at)} for row in documents], "outcomes": [{"outcome_id": str(row.outcome_id), "incident_id": row.incident_id, "runbook_id": str(row.runbook_id), "runbook_version": row.runbook_version, "reviewed": row.reviewed, "successful": row.successful, "created_at": _iso(row.created_at)} for row in outcomes[:50]], "learning_audit": audits[:50], "recent_evidence": [{"incident_id": row.incident_id, "service": row.service, "environment": row.environment, "alert_type": row.alert_type, "reviewed": row.reviewed, "collected_at": _iso(row.collected_at)} for row in evidence[:20]]}
