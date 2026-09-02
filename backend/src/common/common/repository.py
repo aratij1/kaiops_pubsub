@@ -9190,7 +9190,27 @@ class ContextEnrichmentRepository(EvaluationRepository):
                 persisted_state = IncidentLifecycleState(projection.lifecycle_state)
             except ValueError:
                 persisted_state = None
-            if persisted_state is not None:
+            # Evidence requirements and immutable RCA bindings can advance
+            # before the asynchronous lifecycle projection is reduced.  Do
+            # not let a stale early projection send the cockpit backwards to
+            # "identifying requirements" after work is already scheduled,
+            # blocked for review, or analysed.
+            stale_early_projection = bool(
+                persisted_state
+                in {
+                    IncidentLifecycleState.DETECTED,
+                    IncidentLifecycleState.REQUIREMENTS_IDENTIFIED,
+                    IncidentLifecycleState.COLLECTING,
+                    IncidentLifecycleState.WAITING_FOR_HUMAN,
+                    IncidentLifecycleState.CONTEXT_READY,
+                }
+                and (
+                    binding is not None
+                    or bool(requirement_projection)
+                )
+                and persisted_state.value != lifecycle_state
+            )
+            if persisted_state is not None and not stale_early_projection:
                 lifecycle_state = persisted_state.value
                 next_action = {
                     IncidentLifecycleState.DETECTED: {

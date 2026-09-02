@@ -220,6 +220,13 @@ async def test_operations_state_selects_current_requirement_and_latest_job(
             id=incident_id, tenant_id="tenant-a", service="checkout-api", environment="prod",
             severity="critical", status="investigating", title="Checkout latency", payload={},
         ))
+        # Simulate the normal asynchronous lag where evidence work has
+        # advanced but the incident projection still says DETECTED.
+        session.add(IncidentProjectionRecord(
+            incident_id=incident_id, tenant_id="tenant-a", service="checkout-api",
+            environment="prod", severity="critical", status="investigating",
+            lifecycle_state="DETECTED", first_seen_at=now, projection_payload={},
+        ))
         await repo.upsert_context_evidence_requirements([old_requirement, current_requirement])
         first = await repo.schedule_context_enrichment_job(
             tenant_id="tenant-a", incident_id=incident_id,
