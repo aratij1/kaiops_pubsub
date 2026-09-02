@@ -11,6 +11,8 @@ from common.context_enrichment_contract import (
     validate_enrichment_observation,
 )
 from common.database import (
+    ActionRecord,
+    ApprovalRecord,
     AuditLogRecord,
     CanonicalEvidenceRecord,
     ContextSnapshotRecord,
@@ -19,10 +21,11 @@ from common.database import (
     IncidentProjectionRecord,
     IncidentInvestigationBindingRecord,
     IncidentRecord,
+    RcaReportRecord,
     ResolutionOutboxRecord,
 )
 from common.models import Alert, AlertSeverity, Incident
-from common.repository import ContextEnrichmentRepository
+from common.repository import ContextEnrichmentRepository, IncidentRepository
 from context_agent.connectors import execute_enrichment_plan
 from context_agent.context_quality import plan_missing_evidence
 from sqlalchemy import select
@@ -148,6 +151,56 @@ async def test_missing_automatic_evidence_creates_idempotent_enrichment_jobs(
         assert activity["jobs"][0]["lease_owner"] is None
 
 
+def test_requirement_identity_normalizes_question_case_and_whitespace() -> None:
+    incident_id = uuid4()
+    now = datetime.now(UTC)
+    first = build_evidence_requirements(
+        tenant_id="tenant-a", incident_id=incident_id, rca_version=3,
+        missing_evidence=[{"category": "logs", "question": "Which errors preceded the alert?"}],
+        now=now,
+    )[0]
+    second = build_evidence_requirements(
+        tenant_id="tenant-a", incident_id=incident_id, rca_version=3,
+        missing_evidence=[{"category": "logs", "question": "  WHICH   ERRORS preceded the ALERT? "}],
+        now=now,
+    )[0]
+
+    assert first.requirement_id == second.requirement_id
+    assert second.question == "WHICH ERRORS preceded the ALERT?"
+
+
+@pytest.mark.asyncio
+async def test_failed_human_evidence_jira_sync_observes_retry_cooldown(
+    sqlite_session_factory,
+):
+    incident_id = uuid4()
+    requirement = build_evidence_requirements(
+        tenant_id="tenant-a", incident_id=incident_id, rca_version=1,
+        missing_evidence=[{"category": "runbook", "question": "Which approved runbook applies?"}],
+        now=datetime.now(UTC),
+    )[0]
+    async with sqlite_session_factory() as session:
+        repo = ContextEnrichmentRepository(session)
+        await repo.upsert_context_evidence_requirements([requirement])
+        request = await repo.create_human_evidence_request(
+            tenant_id="tenant-a", incident_id=incident_id, requirement_id=requirement.requirement_id,
+            expected_responder="platform-ops", assignment_source="service_ownership",
+            due_at=datetime.now(UTC) + timedelta(hours=1), acceptable_format="A governed runbook URL.",
+            evidence_already_checked=["vector-db"], hypothesis_impact="RCA requires an approved runbook.",
+        )
+        await session.commit()
+
+        claimed = await repo.claim_human_evidence_jira_requests(limit=1)
+        assert [row["request_id"] for row in claimed] == [str(request.request_id)]
+        await repo.fail_human_evidence_jira_sync(request_id=request.request_id, error="upstream unavailable")
+        await session.commit()
+
+        assert await repo.claim_human_evidence_jira_requests(limit=1) == []
+        request.updated_at = datetime.now(UTC) - timedelta(minutes=6)
+        await session.commit()
+        assert len(await repo.claim_human_evidence_jira_requests(limit=1)) == 1
+
+
 @pytest.mark.asyncio
 async def test_operations_state_selects_current_requirement_and_latest_job(
     sqlite_session_factory,
@@ -188,6 +241,19 @@ async def test_operations_state_selects_current_requirement_and_latest_job(
     assert state is not None
     assert state["lifecycle_state"] == "COLLECTING"
     assert state["investigation"]["rca_version"] == 0
+    assert state["approval"] == {
+        "approval_id": None,
+        "incident_id": str(incident_id),
+        "recommendation_id": None,
+        "plan_id": None,
+        "plan_fingerprint": None,
+        "status": "not_requested",
+        "approver": None,
+        "approver_role": None,
+        "expires_at": None,
+        "updated_at": None,
+        "blocked_reasons": ["RCA_NOT_READY"],
+    }
     assert [row["requirement_id"] for row in state["requirements"]] == [str(current_requirement.requirement_id)]
     assert state["requirements"][0]["latest_job"]["job_id"] == str(second.job_id)
     assert state["requirement_history"][0]["requirement_id"] == str(old_requirement.requirement_id)
@@ -223,6 +289,80 @@ async def test_operations_state_is_tenant_scoped(sqlite_session_factory):
             tenant_id="tenant-b", incident_id=incident_id,
         ) is None
         assert await repository.enabled_reconciliation_tenants() == ["tenant-a"]
+
+
+@pytest.mark.asyncio
+async def test_operations_state_selects_current_execution_and_validation_lineage(
+    sqlite_session_factory,
+):
+    incident_id, alert_id = uuid4(), uuid4()
+    recommendation_id, plan_id, approval_id, action_id = uuid4(), uuid4(), uuid4(), uuid4()
+    snapshot_id, analysis_id = uuid4(), uuid4()
+    plan_fingerprint = "sha256:" + "a" * 64
+    now = datetime.now(UTC)
+    async with sqlite_session_factory() as session:
+        session.add(IncidentRecord(
+            id=incident_id, tenant_id="tenant-a", service="checkout-api", environment="prod",
+            severity="critical", status="validating", title="Checkout latency", payload={},
+        ))
+        session.add(IncidentProjectionRecord(
+            incident_id=incident_id, alert_id=alert_id, tenant_id="tenant-a",
+            service="checkout-api", environment="prod", severity="critical",
+            status="validating", lifecycle_state="VALIDATING", first_seen_at=now,
+            projection_payload={},
+        ))
+        session.add(IncidentInvestigationBindingRecord(
+            tenant_id="tenant-a", project_id="project-a", incident_id=incident_id,
+            alert_id=alert_id, analysis_request_id=analysis_id, context_snapshot_id=snapshot_id,
+            context_fingerprint="c" * 64, recommendation_id=recommendation_id,
+            rca_version=2, resolution_plan_id=plan_id, plan_fingerprint=plan_fingerprint,
+            status="grounded", created_at=now, expires_at=now + timedelta(hours=1),
+        ))
+        session.add(AuditLogRecord(
+            id=recommendation_id, tenant_id="tenant-a", actor="resolution-agent",
+            action="recommendation.generated", resource_type="incident",
+            resource_id=str(incident_id), payload={"confidence": 0.9, "metadata": {
+                "quality_gate": {"passed": True},
+            }},
+        ))
+        session.add(ApprovalRecord(
+            id=approval_id, tenant_id="tenant-a", incident_id=incident_id,
+            recommendation_id=recommendation_id, plan_id=plan_id,
+            plan_fingerprint=plan_fingerprint, decision="approved", approver="sre@example.com",
+            approval_expires_at=now + timedelta(minutes=30), payload={},
+        ))
+        session.add(ActionRecord(
+            id=action_id, tenant_id="tenant-a", incident_id=incident_id,
+            recommendation_id=recommendation_id, resolution_plan_id=plan_id,
+            plan_fingerprint=plan_fingerprint, approval_id=approval_id,
+            action_type="rollback_deployment", target="checkout-api", status="succeeded", payload={},
+        ))
+        session.add(ActionRecord(
+            id=uuid4(), tenant_id="tenant-a", incident_id=incident_id,
+            recommendation_id=uuid4(), resolution_plan_id=uuid4(),
+            plan_fingerprint="sha256:" + "b" * 64, approval_id=uuid4(),
+            action_type="restart_service", target="stale-target", status="failed", payload={},
+        ))
+        session.add(RcaReportRecord(
+            id=uuid4(), tenant_id="tenant-a", incident_id=incident_id,
+            recommendation_id=recommendation_id, resolution_plan_id=plan_id,
+            plan_fingerprint=plan_fingerprint, approval_id=approval_id,
+            remediation_action_id=action_id, validation_checksum="sha256:" + "d" * 64,
+            closure_kind="recovery", closure_status="closed", root_cause="Deployment regression",
+            impact="Checkout unavailable", payload={"health_restored": True, "alerts_cleared": True},
+        ))
+        await session.commit()
+
+        state = await ContextEnrichmentRepository(session).incident_operations_state(
+            tenant_id="tenant-a", incident_id=incident_id,
+        )
+
+    assert state["execution"]["action_id"] == str(action_id)
+    assert state["execution"]["status"] == "succeeded"
+    assert state["execution"]["target"] == "checkout-api"
+    assert state["validation"]["status"] == "closed"
+    assert state["validation"]["health_restored"] is True
+    assert state["validation"]["alerts_cleared"] is True
 
 
 @pytest.mark.asyncio
@@ -368,16 +508,54 @@ async def test_exhausted_context_job_is_dead_lettered(sqlite_session_factory):
         )
         await session.commit()
         await repo.claim_context_enrichment_jobs(worker_id="worker-a", limit=1)
-        await repo.finish_context_enrichment_job(
+        final_status = await repo.finish_context_enrichment_job(
             job_id=job.job_id, worker_id="worker-a", collected=False,
             error="connector unavailable", maximum_attempts=1,
         )
+        assert final_status == "dead_letter"
         await session.commit()
         activity = await repo.list_context_enrichment_activity(
             tenant_id="tenant-a", incident_id=incident_id,
         )
         assert activity["jobs"][0]["status"] == "dead_letter"
         assert "connector unavailable" in activity["jobs"][0]["last_error"]
+
+
+@pytest.mark.asyncio
+async def test_scheduling_fallback_reopens_blocked_requirement(sqlite_session_factory):
+    incident_id = uuid4()
+    now = datetime.now(UTC)
+    requirement = build_evidence_requirements(
+        tenant_id="tenant-a", incident_id=incident_id, rca_version=1,
+        missing_evidence=[{"category": "traces", "question": "Which span failed?"}], now=now,
+    )[0]
+    async with sqlite_session_factory() as session:
+        repo = ContextEnrichmentRepository(session)
+        await repo.upsert_context_evidence_requirements([requirement])
+        first = await repo.schedule_context_enrichment_job(
+            tenant_id="tenant-a", incident_id=incident_id,
+            requirement_id=requirement.requirement_id, connector_id="jaeger",
+            query_payload={}, observation_start=now - timedelta(minutes=5), observation_end=now,
+        )
+        await repo.claim_context_enrichment_jobs(worker_id="worker-a", limit=1)
+        await repo.finish_context_enrichment_job(
+            job_id=first.job_id, worker_id="worker-a", collected=False,
+            error="connector unavailable", maximum_attempts=1,
+        )
+        await repo.schedule_context_enrichment_job(
+            tenant_id="tenant-a", incident_id=incident_id,
+            requirement_id=requirement.requirement_id, connector_id="discovery-mcp",
+            query_payload={}, observation_start=now - timedelta(minutes=5), observation_end=now,
+        )
+        requirement_row = await repo.context_evidence_requirement(
+            tenant_id="tenant-a", requirement_id=requirement.requirement_id,
+        )
+
+        assert requirement_row["status"] == "scheduled"
+        activity = await repo.list_context_enrichment_activity(
+            tenant_id="tenant-a", incident_id=incident_id,
+        )
+        assert {job["connector_id"] for job in activity["jobs"]} == {"jaeger", "discovery-mcp"}
 
 
 @pytest.mark.asyncio
@@ -433,6 +611,9 @@ async def test_atomic_enrichment_persists_exact_evidence_snapshot_and_outbox(
         assert result["evidence_ids"] == [record.evidence_id]
         assert await session.get(CanonicalEvidenceRecord, record.evidence_id) is not None
         assert await session.get(ResolutionOutboxRecord, result["outbox_event_id"]) is not None
+        enriched_request_id = result["outbox_payload"]["decision"]["analysis_request_id"]
+        assert UUID(enriched_request_id)
+        assert result["outbox_payload"]["context"]["metadata"]["analysis_request_id"] == enriched_request_id
         snapshot = await session.get(ContextSnapshotRecord, UUID(result["snapshot_id"]))
         assert snapshot.evidence_ids == [record.evidence_id]
         assert snapshot.payload["metadata"]["context_evidence"]["metrics"][0]["evidence_id"] == record.evidence_id
@@ -640,24 +821,57 @@ async def test_active_gap_reconciliation_is_idempotent(sqlite_session_factory) -
             snapshot_id=snapshot_id, tenant_id="tenant-a", incident_id=str(incident_id),
             alert_signature="signature", subject_fingerprint="s" * 64,
             context_fingerprint="c" * 64, contract_version="kaiops.context.v2",
-            quality_score=0.4, reusable=False, source_manifest={}, payload={},
+            quality_score=0.4, reusable=False, source_manifest={}, evidence_ids=["LOG-attached", "METRIC-context-only"], payload={"metadata": {
+                "context_evidence": {"logs": [{
+                    "evidence_id": "LOG-attached", "category": "logs",
+                    "connector": "opensearch", "citation": "opensearch://logs/attached",
+                }], "metrics": [{
+                    "evidence_id": "METRIC-context-only", "category": "metrics",
+                    "connector": "prometheus", "citation": "prometheus://query/context-only",
+                }]},
+            }},
             collected_at=now, expires_at=now + timedelta(hours=1),
+        ))
+        session.add(ContextSnapshotRecord(
+            snapshot_id=uuid4(), tenant_id="tenant-a", incident_id=str(incident_id),
+            alert_signature="signature", subject_fingerprint="s" * 64,
+            context_fingerprint="o" * 64, contract_version="kaiops.context.v2",
+            snapshot_stage="investigation_complete", snapshot_version=2,
+            quality_score=0.4, reusable=False, source_manifest={}, evidence_ids=[], payload={"metadata": {}},
+            collected_at=now + timedelta(seconds=1), expires_at=now + timedelta(hours=1),
         ))
         session.add(IncidentInvestigationBindingRecord(
             tenant_id="tenant-a", project_id="project-a", incident_id=incident_id,
             alert_id=alert_id, analysis_request_id=analysis_id, context_snapshot_id=snapshot_id,
             context_fingerprint="c" * 64, recommendation_id=recommendation_id,
+            evidence_ids=["LOG-attached", "METRIC-context-only"],
             rca_version=3, status="insufficient_evidence", created_at=now,
             expires_at=now + timedelta(hours=1),
+        ))
+        session.add(IncidentProjectionRecord(
+            incident_id=incident_id, alert_id=alert_id, recommendation_id=recommendation_id,
+            tenant_id="tenant-a", service="checkout-api", environment="prod",
+            status="investigating", first_seen_at=now, projection_payload={},
         ))
         session.add(AuditLogRecord(
             id=recommendation_id, tenant_id="tenant-a", actor="resolution-agent",
             action="recommendation.generated", resource_type="incident",
-            resource_id=str(incident_id), payload={"metadata": {"rca_analysis": {
-                "missing_evidence": [{"category": "logs", "question": "Which errors occurred?"}],
-            }}},
+            resource_id=str(incident_id), payload={"metadata": {
+                "analysis_request_id": str(analysis_id), "project_id": "project-a",
+                "alert_id": str(alert_id), "context_snapshot_id": str(snapshot_id),
+                "context_fingerprint": "c" * 64, "evidence_ids": ["LOG-attached", "METRIC-context-only"],
+                "rca_analysis": {
+                    "evidence_used": ["LOG-attached"],
+                    "missing_evidence": [{"category": "logs", "question": "Which errors occurred?"}],
+                },
+            }},
         ))
         await session.flush()
+        verified = await IncidentRepository(session).get_bound_incident_investigation(
+            tenant_id="tenant-a", incident_id=incident_id, alert_id=alert_id,
+            recommendation_id=recommendation_id,
+        )
+        assert verified["investigation_integrity"]["status"] == "verified"
         repo = ContextEnrichmentRepository(session)
         candidates = await repo.active_incident_gap_candidates(tenant_id="tenant-a")
         requirements = await plan_missing_evidence(
@@ -670,6 +884,16 @@ async def test_active_gap_reconciliation_is_idempotent(sqlite_session_factory) -
         second = await repo.upsert_context_evidence_requirements(requirements)
         assert len(candidates) == 1
         assert first[0].requirement_id == second[0].requirement_id
+        state = await repo.incident_operations_state(tenant_id="tenant-a", incident_id=incident_id)
+        attached = state["investigation_workspace"]["evidence"]
+        assert len(attached) == 2
+        attached_by_id = {row["evidence_id"]: row for row in attached}
+        assert attached_by_id["LOG-attached"]["connector"] == "opensearch"
+        assert attached_by_id["LOG-attached"]["citation"] == "opensearch://logs/attached"
+        assert attached_by_id["LOG-attached"]["accepted_for_rca"] is True
+        assert attached_by_id["METRIC-context-only"]["accepted_for_rca"] is False
+        assert state["investigation_workspace"]["evidence_summary"]["rca_bound_records"] == 1
+        assert state["context"]["snapshot_id"] == str(snapshot_id)
 
 
 def test_hitl_routing_configuration_rejects_placeholder_identity():

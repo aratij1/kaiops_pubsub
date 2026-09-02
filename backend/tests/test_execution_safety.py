@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from uuid import uuid4
 
 import pytest
@@ -20,6 +21,7 @@ def _approved_action(action_type: str = "fake_test") -> RemediationAction:
         parameters={
             "target_resource_id": "k8s://production/orders",
             "credential_ref": "vault://kaiops/orders",
+            "approval_expires_at": "2099-01-01T00:00:00+00:00",
         },
         status=RemediationStatus.RUNNING,
     )
@@ -48,6 +50,20 @@ def test_unapproved_action_requires_explicit_auto_authorization() -> None:
     assert assessment.reason == "APPROVAL_OR_AUTO_AUTHORIZATION_REQUIRED"
     action.metadata["auto_execution_authorized"] = True
     assert assess_execution_safety(action, allowlisted_actions={"fake_test"}).decision == ExecutionSafetyDecision.ALLOW
+
+
+def test_expired_or_missing_approval_expiry_fails_closed() -> None:
+    action = _approved_action()
+    action.parameters.pop("approval_expires_at")
+    assert assess_execution_safety(action, allowlisted_actions={"fake_test"}).reason == "APPROVAL_EXPIRY_MISSING"
+
+    action.parameters["approval_expires_at"] = "2026-09-01T09:59:59+00:00"
+    assessment = assess_execution_safety(
+        action,
+        allowlisted_actions={"fake_test"},
+        now=datetime(2026, 9, 1, 10, 0, tzinfo=UTC),
+    )
+    assert assessment.reason == "APPROVAL_EXPIRED"
 
 
 @pytest.mark.asyncio

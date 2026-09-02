@@ -6864,7 +6864,7 @@ async def get_unified_incident_inbox(
     status: str | None = None,
     service: str | None = None,
     inbox_view: str = "all",
-    record_type: str = "all",
+    record_type: str = "incidents",
     severity: str | None = None,
 ) -> dict[str, Any]:
     session_factory = getattr(app.state, "session_factory", None)

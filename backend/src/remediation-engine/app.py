@@ -1210,6 +1210,11 @@ async def rollback_execution_direct(payload: dict[str, Any], x_kaiops_internal_t
         str(item).strip() for item in plan.get("rollback_commands", [])
         if str(item).strip()
     ] if isinstance(plan.get("rollback_commands"), list) else []
+    if str(plan.get("rollback_mode") or "").strip().lower() != "automatic":
+        raise HTTPException(
+            status_code=409,
+            detail="Rollback blocked: the approved plan does not authorize automatic rollback.",
+        )
     preview = engine.build_action(approval)
     original = await _find_existing_action(app, _build_action_idempotency_key(approval, preview.action_type))
 

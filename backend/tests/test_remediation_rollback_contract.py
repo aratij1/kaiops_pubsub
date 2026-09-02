@@ -24,7 +24,16 @@ def test_rollback_endpoint_uses_only_approved_plan_commands_and_escalates() -> N
     assert 'plan.get("rollback_commands"' in endpoint
     assert "approved_rollback_unavailable" in endpoint
     assert "automatic_rollback_failed" in app
+    assert "does not authorize automatic rollback" in endpoint
     assert "RemediationStatus.ROLLED_BACK" in endpoint
     assert "engine.dispatch(action)" in endpoint
     assert "engine.execute(action)" not in endpoint
     assert "llm" not in endpoint.lower()
+
+
+def test_temporal_rolls_back_only_when_exact_approved_plan_authorizes_it() -> None:
+    workflow = (ROOT / "backend/src/temporal-pilot/temporal_pilot/workflow.py").read_text(encoding="utf-8")
+
+    assert 'plan.get("rollback_mode")' in workflow
+    assert 'approval.get("plan_fingerprint")' in workflow
+    assert "approved_automatic_rollback_binding_missing" in workflow

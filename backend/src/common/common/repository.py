@@ -1281,22 +1281,35 @@ class IncidentRepository:
                 )
             )
         ).scalar_one_or_none()
+        current_binding = (
+            await self.session.execute(
+                select(IncidentInvestigationBindingRecord)
+                .where(
+                    IncidentInvestigationBindingRecord.tenant_id == normalized_tenant_id,
+                    IncidentInvestigationBindingRecord.incident_id == incident_record.id,
+                    IncidentInvestigationBindingRecord.alert_id == alert_uuid,
+                )
+                .order_by(
+                    IncidentInvestigationBindingRecord.rca_version.desc(),
+                    IncidentInvestigationBindingRecord.created_at.desc(),
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        current_recommendation_id = (
+            current_binding.recommendation_id
+            if current_binding is not None
+            else bound_projection.recommendation_id if bound_projection is not None else None
+        )
         bound_investigation = await self.get_bound_incident_investigation(
             tenant_id=normalized_tenant_id,
             incident_id=incident_record.id,
             alert_id=alert_uuid,
-            recommendation_id=(
-                bound_projection.recommendation_id if bound_projection is not None else None
-            ),
+            recommendation_id=current_recommendation_id,
         )
         recommendation = dict(bound_investigation.get("recommendation") or {})
         investigation_integrity = dict(
             bound_investigation.get("investigation_integrity") or {}
-        )
-        current_binding = (
-            await self.session.get(IncidentInvestigationBindingRecord, bound_projection.recommendation_id)
-            if bound_projection is not None and bound_projection.recommendation_id is not None
-            else None
         )
         current_plan_id = current_binding.resolution_plan_id if current_binding is not None else None
         current_plan_fingerprint = current_binding.plan_fingerprint if current_binding is not None else None
@@ -1306,9 +1319,9 @@ class IncidentRepository:
                 ApprovalRecord.incident_id == UUID(incident_id_str),
                 ApprovalRecord.tenant_id == normalized_tenant_id,
             )
-        if bound_projection is not None and bound_projection.recommendation_id is not None:
+        if current_recommendation_id is not None:
             approval_stmt = approval_stmt.where(
-                ApprovalRecord.recommendation_id == bound_projection.recommendation_id
+                ApprovalRecord.recommendation_id == current_recommendation_id
             )
         if current_plan_id is not None and current_plan_fingerprint:
             approval_stmt = approval_stmt.where(
@@ -1333,7 +1346,7 @@ class IncidentRepository:
             action_stmt = select(ActionRecord).where(
                 ActionRecord.incident_id == UUID(incident_id_str),
                 ActionRecord.tenant_id == normalized_tenant_id,
-                ActionRecord.recommendation_id == bound_projection.recommendation_id,
+                ActionRecord.recommendation_id == current_recommendation_id,
                 ActionRecord.resolution_plan_id == current_plan_id,
                 ActionRecord.plan_fingerprint == current_plan_fingerprint,
                 ActionRecord.approval_id == approval_record.id,
@@ -1351,7 +1364,7 @@ class IncidentRepository:
             report_stmt = select(RcaReportRecord).where(
                 RcaReportRecord.incident_id == UUID(incident_id_str),
                 RcaReportRecord.tenant_id == normalized_tenant_id,
-                RcaReportRecord.recommendation_id == bound_projection.recommendation_id,
+                RcaReportRecord.recommendation_id == current_recommendation_id,
                 RcaReportRecord.resolution_plan_id == current_plan_id,
                 RcaReportRecord.plan_fingerprint == current_plan_fingerprint,
                 RcaReportRecord.approval_id == approval_record.id,
@@ -3060,8 +3073,16 @@ class IncidentRepository:
         await self._save_validation_observations(report, tenant_id=verified_tenant)
 
     async def _save_validation_observations(self, report: ResolutionReport, *, tenant_id: str) -> None:
-        observations = report.metadata.get("independent_validation_observations")
-        observations = observations if isinstance(observations, list) else []
+        observations = [
+            *(
+                report.metadata.get("pre_state_validation_observations")
+                if isinstance(report.metadata.get("pre_state_validation_observations"), list) else []
+            ),
+            *(
+                report.metadata.get("independent_validation_observations")
+                if isinstance(report.metadata.get("independent_validation_observations"), list) else []
+            ),
+        ]
         for observation in observations:
             if not isinstance(observation, dict):
                 continue
@@ -3077,6 +3098,9 @@ class IncidentRepository:
                 validator_id=self._require("validation.validator_id", observation.get("validator_id")),
                 connector_id=self._require("validation.connector_id", observation.get("connector_id")),
                 target_resource_id=self._require("validation.target_resource_id", observation.get("target_resource_id")),
+                phase=str(observation.get("phase") or "post_state"),
+                observation_window_start=self._parse_datetime(observation.get("observation_window_start")),
+                observation_window_end=self._parse_datetime(observation.get("observation_window_end")),
                 observed_at=observed_at, collected_at=utc_now(),
                 authoritative_source=self._require("validation.authoritative_source", observation.get("connector_id")),
                 result_checksum=self._require("validation.result_checksum", observation.get("result_checksum")),
@@ -3429,6 +3453,21 @@ class IncidentRepository:
     ) -> None:
         if await self.session.get(ContextSnapshotRecord, snapshot_id) is not None:
             return
+        previous = (
+            await self.session.execute(
+                select(ContextSnapshotRecord)
+                .where(
+                    ContextSnapshotRecord.tenant_id == tenant_id,
+                    ContextSnapshotRecord.incident_id == incident_id,
+                )
+                .order_by(
+                    ContextSnapshotRecord.snapshot_version.desc(),
+                    ContextSnapshotRecord.collected_at.desc(),
+                )
+                .with_for_update()
+                .limit(1)
+            )
+        ).scalar_one_or_none()
         self.session.add(
             ContextSnapshotRecord(
                 snapshot_id=snapshot_id,
@@ -3438,6 +3477,9 @@ class IncidentRepository:
                 alert_signature=self._require("context_snapshot.alert_signature", alert_signature),
                 subject_fingerprint=self._require("context_snapshot.subject_fingerprint", subject_fingerprint),
                 context_fingerprint=self._require("context_snapshot.context_fingerprint", context_fingerprint),
+                parent_snapshot_id=previous.snapshot_id if previous else None,
+                snapshot_stage="collected",
+                snapshot_version=int(previous.snapshot_version or 0) + 1 if previous else 1,
                 contract_version=contract_version or "kaiops.context.v2",
                 quality_score=max(0.0, min(float(quality_score), 1.0)),
                 reusable=bool(reusable),
@@ -3572,7 +3614,11 @@ class IncidentRepository:
             parent_snapshot_id=parent.snapshot_id, snapshot_stage="investigation_complete",
             snapshot_version=version, evidence_ids=evidence_ids,
             evidence_checksums=evidence_checksums, contract_version=parent.contract_version,
-            quality_score=parent.quality_score, reusable=False,
+            # Investigation adds an immutable report to the same evidence
+            # package; it does not make a reusable parent context unusable.
+            # Execution readiness remains governed independently by the RCA
+            # and plan gates.
+            quality_score=parent.quality_score, reusable=bool(parent.reusable),
             source_manifest=dict(parent.source_manifest or {}),
             payload={**context_payload, "metadata": metadata}, collected_at=datetime.now(UTC),
             expires_at=parent.expires_at,
@@ -3648,7 +3694,12 @@ class IncidentRepository:
             else {}
         )
         metadata = recommendation.get("metadata") if isinstance(recommendation.get("metadata"), dict) else {}
-        binding_record = await self.session.get(IncidentInvestigationBindingRecord, recommendation_uuid)
+        binding_record = (
+            await self.session.execute(select(IncidentInvestigationBindingRecord).where(
+                IncidentInvestigationBindingRecord.tenant_id == normalized_tenant_id,
+                IncidentInvestigationBindingRecord.recommendation_id == recommendation_uuid,
+            ))
+        ).scalar_one_or_none()
         if binding_record is None:
             reasons.append("recommendation predates the normalized investigation binding contract")
             return result("legacy_unbound", recommendation=recommendation)
@@ -3955,6 +4006,7 @@ class IncidentRepository:
         analysis_request_id: UUID | str, context_snapshot_id: UUID | str,
         context_fingerprint: str, recommendation_id: UUID | str, rca_version: int,
         evidence_ids: list[str], source_uris: list[str], lock: bool = False,
+        allow_snapshot_evidence: bool = False,
     ) -> IncidentInvestigationBindingRecord:
         tenant = require_tenant_id(tenant_id, source="evidence draft binding")
         identities = [self._parse_uuid(value) for value in (
@@ -4009,10 +4061,17 @@ class IncidentRepository:
             item for rows in (buckets.values() if isinstance(buckets, dict) else [])
             if isinstance(rows, list) for item in rows if isinstance(item, dict)
         ]
+        if allow_snapshot_evidence:
+            accepted_id_set = {
+                str(item.get("evidence_id") or item.get("id") or "").strip()
+                for item in evidence_rows
+                if str(item.get("evidence_id") or item.get("id") or "").strip()
+            }
         accepted_uri_set = {
             str(item.get(key)).strip() for item in evidence_rows
             if str(item.get("evidence_id") or item.get("id") or "").strip() in accepted_id_set
-            for key in ("uri", "source_uri", "path", "citation") if str(item.get(key) or "").strip()
+            for key in ("source_reference", "uri", "source_uri", "path", "citation")
+            if str(item.get(key) or "").strip()
         }
         requested_ids = {str(value).strip() for value in evidence_ids if str(value).strip()}
         requested_uris = {str(value).strip() for value in source_uris if str(value).strip()}
@@ -4023,6 +4082,7 @@ class IncidentRepository:
     async def create_evidence_rag_drafts(
         self, *, tenant_id: str, created_by: str, binding: dict[str, Any],
         documents: list[dict[str, str]], evidence_ids: list[str], source_uris: list[str],
+        allow_snapshot_evidence: bool = False,
     ) -> list[dict[str, Any]]:
         verified = await self._verified_draft_binding(
             tenant_id=tenant_id, incident_id=binding.get("incident_id"),
@@ -4032,6 +4092,7 @@ class IncidentRepository:
             recommendation_id=binding.get("recommendation_id"),
             rca_version=int(binding.get("rca_version") or 0),
             evidence_ids=evidence_ids, source_uris=source_uris,
+            allow_snapshot_evidence=allow_snapshot_evidence,
         )
         alert_uuid = self._parse_uuid(binding["alert_id"])
         results: list[dict[str, Any]] = []
@@ -4131,6 +4192,47 @@ class IncidentRepository:
             return None
         row = await self.session.get(EvidenceRagDraftRecord, parsed)
         return self._evidence_draft_payload(row)
+
+    async def revise_evidence_rag_draft(
+        self, *, tenant_id: str, draft_id: UUID | str, created_by: str,
+    ) -> dict[str, Any] | None:
+        parsed = self._parse_uuid(draft_id)
+        source = await self.session.get(EvidenceRagDraftRecord, parsed) if parsed else None
+        if source is None or source.tenant_id != tenant_id:
+            return None
+        if source.status not in ("approved_pending_index", "approved"):
+            raise RuntimeError("only published evidence can be revised as a new version")
+        existing = (await self.session.execute(select(EvidenceRagDraftRecord).where(
+            EvidenceRagDraftRecord.tenant_id == tenant_id,
+            EvidenceRagDraftRecord.alert_id == source.alert_id,
+            EvidenceRagDraftRecord.document_kind == source.document_kind,
+            EvidenceRagDraftRecord.document_version > source.document_version,
+            EvidenceRagDraftRecord.status.in_(("draft", "reviewed")),
+        ).order_by(EvidenceRagDraftRecord.document_version.desc()).limit(1))).scalar_one_or_none()
+        if existing is not None:
+            return self._evidence_draft_payload(existing)
+        latest = await self.session.scalar(select(func.max(EvidenceRagDraftRecord.document_version)).where(
+            EvidenceRagDraftRecord.tenant_id == tenant_id,
+            EvidenceRagDraftRecord.alert_id == source.alert_id,
+            EvidenceRagDraftRecord.document_kind == source.document_kind,
+        ))
+        now = datetime.now(UTC)
+        revision = EvidenceRagDraftRecord(
+            draft_id=uuid4(), tenant_id=source.tenant_id, project_id=source.project_id,
+            incident_id=source.incident_id, alert_id=source.alert_id,
+            analysis_request_id=source.analysis_request_id,
+            context_snapshot_id=source.context_snapshot_id,
+            context_fingerprint=source.context_fingerprint,
+            recommendation_id=source.recommendation_id, rca_version=source.rca_version,
+            document_kind=source.document_kind, document_version=int(latest or 0) + 1,
+            status="draft", title=source.title, content=source.content,
+            content_checksum=source.content_checksum, evidence_ids=list(source.evidence_ids or []),
+            source_uris=list(source.source_uris or []), owner_team=source.owner_team,
+            created_by=created_by, row_version=1, created_at=now, updated_at=now,
+        )
+        self.session.add(revision)
+        await self.session.flush()
+        return self._evidence_draft_payload(revision)
 
     async def approve_evidence_rag_draft(
         self, *, tenant_id: str, draft_id: UUID | str, expected_row_version: int,
@@ -4644,6 +4746,12 @@ class IncidentRepository:
             for item in bucket
             if isinstance(item, dict)
         ]
+
+        def contract_timestamp(value: Any) -> str | None:
+            parsed = IncidentRepository._parse_datetime(value)
+            normalized = _utc_dt(parsed)
+            return normalized.isoformat().replace("+00:00", "Z") if normalized else None
+
         sources = []
         for source_id, details in source_manifest.items():
             row = details if isinstance(details, dict) else {}
@@ -4657,7 +4765,9 @@ class IncidentRepository:
                 "failed": "unavailable",
             }
             status = status_aliases.get(raw_status, raw_status)
-            collected_at = row.get("collected_at") or context_snapshot.get("collected_at")
+            collected_at = contract_timestamp(
+                row.get("collected_at") or context_snapshot.get("collected_at")
+            )
             sources.append({
                 "source_id": str(source_id),
                 "category": str(row.get("category") or source_id),
@@ -4675,8 +4785,8 @@ class IncidentRepository:
             "project_id": item.get("project_id") or project_id,
             "service": item.get("service") or context.get("alert", {}).get("service") or "unknown",
             "resource_id": item.get("resource_id"),
-            "observed_at": item.get("observed_at"),
-            "collected_at": (
+            "observed_at": contract_timestamp(item.get("observed_at")),
+            "collected_at": contract_timestamp(
                 item.get("collected_at")
                 or (item.get("provenance") or {}).get("generated_at")
                 or context_snapshot.get("collected_at")
@@ -4796,8 +4906,8 @@ class IncidentRepository:
             "context_snapshot_id": context_snapshot.get("snapshot_id"),
             "context_fingerprint": context_snapshot.get("context_fingerprint"),
             "context_contract_version": context_snapshot.get("contract_version"),
-            "context_collected_at": context_snapshot.get("collected_at"),
-            "context_expires_at": context_snapshot.get("expires_at"),
+            "context_collected_at": contract_timestamp(context_snapshot.get("collected_at")),
+            "context_expires_at": contract_timestamp(context_snapshot.get("expires_at")),
             "context_quality": {
                 "evidence_count": len(evidence),
                 "category_coverage": float(
@@ -6366,7 +6476,7 @@ class IncidentRepository:
         status: str | None = None,
         service: str | None = None,
         inbox_view: str = "all",
-        record_type: str = "all",
+        record_type: str = "incidents",
         severity: str | None = None,
     ) -> dict[str, Any]:
         """Return a snapshot-consistent, database-filtered incident and alert feed."""
@@ -6452,6 +6562,12 @@ class IncidentRepository:
             .where(
                 IncidentCorrelationOwnershipRecord.tenant_id == tenant_id,
                 IncidentCorrelationOwnershipRecord.last_seen_at <= snapshot,
+                # The unified inbox is an operator action queue, not an alert
+                # history. Warning/info incidents remain available by direct
+                # incident lookup and in Live Alerts, but are not admitted here.
+                func.lower(func.coalesce(IncidentProjectionRecord.severity, "")).in_(
+                    ("high", "critical", "p1", "p2", "sev1", "sev2")
+                ),
             )
         )
         if normalized["project_id"]:
@@ -6498,6 +6614,14 @@ class IncidentRepository:
                 IncidentOccurrenceRecord.tenant_id == tenant_id,
                 IncidentOccurrenceRecord.occurrence_id == AlertRecord.id,
             ))),
+            # Legacy/partially migrated occurrence rows may lack the normalized
+            # occurrence-table record while still carrying an authoritative
+            # canonical incident binding in the alert payload. They are linked
+            # occurrences, not unlinked signals.
+            func.json_extract(
+                AlertRecord.payload,
+                "$.metadata.deduplication.canonical_incident_id",
+            ).is_(None),
         )
         if normalized["project_id"]:
             alert_query = alert_query.where(alert_project == normalized["project_id"])
@@ -6539,7 +6663,15 @@ class IncidentRepository:
                 return and_(is_incident, is_terminal)
             return literal(True)
 
-        total_count = int((await self.session.scalar(select(func.count()).select_from(candidates))) or 0)
+        record_count_rows = (await self.session.execute(
+            select(candidates.c.record_type, func.count().label("count"))
+            .select_from(candidates)
+            .group_by(candidates.c.record_type)
+        )).all()
+        record_counts = {"incidents": 0, "alerts": 0}
+        for record_type, count in record_count_rows:
+            record_counts[f"{record_type}s"] = int(count or 0)
+        total_count = sum(record_counts.values())
         view_counts = {
             view: int(
                 (await self.session.scalar(select(func.count()).select_from(candidates).where(view_clause(view))))
@@ -6630,6 +6762,7 @@ class IncidentRepository:
             "previous_cursor": None,
             "total_count": total_count,
             "filtered_count": total_count,
+            "record_counts": record_counts,
             "view_counts": view_counts,
             "snapshot_at": snapshot.isoformat(),
         }
@@ -8463,6 +8596,15 @@ class ContextEnrichmentRepository(EvaluationRepository):
         rows = (await self.session.execute(
             select(IncidentInvestigationBindingRecord).join(
                 IncidentRecord, IncidentRecord.id == IncidentInvestigationBindingRecord.incident_id,
+            ).join(
+                IncidentProjectionRecord,
+                and_(
+                    IncidentProjectionRecord.tenant_id == IncidentInvestigationBindingRecord.tenant_id,
+                    IncidentProjectionRecord.incident_id == IncidentInvestigationBindingRecord.incident_id,
+                    IncidentProjectionRecord.alert_id == IncidentInvestigationBindingRecord.alert_id,
+                    IncidentProjectionRecord.recommendation_id
+                    == IncidentInvestigationBindingRecord.recommendation_id,
+                ),
             ).where(
                 IncidentInvestigationBindingRecord.tenant_id == tenant,
                 IncidentRecord.status.notin_(["closed", "resolved", "cancelled", "canceled"]),
@@ -8475,7 +8617,14 @@ class ContextEnrichmentRepository(EvaluationRepository):
         for row in rows:
             latest.setdefault(row.incident_id, row)
         candidates: list[dict[str, Any]] = []
+        incident_repository = IncidentRepository(self.session)
         for binding in latest.values():
+            verified = await incident_repository.get_bound_incident_investigation(
+                tenant_id=tenant, incident_id=binding.incident_id,
+                alert_id=binding.alert_id, recommendation_id=binding.recommendation_id,
+            )
+            if not verified.get("investigation_integrity", {}).get("verified"):
+                continue
             incident = await self.session.get(IncidentRecord, binding.incident_id)
             audit = await self.session.get(AuditLogRecord, binding.recommendation_id)
             snapshot = await self.session.get(ContextSnapshotRecord, binding.context_snapshot_id)
@@ -8486,10 +8635,36 @@ class ContextEnrichmentRepository(EvaluationRepository):
             if not gaps:
                 continue
             context = dict(snapshot.payload or {}) if snapshot and isinstance(snapshot.payload, dict) else {}
+            context_metadata = context.get("metadata") if isinstance(context.get("metadata"), dict) else {}
+            evidence_buckets = context_metadata.get("context_evidence") or context.get("context_evidence") or {}
+            accepted_ids = metadata.get("evidence_ids")
+            if not isinstance(accepted_ids, list):
+                accepted_ids = analysis.get("evidence_used", [])
+            accepted_id_set = {str(value).strip() for value in accepted_ids if str(value).strip()}
+            accepted_evidence = [
+                item for bucket in (evidence_buckets.values() if isinstance(evidence_buckets, dict) else [])
+                if isinstance(bucket, list) for item in bucket
+                if isinstance(item, dict)
+                and str(item.get("evidence_id") or item.get("id") or "").strip() in accepted_id_set
+            ]
+            snapshot_evidence = [
+                item for bucket in (evidence_buckets.values() if isinstance(evidence_buckets, dict) else [])
+                if isinstance(bucket, list) for item in bucket if isinstance(item, dict)
+            ]
             candidates.append({
                 "incident_id": str(binding.incident_id), "rca_version": binding.rca_version,
                 "alert_id": str(binding.alert_id), "gaps": gaps, "context": context,
                 "incident": dict(incident.payload or {}) if incident and isinstance(incident.payload, dict) else {},
+                "binding": {
+                    "incident_id": str(binding.incident_id), "alert_id": str(binding.alert_id),
+                    "analysis_request_id": str(binding.analysis_request_id),
+                    "context_snapshot_id": str(binding.context_snapshot_id),
+                    "context_fingerprint": binding.context_fingerprint,
+                    "recommendation_id": str(binding.recommendation_id),
+                    "rca_version": binding.rca_version,
+                },
+                "accepted_evidence": accepted_evidence,
+                "snapshot_evidence": snapshot_evidence,
             })
         return candidates
 
@@ -8566,9 +8741,26 @@ class ContextEnrichmentRepository(EvaluationRepository):
             idempotency_key=key, query_payload=dict(query_payload), observation_start=observation_start,
             observation_end=observation_end, status="scheduled", attempt_count=0,
         )
-        self.session.add(row)
-        await self.session.flush()
-        return row
+        try:
+            async with self.session.begin_nested():
+                self.session.add(row)
+                await self.session.flush()
+            requirement = await self.session.get(
+                ContextEvidenceRequirementRecord, self._to_uuid(requirement_id),
+            )
+            if requirement is not None and requirement.tenant_id == tenant:
+                requirement.status = "scheduled"
+                requirement.retry_after = None
+                requirement.version = int(requirement.version or 0) + 1
+            return row
+        except IntegrityError:
+            existing = (await self.session.execute(select(ContextEnrichmentJobRecord).where(
+                ContextEnrichmentJobRecord.tenant_id == tenant,
+                ContextEnrichmentJobRecord.idempotency_key == key,
+            ))).scalar_one_or_none()
+            if existing is None:
+                raise RuntimeError("concurrent enrichment job scheduling could not be resolved") from None
+            return existing
 
     async def claim_context_enrichment_jobs(
         self, *, worker_id: str, limit: int = 10, lease_seconds: int = 120,
@@ -8606,6 +8798,8 @@ class ContextEnrichmentRepository(EvaluationRepository):
                 "requirement_id": str(row.requirement_id),
                 "connector_id": row.connector_id, "attempt_count": row.attempt_count,
                 "query_payload": dict(row.query_payload or {}),
+                "observation_start": row.observation_start,
+                "observation_end": row.observation_end,
                 "lease_owner": owner, "lease_expires_at": lease_expires_at,
             })
         await self.session.flush()
@@ -8713,8 +8907,10 @@ class ContextEnrichmentRepository(EvaluationRepository):
             snapshot_payload, sort_keys=True, separators=(",", ":"), default=str,
         ).encode()).hexdigest()
         snapshot_id = uuid5(NAMESPACE_URL, f"kaims:enriched-snapshot:{job.incident_id}:{evidence_digest}")
+        analysis_request_id = uuid5(NAMESPACE_URL, f"kaims:enriched-analysis:{snapshot_id}")
         metadata.update({"context_snapshot_id": str(snapshot_id), "context_fingerprint": context_fingerprint,
-                         "evidence_ids": evidence_ids, "evidence_set_digest": evidence_digest})
+                         "evidence_ids": evidence_ids, "evidence_set_digest": evidence_digest,
+                         "analysis_request_id": str(analysis_request_id)})
         snapshot = await self.session.get(ContextSnapshotRecord, snapshot_id)
         if snapshot is None:
             previous_expiry = previous.expires_at
@@ -8745,7 +8941,8 @@ class ContextEnrichmentRepository(EvaluationRepository):
             "context": context_payload,
             "incident": dict(job.query_payload.get("incident") or {}),
             "decision": {**dict(job.query_payload.get("decision") or {}),
-                         "context_snapshot_id": str(snapshot_id), "evidence_set_digest": evidence_digest},
+                         "context_snapshot_id": str(snapshot_id), "evidence_set_digest": evidence_digest,
+                         "analysis_request_id": str(analysis_request_id)},
             "transport": "outbox", "event_contract": {"event_id": event_id},
         }
         if await self.session.get(ResolutionOutboxRecord, event_id) is None:
@@ -8800,6 +8997,23 @@ class ContextEnrichmentRepository(EvaluationRepository):
                 IncidentInvestigationBindingRecord.binding_id.desc(),
             ).limit(1)
         )
+        bound_snapshot = (
+            await self.session.get(ContextSnapshotRecord, binding.context_snapshot_id)
+            if binding is not None else None
+        )
+        if (
+            binding is not None
+            and bound_snapshot is not None
+            and snapshot is not None
+            and snapshot.snapshot_stage == "investigation_complete"
+            and snapshot.snapshot_id != binding.context_snapshot_id
+        ):
+            # A final investigation snapshot is only canonical once its
+            # immutable recommendation binding commits. A retried/redelivered
+            # analysis can persist another final snapshot before its binding
+            # loses an idempotency race; treating that orphan as "latest
+            # context" immediately makes the valid RCA appear stale.
+            snapshot = bound_snapshot
         recommendation = await self.session.get(AuditLogRecord, binding.recommendation_id) if binding else None
         recommendation_payload = (
             dict(recommendation.payload or {})
@@ -8809,6 +9023,38 @@ class ContextEnrichmentRepository(EvaluationRepository):
             recommendation_payload.get("metadata")
             if isinstance(recommendation_payload.get("metadata"), dict) else {}
         )
+        iterative_investigation = (
+            recommendation_metadata.get("iterative_investigation")
+            if isinstance(recommendation_metadata.get("iterative_investigation"), dict) else {}
+        )
+        typed_rca_result = (
+            iterative_investigation.get("rca_result")
+            if isinstance(iterative_investigation.get("rca_result"), dict) else {}
+        )
+        typed_claims = [
+            dict(claim) for claim in typed_rca_result.get("claims", [])
+            if isinstance(claim, dict)
+        ]
+        causal_claim = next((
+            claim for claim in typed_claims if str(claim.get("kind") or "").upper() == "CAUSAL"
+        ), None)
+        impact_claim = next((
+            claim for claim in typed_claims if str(claim.get("kind") or "").upper() == "IMPACT"
+        ), None)
+        execution_plan_record = (
+            await self.session.get(ExecutionPlanRecord, binding.resolution_plan_id)
+            if binding and binding.resolution_plan_id else None
+        )
+        governed_plan = (
+            dict(execution_plan_record.plan_payload or {})
+            if execution_plan_record is not None and isinstance(execution_plan_record.plan_payload, dict)
+            else {}
+        )
+        governed_actions = governed_plan.get("actions") if isinstance(governed_plan.get("actions"), list) else []
+        governed_action = governed_actions[0] if len(governed_actions) == 1 and isinstance(governed_actions[0], dict) else {}
+        governed_safety = governed_action.get("safety_binding") if isinstance(governed_action.get("safety_binding"), dict) else {}
+        governed_capability = governed_safety.get("capability") if isinstance(governed_safety.get("capability"), dict) else {}
+        governed_credential = governed_safety.get("credential") if isinstance(governed_safety.get("credential"), dict) else {}
         analysis = (
             recommendation_metadata.get("rca_analysis")
             if isinstance(recommendation_metadata.get("rca_analysis"), dict) else {}
@@ -8824,6 +9070,44 @@ class ContextEnrichmentRepository(EvaluationRepository):
                 ApprovalRecord.recommendation_id == binding.recommendation_id,
             ).order_by(ApprovalRecord.updated_at.desc(), ApprovalRecord.id.desc()).limit(1)
         ) if binding else None
+        action = await self.session.scalar(
+            select(ActionRecord).where(
+                ActionRecord.tenant_id == tenant,
+                ActionRecord.incident_id == incident_uuid,
+                ActionRecord.recommendation_id == binding.recommendation_id,
+                ActionRecord.resolution_plan_id == binding.resolution_plan_id,
+                ActionRecord.plan_fingerprint == binding.plan_fingerprint,
+                ActionRecord.approval_id == approval.id,
+            ).order_by(ActionRecord.updated_at.desc(), ActionRecord.id.desc()).limit(1)
+        ) if binding and approval and binding.resolution_plan_id and binding.plan_fingerprint else None
+        report = await self.session.scalar(
+            select(RcaReportRecord).where(
+                RcaReportRecord.tenant_id == tenant,
+                RcaReportRecord.incident_id == incident_uuid,
+                RcaReportRecord.recommendation_id == binding.recommendation_id,
+                RcaReportRecord.resolution_plan_id == binding.resolution_plan_id,
+                RcaReportRecord.plan_fingerprint == binding.plan_fingerprint,
+                RcaReportRecord.approval_id == approval.id,
+                RcaReportRecord.remediation_action_id == action.id,
+            ).order_by(RcaReportRecord.updated_at.desc(), RcaReportRecord.id.desc()).limit(1)
+        ) if binding and approval and action else None
+        report_payload = dict(report.payload or {}) if report and isinstance(report.payload, dict) else {}
+        report_metadata = report_payload.get("metadata") if isinstance(report_payload.get("metadata"), dict) else {}
+        pre_state_observations = (
+            report_metadata.get("pre_state_validation_observations")
+            if isinstance(report_metadata.get("pre_state_validation_observations"), list) else []
+        )
+        post_state_observations = (
+            report_metadata.get("independent_validation_observations")
+            if isinstance(report_metadata.get("independent_validation_observations"), list) else []
+        )
+        knowledge_draft = await self.session.scalar(select(KnowledgeRagDraftRecord).where(
+            KnowledgeRagDraftRecord.tenant_id == tenant,
+            KnowledgeRagDraftRecord.source_ref == f"report://{report.id}",
+        ).order_by(
+            KnowledgeRagDraftRecord.document_version.desc(),
+            KnowledgeRagDraftRecord.updated_at.desc(),
+        ).limit(1)) if report else None
 
         requirements = await self.list_context_evidence_requirements(
             tenant_id=tenant, incident_id=incident_uuid,
@@ -8916,10 +9200,65 @@ class ContextEnrichmentRepository(EvaluationRepository):
                     },
                 }.get(persisted_state, next_action)
 
-        resolution_ready = lifecycle_state == "RCA_READY" and bool(quality.get("passed"))
-        blocked_reasons = list(quality.get("blocking_reasons") or analysis.get("missing_evidence") or [])
-        accepted_evidence_ids = list(binding.evidence_ids or []) if binding else []
+        rca_ready = lifecycle_state == "RCA_READY" and bool(quality.get("passed"))
+        governed_plan_ready = bool(
+            governed_plan.get("execution_ready") is True
+            and governed_plan.get("mutating") is True
+            and governed_plan.get("plan_fingerprint")
+            and verify_plan_fingerprint(governed_plan)
+            and governed_action
+            and governed_capability.get("capability_id")
+        )
+        resolution_ready = rca_ready and governed_plan_ready
+        raw_blocked_reasons = list(quality.get("blocking_reasons") or analysis.get("missing_evidence") or [])
+        blocked_reasons = [
+            str(reason.get("reason") or reason.get("question") or reason.get("category") or "EVIDENCE_REQUIRED")
+            if isinstance(reason, dict) else str(reason)
+            for reason in raw_blocked_reasons
+            if reason
+        ]
+        if binding is None:
+            blocked_reasons = ["RCA_NOT_READY"]
+        if not rca_ready and not blocked_reasons:
+            blocked_reasons.append("RCA_NOT_GROUNDED")
+        if binding is not None and not governed_plan_ready:
+            blocked_reasons.extend(
+                str(reason) for reason in governed_plan.get("readiness_blocks", []) if str(reason).strip()
+            )
+            if not governed_plan:
+                blocked_reasons.append("GOVERNED_EXECUTION_PLAN_NOT_PUBLISHED")
+            elif not governed_capability.get("capability_id"):
+                blocked_reasons.append("REGISTERED_CAPABILITY_NOT_BOUND")
+            elif not verify_plan_fingerprint(governed_plan):
+                blocked_reasons.append("EXECUTION_PLAN_FINGERPRINT_INVALID")
+        blocked_reasons = list(dict.fromkeys(blocked_reasons))
+        analysis_evidence_ids = (
+            analysis.get("evidence_used")
+            if isinstance(analysis.get("evidence_used"), list)
+            else None
+        )
+        # Prefer the recommendation's explicit RCA citations. Older bindings
+        # incorrectly stored the entire snapshot evidence set, which made
+        # collected context appear to be accepted RCA proof.
+        accepted_evidence_ids = list(dict.fromkeys(
+            str(value) for value in (
+                analysis_evidence_ids
+                if analysis_evidence_ids is not None
+                else list(binding.evidence_ids or []) if binding else []
+            )
+            if str(value).strip()
+        ))
         accepted_evidence_set = set(accepted_evidence_ids)
+        workspace_snapshot = bound_snapshot or snapshot
+        workspace_evidence_ids = list(workspace_snapshot.evidence_ids or []) if workspace_snapshot else []
+        workspace_evidence_rows = (
+            (await self.session.execute(select(CanonicalEvidenceRecord).where(
+                CanonicalEvidenceRecord.tenant_id == tenant,
+                CanonicalEvidenceRecord.incident_id == incident_uuid,
+                CanonicalEvidenceRecord.evidence_id.in_(workspace_evidence_ids),
+            ).order_by(CanonicalEvidenceRecord.category, CanonicalEvidenceRecord.evidence_id))).scalars().all()
+            if workspace_evidence_ids else []
+        )
         workspace_evidence = [{
             "evidence_id": row.evidence_id,
             "category": row.category,
@@ -8932,21 +9271,73 @@ class ContextEnrichmentRepository(EvaluationRepository):
             "current_observation": bool(row.current_observation),
             "accepted_for_rca": row.evidence_id in accepted_evidence_set,
             "contradiction_status": row.contradiction_status,
-        } for row in evidence_rows]
+        } for row in workspace_evidence_rows]
+        represented_evidence_ids = {row["evidence_id"] for row in workspace_evidence}
+        workspace_snapshot_payload = (
+            dict(workspace_snapshot.payload or {})
+            if workspace_snapshot and isinstance(workspace_snapshot.payload, dict) else {}
+        )
+        workspace_snapshot_metadata = (
+            workspace_snapshot_payload.get("metadata")
+            if isinstance(workspace_snapshot_payload.get("metadata"), dict) else {}
+        )
+        snapshot_buckets = (
+            workspace_snapshot_metadata.get("context_evidence")
+            or workspace_snapshot_payload.get("context_evidence") or {}
+        )
+        for category, rows in snapshot_buckets.items() if isinstance(snapshot_buckets, dict) else []:
+            for item in rows if isinstance(rows, list) else []:
+                if not isinstance(item, dict):
+                    continue
+                evidence_id = str(item.get("evidence_id") or item.get("id") or "").strip()
+                if not evidence_id or evidence_id in represented_evidence_ids:
+                    continue
+                workspace_evidence.append({
+                    "evidence_id": evidence_id,
+                    "category": str(item.get("category") or category),
+                    "source_id": str(item.get("source_id") or item.get("source") or "snapshot"),
+                    "connector": str(item.get("connector") or item.get("provider") or "snapshot"),
+                    "citation": str(item.get("source_reference") or item.get("citation") or item.get("uri") or ""),
+                    "freshness": str(item.get("freshness") or "snapshot"),
+                    "observed_at": item.get("observed_at") or item.get("timestamp"),
+                    "collected_at": item.get("collected_at") or workspace_snapshot.collected_at,
+                    "current_observation": bool(item.get("current_observation", False)),
+                    "accepted_for_rca": evidence_id in accepted_evidence_set,
+                    "contradiction_status": str(item.get("contradiction_status") or "none"),
+                })
+                represented_evidence_ids.add(evidence_id)
         traceable_citation_count = sum(
             1 for row in workspace_evidence
             if row["accepted_for_rca"] and is_traceable_evidence_citation(row["citation"])
         )
+        represented_evidence_set = {row["evidence_id"] for row in workspace_evidence}
+        resolved_accepted_evidence_ids = [
+            evidence_id for evidence_id in accepted_evidence_ids
+            if evidence_id in represented_evidence_set
+        ]
+        unresolved_accepted_evidence_ids = [
+            evidence_id for evidence_id in accepted_evidence_ids
+            if evidence_id not in represented_evidence_set
+        ]
         hypothesis = str(
-            analysis.get("root_cause") or analysis.get("leading_hypothesis")
+            (causal_claim or {}).get("statement")
+            or analysis.get("root_cause") or analysis.get("leading_hypothesis")
             or recommendation_payload.get("root_cause") or ""
         ).strip()
         investigation_status = str(binding.status).lower() if binding else "not_started"
+        analysis_missing = list(analysis.get("missing_evidence") or [])
+        analysis_conflicts = list(analysis.get("conflicting_evidence") or [])
         grounded = investigation_status in {"grounded", "conclusive"} and bool(
-            accepted_evidence_ids and traceable_citation_count
+            resolved_accepted_evidence_ids
+            and traceable_citation_count == len(resolved_accepted_evidence_ids)
+            and not unresolved_accepted_evidence_ids
+            and not analysis_missing
+            and not analysis_conflicts
+            and not unresolved
         )
         impact_statement = str(
-            analysis.get("customer_impact") or analysis.get("business_impact")
+            (impact_claim or {}).get("statement")
+            or analysis.get("customer_impact") or analysis.get("business_impact")
             or recommendation_payload.get("customer_impact") or recommendation_payload.get("business_impact")
             or ""
         ).strip()
@@ -8993,12 +9384,64 @@ class ContextEnrichmentRepository(EvaluationRepository):
                 "readiness": quality,
                 "recommendation_version": str(binding.recommendation_id) if binding else None,
                 "plan_version": str(binding.resolution_plan_id) if binding and binding.resolution_plan_id else None,
+                "catalog_operation_id": governed_capability.get("operation"),
+                "capability_id": governed_capability.get("capability_id"),
+                "connector_id": governed_action.get("connector_id") or governed_plan.get("connector_id"),
+                "target_resource_id": governed_action.get("target_resource_id") or governed_plan.get("remediation_target"),
+                "credential_bound": bool(str(governed_credential.get("reference") or "").strip()),
+                "rollback_bound": bool(governed_action.get("rollback_action") or governed_plan.get("rollback")),
+                "policy_decision": dict(governed_plan.get("policy_decision") or {}),
+                "plan_fingerprint": governed_plan.get("plan_fingerprint"),
+                "rca_version": governed_plan.get("rca_version"),
+                "evidence_snapshot_id": governed_plan.get("evidence_snapshot_id"),
             },
             "approval": {
+                "approval_id": str(approval.id) if approval else None,
+                "incident_id": str(approval.incident_id) if approval else str(incident_uuid),
+                "recommendation_id": str(approval.recommendation_id) if approval else (
+                    str(binding.recommendation_id) if binding else None
+                ),
+                "plan_id": str(approval.plan_id) if approval and approval.plan_id else None,
+                "plan_fingerprint": approval.plan_fingerprint if approval else None,
                 "status": str(approval.decision).lower() if approval else "not_requested",
+                "approver": approval.approver if approval else None,
+                "approver_role": approval.approver_role if approval else None,
+                "expires_at": approval.approval_expires_at if approval else None,
+                "updated_at": approval.updated_at if approval else None,
                 "blocked_reasons": (
                     [] if approval or resolution_ready else blocked_reasons or ["RCA_NOT_READY"]
                 ),
+            },
+            "execution": {
+                "action_id": str(action.id) if action else None,
+                "status": str(action.status).lower() if action else "not_started",
+                "action_type": action.action_type if action else None,
+                "target": action.target if action else None,
+                "recommendation_id": str(action.recommendation_id) if action and action.recommendation_id else None,
+                "plan_id": str(action.resolution_plan_id) if action and action.resolution_plan_id else None,
+                "plan_fingerprint": action.plan_fingerprint if action else None,
+                "approval_id": str(action.approval_id) if action and action.approval_id else None,
+                "updated_at": action.updated_at if action else None,
+            },
+            "validation": {
+                "report_id": str(report.id) if report else None,
+                "status": str(report.closure_status).lower() if report and report.closure_status else "not_started",
+                "closure_kind": report.closure_kind if report else None,
+                "validation_checksum": report.validation_checksum if report else None,
+                "action_id": str(report.remediation_action_id) if report and report.remediation_action_id else None,
+                "health_restored": bool((report.payload or {}).get("health_restored")) if report else False,
+                "alerts_cleared": bool((report.payload or {}).get("alerts_cleared")) if report else False,
+                "details": {
+                    **report_payload,
+                    "pre_state": pre_state_observations,
+                    "post_state": post_state_observations,
+                } if report else {},
+                "pre_state_observations": pre_state_observations,
+                "post_state_observations": post_state_observations,
+                "observation_window": dict(report_metadata.get("stability_window") or {}),
+                "outcome_decision": dict(report_metadata.get("outcome_validation") or {}),
+                "knowledge_draft": self._knowledge_draft_payload(knowledge_draft) if knowledge_draft else None,
+                "updated_at": report.updated_at if report else None,
             },
             "next_action": next_action,
             "investigation_workspace": {
@@ -9010,31 +9453,56 @@ class ContextEnrichmentRepository(EvaluationRepository):
                     "snapshot_id": str(binding.context_snapshot_id) if binding else None,
                     "context_snapshot_id": str(binding.context_snapshot_id) if binding else None,
                     "context_fingerprint": str(binding.context_fingerprint) if binding else None,
-                    "snapshot_version": int(snapshot.snapshot_version) if snapshot else 0,
+                    "snapshot_version": int(workspace_snapshot.snapshot_version) if workspace_snapshot else 0,
                     "investigation_id": str(binding.investigation_id) if binding and binding.investigation_id else None,
                     "rca_version": int(binding.rca_version) if binding else 0,
                     "recommendation_id": str(binding.recommendation_id) if binding else None,
                 },
                 "impact": {
-                    "status": "established" if impact_statement else "not_established",
+                    "status": str((impact_claim or {}).get("status") or (
+                        "established" if impact_statement else "not_established"
+                    )).lower(),
                     "statement": impact_statement or None,
+                    "claim": impact_claim,
                 },
                 "rca": {
-                    "status": "grounded" if grounded else investigation_status,
+                    "status": str((causal_claim or {}).get("status") or (
+                        "grounded" if grounded else investigation_status
+                    )).lower(),
                     "hypothesis": hypothesis or None,
                     "confidence": float(recommendation_payload.get("confidence") or 0.0),
                     "accepted_evidence_ids": accepted_evidence_ids,
+                    "resolved_evidence_ids": resolved_accepted_evidence_ids,
+                    "unresolved_evidence_ids": unresolved_accepted_evidence_ids,
                     "traceable_citation_count": traceable_citation_count,
                     "missing_evidence": list(analysis.get("missing_evidence") or []),
                     "conflicting_evidence": list(analysis.get("conflicting_evidence") or []),
+                    "claims": typed_claims,
                 },
                 "evidence": workspace_evidence,
+                "evidence_summary": {
+                    "latest_context_records": len(snapshot.evidence_ids or []) if snapshot else 0,
+                    "bound_snapshot_records": len(workspace_evidence),
+                    "rca_bound_records": len(resolved_accepted_evidence_ids),
+                    "traceable_citations": traceable_citation_count,
+                    "unresolved_bindings": len(unresolved_accepted_evidence_ids),
+                },
                 "requirements": requirement_projection,
                 "resolution": {
                     "status": "ready" if resolution_ready and grounded else "blocked",
                     "recommendation_id": str(binding.recommendation_id) if binding else None,
                     "plan_id": str(binding.resolution_plan_id) if binding and binding.resolution_plan_id else None,
                     "blocking_reasons": [] if resolution_ready and grounded else blocked_reasons or ["RCA_NOT_GROUNDED"],
+                    "catalog_operation_id": governed_capability.get("operation"),
+                    "capability_id": governed_capability.get("capability_id"),
+                    "connector_id": governed_action.get("connector_id") or governed_plan.get("connector_id"),
+                    "target_resource_id": governed_action.get("target_resource_id") or governed_plan.get("remediation_target"),
+                    "credential_bound": bool(str(governed_credential.get("reference") or "").strip()),
+                    "rollback_bound": bool(governed_action.get("rollback_action") or governed_plan.get("rollback")),
+                    "policy_decision": dict(governed_plan.get("policy_decision") or {}),
+                    "plan_fingerprint": governed_plan.get("plan_fingerprint"),
+                    "rca_version": governed_plan.get("rca_version"),
+                    "evidence_snapshot_id": governed_plan.get("evidence_snapshot_id"),
                 },
                 "operator_review": {
                     "required": not grounded,
@@ -9233,7 +9701,7 @@ class ContextEnrichmentRepository(EvaluationRepository):
         self, *, job_id: UUID | str, worker_id: str, collected: bool, error: str | None = None,
         retry_after_seconds: int = 60, maximum_attempts: int = 4,
         evidence_ids: list[str] | None = None,
-    ) -> None:
+    ) -> str:
         row = await self.session.get(ContextEnrichmentJobRecord, self._to_uuid(job_id))
         if row is None:
             raise LookupError("context enrichment job not found")
@@ -9269,6 +9737,7 @@ class ContextEnrichmentRepository(EvaluationRepository):
         row.lease_owner = None
         row.lease_expires_at = None
         await self.session.flush()
+        return row.status
 
     async def enqueue_resolution_event(
         self,
@@ -9402,7 +9871,11 @@ class ContextEnrichmentRepository(EvaluationRepository):
             HumanEvidenceRequestRecord.status == "pending",
             HumanEvidenceRequestRecord.expected_responder.is_not(None),
             or_(
-                HumanEvidenceRequestRecord.jira_sync_status.in_(("pending", "failed")),
+                HumanEvidenceRequestRecord.jira_sync_status == "pending",
+                and_(
+                    HumanEvidenceRequestRecord.jira_sync_status == "failed",
+                    HumanEvidenceRequestRecord.updated_at < now - timedelta(minutes=5),
+                ),
                 and_(
                     HumanEvidenceRequestRecord.jira_sync_status == "syncing",
                     HumanEvidenceRequestRecord.updated_at < now - timedelta(minutes=5),
@@ -9528,6 +10001,13 @@ class ContextEnrichmentRepository(EvaluationRepository):
         if request is None:
             raise LookupError("human evidence request not found")
         responder = self._require("responder_id", response.get("responder_id"))
+        manual_claim = bool(response.get("allow_manual_claim"))
+        if (not request.expected_responder or request.status == "assignment_blocked") and manual_claim:
+            request.expected_responder = responder
+            request.assignment_source = "authenticated-operator-manual-claim"
+            request.assignment_failure_reason = None
+            request.status = "pending"
+            request.version += 1
         if not request.expected_responder or request.status == "assignment_blocked":
             raise ValueError("human evidence request has no authorized responder")
         if responder.casefold() != request.expected_responder.casefold():
@@ -9575,6 +10055,8 @@ class ContextEnrichmentRepository(EvaluationRepository):
                 content=content, provenance={
                     "responder_id": responder, "request_id": str(request.request_id),
                     "retrieval": "authenticated-human-submission",
+                    "manual_claim": manual_claim,
+                    "responder_role": str(response.get("responder_role") or ""),
                 }, current_observation=True, contradiction_status=None,
                 content_digest=hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest(),
             ))

@@ -22,7 +22,11 @@ from ai_workbench_common.agentic import AgentContext, BaseAgent
 from ai_workbench_common.embeddings import cosine_similarity, describe_embedding_model, get_embedding_model
 from ai_workbench_common.models import Context
 from common.config import get_settings
-from common.context_enrichment_contract import EnrichmentResult, EvidenceRequirement
+from common.context_enrichment_contract import (
+    EnrichmentResult,
+    EvidenceRequirement,
+    next_authorized_enrichment_connector,
+)
 from common.models import Alert, Incident
 from common.rag_governance import production_retrievable, retrieval_allowed
 from common.resilience import retry_async
@@ -57,9 +61,9 @@ async def execute_enrichment_plan(
         if requirement.collection_mode == "human_required":
             human.append(requirement.requirement_id)
             continue
-        connector = next(
-            (name for name in requirement.candidate_connectors if name in authorized),
-            None,
+        connector = next_authorized_enrichment_connector(
+            candidate_connectors=requirement.candidate_connectors,
+            authorized_connectors=authorized,
         )
         if connector is None:
             human.append(requirement.requirement_id)
@@ -463,6 +467,7 @@ class DiscoveryMCPConnector(BaseConnector):
         "code.search",
         "mysql.search",
         "telemetry.search",
+        "traces.search",
     )
 
     def __init__(self) -> None:
@@ -608,6 +613,20 @@ class DiscoveryMCPConnector(BaseConnector):
         selected: set[str] = set()
         reasons: list[str] = []
 
+        requirement_category = str(metadata.get("context_requirement_category") or "").strip().lower()
+        targeted_tools = {
+            "metrics": "telemetry.search",
+            "logs": "logs.search",
+            "traces": "traces.search",
+            "database": "mysql.search",
+            "ticket": "tickets.search",
+            "source_code": "code.search",
+            "deployment": "code.search",
+            "change": "code.search",
+        }
+        if requirement_category in targeted_tools:
+            return [targeted_tools[requirement_category]], ["evidence_requirement"]
+
         if source in {"prometheus", "grafana", "azure-monitor", "datadog", "newrelic", "otel", "opentelemetry"}:
             selected.add("telemetry.search")
             reasons.append("metric_or_trace_signal")
@@ -668,6 +687,7 @@ class DiscoveryMCPConnector(BaseConnector):
                 "database": "mysql.search",
                 "mysql": "mysql.search",
                 "telemetry": "telemetry.search",
+                "traces": "traces.search",
             }
             explicit = {
                 aliases.get(str(item).strip().lower(), str(item).strip().lower())
@@ -782,6 +802,9 @@ class DiscoveryMCPConnector(BaseConnector):
             "application": str(alert.labels.get("application") or ""),
             "project": str(alert.labels.get("project") or ""),
             "environment": alert.environment,
+            "operation": str(alert.labels.get("operation") or alert.metadata.get("operation") or ""),
+            "start_time": str(alert.metadata.get("context_observation_start") or ""),
+            "end_time": str(alert.metadata.get("context_observation_end") or ""),
         }
         response = await client.post(
             self.mcp_url,
@@ -1087,6 +1110,7 @@ class DiscoveryMCPConnector(BaseConnector):
             ),
         ]
         evidence_by_tool: dict[str, list[dict[str, Any]]] = {}
+        evidence_gaps: list[str] = []
         client: httpx.AsyncClient | None = None
         try:
             client, mcp_proxy_policy = self._build_client(self.mcp_url)
@@ -1109,6 +1133,9 @@ class DiscoveryMCPConnector(BaseConnector):
                     continue
                 rows = result.get("evidence", []) if isinstance(result.get("evidence"), list) else []
                 evidence_by_tool[tool] = [row for row in rows if isinstance(row, dict)]
+                evidence_gap = str(result.get("evidence_gap") or "").strip()
+                if evidence_gap:
+                    evidence_gaps.append(evidence_gap)
                 provider_status = str(result.get("provider_status") or "completed")
                 stages.append(
                     {
@@ -1231,6 +1258,7 @@ class DiscoveryMCPConnector(BaseConnector):
                 "reasons": routing_reasons,
             },
             "evidence": deduped,
+            "evidence_gap": evidence_gaps[0] if evidence_gaps and not deduped else "",
             "report": report,
             "detected_errors": detected_errors,
             "retrieval_stages": stages,
@@ -1529,6 +1557,7 @@ class VectorDBConnector(BaseConnector):
         return {
             "matches": ranked,
             "document_count": len(self.documents),
+            "evidence_gap": "" if ranked else "NO_MATCHING_APPROVED_EVIDENCE",
             "knowledge_graph": self._knowledge_graph.context(str(alert.service or "").strip()),
         }
 

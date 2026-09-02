@@ -210,7 +210,10 @@ def plan_connectors(alert: Any, available: list[str]) -> tuple[list[str], list[s
         or any(str(labels.get(key) or metadata.get(key) or "").strip() for key in ("cluster", "namespace", "pod", "container"))
     )
     has_local_evidence_signal = has_change_signal or bool(
-        re.search(r"\b(exception|stack|traceback|error|failed|failure|crash|source|code|log)\b", haystack)
+        re.search(
+            r"\b(exception|stack|traceback|error|failed|failure|crash|source|code|log|latency|timeout|5xx|availability|down)\b",
+            haystack,
+        )
     )
     if has_change_signal:
         selected.update(name for name in ("jenkins", "github", "servicenow") if name in names)
@@ -275,6 +278,8 @@ def _normalise_row(
     observed_at = _as_utc(observed_value, collected_at)
     retrieved_at = _as_utc(public.get("retrieved_at"), collected_at)
     age_seconds = max(0.0, (now - observed_at).total_seconds())
+    alert_started_at = _as_utc(context.alert.starts_at or context.alert.created_at, collected_at)
+    incident_window_aligned = abs((observed_at - alert_started_at).total_seconds()) <= 20 * 60
     ttl_seconds = int(policy["ttl_seconds"])
     freshness_score = max(0.0, min(1.0, 1.0 - (age_seconds / max(1, ttl_seconds))))
     if observed_at_inferred and source in {"logs", "telemetry", "database", "deployments", "changes", "tickets"}:
@@ -318,6 +323,7 @@ def _normalise_row(
             "retrieved_at": retrieved_at.isoformat(),
             "observation_window": public.get("observation_window"),
             "age_seconds": round(age_seconds, 3),
+            "incident_window_aligned": incident_window_aligned,
             "ttl_seconds": ttl_seconds,
             "freshness_score": round(freshness_score, 4),
             "freshness": "Fresh" if freshness_score > 0 else "Stale",
@@ -381,12 +387,14 @@ def assess_context(context: Context, *, now: datetime | None = None, threshold: 
     weights = {"identity": 0.15, "signal": 0.35, "topology": 0.15, "causal": 0.20, "action": 0.15}
     coverage = sum(weights[name] for name, available in present.items() if available)
     severity = str(getattr(context.alert.severity, "value", context.alert.severity) or "warning").lower()
+    # A context snapshot is usable when it identifies the subject and carries
+    # a real signal.  Causal/action evidence determines RCA and execution
+    # readiness; it must not make otherwise valid observations look unusable.
     required = ["identity", "signal"]
-    if severity in {"critical", "high"}:
-        required.append("causal_or_action")
-    missing_required = [name for name in required if name != "causal_or_action" and not present.get(name)]
-    if "causal_or_action" in required and not (present["causal"] or present["action"]):
-        missing_required.append("causal_or_action")
+    missing_required = [name for name in required if not present.get(name)]
+    diagnostic_gaps: list[str] = []
+    if severity in {"critical", "high"} and not (present["causal"] or present["action"]):
+        diagnostic_gaps.append("causal_or_action")
     if discovery_degraded and "discovery_evidence" not in missing_required:
         missing_required.append("discovery_evidence")
     missing = [name for name, available in present.items() if not available]
@@ -418,6 +426,7 @@ def assess_context(context: Context, *, now: datetime | None = None, threshold: 
             canonical_source(row.get("source"))
             for row in all_rows
             if _clamp(row.get("freshness_score")) <= 0.0
+            and not bool(row.get("incident_window_aligned"))
         }
     )
     conflicts = metadata.get("context_conflicts") if isinstance(metadata.get("context_conflicts"), list) else []
@@ -433,26 +442,25 @@ def assess_context(context: Context, *, now: datetime | None = None, threshold: 
         sum(1 for row in all_rows if row.get("observed_at_inferred")) / len(all_rows)
         if all_rows else 0.0
     )
+    # Score what was actually observable. Missing optional planes remain
+    # explicit gaps, but are not treated as measured zero-quality evidence.
+    observed_quality = (freshness + provenance + relevance) / 3
+    signal_strength = min(1.0, 0.75 + (0.25 * max(0, len(direct_signal_planes) - 1))) if direct_signal_planes else 0.0
+    causal_strength = min(1.0, 0.75 + (0.25 * max(0, len(causal_planes) - 1))) if causal_planes else 0.0
     rca_readiness = (
-        (source_coverage * 0.40)
-        + (min(len(direct_signal_planes) / 3, 1.0) * 0.25)
-        + (min(len(causal_planes) / 2, 1.0) * 0.15)
+        (observed_quality * 0.40)
+        + (signal_strength * 0.30)
+        + (causal_strength * 0.20)
         + (0.10 if "topology" in represented_planes else 0.0)
-        + (provenance * 0.10)
         - (inferred_timestamp_ratio * 0.15)
     )
     if not direct_signal_planes:
-        rca_readiness = min(rca_readiness, 0.25)
-    elif len(direct_signal_planes) < 2:
-        rca_readiness = min(rca_readiness, 0.59)
-    if len(represented_planes) < 2:
-        rca_readiness = min(rca_readiness, 0.49)
+        rca_readiness = min(rca_readiness, 0.35)
     rca_readiness = _clamp(rca_readiness)
     impact_readiness = _clamp(
-        (min(len(direct_signal_planes) / 2, 1.0) * 0.55)
-        + (0.20 if "topology" in represented_planes else 0.0)
-        + (source_coverage * 0.15)
-        + (provenance * 0.10)
+        (observed_quality * 0.45)
+        + (signal_strength * 0.40)
+        + (0.15 if "topology" in represented_planes else 0.0)
         - (inferred_timestamp_ratio * 0.10)
     )
     if not direct_signal_planes:
@@ -464,7 +472,11 @@ def assess_context(context: Context, *, now: datetime | None = None, threshold: 
     reusable = bool(confidence >= threshold and not missing_required and not stale_sources and not conflicts)
     valid_for = min(
         (
-            max(0, int(row.get("ttl_seconds") or 0) - int(float(row.get("age_seconds") or 0)))
+            max(0, int(row.get("ttl_seconds") or 0) - int(
+                max(0.0, (now - _as_utc(row.get("retrieved_at"), now)).total_seconds())
+                if row.get("incident_window_aligned")
+                else float(row.get("age_seconds") or 0)
+            ))
             for row in all_rows
         ),
         default=max(0, int(SOURCE_POLICIES["other"]["ttl_seconds"])),
@@ -482,19 +494,27 @@ def assess_context(context: Context, *, now: datetime | None = None, threshold: 
         "rca_readiness_score": round(rca_readiness, 4),
         "rca_ready": bool(
             rca_readiness >= 0.70
-            and len(direct_signal_planes) >= 2
+            and bool(direct_signal_planes)
             and bool(causal_planes)
             and not conflicts
         ),
         "impact_readiness_score": round(impact_readiness, 4),
-        "impact_ready": bool(impact_readiness >= 0.65 and len(direct_signal_planes) >= 2),
+        "impact_ready": bool(impact_readiness >= 0.65 and bool(direct_signal_planes)),
         "represented_evidence_planes": sorted(represented_planes.intersection(EVIDENCE_PLANES)),
         "evidence_plane_count": len(EVIDENCE_PLANES),
-        "execution_ready": bool(reusable and not discovery_degraded),
+        "execution_ready": bool(
+            reusable
+            and rca_readiness >= 0.70
+            and bool(direct_signal_planes)
+            and bool(causal_planes)
+            and not discovery_degraded
+            and not conflicts
+        ),
         "discovery_degraded": discovery_degraded,
         "present": present,
         "missing_context": missing,
         "missing_required": missing_required,
+        "diagnostic_gaps": diagnostic_gaps,
         "stale_sources": stale_sources,
         "conflicts": conflicts,
         "evidence_count": len(all_rows),
@@ -641,10 +661,18 @@ def govern_context(
     for source in set(normalised) | set(untraceable_counts):
         rows = normalised.get(source, [])
         prior = source_manifest.get(source, {})
-        stale = bool(rows) and all(_clamp(row.get("freshness_score")) <= 0.0 for row in rows)
+        stale = bool(rows) and all(
+            _clamp(row.get("freshness_score")) <= 0.0 and not row.get("incident_window_aligned")
+            for row in rows
+        )
+        historical = bool(rows) and all(
+            _clamp(row.get("freshness_score")) <= 0.0 and row.get("incident_window_aligned")
+            for row in rows
+        )
         untraceable = untraceable_counts.get(source, 0)
         status = (
             "stale" if stale
+            else "historical" if historical
             else "fresh" if rows
             else "unavailable" if untraceable
             else str(prior.get("status") or "no_data")
@@ -664,6 +692,7 @@ def govern_context(
             ),
             "last_attempt_at": prior.get("last_attempt_at") or collected_at.isoformat(),
             "fresh_count": sum(1 for row in rows if _clamp(row.get("freshness_score")) > 0.0),
+            "incident_aligned_count": sum(1 for row in rows if row.get("incident_window_aligned")),
             "inferred_timestamp_count": sum(1 for row in rows if row.get("observed_at_inferred")),
             "oldest_observed_at": min((str(row.get("observed_at")) for row in rows), default=None),
             "newest_observed_at": max((str(row.get("observed_at")) for row in rows), default=None),

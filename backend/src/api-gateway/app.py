@@ -31,12 +31,15 @@ from common.database import (
     AlertRecord,
     ApprovalRecord,
     AuditLogRecord,
+    HumanCorrectionRecord,
+    IncidentInvestigationBindingRecord,
     IncidentOccurrenceRecord,
     IncidentProjectionRecord,
     IncidentRecord,
     MonitoringConnectionHealthRecord,
 )
 from common.event_publishers import build_agent_event_contract, build_orchestration_envelope
+from common.incident_command_contract import build_incident_command_workspace
 from common.kafka import normalize_payload
 from common.models import Alert, GatewayAuditEvent, Incident, SafetyDecision
 from common.repository import IncidentRepository
@@ -1262,8 +1265,14 @@ async def get_alert_linked_documents(
     tenant_id: str = Depends(current_tenant_id),
 ) -> dict[str, Any]:
     trace_id = trace_id_from_header(x_trace_id)
-    safe_limit = max(1, min(int(limit), 1000))
-    alerts_path = f"/alerts/all?{urlencode({'limit': str(safe_limit), 'tenant_id': tenant_id})}"
+    # Resolve one alert directly. Pulling the entire unified inbox transferred
+    # several megabytes and intermittently exhausted this optional view's
+    # two-second budget as incident volume grew.
+    _ = max(1, min(int(limit), 1000))  # retained for API compatibility
+    alerts_path = (
+        f"/alerts/{quote(alert_id, safe='')}/processed-result?"
+        f"{urlencode({'tenant_id': tenant_id})}"
+    )
     alerts_degraded = False
     try:
         _, alerts_payload = await proxy(
@@ -1319,7 +1328,8 @@ async def get_alert_linked_documents(
         documents = []
 
     normalized_id = str(alert_id or "").strip()
-    selected_alert = next(
+    exact_alert = alerts_data.get("alert") if isinstance(alerts_data.get("alert"), dict) else None
+    selected_alert = exact_alert or next(
         (
             row for row in rows
             if isinstance(row, dict)
@@ -2200,6 +2210,127 @@ async def regenerate_alert_analysis(
         "analysis_mode": mode,
         "context_strategy": strategies[mode],
         "poll_after_ms": 2500,
+    }
+
+
+@app.post("/incidents/{incident_id}/claims/{claim_id}/amend", status_code=202)
+async def amend_incident_claim(
+    incident_id: str,
+    claim_id: str,
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    auth: AuthContext = Depends(require_roles(  # noqa: B008
+        SystemRole.ADMINISTRATOR.value,
+        SystemRole.L2_ENGINEER.value,
+        SystemRole.L3_ENGINEER.value,
+    )),
+) -> dict[str, Any]:
+    """Record an operator amendment and rerun analysis without treating it as observed evidence."""
+    try:
+        incident_uuid = UUID(incident_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="incident_id must be a UUID") from exc
+    corrected_statement = str(payload.get("statement") or "").strip()
+    reason = str(payload.get("reason") or "").strip()
+    source_reference = str(payload.get("source_reference") or "").strip()
+    if len(corrected_statement) < 10:
+        raise HTTPException(status_code=422, detail="statement must contain at least 10 characters")
+    if len(reason) < 10:
+        raise HTTPException(status_code=422, detail="reason must contain at least 10 characters")
+    parsed_source = urlparse(source_reference)
+    if not source_reference or not parsed_source.scheme:
+        raise HTTPException(status_code=422, detail="source_reference must be an absolute source URI")
+
+    factory = getattr(request.app.state, "session_factory", None)
+    if not settings.database_enabled or factory is None:
+        raise HTTPException(status_code=503, detail="Claim amendment persistence is unavailable")
+    actor = str(auth.email or auth.username or auth.user_id).strip()
+    async with factory() as session:
+        binding = await session.scalar(select(IncidentInvestigationBindingRecord).where(
+            IncidentInvestigationBindingRecord.tenant_id == auth.tenant_id,
+            IncidentInvestigationBindingRecord.incident_id == incident_uuid,
+            IncidentInvestigationBindingRecord.status.notin_(["superseded", "invalidated"]),
+        ).order_by(
+            IncidentInvestigationBindingRecord.rca_version.desc(),
+            IncidentInvestigationBindingRecord.created_at.desc(),
+        ).limit(1))
+        if binding is None:
+            raise HTTPException(status_code=409, detail="No current governed RCA binding is available to amend")
+        recommendation = await session.get(AuditLogRecord, binding.recommendation_id)
+        recommendation_payload = dict(recommendation.payload or {}) if recommendation else {}
+        metadata = recommendation_payload.get("metadata") if isinstance(recommendation_payload.get("metadata"), dict) else {}
+        iterative = metadata.get("iterative_investigation") if isinstance(metadata.get("iterative_investigation"), dict) else {}
+        rca_result = iterative.get("rca_result") if isinstance(iterative.get("rca_result"), dict) else {}
+        claims = [item for item in rca_result.get("claims", []) if isinstance(item, dict)]
+        original_claim = next((item for item in claims if str(item.get("claim_id")) == claim_id), None)
+        if original_claim is None:
+            raise HTTPException(status_code=409, detail="The claim is stale or is not part of the current RCA version")
+        prior = await session.scalar(select(func.max(HumanCorrectionRecord.version)).where(
+            HumanCorrectionRecord.tenant_id == auth.tenant_id,
+            HumanCorrectionRecord.entity_type == "rca",
+            HumanCorrectionRecord.entity_id == claim_id,
+        ))
+        correction = HumanCorrectionRecord(
+            id=uuid4(), tenant_id=auth.tenant_id, entity_type="rca", entity_id=claim_id,
+            correction_type="rca" if str(original_claim.get("kind") or "").upper() == "CAUSAL" else "impact",
+            original_payload=original_claim,
+            corrected_payload={
+                "statement": corrected_statement,
+                "source_reference": source_reference,
+                "parent_claim_id": claim_id,
+                "rca_version": binding.rca_version,
+            },
+            reason=reason, actor=actor, actor_role=auth.role,
+            status="pending_reanalysis", version=int(prior or 0) + 1,
+        )
+        session.add(correction)
+        binding.status = "invalidated"
+        approvals = (await session.execute(select(ApprovalRecord).where(
+            ApprovalRecord.tenant_id == auth.tenant_id,
+            ApprovalRecord.incident_id == incident_uuid,
+            ApprovalRecord.recommendation_id == binding.recommendation_id,
+        ))).scalars().all()
+        for approval in approvals:
+            approval.decision = "stale"
+            approval.payload = {**dict(approval.payload or {}), "invalidated_by_claim_amendment_id": str(correction.id)}
+        session.add(AuditLogRecord(
+            tenant_id=auth.tenant_id, actor=actor, action="incident.claim.amendment.recorded",
+            resource_type="incident", resource_id=str(incident_uuid),
+            payload={
+                "correction_id": str(correction.id), "claim_id": claim_id,
+                "rca_version": binding.rca_version, "source_reference": source_reference,
+                "actor_role": auth.role, "stale_approvals_invalidated": len(approvals),
+            },
+        ))
+        alert_id = str(binding.alert_id)
+        correction_id = str(correction.id)
+        await session.commit()
+
+    alert, incident, existing_decision, previous_recommendation_id = await _load_analysis_regeneration_subject(
+        alert_id=alert_id, tenant_id=auth.tenant_id, session_factory=factory,
+    )
+    request_id = str(uuid4())
+    decision = {
+        "workflow": "guided-remediation", "requires_approval": True,
+        "risk_tier": "high", "execution_mode": "supervised",
+        "policy_version": "policy-v1", "policy_reason": "Human claim amendments require governed reanalysis.",
+        **existing_decision,
+        "flow_id": str(existing_decision.get("flow_id") or incident.id),
+        "analysis_request_id": request_id, "analysis_mode": "fresh", "context_strategy": "realtime",
+        "force_full_analysis": True, "regeneration_requested": True,
+        "claim_amendment_id": correction_id,
+        "rca_version": max(1, int(existing_decision.get("rca_version") or 1)),
+    }
+    expected_id = _analysis_recommendation_id(incident_id=incident.id, request_id=UUID(request_id))
+    delivery, effective_request_id, _ = await _publish_analysis_regeneration_command(
+        request_id=request_id, tenant_id=auth.tenant_id, alert=alert, incident=incident,
+        decision=decision, expected_recommendation_id=expected_id,
+    )
+    return {
+        "correction_id": correction_id, "claim_id": claim_id, "status": "pending_reanalysis",
+        "request_id": effective_request_id, "delivery": delivery,
+        "previous_recommendation_id": previous_recommendation_id,
+        "expected_recommendation_id": str(expected_id), "poll_after_ms": 2500,
     }
 
 
@@ -3672,6 +3803,51 @@ async def get_incident_by_id(
     )
 
 
+@app.get("/incidents/{incident_id}/command")
+async def get_incident_command_workspace(
+    incident_id: str,
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    encoded_incident_id = quote(incident_id, safe="")
+    trace_id = trace_id_from_header(x_trace_id)
+    incident, operations = await asyncio.gather(
+        guarded_proxy(
+            request=request,
+            method="GET",
+            path=f"/incidents/{encoded_incident_id}?{urlencode({'tenant_id': tenant_id})}",
+            target_base=settings.monitoring_adapter_url,
+            payload={},
+            trace_id=trace_id,
+        ),
+        guarded_proxy(
+            request=request,
+            method="GET",
+            path=f"/incidents/{encoded_incident_id}/operations-state",
+            target_base=settings.context_agent_url,
+            payload=None,
+            params={"tenant_id": tenant_id},
+            trace_id=trace_id,
+            timeout_seconds=30.0,
+        ),
+    )
+    incident_payload = incident.get("data") if isinstance(incident.get("data"), dict) else incident
+    operations_payload = operations.get("data") if isinstance(operations.get("data"), dict) else operations
+    try:
+        return build_incident_command_workspace(
+            incident_id=incident_id,
+            incident=incident_payload,
+            operations=operations_payload,
+        ).model_dump(mode="json")
+    except ValidationError as exc:
+        logger.error("Incident command workspace identity mismatch for %s: %s", incident_id, exc)
+        raise HTTPException(
+            status_code=409,
+            detail="Incident read models are inconsistent; retry after reconciliation.",
+        ) from exc
+
+
 @app.get("/incidents/inbox/feed")
 async def get_unified_incident_inbox(
     request: Request,
@@ -3684,7 +3860,7 @@ async def get_unified_incident_inbox(
     status: str | None = None,
     service: str | None = None,
     inbox_view: str = "all",
-    record_type: str = "all",
+    record_type: str = "incidents",
     severity: str | None = None,
     x_trace_id: str | None = Header(default=None),
     tenant_id: str = Depends(current_tenant_id),
@@ -3815,6 +3991,32 @@ async def approve_evidence_rag_draft(
     )
 
 
+@app.post("/rag/evidence-drafts/{draft_id}/revision")
+async def revise_evidence_rag_draft(
+    draft_id: str,
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+    auth: AuthContext = Depends(require_roles(  # noqa: B008
+        SystemRole.ADMINISTRATOR.value,
+        SystemRole.L2_ENGINEER.value,
+        SystemRole.L3_ENGINEER.value,
+    )),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path=f"/rag/evidence-drafts/{quote(draft_id, safe='')}/revision",
+        target_base=settings.context_agent_url,
+        payload={
+            **payload,
+            "tenant_scope": auth.tenant_id,
+            "created_by": auth.email or auth.username or str(auth.user_id),
+        },
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
 @app.get("/incidents/{incident_id}/context-gaps")
 async def get_incident_context_gaps(
     incident_id: str,
@@ -3865,6 +4067,10 @@ async def post_incident_context_gap_response(
         # These fields are audit evidence and may never be asserted by the browser.
         "responder_id": responder_id,
         "responded_at": datetime.now(UTC).isoformat(),
+        "allow_manual_claim": role_is_allowed(
+            auth.role, {OperationalRole.ADMIN.value, OperationalRole.HITL_APPROVER.value}
+        ),
+        "responder_role": auth.role,
     }
     return await guarded_proxy(
         request=request, method="POST",

@@ -1320,7 +1320,11 @@ class ResolutionIntelligenceAgent(BaseAgent):
                 keys=("impact_summary", "customer_impact", "service_impact", "severity_rationale", "summary"),
                 fallback_text=evidence_safe_fallback,
             )
-        if model_fallback and not has_specific_mysql_exporter_impact:
+        deterministic_observed_impact = bool(
+            has_specific_mysql_exporter_impact
+            or ("latency" in normalized_description and affected_service)
+        )
+        if model_fallback and not deterministic_observed_impact:
             state["impact"] = evidence_safe_fallback
         impact_external_text, impact_external_meta = self._build_external_impact_fallback(
             context=context,

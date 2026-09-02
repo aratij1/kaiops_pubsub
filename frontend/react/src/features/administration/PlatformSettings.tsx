@@ -14,8 +14,9 @@ import {
   Zap,
 } from "lucide-react";
 
-import { useRouteRuntime } from "../../app/routeRuntime";
+import { useSession } from "../../app/SessionContext";
 import { ReadinessScore, StatusBadge, type StatusTone } from "../../components/design-system";
+import { useSafetyData } from "../safety/useSafetyData";
 import "./PlatformSettings.css";
 
 type ProbeKey = "applications" | "queue" | "context" | "models" | "capacity";
@@ -60,7 +61,8 @@ function probeTone(error: string, healthy: boolean): StatusTone {
 }
 
 export default function PlatformSettings() {
-  const { safety, session } = useRouteRuntime();
+  const session = useSession();
+  const safety = useSafetyData();
   const [state, setState] = useState({ loading: false, checkedAt: "", probes: EMPTY_PROBES });
 
   const refresh = useCallback(async (signal?: AbortSignal) => {

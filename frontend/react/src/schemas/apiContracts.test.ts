@@ -112,6 +112,40 @@ describe("internal API contract registry", () => {
     )).toEqual(state);
   });
 
+  it("validates the canonical incident command workspace", () => {
+    const incidentId = "1f11cbe9-274a-490a-ae4c-aebb3d70e58a";
+    const state = {
+      schema_version: "kaiops.operations-state.v1",
+      incident_id: incidentId,
+      lifecycle_state: "RCA_READY",
+      context: {}, investigation: {}, requirements: [], requirement_history: [],
+      resolution: {}, approval: {}, updated_at: "2026-09-01T10:00:00Z",
+    };
+    const workspace = {
+      schema_version: "kaiops.incident-command.v2",
+      incident_id: incidentId,
+      revision: "a".repeat(64),
+      incident: { incident_id: incidentId, status: "investigating" },
+      operations: state,
+      evidence: {
+        latest_snapshot_id: null, bound_snapshot_id: null, binding_consistent: false,
+        counts: {
+          latest_context_records: 0, bound_snapshot_records: 0, rca_bound_records: 0,
+          traceable_citations: 0, unresolved_bindings: 0, open_requirements: 0, open_conflicts: 0,
+        },
+        scores: [{
+          key: "context_quality", label: "Context quality", percent: null,
+          status: "unavailable", ratio: null, reason: "Context quality was not published", blockers: [],
+        }],
+        blockers: ["RCA_SNAPSHOT_NOT_BOUND"],
+      },
+    };
+
+    expect(parseInternalApiResponse(
+      `/api-gateway/incidents/${incidentId}/command`, "GET", workspace,
+    )).toEqual(workspace);
+  });
+
   it("validates identity-provider discovery and token contracts", () => {
     expect(OidcDiscoverySchema.parse({ authorization_endpoint: "https://id.example/authorize", token_endpoint: "https://id.example/token" })).toBeTruthy();
     expect(OidcTokenResponseSchema.safeParse({ access_token: "" }).success).toBe(false);

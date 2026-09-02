@@ -21,7 +21,9 @@ from common.config import get_settings
 from common.context_enrichment_contract import (
     EvidenceRequirement,
     HumanEvidenceResponse,
+    authorized_enrichment_connectors,
     build_evidence_requirements,
+    next_authorized_enrichment_connector,
     normalize_connector_response,
 )
 from common.database import AuditLogRecord, ContextEnrichmentJobRecord
@@ -594,7 +596,7 @@ async def _persist_context_event(
     # quality blockers, and execution gates remain independently authoritative.
     processing_lease_seconds = 300
     operator_review_lease_seconds = int(
-        getattr(settings, "context_knowledge_ttl_seconds", 3600) or 3600
+        getattr(settings, "context_knowledge_ttl_seconds", 14400) or 14400
     )
     expires_at = assessed_at + timedelta(
         seconds=max(
@@ -721,17 +723,34 @@ async def _context_enrichment_worker(app: FastAPI) -> None:
                     alert = Alert.model_validate(query.get("alert"))
                     incident = Incident.model_validate(query.get("incident"))
                     async with app.state.session_factory() as session:
-                        requirement_payload = await ContextEnrichmentRepository(session).context_evidence_requirement(
+                        repository = ContextEnrichmentRepository(session)
+                        requirement_payload = await repository.context_evidence_requirement(
                             tenant_id=job["tenant_id"], requirement_id=job["requirement_id"],
                         )
+                        if requirement_payload is None:
+                            await repository.finish_context_enrichment_job(
+                                job_id=job["job_id"], worker_id=worker_id,
+                                collected=False, error="ORPHANED_EVIDENCE_REQUIREMENT",
+                                maximum_attempts=1,
+                            )
+                            await session.commit()
                     if requirement_payload is None:
-                        raise RuntimeError("the claimed enrichment requirement no longer exists")
+                        logger.warning(
+                            "orphaned context enrichment job dead-lettered job_id=%s requirement_id=%s",
+                            job["job_id"], job["requirement_id"],
+                        )
+                        continue
                     requirement = EvidenceRequirement.model_validate(requirement_payload)
                     connector_name = connector_aliases.get(job["connector_id"], job["connector_id"])
                     connector = next((item for item in agent.connectors if item.name == connector_name), None)
                     if connector is None:
                         raise RuntimeError(f"connector {job['connector_id']} is not installed")
-                    raw_response = await connector.fetch(alert, incident)
+                    targeted_metadata = dict(alert.metadata)
+                    targeted_metadata["context_requirement_category"] = requirement.category
+                    targeted_metadata["context_observation_start"] = job.get("observation_start")
+                    targeted_metadata["context_observation_end"] = job.get("observation_end")
+                    targeted_alert = alert.model_copy(update={"metadata": targeted_metadata})
+                    raw_response = await connector.fetch(targeted_alert, incident)
                     normalization = normalize_connector_response(
                         raw_response=raw_response, requirement=requirement, incident=incident,
                         connector=job["connector_id"], collected_at=datetime.now(UTC),
@@ -745,22 +764,71 @@ async def _context_enrichment_worker(app: FastAPI) -> None:
                             source_response_metadata=normalization.metadata,
                         )
                         if not persisted["accepted"]:
-                            failure = "; ".join(
+                            explicit_gap = str(raw_response.get("evidence_gap") or "").strip()
+                            failure = explicit_gap or "; ".join(
                                 str(item.get("code") or "EVIDENCE_REJECTED")
                                 for item in normalization.rejected
                             ) or failure
-                            await repository.finish_context_enrichment_job(
+                            final_status = await repository.finish_context_enrichment_job(
                                 job_id=job["job_id"], worker_id=worker_id,
                                 collected=False, error=failure,
                                 retry_after_seconds=min(300, 15 * (2 ** max(0, int(job["attempt_count"]) - 1))),
+                                maximum_attempts=(
+                                    1 if explicit_gap in {
+                                        "NO_MATCHING_APPROVED_EVIDENCE",
+                                        "TRACE_NOT_FOUND_OR_EXPIRED",
+                                    } else 4
+                                ),
                             )
+                            fallback_connector = None
+                            if final_status == "dead_letter":
+                                authorized = set(query.get("authorized_connectors") or [])
+                                if not authorized:
+                                    authorized = authorized_enrichment_connectors(
+                                        alert_metadata=alert.metadata, context_payload={},
+                                    )
+                                attempted = {
+                                    *query.get("attempted_connectors", []),
+                                    str(job["connector_id"]),
+                                }
+                                fallback_connector = next_authorized_enrichment_connector(
+                                    candidate_connectors=requirement.candidate_connectors,
+                                    authorized_connectors=authorized,
+                                    attempted_connectors=attempted,
+                                )
+                                if fallback_connector:
+                                    await repository.schedule_context_enrichment_job(
+                                        tenant_id=job["tenant_id"], incident_id=job["incident_id"],
+                                        requirement_id=job["requirement_id"], connector_id=fallback_connector,
+                                        query_payload={
+                                            **query,
+                                            "authorized_connectors": sorted(authorized),
+                                            "attempted_connectors": sorted(attempted),
+                                        },
+                                        observation_start=job["observation_start"],
+                                        observation_end=job["observation_end"],
+                                    )
+                            if final_status == "dead_letter" and fallback_connector is None:
+                                assignment = await repository.resolve_human_evidence_responder(
+                                    tenant_id=job["tenant_id"], incident_id=job["incident_id"],
+                                )
+                                await repository.create_human_evidence_request(
+                                    tenant_id=job["tenant_id"], incident_id=job["incident_id"],
+                                    requirement_id=job["requirement_id"],
+                                    expected_responder=assignment["identity"] if assignment else None,
+                                    assignment_source=assignment["source"] if assignment else None,
+                                    assignment_failure_reason=None if assignment else "NO_AUTHORIZED_RESPONDER",
+                                    due_at=datetime.now(UTC) + timedelta(hours=1),
+                                    acceptable_format="A source reference and a concise factual observation.",
+                                    evidence_already_checked=requirement.candidate_connectors,
+                                    hypothesis_impact=requirement.reason,
+                                    investigation_can_continue=True,
+                                )
                         await session.commit()
                     if persisted["accepted"]:
-                        outgoing = dict(persisted["outbox_payload"])
-                        context = Context.model_validate(outgoing["context"])
-                        await _publish_context_event(
-                            app=app, provider="rabbitmq", alert=alert, incident=incident,
-                            context=context, decision=outgoing["decision"], payload=outgoing,
+                        logger.info(
+                            "context enrichment persisted for outbox delivery job_id=%s event_id=%s",
+                            job["job_id"], persisted["outbox_event_id"],
                         )
                 except Exception as exc:
                     failure = str(exc)[:1000]
@@ -1094,13 +1162,17 @@ async def _human_evidence_jira_sync_loop(app: FastAPI) -> None:
     """Deliver durable assigned evidence requests to the Jira integration."""
     endpoint = f"{str(settings.monitoring_adapter_url).rstrip('/')}/api/v1/jira/evidence-requests"
     ui_base = os.getenv("KAIMS_UI_BASE_URL", "http://localhost").rstrip("/")
+    failure_cooldown_seconds = max(
+        30.0, min(float(os.getenv("CONTEXT_JIRA_FAILURE_COOLDOWN_SECONDS", "300")), 1800.0)
+    )
     while True:
+        upstream_failed = False
         try:
             async with app.state.session_factory() as session:
                 rows = await ContextEnrichmentRepository(session).claim_human_evidence_jira_requests(limit=20)
                 await session.commit()
             async with httpx.AsyncClient(timeout=30.0) as client:
-                for row in rows:
+                for index, row in enumerate(rows):
                     try:
                         response = await client.post(endpoint, json={
                             **row,
@@ -1113,15 +1185,23 @@ async def _human_evidence_jira_sync_loop(app: FastAPI) -> None:
                     except Exception as exc:
                         logger.warning("human evidence Jira synchronization failed request_id=%s", row["request_id"])
                         async with app.state.session_factory() as session:
-                            await ContextEnrichmentRepository(session).fail_human_evidence_jira_sync(
-                                request_id=row["request_id"], error=type(exc).__name__,
-                            )
+                            repository = ContextEnrichmentRepository(session)
+                            # A transport/upstream failure applies to the batch.
+                            # Do not hammer the same unavailable integration once
+                            # per pending request or leave the claimed remainder
+                            # stranded in "syncing" until lease recovery.
+                            for pending in rows[index:]:
+                                await repository.fail_human_evidence_jira_sync(
+                                    request_id=pending["request_id"], error=type(exc).__name__,
+                                )
                             await session.commit()
+                        upstream_failed = True
+                        break
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("human evidence Jira synchronization scan failed")
-        await asyncio.sleep(10.0)
+        await asyncio.sleep(failure_cooldown_seconds if upstream_failed else 10.0)
 
 
 async def startup(app: FastAPI) -> None:
@@ -1320,6 +1400,11 @@ class EvidenceRagDraftApproveRequest(BaseModel):
     expected_row_version: int = Field(ge=1)
     approved_by: str = Field(min_length=2, max_length=120)
     owner_team: str | None = Field(default=None, min_length=2, max_length=160)
+
+
+class EvidenceRagDraftRevisionRequest(BaseModel):
+    tenant_scope: str = Field(min_length=1, max_length=128)
+    created_by: str = Field(min_length=2, max_length=160)
 
 
 class GovernedRagIndexRetryRequest(BaseModel):
@@ -1868,6 +1953,86 @@ def _typed_incident_document_content(kind: str, *, alert_name: str, service: str
     ])
 
 
+def _crawled_incident_document_bundle(
+    *, alert_name: str, service: str, environment: str,
+    evidence_rows: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    facts: list[str] = []
+    for row in evidence_rows[:50]:
+        evidence_id = str(row.get("evidence_id") or row.get("id") or "").strip()
+        source_uri = str(
+            row.get("source_reference") or row.get("source_uri") or row.get("uri")
+            or row.get("path") or row.get("citation") or ""
+        ).strip()
+        content = row.get("content") if isinstance(row.get("content"), dict) else {}
+        observation = (
+            row.get("snippet") or row.get("message") or row.get("summary")
+            or (json.dumps(content, sort_keys=True, default=str) if content else "")
+        )
+        if evidence_id and source_uri and str(observation).strip():
+            facts.append(f"- [{evidence_id}] {str(observation).strip()[:1000]} (source: {source_uri})")
+    base = "\n".join(facts) or "No attributable crawler evidence was available."
+    return [{
+        "document_kind": kind,
+        "title": f"{kind.replace('_', ' ').title()} draft: {alert_name}",
+        "content": _typed_incident_document_content(
+            kind, alert_name=alert_name, service=service, environment=environment, base=base,
+        ),
+    } for kind in INCIDENT_DOCUMENT_KINDS]
+
+
+async def _create_crawled_evidence_drafts(
+    repository: IncidentRepository, *, tenant_id: str, candidate: dict[str, Any],
+    alert: Alert, incident: Incident,
+) -> int:
+    evidence_rows = [
+        row for row in (
+            candidate.get("accepted_evidence") or candidate.get("snapshot_evidence") or []
+        )
+        if isinstance(row, dict)
+    ]
+    evidence_ids = list(dict.fromkeys(
+        str(row.get("evidence_id") or row.get("id") or "").strip()
+        for row in evidence_rows
+        if str(row.get("evidence_id") or row.get("id") or "").strip()
+    ))
+    source_uris = list(dict.fromkeys(
+        str(
+            row.get("source_reference") or row.get("source_uri") or row.get("uri")
+            or row.get("path") or row.get("citation") or ""
+        ).strip()
+        for row in evidence_rows
+        if str(
+            row.get("source_reference") or row.get("source_uri") or row.get("uri")
+            or row.get("path") or row.get("citation") or ""
+        ).strip()
+    ))
+    if not evidence_ids or not source_uris:
+        return 0
+    existing = await repository.list_evidence_rag_drafts(
+        tenant_id=tenant_id, alert_id=candidate["alert_id"],
+    )
+    existing_kinds = {str(row.get("document_kind") or "").lower() for row in existing}
+    documents = [
+        row for row in _crawled_incident_document_bundle(
+            alert_name=str(alert.name or incident.title or "Incident"),
+            service=str(alert.service or incident.service or "unknown"),
+            environment=str(alert.environment or incident.environment or "unknown"),
+            evidence_rows=evidence_rows,
+        )
+        if row["document_kind"] not in existing_kinds
+    ]
+    if not documents:
+        return 0
+    drafts = await repository.create_evidence_rag_drafts(
+        tenant_id=tenant_id, created_by="context-enrichment-crawler",
+        binding=dict(candidate["binding"]), documents=documents,
+        evidence_ids=evidence_ids, source_uris=source_uris,
+        allow_snapshot_evidence=True,
+    )
+    return len(drafts)
+
+
 def _write_incident_document_bundle(common: dict[str, Any], base_content: str) -> list[dict[str, Any]]:
     now = datetime.now(UTC).isoformat()
     drafts: list[dict[str, Any]] = []
@@ -2153,7 +2318,7 @@ async def context_strategy_status() -> dict[str, Any]:
         "supported": ["auto", "realtime", "historical"],
         "auto": {
             "cache_aside": True,
-            "ttl_seconds": int(getattr(settings, "context_knowledge_ttl_seconds", 3600) or 3600),
+            "ttl_seconds": int(getattr(settings, "context_knowledge_ttl_seconds", 14400) or 14400),
             "refresh_policy": "quality_freshness_scope_or_conflict_failure",
             "match_scope": ["tenant", "service", "environment", "alert-family", "subject-fingerprint"],
             "quality_threshold": float(getattr(settings, "context_min_quality_score", 0.70) or 0.70),
@@ -2291,10 +2456,11 @@ async def _reconcile_context_enrichment_tenant(
     summary: dict[str, Any] = {
         "incidents_scanned": 0, "gaps_found": 0, "requirements_created": 0,
         "jobs_scheduled": 0, "human_requests_created": 0, "skipped_incidents": 0,
-        "errors": [], "dry_run": request.dry_run,
+        "document_drafts_created": 0, "errors": [], "dry_run": request.dry_run,
     }
     async with app.state.session_factory() as session:
         repository = ContextEnrichmentRepository(session)
+        draft_repository = IncidentRepository(session)
         candidates = await repository.active_incident_gap_candidates(
             tenant_id=request.tenant_id, limit=request.limit,
         )
@@ -2310,6 +2476,18 @@ async def _reconcile_context_enrichment_tenant(
                 existing = await repository.list_context_evidence_requirements(
                     tenant_id=request.tenant_id, incident_id=candidate["incident_id"],
                 )
+                activity = await repository.list_context_enrichment_activity(
+                    tenant_id=request.tenant_id, incident_id=candidate["incident_id"],
+                )
+                human_requirement_ids = {
+                    str(row["requirement_id"])
+                    for row in activity["human_requests"]
+                }
+                dead_letter_requirement_ids = {
+                    str(row["requirement_id"])
+                    for row in activity["jobs"]
+                    if str(row.get("status") or "").lower() == "dead_letter"
+                }
                 ledger_coverage = await repository.reconcile_requirement_coverage_from_ledger(
                     tenant_id=request.tenant_id, incident_id=candidate["incident_id"],
                     apply=not request.dry_run,
@@ -2341,21 +2519,39 @@ async def _reconcile_context_enrichment_tenant(
                     **incident_payload, "id": candidate["incident_id"],
                     "tenant_id": request.tenant_id, "alert_ids": [candidate["alert_id"]],
                 })
-                resolved = alert.metadata.get("resolved_context_connectors", [])
-                authorized = {
-                    str(item.get("provider") or "").strip().lower()
-                    for item in resolved if isinstance(item, dict)
-                }
-                authorized.update({"local-evidence", "vector-db"})
+                authorized = authorized_enrichment_connectors(
+                    alert_metadata=alert.metadata,
+                    context_payload=context_payload,
+                )
+                dead_letter_fallbacks = [
+                    row for row in existing
+                    if int(row["rca_version"]) == int(candidate["rca_version"])
+                    and (
+                        str(row.get("status") or "").lower() == "dead_letter"
+                        or str(row["requirement_id"]) in dead_letter_requirement_ids
+                    )
+                    and str(row["requirement_id"]) not in human_requirement_ids
+                ]
                 planned: list[tuple[EvidenceRequirement, str | None]] = [
                     (requirement, next((name for name in requirement.candidate_connectors if name in authorized), None))
                     for requirement in work
                 ]
                 summary["jobs_scheduled"] += sum(1 for _, connector in planned if connector)
-                summary["human_requests_created"] += sum(1 for _, connector in planned if not connector)
-                if not request.dry_run and work:
+                summary["human_requests_created"] += (
+                    sum(1 for _, connector in planned if not connector)
+                    + len(dead_letter_fallbacks)
+                )
+                if not request.dry_run and (work or dead_letter_fallbacks):
                     await repository.upsert_context_evidence_requirements(requirements)
-                    window_end = datetime.now(UTC).replace(microsecond=0)
+                    now = datetime.now(UTC).replace(microsecond=0)
+                    alert_start = alert.starts_at.astimezone(UTC).replace(microsecond=0)
+                    alert_end = (
+                        alert.ends_at.astimezone(UTC).replace(microsecond=0)
+                        if alert.ends_at is not None
+                        else alert_start + timedelta(minutes=15)
+                    )
+                    window_start = alert_start - timedelta(minutes=15)
+                    window_end = min(now, max(alert_start, alert_end) + timedelta(minutes=15))
                     for requirement, connector in planned:
                         if connector:
                             await repository.schedule_context_enrichment_job(
@@ -2367,8 +2563,10 @@ async def _reconcile_context_enrichment_tenant(
                                     "alert": alert.model_dump(mode="json"),
                                     "incident": incident.model_dump(mode="json"),
                                     "decision": {"reconciled": True},
+                                    "authorized_connectors": sorted(authorized),
+                                    "attempted_connectors": [],
                                 },
-                                observation_start=window_end - timedelta(minutes=30),
+                                observation_start=window_start,
                                 observation_end=window_end,
                             )
                         else:
@@ -2402,6 +2600,27 @@ async def _reconcile_context_enrichment_tenant(
                                         "reason": "NO_AUTHORIZED_RESPONDER",
                                     },
                                 )
+                    for row in dead_letter_fallbacks:
+                        assignment = await repository.resolve_human_evidence_responder(
+                            tenant_id=request.tenant_id, incident_id=incident.id,
+                        )
+                        await repository.create_human_evidence_request(
+                            tenant_id=request.tenant_id, incident_id=incident.id,
+                            requirement_id=row["requirement_id"],
+                            expected_responder=assignment["identity"] if assignment else None,
+                            assignment_source=assignment["source"] if assignment else None,
+                            assignment_failure_reason=None if assignment else "NO_AUTHORIZED_RESPONDER",
+                            due_at=datetime.now(UTC) + timedelta(hours=1),
+                            acceptable_format="A source reference and a concise factual observation.",
+                            evidence_already_checked=list(row.get("candidate_connectors") or []),
+                            hypothesis_impact=str(row.get("reason") or "Required evidence was unavailable."),
+                            investigation_can_continue=True,
+                        )
+                if not request.dry_run:
+                    summary["document_drafts_created"] += await _create_crawled_evidence_drafts(
+                        draft_repository, tenant_id=request.tenant_id, candidate=candidate,
+                        alert=alert, incident=incident,
+                    )
             except Exception as exc:
                 summary["errors"].append({"incident_id": candidate["incident_id"], "error": str(exc)[:500]})
         if request.dry_run:
@@ -2660,6 +2879,27 @@ async def approve_evidence_rag_draft(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
     draft, document = approved
     return {"status": "approved_pending_index", "draft": draft, "document": document}
+
+
+@app.post("/rag/evidence-drafts/{draft_id}/revision")
+async def revise_evidence_rag_draft(
+    draft_id: str, request: EvidenceRagDraftRevisionRequest,
+) -> dict[str, Any]:
+    tenant = require_tenant_id(request.tenant_scope, source="evidence revision")
+    if not settings.database_enabled or getattr(app.state, "session_factory", None) is None:
+        raise HTTPException(status_code=503, detail="durable evidence draft storage is unavailable")
+    async with app.state.session_factory() as session:
+        try:
+            draft = await IncidentRepository(session).revise_evidence_rag_draft(
+                tenant_id=tenant, draft_id=draft_id, created_by=request.created_by.strip(),
+            )
+            if draft is None:
+                raise HTTPException(status_code=404, detail="evidence RAG draft not found")
+            await session.commit()
+        except RuntimeError as exc:
+            await session.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"status": "draft", "draft": draft}
 
 
 @app.post("/rag/governed-documents/{document_id}/retry-index")

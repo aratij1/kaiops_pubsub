@@ -117,6 +117,37 @@ def test_unapproved_rag_document_is_rejected_with_reason() -> None:
     assert result.rejected == [{"code": "KNOWLEDGE_NOT_APPROVED", "record_index": 0}]
 
 
+def test_governed_vector_search_match_normalizes_as_approved_runbook() -> None:
+    incident = Incident(tenant_id="tenant-a", service="api-gateway", title="availability")
+    payload = {
+        "matches": [{
+            "document_id": "runbook-123",
+            "kind": "runbook",
+            "title": "API gateway recovery",
+            "content": "Restore the gateway using the approved procedure.",
+            "content_version": "3",
+            "review_status": "approved",
+            "source_ref": "governed-rag://runbook-123",
+            "tenant_scope": "tenant-a",
+            "service": "api-gateway",
+            "approved_by": "platform-ops",
+            "approved_at": "2024-08-26T12:00:00+00:00",
+        }],
+        "document_count": 1,
+    }
+
+    result = normalize_connector_response(
+        raw_response=payload, requirement=_requirement(incident, "runbook"), incident=incident,
+        connector="vector-db", collected_at=datetime(2024, 8, 26, 13, 32, tzinfo=UTC),
+    )
+
+    assert result.rejected == []
+    assert len(result.records) == 1
+    assert result.records[0].content["version"] == "3"
+    assert result.records[0].content["approved"] is True
+    assert result.records[0].source_reference == "governed-rag://runbook-123"
+
+
 def test_rca_domain_gap_aliases_create_executable_canonical_requirements() -> None:
     incident = Incident(tenant_id="tenant-a", service="api-gateway", title="availability")
     requirements = build_evidence_requirements(

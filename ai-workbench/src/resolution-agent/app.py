@@ -15,7 +15,11 @@ import httpx
 from ai_workbench_common.models import Context
 from common.capability_registry import default_capability_registry
 from common.config import get_settings
-from common.context_enrichment_contract import build_evidence_requirements
+from common.context_enrichment_contract import (
+    authorized_enrichment_connectors,
+    build_evidence_requirements,
+    next_authorized_enrichment_connector,
+)
 from common.event_publishers import build_agent_event_contract, build_event_envelope
 from common.kafka import KafkaConsumer
 from common.kafka import consume_forever as consume_kafka_forever
@@ -173,7 +177,22 @@ def _attach_rca_governance_binding(recommendation: Recommendation, context: Cont
 
     context_metadata = context.metadata if isinstance(context.metadata, dict) else {}
     runtime = recommendation.metadata if isinstance(recommendation.metadata, dict) else {}
-    evidence_ids = sorted({str(value) for value in context_metadata.get("evidence_ids") or [] if str(value).strip()})
+    snapshot_evidence_ids = {
+        str(value) for value in context_metadata.get("evidence_ids") or [] if str(value).strip()
+    }
+    rca_analysis = runtime.get("rca_analysis") if isinstance(runtime.get("rca_analysis"), dict) else {}
+    referenced_evidence = (
+        rca_analysis.get("evidence_used")
+        if isinstance(rca_analysis.get("evidence_used"), list)
+        else []
+    )
+    # The immutable binding records evidence actually referenced by this RCA,
+    # not every record available in its context snapshot. The snapshot identity
+    # already preserves the complete evidence universe.
+    evidence_ids = sorted({
+        str(value) for value in referenced_evidence
+        if str(value).strip() and str(value) in snapshot_evidence_ids
+    })
     model_usage = runtime.get("model_usage") if isinstance(runtime.get("model_usage"), list) else []
     model_versions = sorted({
         str(item.get("model") or item.get("provider") or "").strip()
@@ -902,6 +921,7 @@ _CAPABILITY_BINDINGS: dict[tuple[str, str], str] = {
     ("mysql", "read_status"): "database.collect_diagnostics",
     ("mysql", "collect_diagnostics"): "database.collect_diagnostics",
     ("mysql", "failover_database"): "database.failover",
+    ("api", "restart_service"): "application.restart_service",
 }
 
 
@@ -1194,19 +1214,15 @@ async def _persist_resolution_event(
             )
             enrichment_repo = ContextEnrichmentRepository(session)
             await enrichment_repo.upsert_context_evidence_requirements(requirements)
-            resolved = context.alert.metadata.get("resolved_context_connectors", [])
-            authorized = {
-                str(item.get("provider") or "").strip().lower()
-                for item in resolved if isinstance(item, dict)
-            }
-            # Built-in governed read-only sources are available without a
-            # tenant secret; all other connectors must be explicitly onboarded.
-            authorized.update({"local-evidence", "vector-db"})
+            authorized = authorized_enrichment_connectors(
+                alert_metadata=context.alert.metadata,
+                context_payload=context.model_dump(mode="json"),
+            )
             window_end = datetime.now(UTC)
             for requirement in requirements:
-                connector = next(
-                    (candidate for candidate in requirement.candidate_connectors if candidate in authorized),
-                    None,
+                connector = next_authorized_enrichment_connector(
+                    candidate_connectors=requirement.candidate_connectors,
+                    authorized_connectors=authorized,
                 )
                 if connector:
                     await enrichment_repo.schedule_context_enrichment_job(
@@ -1222,6 +1238,8 @@ async def _persist_resolution_event(
                             "alert": context.alert.model_dump(mode="json"),
                             "incident": incident.model_dump(mode="json"),
                             "decision": dict(decision_payload),
+                            "authorized_connectors": sorted(authorized),
+                            "attempted_connectors": [],
                         },
                         observation_start=window_end.replace(microsecond=0) - timedelta(minutes=30),
                         observation_end=window_end.replace(microsecond=0),

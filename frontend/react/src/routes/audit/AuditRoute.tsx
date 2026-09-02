@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { FileClock, Filter, LockKeyhole, RefreshCw, ScrollText } from "lucide-react";
 import { Link } from "react-router-dom";
-import { useRouteRuntimeSlice } from "../../app/routeRuntime";
+import { useSession } from "../../app/SessionContext";
 import { durableIncidentPath } from "../../domain/incidentNavigation";
 import "./AuditRoute.css";
 
@@ -11,7 +11,7 @@ const PAGE_SIZE = 50;
 const relatedPath = (row: AuditRow) => row.resource_type === "incident" ? durableIncidentPath({ incident_id: row.resource_id }) : row.resource_type === "approval" ? `/approvals?approval_id=${encodeURIComponent(row.resource_id)}` : null;
 
 export default function AuditRoute() {
-  const { accessToken } = useRouteRuntimeSlice("session");
+  const { accessToken } = useSession();
   const [page, setPage] = useState(1);
   const [action, setAction] = useState("");
   const [reload, setReload] = useState(0);

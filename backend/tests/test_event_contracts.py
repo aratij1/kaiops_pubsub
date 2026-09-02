@@ -351,6 +351,7 @@ async def test_analysis_request_identity_flows_from_context_to_recommendation() 
         root_cause="Insufficient evidence", confidence=0.2, impact="Unknown",
         recommended_action="Collect evidence", severity=first.alert.severity,
         rationale="Evidence is incomplete", commands=[], risk="low",
+        metadata={"rca_analysis": {"evidence_used": first.metadata.get("evidence_ids", [])[:1]}},
     )
     resolution_agent_app._attach_rca_governance_binding(recommendation, first)
     assert recommendation.metadata["analysis_request_id"] == first_request_id
@@ -358,7 +359,7 @@ async def test_analysis_request_identity_flows_from_context_to_recommendation() 
     assert recommendation.metadata["context_fingerprint"] == first.metadata["context_fingerprint"]
     assert recommendation.metadata["rca_version"] == 1
     assert recommendation.metadata["recommendation_version"] == str(recommendation.id)
-    assert recommendation.metadata["evidence_ids"] == sorted(first.metadata.get("evidence_ids", []))
+    assert recommendation.metadata["evidence_ids"] == sorted(first.metadata.get("evidence_ids", [])[:1])
     assert recommendation.metadata["evidence_set_digest"].startswith("sha256:")
     assert recommendation.metadata["model_version"] == "deterministic-fallback-v1"
     assert recommendation.metadata["prompt_version"] == "resolution-graph-v2"

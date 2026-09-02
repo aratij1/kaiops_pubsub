@@ -12,10 +12,31 @@ export function isTraceableEvidenceCitation(value) {
   return Boolean(citation) && !["context://", "unknown://", "unavailable://"].some((prefix) => citation.startsWith(prefix));
 }
 
+export function draftEvidenceProvenance(evidence) {
+  const accepted = Array.isArray(evidence) ? evidence.filter((item) => item?.accepted === true) : [];
+  const linked = accepted.map((item) => {
+    const evidenceId = String(item.id || item.evidence_id || "").trim();
+    const candidates = [item.source_uri, item.uri, item.path, item.source_reference, item.citation];
+    const sourceUri = String(candidates.find((value) => isTraceableEvidenceCitation(value)) || "").trim();
+    return { evidenceId, sourceUri };
+  }).filter((item) => item.evidenceId && item.sourceUri);
+  const evidenceIds = [...new Set(linked.map((item) => item.evidenceId))];
+  const sourceUris = [...new Set(linked.map((item) => item.sourceUri))];
+  return { evidenceIds, sourceUris, ready: evidenceIds.length > 0 && sourceUris.length > 0 };
+}
+
 export function canonicalIncidentEvidence(workflow) {
   const root = object(workflow);
-  const parsedContract = IncidentInvestigationV1.safeParse(root.incident_investigation);
-  const contract = parsedContract.success ? parsedContract.data : null;
+  const contractPresent = Boolean(
+    root.incident_investigation
+    && typeof root.incident_investigation === "object"
+    && !Array.isArray(root.incident_investigation),
+  );
+  const parsedContract = contractPresent
+    ? IncidentInvestigationV1.safeParse(root.incident_investigation)
+    : null;
+  const contractIssue = parsedContract && !parsedContract.success ? parsedContract.error.issues[0] : null;
+  const contract = parsedContract?.success ? parsedContract.data : null;
   const context = object(root.context);
   const contextMetadata = object(context.metadata || root.context_metadata);
   const recommendation = object(root.recommendation);
@@ -79,8 +100,10 @@ export function canonicalIncidentEvidence(workflow) {
     acceptedEvidenceIds: [...acceptedIds],
     conclusive, grounded, integrity, integrityVerified,
     contextReady, rcaReady, resolutionReady, approvalReady, executionReady, validationReady, closureReady,
-    contract, contractValid: parsedContract.success,
-    contractError: parsedContract.success ? null : "Investigation contract invalid",
+    contract, contractPresent, contractValid: parsedContract?.success === true,
+    contractError: contractIssue
+      ? `Investigation contract invalid at ${contractIssue.path.join(".") || "root"}: ${contractIssue.message}`
+      : contractPresent ? null : "Investigation contract has not been published",
     // Confidence describes the bounded diagnostic assessment. Grounding and
     // execution readiness remain separate, stricter booleans so showing an
     // honest low/ungrounded score can never authorize remediation.

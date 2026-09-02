@@ -3,15 +3,6 @@ import { expect, test } from "@playwright/test";
 const liveAlertId = String(process.env.KAIOPS_LIVE_ALERT_ID || "").trim();
 const liveIncidentId = String(process.env.KAIOPS_LIVE_INCIDENT_ID || "").trim();
 
-async function visibleConfidence(page) {
-  const meter = page.getByRole("progressbar", { name: /Leading hypothesis confidence|Confirmed RCA confidence/ });
-  await expect(meter).toBeVisible({ timeout: 45_000 });
-  const label = await meter.getAttribute("aria-label");
-  const value = Number(await meter.getAttribute("aria-valuenow"));
-  expect(value, `expected a positive ${label} percentage`).toBeGreaterThan(0);
-  return { label, value };
-}
-
 test.skip(!process.env.KAIOPS_LIVE_E2E || !liveAlertId, "Set KAIOPS_LIVE_E2E=1 and KAIOPS_LIVE_ALERT_ID to run against a live API stack");
 
 test("live fresh RCA stays authenticated and renders the persisted analysis", async ({ page }) => {
@@ -43,10 +34,15 @@ test("live fresh RCA stays authenticated and renders the persisted analysis", as
   await expect(page.locator(".alert-details-cockpit")).toBeVisible({ timeout: 45_000 });
   const tabs = page.getByRole("tablist", { name: "Incident workspace sections" });
   await tabs.getByRole("tab", { name: "Evidence, RCA, and impact" }).click();
-  await page.getByRole("button", { name: /Fresh context/ }).click();
-  await page.getByRole("button", { name: "Run fresh analysis" }).click();
+  await page.getByText("Refresh analysis", { exact: true }).click();
+  await page.getByLabel("Context strategy").selectOption("fresh");
+  await page.getByRole("button", { name: "Run analysis" }).click();
 
-  await expect(page.getByText(new RegExp(`Fresh context and RCA analysis completed for alert ${liveAlertId}|Analysis for alert ${liveAlertId} is still running in the backend`))).toBeVisible({ timeout: 330_000 });
+  await expect(
+    page.locator("main").getByText(
+      new RegExp(`Fresh context and RCA analysis completed for alert ${liveAlertId}|Analysis for alert ${liveAlertId} is still running in the backend`),
+    ).first(),
+  ).toBeVisible({ timeout: 330_000 });
   await expect(page.getByText(/HTTP 401|Not authenticated/)).toHaveCount(0);
   expect(analysisRequests.some(({ url }) => url.includes(`/analysis/alerts/${liveAlertId}/regenerate`))).toBeTruthy();
   const orchestrationRequests = analysisRequests.filter(({ url }) => url.includes(`/analysis/alerts/${liveAlertId}/regenerate`)
@@ -56,18 +52,14 @@ test("live fresh RCA stays authenticated and renders the persisted analysis", as
   expect(analysisRequests.every(({ authorization }) => authorization.startsWith("Bearer "))).toBeTruthy();
   expect(analysisResponses.filter(({ url }) => url.includes(`/analysis/alerts/${liveAlertId}/regenerate`)).every(({ status }) => status >= 200 && status < 300)).toBeTruthy();
 
-  const workspaceConfidence = await visibleConfidence(page);
-  expect(workspaceConfidence.label).toBe("Leading hypothesis confidence");
-  await expect(page.getByText("This is a diagnostic hypothesis score, not a confirmed RCA or execution permission.")).toBeVisible();
+  await page.getByRole("tab", { name: /Analysis Reasoning and options/ }).click();
+  await expect(page.getByText(/Analysis:\s*insufficient evidence/i)).toBeVisible();
+  await expect(page.getByText(/Missing evidence: traces/i)).toBeVisible();
 
   if (liveIncidentId) {
     await page.goto(`/incidents/${encodeURIComponent(liveIncidentId)}`);
-    const incidentConfidence = page.locator(".ic-confidence");
-    await expect(incidentConfidence).toBeVisible({ timeout: 45_000 });
-    await expect(incidentConfidence).toContainText("Leading hypothesis confidence");
-    const incidentText = await incidentConfidence.innerText();
-    expect(Number(incidentText.match(/(\d+)%/)?.[1])).toBe(workspaceConfidence.value);
-    await incidentConfidence.locator("xpath=ancestor::section").getByText("Why this confidence?").click();
-    await expect(page.getByText("The investigation is not conclusive; this score cannot authorize remediation.")).toBeVisible();
+    await expect(page.getByText(/Working hypothesis · RCA v\d+/)).toBeVisible();
+    await expect(page.getByText(/Causal path is incomplete/)).toBeVisible();
+    await expect(page.getByText(/No executable resolution is available/)).toBeVisible();
   }
 });

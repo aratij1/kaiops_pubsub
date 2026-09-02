@@ -1,178 +1,51 @@
 import { useMemo } from "react";
-import { CheckCircle2, ChevronRight, ShieldCheck, Target, TriangleAlert, Wrench } from "lucide-react";
-import { canonicalIncidentAnalysis, formatQualityPercent } from "../../appHelpers.jsx";
+import { CheckCircle2, ChevronRight, TriangleAlert } from "lucide-react";
+import { canonicalIncidentAnalysis } from "../../domain/incidentAnalysis";
 import { canonicalApprovalEligibility } from "../../domain/approvalEligibility";
 import DecisionReadinessPanel, { type ReadinessCheck } from "./DecisionReadinessPanel";
 
-interface ExecutionPlan {
-  requiresApproval?: boolean;
-  riskTier?: string;
-  executionMode?: string;
-  action?: string;
-  target?: string;
-  expectedOutcome?: string;
-  catalogPlan?: any;
-  readinessDecision?: any;
-}
+interface ExecutionPlan { requiresApproval?: boolean; riskTier?: string; executionMode?: string; action?: string; target?: string; expectedOutcome?: string; commands?: string[]; catalogPlan?: any; readinessDecision?: any; }
+interface Props { workflow: any; alertRow: any; confidenceScore: number; executionPlan: ExecutionPlan; onNavigateTab: (tab: string) => void; embedded?: boolean; readinessChecks?: ReadinessCheck[]; }
 
-interface ResolutionPanelProps {
-  workflow: any;
-  alertRow: any;
-  confidenceScore: number;
-  executionPlan: ExecutionPlan;
-  onNavigateTab: (tab: string) => void;
-  embedded?: boolean;
-  readinessChecks?: ReadinessCheck[];
+function commands(value: any): string[] {
+  if (Array.isArray(value)) return value.flatMap(commands);
+  if (typeof value === "string" && value.trim()) return [value.trim()];
+  if (value && typeof value === "object") return commands(value.command ?? value.script ?? value.value);
+  return [];
 }
+function text(...values: any[]): string { return values.find((value) => typeof value === "string" && value.trim())?.trim() || ""; }
 
-export default function ResolutionPanel({
-  workflow,
-  alertRow,
-  confidenceScore,
-  executionPlan,
-  onNavigateTab,
-  embedded = false,
-  readinessChecks = [],
-}: ResolutionPanelProps) {
+export default function ResolutionPanel({ workflow, alertRow, executionPlan, onNavigateTab, embedded = false, readinessChecks = [] }: Props) {
   const analysis = useMemo(() => canonicalIncidentAnalysis(workflow, alertRow), [workflow, alertRow]);
-  const confidencePercent = Math.max(0, Math.min(100, Math.round(Number(confidenceScore || 0) * 100)));
-  const riskTier = executionPlan.riskTier || "Not classified";
-  const action = executionPlan.action && executionPlan.action !== "-" ? executionPlan.action : analysis.action;
-  const typedAction = Array.isArray(executionPlan.catalogPlan?.actions) ? executionPlan.catalogPlan.actions[0] : null;
-  const target = executionPlan.target
-    || executionPlan.catalogPlan?.remediation_target
-    || typedAction?.target_resource_id
-    || "Target not identified";
-  const expectedOutcome = executionPlan.expectedOutcome
-    || typedAction?.expected_outcome
-    || "Independent recovery checks pass for the approved target.";
-  const environment = alertRow?.environment || workflow?.incident?.environment || "Environment not identified";
-  const readinessReceipt = executionPlan.readinessDecision
-    || executionPlan.catalogPlan?.approval_readiness
-    || workflow?.recommendation?.metadata?.approval_readiness
-    || {};
-  const recommendationMetadata = workflow?.recommendation?.metadata || {};
-  const investigation = recommendationMetadata.iterative_investigation || recommendationMetadata.investigation_report || {};
-  const hypotheses = Array.isArray(investigation.typed_hypotheses) ? investigation.typed_hypotheses : [];
-  const questions = Array.isArray(investigation?.investigation_plan?.questions_to_answer) ? investigation.investigation_plan.questions_to_answer : [];
-  const resolutionOptions = Array.isArray(recommendationMetadata.resolution_options) ? recommendationMetadata.resolution_options : [];
-  const safetyBinding = typedAction?.safety_binding || {};
-  const blastRadius = safetyBinding?.blast_radius || {};
-  const preflight = workflow?.remediation_action?.parameters?.preflight_evidence || workflow?.remediation?.parameters?.preflight_evidence || safetyBinding?.preflight || {};
-  const outcomeValidation = workflow?.resolution_report?.metadata?.outcome_validation || workflow?.closure_report?.metadata?.outcome_validation || workflow?.report?.metadata?.outcome_validation || {};
-  const leadingHypothesis = hypotheses.find((item: any) => item.status === "SUPPORTED") || hypotheses[0];
-  const confidenceFactors = leadingHypothesis?.confidence_factors && typeof leadingHypothesis.confidence_factors === "object" ? Object.entries(leadingHypothesis.confidence_factors) : [];
-  const confidencePenalties = leadingHypothesis?.confidence_penalties && typeof leadingHypothesis.confidence_penalties === "object" ? Object.entries(leadingHypothesis.confidence_penalties) : [];
-  const reviewArtifacts = workflow?.evaluation?.report || workflow?.evaluation_report?.report || recommendationMetadata;
-  const patchProposals = Array.isArray(reviewArtifacts.code_patch_proposals) ? reviewArtifacts.code_patch_proposals : [];
-  const preventiveRecommendations = Array.isArray(reviewArtifacts.preventive_recommendations) ? reviewArtifacts.preventive_recommendations : [];
-  const evidenceCouncil = reviewArtifacts.evidence_council || {};
-  const temporalGraph = reviewArtifacts.temporal_service_graph || {};
-  const approvalEligibility = canonicalApprovalEligibility({ workflow, plan: executionPlan.catalogPlan, receipt: readinessReceipt });
-  const planComplete = Boolean(analysis.rootCause && analysis.rootCause !== "-" && action && action !== "-");
-  const decisionChecks: ReadinessCheck[] = [
-    ...readinessChecks,
-    {
-      id: "governed-target",
-      label: "Governed target",
-      detail: target !== "Target not identified" ? `Approved target: ${target}.` : "The approved plan has no typed target.",
-      passed: target !== "Target not identified",
-      action: "select a catalog plan with a typed target",
-    },
-    {
-      id: "decision-confidence",
-      label: "Evidence confidence",
-      detail: `${confidencePercent}% evidence-derived confidence.`,
-      passed: confidencePercent >= 85,
-      action: "continue investigation until confidence reaches 85%",
-    },
-  ];
-  const readyForDecision = approvalEligibility.eligible;
+  const metadata = workflow?.recommendation?.metadata || {};
+  const plan = executionPlan.catalogPlan || metadata.execution_plan || {};
+  const typedAction = Array.isArray(plan.actions) ? plan.actions[0] : null;
+  const receipt = executionPlan.readinessDecision || plan.approval_readiness || metadata.approval_readiness || {};
+  const eligibility = canonicalApprovalEligibility({ workflow, plan, receipt });
+  const target = text(executionPlan.target, plan.remediation_target, typedAction?.target_resource_id) || "Not identified";
+  const environment = text(alertRow?.environment, workflow?.incident?.environment) || "Not identified";
+  const action = text(executionPlan.action, workflow?.recommendation?.recommended_action, analysis.action) || "No action proposed";
+  const reason = text(typedAction?.reason, typedAction?.rationale, plan.rationale, metadata.rationale, analysis.rootCause) || "The evidence does not yet establish why a system change is required.";
+  const outcome = text(executionPlan.expectedOutcome, typedAction?.expected_outcome, plan.expected_outcome) || "Independent health checks confirm recovery for the target.";
+  const run = commands(typedAction?.commands ?? typedAction?.command ?? plan.commands);
+  const validation = commands(typedAction?.validation_commands ?? plan.validation_commands ?? plan.validation_queries);
+  const rollback = commands(typedAction?.rollback_commands ?? plan.rollback_commands ?? plan.rollback_plan);
+  const suggestions = run.length ? [] : commands(metadata.model_proposed_execution_plan?.commands);
+  const hasScript = run.length > 0;
+  const evidenceOnly = /collect|evidence|trace|runbook|investigat|diagnos/i.test(action) && !hasScript;
+  const status = hasScript ? (eligibility.eligible ? "Ready for guarded approval" : "Execution safeguards incomplete") : (evidenceOnly ? "Evidence collection required" : "No governed execution script");
+  const purpose = evidenceOnly ? `${reason} This diagnostic step is needed to close the evidence gaps before KaiMS can safely propose a system change.` : `${reason} The script is intended to produce this outcome: ${outcome}`;
+  const checks: ReadinessCheck[] = [...readinessChecks, { id: "governed-script", label: "Governed execution script", detail: hasScript ? `${run.length} bound command${run.length === 1 ? "" : "s"} available.` : "No executable command is bound to this plan.", passed: hasScript, action: evidenceOnly ? "collect the requested evidence and rerun resolution" : "select a governed catalog plan with bound commands" }];
 
-  return (
-    <section className="panel incident-workspace-section incident-resolution-section resolution-decision-brief" role="tabpanel" aria-labelledby="resolution-recommendation-title">
-      <header className="resolution-brief-header">
-        <div>
-          <span className="discovery-eyebrow">Resolution decision</span>
-          <h3 id="resolution-recommendation-title">Remediation recommendation</h3>
-          <p>Review the exact change, target, evidence basis, and safety envelope before approval.</p>
-        </div>
-        <span className={`decision-readiness ${readyForDecision ? "is-ready" : "is-blocked"}`}>
-          {readyForDecision ? <CheckCircle2 size={17} /> : <TriangleAlert size={17} />}
-          {readyForDecision ? "Backend eligibility verified" : planComplete ? "Backend readiness required" : "Plan incomplete"}
-        </span>
-      </header>
-
-      <div className="resolution-brief-layout">
-        <article className="resolution-change-summary">
-          <span className="resolution-brief-icon"><Wrench size={20} /></span>
-          <div>
-            <span className="resolution-brief-label">Proposed change</span>
-            <h4>{action || "No corrective action has been proposed."}</h4>
-            <dl>
-              <div><dt>Target</dt><dd>{target}</dd></div>
-              <div><dt>Environment</dt><dd>{environment}</dd></div>
-              <div><dt>Current impact</dt><dd>{analysis.impact}</dd></div>
-              <div><dt>Expected outcome</dt><dd>{expectedOutcome}</dd></div>
-            </dl>
-          </div>
-        </article>
-
-        <aside className="resolution-readiness-summary">
-          <div className="decision-confidence">
-            <div><span>AI confidence</span><strong>{formatQualityPercent(confidenceScore)}</strong></div>
-            <div className="decision-confidence-track" role="progressbar" aria-label="Recommendation confidence" aria-valuemin={0} aria-valuemax={100} aria-valuenow={confidencePercent}><span style={{ width: `${confidencePercent}%` }} /></div>
-            <small>Evidence support, not execution permission</small>
-          </div>
-          <dl className="decision-safety-facts">
-            <div><dt>Approval gate</dt><dd>{executionPlan.requiresApproval ? "Human approval required" : "Policy controlled"}</dd></div>
-            <div><dt>Risk tier</dt><dd>{riskTier}</dd></div>
-            <div><dt>Executor</dt><dd>{executionPlan.executionMode || "Not configured"}</dd></div>
-          </dl>
-        </aside>
-      </div>
-
-      <div className="resolution-rationale-grid">
-        <article>
-          <span><Target size={17} /> Why this action</span>
-          <strong>{analysis.rootCause}</strong>
-          <p>The proposed change should address this leading cause. Validate the evidence and target before release.</p>
-        </article>
-        <article>
-          <span><ShieldCheck size={17} /> What protects the service</span>
-          <strong>Approval, idempotency, rollback, and recovery checks</strong>
-          <p>The execution workspace shows any missing safeguard as a blocker before the primary action becomes available.</p>
-        </article>
-      </div>
-
-      <section className="autonomy-decision-details" aria-labelledby="autonomy-details-title">
-        <header><div><span className="discovery-eyebrow">Decision trace</span><h4 id="autonomy-details-title">Evidence-to-recovery controls</h4></div><span className={`autonomy-outcome is-${String(outcomeValidation.outcome || investigation.outcome || "pending").toLowerCase().replaceAll("_", "-")}`}>{String(outcomeValidation.outcome || investigation.outcome || "Awaiting validation").replaceAll("_", " ")}</span></header>
-        <div className="autonomy-detail-grid">
-          <details open><summary>Investigation and hypotheses <small>{hypotheses.length} typed</small></summary><div className="autonomy-detail-body">{questions.length ? <ul className="autonomy-question-list">{questions.slice(0, 3).map((question: string) => <li key={question}>{question}</li>)}</ul> : <p>No typed investigation question was returned.</p>}{leadingHypothesis ? <article className="autonomy-highlight"><strong>{leadingHypothesis.title}</strong><span>{leadingHypothesis.status} · {formatQualityPercent(Number(leadingHypothesis.probability || 0))}</span><p>{leadingHypothesis.reasoning_summary || leadingHypothesis.description}</p><small>{Array.isArray(leadingHypothesis.supporting_evidence_ids) ? leadingHypothesis.supporting_evidence_ids.length : 0} supporting · {Array.isArray(leadingHypothesis.contradicting_evidence_ids) ? leadingHypothesis.contradicting_evidence_ids.length : 0} contradicting evidence records</small></article> : <p className="autonomy-empty">No causal hypothesis is available. Approval remains evidence-gated.</p>}{(confidenceFactors.length || confidencePenalties.length) ? <dl className="autonomy-factor-list">{confidenceFactors.slice(0, 4).map(([name, value]) => <div key={`factor-${name}`}><dt>{String(name).replaceAll("_", " ")}</dt><dd>+{formatQualityPercent(Number(value || 0))}</dd></div>)}{confidencePenalties.slice(0, 3).map(([name, value]) => <div key={`penalty-${name}`} className="is-penalty"><dt>{String(name).replaceAll("_", " ")}</dt><dd>−{formatQualityPercent(Number(value || 0))}</dd></div>)}</dl> : null}</div></details>
-          <details><summary>Ranked resolution options <small>{resolutionOptions.length}</small></summary><div className="autonomy-detail-body">{resolutionOptions.length ? <ol className="autonomy-option-list">{resolutionOptions.map((option: any) => <li key={option.option_id}><strong>{option.title}</strong><span>{option.risk_level} risk · {option.automation_eligibility}</span><p>{option.reasoning}</p></li>)}</ol> : <p className="autonomy-empty">No governed option is available for this evidence state.</p>}</div></details>
-          <details><summary>Blast radius and preflight <small>{preflight.status || "Not run"}</small></summary><div className="autonomy-detail-body"><dl className="autonomy-facts"><div><dt>Scope</dt><dd>{String(blastRadius.scope || "Unverified").replaceAll("-", " ")}</dd></div><div><dt>Verified</dt><dd>{blastRadius.verified === true ? "Yes" : "No"}</dd></div><div><dt>Dependencies</dt><dd>{blastRadius.unknown_dependencies === true ? "Unknown — blocked" : "Bounded"}</dd></div><div><dt>Preflight</dt><dd>{String(preflight.status || "Not run").replaceAll("_", " ")}</dd></div><div><dt>Dry-run evidence</dt><dd>{preflight.dry_run_evidence_id ? "Recorded" : "Required"}</dd></div><div><dt>Credential</dt><dd>{safetyBinding?.credential?.reference ? "Scoped reference present" : "Not verified"}</dd></div></dl></div></details>
-          <details><summary>Validation and rollback <small>{outcomeValidation.rollback?.disposition || "Pending"}</small></summary><div className="autonomy-detail-body"><dl className="autonomy-facts"><div><dt>Recovery outcome</dt><dd>{String(outcomeValidation.outcome || "Not evaluated").replaceAll("_", " ")}</dd></div><div><dt>Closure authorized</dt><dd>{outcomeValidation.closure_authorized === true ? "Yes" : "No"}</dd></div><div><dt>Observation window</dt><dd>{outcomeValidation.stability_window_seconds ? `${outcomeValidation.stability_window_seconds}s` : "Pending"}</dd></div><div><dt>Rollback</dt><dd>{String(outcomeValidation.rollback?.disposition || "Pending").replaceAll("_", " ")}</dd></div></dl>{Array.isArray(outcomeValidation.failed_checks) && outcomeValidation.failed_checks.length ? <p className="autonomy-warning">Failed checks: {outcomeValidation.failed_checks.join(", ")}</p> : null}</div></details>
-          <details><summary>Review-only intelligence <small>{patchProposals.length + preventiveRecommendations.length} artifacts</small></summary><div className="autonomy-detail-body"><dl className="autonomy-facts"><div><dt>Patch proposals</dt><dd>{patchProposals.length} · review only</dd></div><div><dt>Preventive recommendations</dt><dd>{preventiveRecommendations.length} · non-executing</dd></div><div><dt>Evidence council</dt><dd>{String(evidenceCouncil.disposition || "Not evaluated").replaceAll("_", " ")}</dd></div><div><dt>Temporal graph</dt><dd>{Array.isArray(temporalGraph.edges) ? `${temporalGraph.edges.length} evidence-bound edges` : "Not available"}</dd></div></dl>{patchProposals.slice(0, 2).map((proposal: any) => <article className="autonomy-highlight" key={proposal.proposal_id || proposal.title}><strong>{proposal.title}</strong><span>Human review required · not executable</span><p>{proposal.explanation}</p></article>)}{preventiveRecommendations.slice(0, 2).map((recommendation: any) => <article className="autonomy-highlight" key={recommendation.recommendation_id || recommendation.risk_signal}><strong>{recommendation.risk_signal}</strong><span>{recommendation.mode} · execution not authorized</span><p>{recommendation.recommended_review}</p></article>)}</div></details>
-        </div>
-      </section>
-
-      <DecisionReadinessPanel
-        title="Approval eligibility"
-        checks={[...decisionChecks, {
-          id: "backend-readiness-receipt",
-          label: "Signed backend readiness",
-          detail: approvalEligibility.eligible ? `Verified decision ${readinessReceipt.decision_id}.` : approvalEligibility.reasons.join("; "),
-          passed: approvalEligibility.eligible,
-          action: "request a fresh backend approval-readiness evaluation",
-        }]}
-        eligibleLabel="Eligible for guarded approval"
-        onReviewEvidence={() => onNavigateTab("evidence")}
-      />
-
-      {!embedded ? <footer className="incident-section-actions resolution-brief-actions">
-        <button type="button" className="button-secondary" onClick={() => onNavigateTab("rca")}>Review supporting evidence</button>
-        <button type="button" className="button-primary" onClick={() => onNavigateTab("execution")}>Inspect safeguards and decide <ChevronRight size={16} /></button>
-      </footer> : null}
-    </section>
-  );
+  return <section className="panel incident-workspace-section incident-resolution-section resolution-decision-brief" role="tabpanel" aria-labelledby="resolution-recommendation-title">
+    <header className="resolution-brief-header"><div><span className="discovery-eyebrow">Resolution</span><h3 id="resolution-recommendation-title">{hasScript ? "Review execution plan" : "Resolution needs more evidence"}</h3><p>{hasScript ? "Confirm exactly what will run, why it is needed, and how recovery will be verified." : "No system-changing command will be presented until it is evidence-backed and bound to a governed plan."}</p></div><span className={`decision-readiness ${eligibility.eligible && hasScript ? "is-ready" : "is-blocked"}`}>{eligibility.eligible && hasScript ? <CheckCircle2 size={17} /> : <TriangleAlert size={17} />}{status}</span></header>
+    <div className="resolution-operator-brief">
+      <section className="resolution-purpose" aria-labelledby="resolution-purpose-title"><span className="resolution-brief-label">Why this is needed</span><h4 id="resolution-purpose-title">{action}</h4><p>{purpose}</p></section>
+      <dl className="resolution-plan-facts"><div><dt>Target</dt><dd>{target}</dd></div><div><dt>Environment</dt><dd>{environment}</dd></div><div><dt>Executor</dt><dd>{executionPlan.executionMode || "Not configured"}</dd></div><div><dt>Risk / approval</dt><dd>{executionPlan.riskTier || "Not classified"} · {executionPlan.requiresApproval ? "Human approval" : "Policy controlled"}</dd></div></dl>
+      <section className="resolution-script" aria-labelledby="execution-script-title"><div><span className="resolution-brief-label">Execution script</span><small>{hasScript ? "Exact governed commands" : "Unavailable"}</small></div><h4 id="execution-script-title">{hasScript ? "What will run" : "No executable remediation script is available"}</h4>{hasScript ? <pre><code>{run.join("\n")}</code></pre> : <p>{evidenceOnly ? "Complete the evidence request, then refresh the analysis to generate an evidence-backed resolution." : "Bind an approved catalog action before requesting execution."}</p>}{suggestions.length ? <details><summary>Review-only model suggestion</summary><pre><code>{suggestions.join("\n")}</code></pre><p>This suggestion is not governed and cannot be executed from KaiMS.</p></details> : null}</section>
+      <div className="resolution-verification-grid"><section><span className="resolution-brief-label">Expected result</span><p>{outcome}</p></section><section><span className="resolution-brief-label">Validation</span>{validation.length ? <pre><code>{validation.join("\n")}</code></pre> : <p>No validation command is bound.</p>}</section><section><span className="resolution-brief-label">Rollback</span>{rollback.length ? <pre><code>{rollback.join("\n")}</code></pre> : <p>No rollback command is bound.</p>}</section></div>
+    </div>
+    <DecisionReadinessPanel title="What is blocking execution" checks={[...checks, { id: "backend-readiness-receipt", label: "Signed backend readiness", detail: eligibility.eligible ? `Verified decision ${receipt.decision_id}.` : eligibility.reasons.join("; "), passed: eligibility.eligible, action: "request a fresh backend approval-readiness evaluation" }]} eligibleLabel="Eligible for guarded approval" onReviewEvidence={() => onNavigateTab("evidence")} />
+    {!embedded ? <footer className="incident-section-actions resolution-brief-actions"><button type="button" className="button-secondary" onClick={() => onNavigateTab("rca")}>Review supporting evidence</button><button type="button" className="button-primary" disabled={!hasScript} onClick={() => onNavigateTab("execution")}>Inspect safeguards and decide <ChevronRight size={16} /></button></footer> : null}
+  </section>;
 }

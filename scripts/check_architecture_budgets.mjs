@@ -70,6 +70,19 @@ for (const file of featureFiles) {
   if (statSync(file).size > 80 * 1024) failures.push(`feature asset exceeds 80 KiB source budget: ${path}`);
 }
 
+const routeOwnedFiles = [
+  ...featureFiles,
+  ...walk(join(frontendRoot, "src", "routes")),
+];
+for (const file of routeOwnedFiles) {
+  if (![".ts", ".tsx", ".js", ".jsx"].includes(extname(file))) continue;
+  const path = relative(repositoryRoot, file).replaceAll("\\", "/");
+  const content = readFileSync(file, "utf8");
+  if (/from\s+["'][^"']*appHelpers(?:\.jsx)?["']/.test(content)) {
+    failures.push(`route-owned code may not import the legacy appHelpers runtime: ${path}`);
+  }
+}
+
 const incidentCommand = source("frontend/react/src/features/incidents/IncidentCommand.tsx");
 for (const phrase of ["Not provided by backend", "does not invent confidence", "Evidence provenance", "Execution safety envelope"]) {
   if (!incidentCommand.includes(phrase)) failures.push(`Incident Command truth contract is missing: ${phrase}`);

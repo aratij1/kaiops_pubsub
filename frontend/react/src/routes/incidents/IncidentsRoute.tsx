@@ -4,13 +4,24 @@ import { useSearchParams } from "react-router-dom";
 import { useRouteRuntimeSlice, type AlertStreamRow, type IncidentFilters, type IncidentRow } from "../../app/routeRuntime";
 import { OperationsWorkflowNav } from "../../components/operations/OperationsWorkflowNav";
 import { effectiveIncidentStatus } from "../../domain/incidentStatus";
-import { formatIstTimestamp } from "../../appHelpers.jsx";
+import { formatIstTimestamp } from "../../utils/presentation";
 import IncidentDecisionWorkspace from "./IncidentDecisionWorkspace";
 import "./IncidentsRoute.css";
 
 const PAGE_SIZE = 10;
 type InboxView = "needs_me" | "kai_handling" | "critical" | "watching" | "resolved" | "all";
 type RecordType = "all" | "incidents" | "alerts";
+
+function apiErrorMessage(payload: any, fallback: string) {
+  const detail = payload?.detail;
+  if (typeof detail === "string" && detail.trim()) return detail;
+  if (detail && typeof detail === "object") {
+    const message = detail.message || detail.error?.message || detail.code;
+    if (typeof message === "string" && message.trim()) return message;
+  }
+  const message = payload?.message || payload?.error?.message;
+  return typeof message === "string" && message.trim() ? message : fallback;
+}
 
 function belongsToInboxView(row: IncidentRow, view: InboxView) {
   const status = String(row.status || "").toLowerCase();
@@ -92,14 +103,14 @@ type IncidentGroupPage = {
   generated_at: string;
 };
 type UnifiedRecord = { record_type: "incident"; score: number; row: IncidentRow } | { record_type: "alert"; score: number; row: AlertStreamRow };
-type UnifiedPage = { rows: UnifiedRecord[]; next_cursor: string | null; previous_cursor: string | null; total_count: number; filtered_count: number; view_counts: Record<string, number> };
+type UnifiedPage = { rows: UnifiedRecord[]; next_cursor: string | null; previous_cursor: string | null; total_count: number; filtered_count: number; record_counts: { incidents: number; alerts: number }; view_counts: Record<string, number> };
 
 const EMPTY_GROUP_PAGE: IncidentGroupPage = {
   rows: [], next_cursor: null, previous_cursor: null, total_count: 0,
   filtered_count: 0, active_count: 0, needs_attention_count: 0,
   unlinked_signal_count: 0, generated_at: "",
 };
-const EMPTY_UNIFIED_PAGE: UnifiedPage = { rows: [], next_cursor: null, previous_cursor: null, total_count: 0, filtered_count: 0, view_counts: {} };
+const EMPTY_UNIFIED_PAGE: UnifiedPage = { rows: [], next_cursor: null, previous_cursor: null, total_count: 0, filtered_count: 0, record_counts: { incidents: 0, alerts: 0 }, view_counts: {} };
 
 function incidentTime(row: IncidentRow) {
   const timestamp = Date.parse(String(row.updated_at || row.created_at || ""));
@@ -338,6 +349,12 @@ function incidentNoise(row: IncidentRow) {
   };
 }
 
+export function isActionableInboxIncident(row: IncidentRow) {
+  const severity = String(row.severity || row.risk_tier || "").trim().toLowerCase();
+  return ["high", "critical", "p1", "p2", "sev1", "sev2"].includes(severity)
+    && !incidentNoise(row).noise;
+}
+
 function contextPresentation(row: IncidentRow) {
   const projection = row.projection_payload && typeof row.projection_payload === "object" ? row.projection_payload : {};
   const event = projectionEvent(row);
@@ -383,8 +400,7 @@ export default function IncidentsRoute() {
   const groupError = incidents.error;
   const focusedIncidentId = String(searchParams.get("incident_id") || "").trim();
   const [recordType, setRecordType] = useState<RecordType>(() => {
-    const requested = searchParams.get("type");
-    return requested === "alerts" || requested === "incidents" ? requested : "all";
+    return "incidents";
   });
   const [presentation, setPresentation] = useState<Presentation>(() => {
     const saved = window.localStorage.getItem("kaiops.incident-presentation");
@@ -401,8 +417,8 @@ export default function IncidentsRoute() {
   const inboxAlertRows = alerts.inboxRows || alerts.rows;
   useEffect(() => { incidents.loadPage(cursor); }, [cursor]);
   useEffect(() => {
-    if (!session.accessToken || recordType !== "all") return undefined;
-    const params = new URLSearchParams({ limit: String(PAGE_SIZE), inbox_view: inboxView, record_type: "all" });
+    if (!session.accessToken) return undefined;
+    const params = new URLSearchParams({ limit: String(PAGE_SIZE), inbox_view: inboxView, record_type: "incidents" });
     if (cursor) params.set("cursor", cursor);
     for (const [key, filterValue] of Object.entries({
       risk_tier: restoredFilter("risk_tier"), execution_mode: restoredFilter("execution_mode"),
@@ -416,7 +432,7 @@ export default function IncidentsRoute() {
       headers: { Authorization: `Bearer ${session.accessToken}` }, signal: controller.signal,
     }).then(async (response) => {
       const payload = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(String(payload?.detail?.message || payload?.detail || `Unified inbox failed (${response.status})`));
+      if (!response.ok) throw new Error(apiErrorMessage(payload, `Unified inbox failed (${response.status})`));
       const result = payload?.data && typeof payload.data === "object" ? payload.data : payload;
       setUnifiedPage({ ...EMPTY_UNIFIED_PAGE, ...result, rows: Array.isArray(result?.rows) ? result.rows : [] });
     }).catch((error) => {
@@ -424,7 +440,7 @@ export default function IncidentsRoute() {
       setUnifiedError(String((error as Error).message || error));
     }).finally(() => { if (!controller.signal.aborted) setUnifiedLoading(false); });
     return () => controller.abort();
-  }, [cursor, inboxView, recordType, session.accessToken, incidents.filters.execution_mode, incidents.filters.risk_tier, incidents.filters.service, incidents.filters.status, incidents.filters.transport_provider]);
+  }, [cursor, inboxView, session.accessToken, incidents.filters.execution_mode, incidents.filters.risk_tier, incidents.filters.service, incidents.filters.status, incidents.filters.transport_provider]);
   const closeIncident = async (row: IncidentRow) => {
     const incidentId = String(row.incident_id || row.id || "").trim();
     const comment = closure.comment.trim();
@@ -451,7 +467,10 @@ export default function IncidentsRoute() {
       || incidents.rows.find((row) => String(row.incident_id || row.id || "") === focusedIncidentId);
     return focused ? [{ ...focused, duplicateIncidents: [] }] : canonicalRows;
   }, [focusedIncidentId, groupPage.rows, incidents.rows, inboxAlertRows]);
-  const filteredIncidents = useMemo(() => groupedIncidents.filter((row) => belongsToInboxView(row, inboxView)), [groupedIncidents, inboxView]);
+  const filteredIncidents = useMemo(
+    () => groupedIncidents.filter((row) => isActionableInboxIncident(row) && belongsToInboxView(row, inboxView)),
+    [groupedIncidents, inboxView],
+  );
   useEffect(() => window.localStorage.setItem("kaiops.incident-presentation", presentation), [presentation]);
   useEffect(() => setPage(1), [incidents.filters.risk_tier, incidents.filters.execution_mode, incidents.filters.status, incidents.filters.service, inboxView, recordType]);
   const incidentAlertIds = useMemo(() => new Set(incidents.rows.map((row) => String(row.alert_id || "")).filter(Boolean)), [incidents.rows]);
@@ -460,7 +479,7 @@ export default function IncidentsRoute() {
     return !alertLinkedIncidentId(alert) && (!alertId || !incidentAlertIds.has(alertId));
   }), [inboxAlertRows, incidentAlertIds]);
   const filteredAlerts = useMemo(() => {
-    const candidates = recordType === "alerts" ? inboxAlertRows : unlinkedAlerts;
+    const candidates = unlinkedAlerts;
     const serviceQuery = incidents.filters.service.trim().toLowerCase();
     return candidates.filter((alert) => {
       if (!alertBelongsToInboxView(alert, inboxView)) return false;
@@ -472,7 +491,7 @@ export default function IncidentsRoute() {
   const unifiedRecords = useMemo(() => unifiedPage.rows.map((item) => item.record_type === "incident"
     ? { kind: "incident" as const, score: item.score, row: item.row as IncidentRow }
     : { kind: "alert" as const, score: item.score, row: item.row as AlertStreamRow }), [unifiedPage.rows]);
-  const totalRecords = recordType === "all" ? unifiedPage.filtered_count : recordType === "alerts" ? filteredAlerts.length : groupPage.filtered_count;
+  const totalRecords = recordType === "all" ? unifiedPage.filtered_count : recordType === "alerts" ? filteredAlerts.length : filteredIncidents.length;
   const pages = Math.max(1, Math.ceil(totalRecords / PAGE_SIZE));
   useEffect(() => {
     if (!focusedIncidentId) return;
@@ -512,17 +531,12 @@ export default function IncidentsRoute() {
   return <section className="grid single-col operations-center">
     <OperationsWorkflowNav active="incidents" />
     <header className="incident-list-heading unified-inbox-heading">
-      <div><span className="inbox-eyebrow"><Activity size={14} /> Operations command queue</span><h2>Unified Inbox</h2><p>One prioritized workspace for signals, incidents, and decisions that need attention.</p></div>
-      <div className="operations-kpis" aria-label="Operational totals"><span className={needsAttention ? "is-urgent" : ""}><small>Needs attention</small><strong>{needsAttention}</strong></span><span><small>Active incidents</small><strong>{active}</strong></span><span><small>Unlinked signals</small><strong>{groupPage.unlinked_signal_count}</strong></span><span><small>Total incidents</small><strong>{groupPage.total_count}</strong></span></div>
+      <div><span className="inbox-eyebrow"><Activity size={14} /> Incident command queue</span><h2>Unified Inbox</h2><p>Canonical incidents that require investigation, decisions, remediation, or validation.</p></div>
+      <div className="operations-kpis" aria-label="Incident totals"><span className={needsAttention ? "is-urgent" : ""}><small>Needs attention</small><strong>{needsAttention}</strong></span><span><small>Active incidents</small><strong>{active}</strong></span><span><small>Total incidents</small><strong>{unifiedPage.record_counts.incidents}</strong></span></div>
     </header>
     <nav className="incident-inbox-views" aria-label="Incident inbox views">{([
       ["needs_me", "Needs me"], ["kai_handling", "Kai handling"], ["critical", "Critical"], ["watching", "Watching"], ["resolved", "Resolved recently"], ["all", "All"],
     ] as const).map(([id, label]) => <button type="button" key={id} className={inboxView === id ? "active" : ""} aria-pressed={inboxView === id} onClick={() => { setInboxView(id); setPage(1); setSearchParams((current) => { const next = new URLSearchParams(current); next.delete("cursor"); return next; }); }}>{label}<span>{viewCount(id)}</span></button>)}</nav>
-    <div className="inbox-source-tabs" role="tablist" aria-label="Inbox source">
-      <button type="button" role="tab" aria-selected={showUnified} className={showUnified ? "active" : ""} onClick={() => { setRecordType("all"); setPresentation("summary"); setPage(1); }}><span>All activity</span><strong>{groupPage.total_count + groupPage.unlinked_signal_count}</strong><small>Incidents + unlinked signals</small></button>
-      <button type="button" role="tab" aria-selected={showIncidents} className={showIncidents ? "active" : ""} onClick={() => { setRecordType("incidents"); setPage(1); }}><span>Incidents</span><strong>{groupPage.total_count}</strong><small>Correlated operational work</small></button>
-      <button type="button" role="tab" aria-selected={showAlerts} className={showAlerts ? "active" : ""} onClick={() => { setRecordType("alerts"); setPage(1); }}><span>Signals</span><strong>{inboxAlertRows.length}</strong><small>Raw intake and outcomes</small></button>
-    </div>
     <div className={`compact-filter-bar inbox-filter-bar ${showUnified ? "is-unified" : showAlerts ? "is-signals" : ""}`}>
       {showIncidents ? <>{select("Risk", "risk_tier", ["all", "high", "medium", "low"])}{select("Status", "status", ["all", "open", "investigating", "awaiting_approval", "remediating", "validating", "closed", "failed"])}</> : null}
       <label className="filter-grow">Service<input value={restoredFilter("service")} placeholder="Search service, application, or signal" onChange={(event) => updateIncidentFilter("service", event.target.value)} /></label>

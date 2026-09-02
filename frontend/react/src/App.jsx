@@ -7,7 +7,7 @@ import { useOperationalEvents } from "./services/operationalEvents";
 import { beginOidcLogin, clearStoredSession, completeOidcLogin, restoreStoredSession, storeSessionTokens } from "./services/oidcClient";
 import { RouteRuntimeProvider } from "./app/routeRuntime";
 import { projectIdentityFromAlert } from "./domain/projectIdentity";
-import { isExpectedAnalysisVersion } from "./domain/analysisVersion";
+import { canHydrateCompletedAnalysis } from "./domain/analysisVersion";
 import { analysisFailureMessage, analysisRequestOutcome } from "./domain/analysisRequestStatus";
 import { durableIncidentPath, effectiveExecutionStatus, effectiveIncidentStatus, executionProcessPresentation, incidentStatusLabel } from "./domain/incidentStatus";
 import { resolveResolutionControl } from "./domain/resolutionControl";
@@ -15,7 +15,7 @@ import { incidentDraftHasSubstantiveContent, simpleIncidentReport } from "./doma
 import { approvalFlowFromPayload, approvalFlowId, approvalIncidentId, approvalRecommendationFromPayload, approvalRecommendationId, approvalTraceId } from "./domain/approvalContext";
 import { buildOnboardingSources } from "./domain/onboardingSources";
 import { buildAlertDocumentDraft as buildRcaEvidenceDocumentDraft } from "./domain/alertDocumentDraft";
-import { canonicalIncidentEvidence } from "./domain/incidentEvidence";
+import { canonicalIncidentEvidence, draftEvidenceProvenance } from "./domain/incidentEvidence";
 import { canonicalApprovalEligibility } from "./domain/approvalEligibility";
 import { buildIncidentGroupQuery } from "./features/incidents/incidentGroupQuery";
 import { isEvidenceDraftConflict, useEvidenceDraftBundle } from "./features/incidents/useEvidenceDraftBundle";
@@ -536,7 +536,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     error: "",
     incidentId: "",
   });
-  const [homeDetailTab, setHomeDetailTab] = useState("overview");
+  const [homeDetailTab, setHomeDetailTab] = useState("evidence");
   const [rcaDetailView, setRcaDetailView] = useState("simple");
   const [diagnosticsDetailTab, setDiagnosticsDetailTab] = useState("pipeline");
   const [approvalForm, setApprovalForm] = useState({
@@ -1367,7 +1367,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     }
   }
 
-  function openAlertDetails(row, initialTab = "overview") {
+  function openAlertDetails(row, initialTab = "evidence") {
     // Incident projections already carry the authoritative alert UUID. Do not
     // replace it with a semantically similar landing-pad row whose id is a
     // filename; processed RCA endpoints are keyed by the canonical UUID.
@@ -1394,11 +1394,13 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     skipNextActiveTabNavigationRef.current = true;
     setActiveTab("home");
     setHomeDetailTab(initialTab === "rca" ? "evidence" : initialTab);
+    if (initialTab === "rca") setRcaDetailView("simple");
     loadAlertDetails(alertId, canonicalRow);
-    onNavigatePath?.(`/?workspace=alert&alert_id=${encodeURIComponent(alertId)}`);
+    const detail = initialTab === "rca" ? "evidence" : initialTab;
+    onNavigatePath?.(`/?workspace=alert&alert_id=${encodeURIComponent(alertId)}&detail=${encodeURIComponent(detail)}`);
   }
 
-  function openAlertDetailsFromIncident(row, initialTab = "overview") {
+  function openAlertDetailsFromIncident(row, initialTab = "evidence") {
     const incidentId = String(row?.incident_id || row?.id || "").trim();
     if (!incidentId) {
       return;
@@ -1470,7 +1472,10 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
         : alerts.rows.find((row) => String(row?.alert_id || row?.id || row?.incident_id || "").trim() === routeAlertId) || null;
       setSelectedAlertId(routeAlertId);
       setSelectedAlertSnapshot(fallbackRow);
-      setHomeDetailTab("overview");
+      const requestedDetail = String(params.get("detail") || "evidence").trim();
+      setHomeDetailTab(requestedDetail === "rca" ? "evidence" : requestedDetail);
+      if (requestedDetail === "evidence") setRcaDetailView("evidence");
+      if (requestedDetail === "rca") setRcaDetailView("simple");
       void loadAlertDetails(routeAlertId, fallbackRow);
       return;
     }
@@ -1492,7 +1497,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       if (alertId) {
         setSelectedAlertId(alertId);
         setSelectedAlertSnapshot(canonicalRow);
-        setHomeDetailTab("overview");
+        setHomeDetailTab("evidence");
         void loadAlertDetails(alertId, canonicalRow);
         onNavigatePath?.(`/?workspace=alert&alert_id=${encodeURIComponent(alertId)}`);
       }
@@ -1500,7 +1505,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     }
     setSelectedAlertId(routeAlertId);
     setSelectedAlertSnapshot(null);
-    setHomeDetailTab("overview");
+    setHomeDetailTab("evidence");
     void loadAlertDetails(routeAlertId);
     if (resolution.status === "pending") {
       setPendingCanonicalAlert(landingPadSourceRow);
@@ -1765,7 +1770,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
         : incidentMetadataFiltersRef.current;
       const payload = await fetchJson(
         `/api-gateway/incidents/groups?${buildIncidentGroupQuery(options || {}, currentFilters)}`,
-        authenticatedOptions(),
+        authenticatedOptions({ staleTimeMs: 0 }),
       );
       const data = unwrap(payload);
       const rows = data?.rows || [];
@@ -2198,7 +2203,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
           }));
           latestPayload = payload;
           const data = unwrap(payload) || {};
-          if (alertAnalysisReady(payload) && isExpectedAnalysisVersion(data, expectedRecommendationId)) {
+          if (canHydrateCompletedAnalysis(statusReady, data, expectedRecommendationId)) {
             return { ready: true, payload, attempts: index + 1 };
           }
         }
@@ -5050,7 +5055,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       try {
         const tasks = [
           loadRecentAlerts({ background: true }),
-          loadIncidentMetadata({ background: true, ignoreFilters: true }),
+          loadIncidentMetadata({ background: true, ignoreFilters: true, limit: 100 }),
           loadClosedIncidents(),
           loadGatewaySummary(),
           loadGatewayRecent(),
@@ -6020,8 +6025,10 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
         let drafts = unwrap(response)?.drafts || [];
         let draft = drafts[0] || null;
         if (drafts.filter((item) => item?.document_kind).length < ALERT_DOC_KIND_OPTIONS.length && selectedRcaDecision.rootCause && selectedRelevantRcaEvidence.length) {
-          const evidenceIds = selectedRelevantRcaEvidence.map((row) => row.id || row.evidence_id).filter(Boolean);
-          const sourceUris = selectedRelevantRcaEvidence.map((row) => row.source_uri || row.uri || row.path).filter(Boolean);
+          const { evidenceIds, sourceUris, ready: provenanceReady } = draftEvidenceProvenance(selectedRelevantRcaEvidence);
+          if (!provenanceReady) {
+            throw new Error("A review document requires at least one accepted evidence record with a traceable source citation. Collect or review source evidence before creating the draft.");
+          }
           const content = buildRcaEvidenceDocumentDraft({ alertId, alert: selectedAlertRow, decision: selectedRcaDecision, workflow: selectedAlertWorkflow, evidence: selectedRelevantRcaEvidence });
           const workflowBinding = selectedAlertWorkflow?.incident_investigation || {};
           const incidentId = String(workflowBinding.incident_id || selectedIncidentId || "").trim();
@@ -8710,10 +8717,10 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   const executionOutcomeReviewed = String(executionOutcomeReview.reviewedAlertId || "") === String(selectedAlertId || "")
     || selectedAlertRagDocuments.some((document) => String(document?.source_system || document?.metadata?.source_system || "").toLowerCase() === "kaims-execution-review");
   const incidentCockpitStages = [
-    { id: "overview", short: "01", label: "Orient", accessibleLabel: "Overview", description: "Identity and lifecycle", complete: Boolean(selectedAlertId) },
-    { id: "evidence", short: "02", label: "Evidence & Understanding", accessibleLabel: "Evidence, RCA, and impact", description: `${selectedAiTrust.evidence.length} linked record(s) · RCA and impact`, complete: selectedAiTrust.evidence.length > 0 && Boolean(cockpitAnalysis.rootCause && cockpitAnalysis.rootCause !== "-") },
-    { id: "execution", short: "03", label: "Resolve", accessibleLabel: "Resolve incident", description: resolveStageDescription, complete: persistedDiagnosticCompletion || (["closed", "resolved"].includes(selectedCanonicalIncidentStatus) && executionAutoCloses) || (!executionPolicyBlocked && !executionAutoCloses && ["succeeded", "skipped", "failed", "dispatch_failed", "execution_failed", "validation_failed", "rolled_back", "rollback_failed", "timed_out", "cancelled", "manual_intervention_required"].includes(cockpitExecutionStatus)) },
-    { id: "audit", short: "04", label: "Validate", accessibleLabel: "Audit Trail", description: selectedCanonicalIncidentStatus === "closed" ? "closed" : executionOutcomeReviewed ? "outcome reviewed" : "audit and recovery", complete: selectedCanonicalIncidentStatus === "closed" || executionOutcomeReviewed },
+    { id: "evidence", short: "01", label: "Evidence & Understanding", accessibleLabel: "Evidence, RCA, and impact", description: `${selectedAiTrust.evidence.length} linked record(s) · RCA and impact`, complete: selectedAiTrust.evidence.length > 0 && Boolean(cockpitAnalysis.rootCause && cockpitAnalysis.rootCause !== "-") },
+    { id: "execution", short: "02", label: "Resolve", accessibleLabel: "Resolve incident", description: resolveStageDescription, complete: persistedDiagnosticCompletion || (["closed", "resolved"].includes(selectedCanonicalIncidentStatus) && executionAutoCloses) || (!executionPolicyBlocked && !executionAutoCloses && ["succeeded", "skipped", "failed", "dispatch_failed", "execution_failed", "validation_failed", "rolled_back", "rollback_failed", "timed_out", "cancelled", "manual_intervention_required"].includes(cockpitExecutionStatus)) },
+    { id: "audit", short: "03", label: "Validate", accessibleLabel: "Audit Trail", description: selectedCanonicalIncidentStatus === "closed" ? "closed" : executionOutcomeReviewed ? "outcome reviewed" : "audit and recovery", complete: selectedCanonicalIncidentStatus === "closed" || executionOutcomeReviewed },
+    { id: "overview", short: "04", label: "Orient", accessibleLabel: "Overview", description: "Identity and lifecycle", complete: Boolean(selectedAlertId) },
   ];
   const cockpitRecommendedStage = (() => {
     if (!incidentCockpitStages.find((stage) => stage.id === "evidence")?.complete || selectedAlertEvaluation.requiresReview) return "evidence";
@@ -10163,7 +10170,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
               selectedProject: String(applicationToMonitor || ""),
               workflow: workflowGuide,
               openSection,
-              refreshProjects: () => Promise.allSettled([loadMonitorApplications(), loadMonitoringApplications(), checkQueueHealth(), loadIncidentMetadata({ background: true })]),
+              refreshProjects: () => Promise.allSettled([loadMonitorApplications(), loadMonitoringApplications(), checkQueueHealth(), loadIncidentMetadata({ limit: 100 })]),
               selectProject: setApplicationToMonitor,
             },
             copilot: {
@@ -10235,14 +10242,8 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
               refresh: loadIncidentMetadata,
               loadPage: (cursor = "") => loadIncidentMetadata({ cursor, limit: 10 }),
               updateFilter: (name, value) => setMetadataFilters((current) => ({ ...current, [name]: value })),
-              open: (row) => {
-                const path = durableIncidentPath(row);
-                if (path && typeof onNavigatePath === "function") {
-                  onNavigatePath(path);
-                  return;
-                }
-              },
-              openTechnical: (row, stage = "overview") => openAlertDetailsFromIncident(row, stage),
+              open: (row) => openAlertDetailsFromIncident(row, "rca"),
+              openTechnical: (row) => openAlertDetailsFromIncident(row, "rca"),
             },
             alerts: {
               loading: landingPadRecent.loading,
@@ -10899,28 +10900,6 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
 
                   {selectedAlertData.loading ? <p className="subtitle">Loading selected alert details...</p> : null}
                   {selectedAlertData.error ? <p className="error">{selectedAlertData.error}</p> : null}
-                  {selectedAlertId ? (
-                    <div className="rca-analysis-toolbar">
-                      <button
-                        type="button"
-                        className="button-secondary"
-                        onClick={() => loadAlertDetails(selectedAlertId)}
-                        disabled={selectedAlertData.loading}
-                      >
-                        {selectedAlertData.loading ? "Refreshing..." : "Reload Alert Details"}
-                      </button>
-                      {homeDetailTab === "evidence" ? <><div className="rca-analysis-mode" role="group" aria-label="RCA analysis mode">
-                        {[
-                          ["smart", "Smart reuse", "Reuse verified analysis; refresh when needed"],
-                          ["fresh", "Fresh context", "Always recollect evidence and regenerate RCA"],
-                          ["cache", "Cache only", "Use verified stored analysis without model work"],
-                        ].map(([mode, label, description]) => <button key={mode} type="button" className={rcaAnalysisMode === mode ? "active" : ""} aria-pressed={rcaAnalysisMode === mode} title={description} onClick={() => setRcaAnalysisMode(mode)} disabled={selectedAlertRegeneration.loading}><strong>{label}</strong><small>{description}</small></button>)}
-                      </div>
-                      <button type="button" className="button-primary" onClick={regenerateSelectedAlertAnalysis} disabled={!selectedAlertRow || !selectedIncidentId || selectedAlertRegeneration.loading} title={!selectedIncidentId ? "RCA becomes available after this alert is linked to a canonical incident." : undefined}>
-                        {selectedAlertRegeneration.loading ? "Running analysis..." : !selectedIncidentId ? "Awaiting incident" : rcaAnalysisMode === "fresh" ? "Run fresh analysis" : rcaAnalysisMode === "cache" ? "Load verified analysis" : "Run smart analysis"}
-                      </button></> : null}
-                    </div>
-                  ) : null}
                   {selectedAlertRegeneration.error ? <p className="error" role="alert">{selectedAlertRegeneration.error}</p> : null}
                   {selectedAlertRegeneration.message ? <p className="subtitle">{selectedAlertRegeneration.message}</p> : null}
 

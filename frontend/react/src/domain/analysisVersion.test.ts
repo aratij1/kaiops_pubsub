@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import { isExpectedAnalysisVersion, recommendationIdFromAnalysis } from "./analysisVersion";
+import {
+  canHydrateCompletedAnalysis,
+  isExpectedAnalysisVersion,
+  recommendationIdFromAnalysis,
+} from "./analysisVersion";
 
 describe("governed analysis version selection", () => {
   it("accepts only the recommendation generated for the active request", () => {
@@ -14,5 +18,20 @@ describe("governed analysis version selection", () => {
     expect(isExpectedAnalysisVersion({ recommendation: {} }, "rca-v2")).toBe(false);
     expect(isExpectedAnalysisVersion({ recommendation: { id: "rca-v2" } }, "")).toBe(false);
     expect(recommendationIdFromAnalysis({ recommendation: { id: "rca-v2" } })).toBe("rca-v2");
+  });
+
+  it("hydrates the expected completed version even when the RCA is safely blocked", () => {
+    const insufficientEvidence = {
+      workflow: {
+        recommendation: {
+          id: "rca-v3",
+          metadata: { rca_analysis: { status: "insufficient-evidence", evidence_used: [] } },
+        },
+      },
+    };
+
+    expect(canHydrateCompletedAnalysis(true, insufficientEvidence, "rca-v3")).toBe(true);
+    expect(canHydrateCompletedAnalysis(false, insufficientEvidence, "rca-v3")).toBe(false);
+    expect(canHydrateCompletedAnalysis(true, insufficientEvidence, "rca-v2")).toBe(false);
   });
 });

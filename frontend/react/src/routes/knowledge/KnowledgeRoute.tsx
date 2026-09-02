@@ -1,7 +1,9 @@
 import { useEffect, useState } from "react";
 import { Activity, BookOpenCheck, BrainCircuit, Network, RefreshCw, Route, ShieldCheck, Sparkles } from "lucide-react";
-import { MessageBusTopology } from "../../appHelpers.jsx";
-import { useRouteRuntime } from "../../app/routeRuntime";
+import { MessageBusTopology } from "../../components/knowledge/MessageBusTopology";
+import { useSession } from "../../app/SessionContext";
+import { useKnowledgeOverview } from "../../features/knowledge/useKnowledgeOverview";
+import { routeJson } from "../../services/routeApi";
 import "./KnowledgeRoute.css";
 
 type HubView = "overview" | "development" | "queues" | "activity" | "topology";
@@ -10,7 +12,8 @@ type DevelopmentConfiguration = { enabled: boolean; interval_hours: number; look
 const defaultConfiguration: DevelopmentConfiguration = { enabled: true, interval_hours: 6, lookback_days: 30, application_scope: "all", collect_logs: true, collect_metrics: true, collect_traces: true, collect_tickets: true, collect_changes: true };
 
 export default function KnowledgeRoute() {
-  const { knowledge, session } = useRouteRuntime();
+  const knowledge = useKnowledgeOverview();
+  const session = useSession();
   const [view, setView] = useState<HubView>("overview");
   const [configuration, setConfiguration] = useState(defaultConfiguration);
   const [development, setDevelopment] = useState<{ loading: boolean; running: boolean; saving: boolean; error: string; report: any }>({ loading: false, running: false, saving: false, error: "", report: null });
@@ -25,10 +28,7 @@ export default function KnowledgeRoute() {
     headers.set("Content-Type", "application/json");
     headers.set("Authorization", `Bearer ${session.accessToken}`);
     const endpoint = path.startsWith("/operations/") ? `/api-gateway${path}` : `/api-gateway/knowledge-development${path}`;
-    const response = await fetch(endpoint, { ...init, headers });
-    const payload = await response.json();
-    if (!response.ok) throw new Error(payload?.detail?.data?.hint || payload?.detail || `HTTP ${response.status}`);
-    return payload?.data || payload;
+    return routeJson<any>(endpoint, { ...init, headers });
   };
   const loadDevelopment = async () => {
     setDevelopment((current) => ({ ...current, loading: true, error: "" }));

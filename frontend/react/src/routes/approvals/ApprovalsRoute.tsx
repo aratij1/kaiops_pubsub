@@ -1,13 +1,14 @@
 import { useMemo, useState } from "react";
 import { AlertTriangle, CheckCircle2, FileSearch, RefreshCw, ShieldCheck } from "lucide-react";
 
-import { useRouteRuntime } from "../../app/routeRuntime";
+import { useRouteRuntimeSlice } from "../../app/routeRuntime";
+import { useSession } from "../../app/SessionContext";
 import { OperationsWorkflowNav } from "../../components/operations/OperationsWorkflowNav";
 import { decisionReadiness } from "../../domain/incidentStatus";
 import { approvalDecisionFields } from "../../domain/approvalDecisionPacket";
 import { canonicalApprovalEligibility } from "../../domain/approvalEligibility";
 import { analysisFailureMessage, analysisRequestOutcome } from "../../domain/analysisRequestStatus";
-import { fetchJson } from "../../appHelpers.jsx";
+import { routeJson } from "../../services/routeApi";
 import "./ApprovalsRoute.css";
 
 type Packet = Record<string, any>;
@@ -22,7 +23,8 @@ const percentage = (value: unknown): string => {
 };
 
 export default function ApprovalsRoute() {
-  const { approvals, session } = useRouteRuntime();
+  const approvals = useRouteRuntimeSlice("approvals");
+  const session = useSession();
   const [view, setView] = useState<"queue" | "review">("queue");
   const [evidenceRequest, setEvidenceRequest] = useState("");
   const [showEvidenceRequest, setShowEvidenceRequest] = useState(false);
@@ -64,13 +66,13 @@ export default function ApprovalsRoute() {
     setAnalysis({ loading: true, message: "Collecting fresh evidence and compiling a governed execution plan…", error: "" });
     try {
       const requestOptions = { headers: { "Content-Type": "application/json", ...(session.accessToken ? { Authorization: `Bearer ${session.accessToken}` } : {}) }, timeoutMs: 30000, maxAttempts: 1 };
-      const command = await fetchJson(`/api-gateway/analysis/alerts/${encodeURIComponent(alertId)}/regenerate`, { ...requestOptions, method: "POST", body: JSON.stringify({ mode: "fresh" }) }) as Packet;
+      const command = await routeJson<Packet>(`/api-gateway/analysis/alerts/${encodeURIComponent(alertId)}/regenerate`, { ...requestOptions, method: "POST", body: JSON.stringify({ mode: "fresh" }) });
       const requestId = String(command?.request_id || "").trim();
       const incidentId = String(command?.incident_id || approvals.selectedIncidentId || "").trim();
       const expectedRecommendationId = String(command?.expected_recommendation_id || "").trim();
       let ready = false;
       for (let attempt = 0; attempt < 100 && requestId && incidentId; attempt += 1) {
-        const status = await fetchJson(`/api-gateway/analysis/requests/${encodeURIComponent(requestId)}/status?incident_id=${encodeURIComponent(incidentId)}`, requestOptions).catch(() => null) as Packet | null;
+        const status = await routeJson<Packet>(`/api-gateway/analysis/requests/${encodeURIComponent(requestId)}/status?incident_id=${encodeURIComponent(incidentId)}`, requestOptions).catch(() => null);
         const outcome = analysisRequestOutcome(status, expectedRecommendationId);
         if (outcome.terminalFailure) throw new Error(analysisFailureMessage(status));
         ready = outcome.ready;

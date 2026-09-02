@@ -161,6 +161,23 @@ def test_closure_requires_exact_plan_all_independent_checks_and_real_stability(m
     ]
     action = _action(plan=_plan(validators=_validators(endpoint_kinds), stability_seconds=60), completed_seconds_ago=90)
     now = datetime.now(UTC)
+    action.parameters["pre_state_validation_observations"] = [
+        {
+            "validator_id": f"validator-{kind}",
+            "execution_id": str(action.id),
+            "plan_fingerprint": action.parameters["execution_plan"]["plan_fingerprint"],
+            "connector_id": "fake-observer",
+            "target_resource_id": "payments-api",
+            "observed_at": (now - timedelta(seconds=120)).isoformat(),
+            "passed": False,
+            "measured_value": 0,
+            "expected_value": 1,
+            "observation_window_start": (now - timedelta(seconds=180)).isoformat(),
+            "observation_window_end": (now - timedelta(seconds=120)).isoformat(),
+            "result_checksum": f"sha256:{'0' * 64}",
+        }
+        for kind in endpoint_kinds
+    ]
     action.parameters["validation_observations"] = [
         {
             "validator_id": f"validator-{kind}",
@@ -188,6 +205,10 @@ def test_closure_requires_exact_plan_all_independent_checks_and_real_stability(m
     assert report.metadata["outcome_validation"]["closure_authorized"] is True
     assert report.metadata["outcome_validation"]["rollback"]["disposition"] == "NOT_REQUIRED"
     assert len(report.metadata["independent_validation_observations"]) == len(endpoint_kinds) * 2
+    assert len(report.metadata["pre_state_validation_observations"]) == len(endpoint_kinds)
+    assert report.metadata["recovery_comparison"]["measured"] is True
+    assert {row["phase"] for row in report.metadata["pre_state_validation_observations"]} == {"pre_state"}
+    assert {row["phase"] for row in report.metadata["independent_validation_observations"]} == {"post_state"}
 
 
 def test_incomplete_stability_window_remains_pending() -> None:

@@ -28,4 +28,17 @@ describe("deriveExecutionCommands", () => {
     expect(commands).toContain("query: curl -fsS http://policy-engine:8000/healthz");
     expect(commands).not.toContain("cmd: kubectl get pods -n prod");
   });
+
+  it("returns no commands when the backend has not published a governed plan", () => {
+    const commands = deriveExecutionCommands({
+      recommendation: {
+        recommended_action: "Restart the payments API",
+        root_cause: "The process may be unhealthy",
+        commands: [],
+        metadata: {},
+      },
+    }, []);
+
+    expect(commands).toEqual([]);
+  });
 });

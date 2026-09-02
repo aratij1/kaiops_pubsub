@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { ClipboardCheck, Save } from "lucide-react";
 
-import { useRouteRuntimeSlice } from "../../app/routeRuntime";
+import { useSession } from "../../app/SessionContext";
 import { onboardingTemplates, saveOnboardingProfile, type OnboardingTemplate } from "./cloudOpsApi";
 import "./CloudOpsRoute.css";
 
@@ -10,7 +10,7 @@ function csv(value: string) {
 }
 
 export default function ServiceOnboardingRoute() {
-  const { accessToken } = useRouteRuntimeSlice("session");
+  const { accessToken } = useSession();
   const [templates, setTemplates] = useState<OnboardingTemplate[]>([]);
   const [projectId, setProjectId] = useState("demo-project");
   const [serviceId, setServiceId] = useState("checkout-api");

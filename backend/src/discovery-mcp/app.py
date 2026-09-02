@@ -69,13 +69,14 @@ def _project_catalog() -> dict[str, dict[str, Any]]:
 
 
 def _project_for(arguments: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    catalog = _project_catalog()
     hints = [
         arguments.get("project"),
         arguments.get("application"),
         *(_terms(arguments)),
     ]
     normalized_hints = {str(value or "").strip().lower() for value in hints if str(value or "").strip()}
-    for project_id, project in _project_catalog().items():
+    for project_id, project in catalog.items():
         aliases = {
             str(project_id).lower(),
             str(project.get("name") or "").lower(),
@@ -84,6 +85,16 @@ def _project_for(arguments: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         }
         if normalized_hints & aliases or any(alias and alias in " ".join(normalized_hints) for alias in aliases):
             return str(project_id), project
+    service = re.sub(r"[^a-zA-Z0-9_-]", "", str(arguments.get("service") or "").strip())
+    if service:
+        matches = [
+            (str(project_id), project)
+            for project_id, project in catalog.items()
+            if str(project.get("service_catalog_root") or "").strip()
+            and (Path(str(project["service_catalog_root"])) / service).is_dir()
+        ]
+        if len(matches) == 1:
+            return matches[0]
     return "", {}
 
 
@@ -773,8 +784,53 @@ async def _search_telemetry(arguments: dict[str, Any]) -> dict[str, Any]:
         jaeger_url = str(telemetry.get("jaeger_url") or "").rstrip("/")
         if jaeger_url:
             try:
+                trace_not_found = False
+                bound_trace_fallback = False
+                operation_filter_fallback = False
                 if trace_id:
                     response = await client.get(f"{jaeger_url}/api/traces/{trace_id}")
+                    if response.status_code == 404:
+                        # Alert correlation IDs are not always Jaeger trace
+                        # IDs. Fall back to the same bounded service,
+                        # operation, and incident-window query used when no
+                        # trace ID is supplied.
+                        trace_params = {"service": service, "limit": str(limit), "lookback": "1h"}
+                        jaeger_operation = _jaeger_operation(requested_operation)
+                        if jaeger_operation:
+                            trace_params["operation"] = jaeger_operation
+                        if start_time and end_time:
+                            try:
+                                trace_params.update({
+                                    "start": str(int(datetime.fromisoformat(
+                                        start_time.replace("Z", "+00:00")
+                                    ).timestamp() * 1_000_000)),
+                                    "end": str(int(datetime.fromisoformat(
+                                        end_time.replace("Z", "+00:00")
+                                    ).timestamp() * 1_000_000)),
+                                })
+                                trace_params.pop("lookback", None)
+                            except ValueError:
+                                pass
+                        fallback = await client.get(f"{jaeger_url}/api/traces", params=trace_params)
+                        fallback.raise_for_status()
+                        traces = fallback.json().get("data", [])
+                        if not traces and trace_params.get("operation"):
+                            # Route labels vary between instrumentation layers
+                            # (for example, a receive span may be recorded while
+                            # the requested HTTP route is absent). Keep the
+                            # service and incident window fixed, but retry
+                            # without the lossy operation-name filter.
+                            broad_params = dict(trace_params)
+                            broad_params.pop("operation", None)
+                            broad = await client.get(f"{jaeger_url}/api/traces", params=broad_params)
+                            broad.raise_for_status()
+                            traces = broad.json().get("data", [])
+                            operation_filter_fallback = bool(traces)
+                        bound_trace_fallback = bool(traces)
+                        trace_not_found = not bool(traces)
+                    else:
+                        response.raise_for_status()
+                        traces = response.json().get("data", [])
                 else:
                     trace_params = {"service": service, "limit": str(limit), "lookback": "1h"}
                     jaeger_operation = _jaeger_operation(requested_operation)
@@ -797,8 +853,15 @@ async def _search_telemetry(arguments: dict[str, Any]) -> dict[str, Any]:
                         f"{jaeger_url}/api/traces",
                         params=trace_params,
                     )
-                response.raise_for_status()
-                traces = response.json().get("data", [])
+                    response.raise_for_status()
+                    traces = response.json().get("data", [])
+                    if not traces and trace_params.get("operation"):
+                        broad_params = dict(trace_params)
+                        broad_params.pop("operation", None)
+                        broad = await client.get(f"{jaeger_url}/api/traces", params=broad_params)
+                        broad.raise_for_status()
+                        traces = broad.json().get("data", [])
+                        operation_filter_fallback = bool(traces)
                 for index, trace in enumerate(traces[:limit], 1):
                     discovered_trace_id = str(trace.get("traceID") or trace_id or "")
                     summary = _trace_evidence_summary(trace, requested_operation)
@@ -820,7 +883,14 @@ async def _search_telemetry(arguments: dict[str, Any]) -> dict[str, Any]:
                     if start_times and min(start_times) > 0:
                         item["observed_at"] = datetime.fromtimestamp(min(start_times) / 1_000_000, tz=UTC).isoformat()
                     evidence.append(item)
-                sources.append({"source": "jaeger", "status": "completed", "result_count": len(traces)})
+                sources.append({
+                    "source": "jaeger",
+                    "status": "not_found" if trace_not_found else "completed",
+                    "result_count": len(traces),
+                    "bound_trace_fallback": bound_trace_fallback,
+                    "operation_filter_fallback": operation_filter_fallback,
+                    **({"reason": "TRACE_NOT_FOUND_OR_EXPIRED"} if trace_not_found else {}),
+                })
             except Exception as exc:
                 sources.append({"source": "jaeger", "status": "unavailable", "error": str(exc)[:240]})
 
@@ -872,6 +942,10 @@ async def _search_telemetry(arguments: dict[str, Any]) -> dict[str, Any]:
     diagnosis = _log_diagnosis(evidence, service)
     if diagnosis:
         evidence.insert(0, diagnosis)
+    trace_not_found = any(
+        source.get("source") == "jaeger" and source.get("status") == "not_found"
+        for source in sources
+    )
     return {
         "tool": "telemetry.search",
         "project": project_id,
@@ -881,6 +955,7 @@ async def _search_telemetry(arguments: dict[str, Any]) -> dict[str, Any]:
         "result_count": len(evidence),
         "evidence": evidence[:limit],
         "sources": sources,
+        "evidence_gap": "TRACE_NOT_FOUND_OR_EXPIRED" if trace_id and trace_not_found else "",
         "correlation_keys": project.get("correlation_keys", []),
     }
 

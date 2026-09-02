@@ -40,6 +40,10 @@ _DEPENDENCY_KEYS = (
 _TOPOLOGY_KEYS = ("cluster", "namespace", "node", "host", "pod", "app", "application", "job", "instance")
 _DEPLOYMENT_KEYS = ("deployment", "release", "revision", "version", "change_id", "change", "build")
 _METRIC_KEYS = ("metric", "metric_name", "__name__", "prometheus_rule", "rule", "alertname")
+_STABLE_RESOURCE_KEYS = (
+    "mountpoint", "filesystem", "volume", "persistentvolumeclaim", "disk",
+    "resource_id", "resource", "database", "queue", "topic",
+)
 
 
 @dataclass
@@ -98,6 +102,8 @@ class AlertIntelligenceAgent(BaseAgent):
                 or (item.ends_at is not None and item.ends_at <= utc_now())
                 or not same_environment_family(alert.environment, item.environment)
             ):
+                continue
+            if self._resource_conflicts(alert, item):
                 continue
             exact = item.fingerprint == fingerprint
             similarity, evidence = self._correlation_score(alert, item)
@@ -265,15 +271,37 @@ class AlertIntelligenceAgent(BaseAgent):
                 alert_identity,
                 self._norm(alert.service),
                 environment_family(alert.environment),
+                self._resource_identity(alert),
             ]
         )
         return hashlib.sha256(stable.encode("utf-8")).hexdigest()
+
+    def _resource_identity(self, alert: Alert) -> str:
+        """Return stable affected-resource identity without ephemeral pod IDs."""
+        values: list[str] = []
+        for source in (alert.labels, alert.annotations, alert.metadata):
+            for key in _STABLE_RESOURCE_KEYS:
+                value = str(source.get(key) or "").strip()
+                if value:
+                    values.append(f"{key}={self._norm(value)}")
+        return "|".join(sorted(set(values)))
+
+    def _resource_conflicts(self, alert: Alert, candidate: Alert) -> bool:
+        left = self._resource_identity(alert)
+        right = self._resource_identity(candidate)
+        return bool(left and right and left != right)
 
     def _correlation_text(self, alert: Alert) -> str:
         labels = " ".join(f"{key}:{value}" for key, value in sorted(alert.labels.items()))
         return f"{alert.service} {alert.environment} {alert.name} {alert.description} {labels}"
 
     def _correlation_score(self, alert: Alert, candidate: Alert) -> tuple[float, dict[str, Any]]:
+        if self._resource_conflicts(alert, candidate):
+            return 0.0, {
+                "resource_identity_conflict": True,
+                "alert_resource": self._resource_identity(alert),
+                "candidate_resource": self._resource_identity(candidate),
+            }
         text_score = cosine_similarity(
             self._embed(self._correlation_text(alert)),
             self._embed(self._correlation_text(candidate)),

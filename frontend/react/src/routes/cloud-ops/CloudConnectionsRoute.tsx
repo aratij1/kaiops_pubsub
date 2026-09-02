@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Cloud, Play, RefreshCw, ShieldCheck } from "lucide-react";
 
-import { useRouteRuntimeSlice } from "../../app/routeRuntime";
+import { useSession } from "../../app/SessionContext";
 import {
   createSimulatorConnection,
   discoverConnection,
@@ -12,7 +12,7 @@ import {
 import "./CloudOpsRoute.css";
 
 export default function CloudConnectionsRoute() {
-  const { accessToken } = useRouteRuntimeSlice("session");
+  const { accessToken } = useSession();
   const [projectId, setProjectId] = useState("demo-project");
   const [serviceId, setServiceId] = useState("checkout-api");
   const [environment, setEnvironment] = useState("prod");

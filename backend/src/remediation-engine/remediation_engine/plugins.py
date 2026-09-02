@@ -923,30 +923,25 @@ class RemediationEngine(BaseAgent):
         """Select an executor only from typed plan data, never operator prose."""
         actions = plan.get("actions") if isinstance(plan.get("actions"), list) else []
         first = actions[0] if len(actions) == 1 and isinstance(actions[0], dict) else {}
-        inputs = first.get("inputs") if isinstance(first.get("inputs"), dict) else {}
-        permissions = first.get("required_permissions") if isinstance(first.get("required_permissions"), list) else []
-        operation = str(inputs.get("operation") or (permissions[0] if permissions else "")).strip().lower()
-        action_id = str(first.get("action_id") or "").strip().lower()
+        safety = first.get("safety_binding") if isinstance(first.get("safety_binding"), dict) else {}
+        capability = safety.get("capability") if isinstance(safety.get("capability"), dict) else {}
+        capability_id = str(capability.get("capability_id") or "").strip().lower()
         explicit = {
-            "restart_service": "restart_service",
-            "restart_service_runtime": "restart_service",
-            "restart_policy_engine": "restart_service",
-            "restart_pod": "restart_pod",
-            "scale_service": "scale_deployment",
-            "scale_service_workers": "scale_deployment",
-            "rollback_deployment": "rollback_deployment",
-            "rollback_service_deployment": "rollback_deployment",
-            "clear_cache": "clear_cache",
-            "failover_database": "failover_database",
-            "terraform_rollback": "terraform_rollback",
-            "script_execution": "script_execution",
-            "api_execution": "api_execution",
+            "kubernetes.restart_workload": "restart_pod",
+            "kubernetes.scale_workload": "scale_deployment",
+            "kubernetes.rollback_deployment": "rollback_deployment",
+            "linux.restart_service": "restart_service",
+            "windows.restart_service": "restart_service",
+            "cache.clear_cache": "clear_cache",
+            "database.failover": "failover_database",
+            "terraform.rollback": "terraform_rollback",
+            "jenkins.rollback_deployment": "rollback_deployment",
+            "application.invoke_recovery_endpoint": "api_execution",
+            "application.restart_service": "restart_service",
         }
-        if operation in explicit:
-            return explicit[operation]
-        if action_id in explicit:
-            return explicit[action_id]
-        raise ValueError("UNSUPPORTED_ACTION_PLAN: typed action operation is absent or invalid")
+        if capability_id in explicit:
+            return explicit[capability_id]
+        raise ValueError("UNSUPPORTED_ACTION_PLAN: registered capability identity is absent or unsupported")
 
     def build_action(self, approval: Approval) -> RemediationAction:
         recommended_action = str(approval.metadata.get("recommended_action") or "").strip()
@@ -954,6 +949,13 @@ class RemediationEngine(BaseAgent):
         approved_execution_plan = approval.metadata.get("execution_plan") if isinstance(approval.metadata.get("execution_plan"), dict) else {}
         if approval.decision != ApprovalDecision.APPROVED:
             raise ValueError("remediation requires an approved decision")
+        if approval.approval_expires_at is None:
+            raise ValueError("remediation requires an approval expiry")
+        approval_expires_at = approval.approval_expires_at
+        if approval_expires_at.tzinfo is None:
+            raise ValueError("remediation approval expiry must include a timezone")
+        if approval_expires_at <= utc_now():
+            raise ValueError("remediation approval has expired")
         if approved_execution_plan.get("schema_version") != "kaims.execution-plan.v2":
             raise ValueError("remediation requires the exact approved kaims.execution-plan.v2 plan")
         if not verify_plan_fingerprint(approved_execution_plan):
@@ -972,12 +974,10 @@ class RemediationEngine(BaseAgent):
         plan_queries = approved_execution_plan.get("queries") if isinstance(approved_execution_plan.get("queries"), list) else []
         has_approved_execution_plan = isinstance(approval.metadata.get("execution_plan"), dict)
         command_list = self._sanitize_recommended_commands([
-            *[str(item) for item in recommended_commands],
             *[str(item) for item in plan_commands],
             *[f"script: {item}" for item in plan_scripts],
             *[f"query: {item}" for item in plan_queries],
         ])
-        inferred_target = self._infer_target_from_commands(command_list)
         action_type = self._action_type_from_plan(plan=approved_execution_plan)
         policy_version = str(approval.metadata.get("policy_version", "")).strip()
         policy_reason = str(approval.metadata.get("policy_reason", "")).strip()
@@ -989,32 +989,17 @@ class RemediationEngine(BaseAgent):
                 return ""
             return candidate
 
-        target_candidates = [
-            approval.metadata.get("remediation_target"),
-            approval.metadata.get("target"),
-            approval.metadata.get("deployment"),
-            approval.metadata.get("resource"),
-            approval.metadata.get("service"),
-            approval.metadata.get("incident_service"),
-            connection_profile.get("target"),
-            connection_profile.get("resource"),
-            connection_profile.get("deployment"),
-            connection_profile.get("service"),
-            connection_profile.get("application"),
-            approved_execution_plan.get("remediation_target"),
-            approved_execution_plan.get("target"),
-            approved_execution_plan.get("resource"),
-            approved_execution_plan.get("service"),
-            inferred_target,
-            approval.metadata.get("incident_id"),
-            approval.incident_id,
-        ]
-        target = next((candidate for value in target_candidates if (candidate := usable_target(value))), str(approval.incident_id))
-        service = next((candidate for value in [approval.metadata.get("service"), approval.metadata.get("incident_service"), connection_profile.get("service"), approved_execution_plan.get("service"), inferred_target] if (candidate := usable_target(value))), "")
+        typed_action = typed_actions[0]
+        target = usable_target(typed_action.get("target_resource_id"))
+        if not target:
+            raise ValueError("remediation requires the catalog action target_resource_id")
+        if target != usable_target(approved_execution_plan.get("remediation_target")):
+            raise ValueError("catalog action target does not match the approved plan target")
+        service = usable_target(approved_execution_plan.get("service"))
         environment = str(approval.metadata.get("environment") or connection_profile.get("environment") or approved_execution_plan.get("environment") or "").strip()
         namespace = str(approval.metadata.get("namespace") or connection_profile.get("namespace") or approved_execution_plan.get("namespace") or "default").strip()
-        if self._looks_like_uuid(target) and service:
-            target = service
+        if self._looks_like_uuid(target):
+            raise ValueError("remediation target must be a catalog-bound resource, not an incident UUID")
         generated_execution_plan = self._build_execution_plan(
             action_type=action_type,
             target=target,
@@ -1045,9 +1030,7 @@ class RemediationEngine(BaseAgent):
         # A reviewed script-only plan is complete in its own execution domain.
         # Do not silently graft an inferred container restart and health check
         # onto it merely because its commands list is empty.
-        use_generated_commands = requested_executor == "jenkins" and not plan_scripts and (
-            stale_platform_plan or not plan_commands
-        )
+        use_generated_commands = False
         governed_generated_commands = [
             str(item).strip()
             for item in generated_execution_plan.get("commands", [])
@@ -1205,6 +1188,7 @@ class RemediationEngine(BaseAgent):
             target=target,
             parameters={
                 "approved_by": approval.approver,
+                "approval_expires_at": approval_expires_at.isoformat(),
                 "channel": approval.channel,
                 "policy_version": policy_version,
                 "policy_reason": policy_reason,

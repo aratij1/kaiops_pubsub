@@ -160,8 +160,9 @@ async function installScenario(page, options = {}) {
         ],
         next_cursor: null,
         previous_cursor: null,
-        total_count: incidentRows.length,
+        total_count: incidentRows.length + alertRows.length,
         filtered_count: incidentRows.length + alertRows.length,
+        record_counts: { incidents: incidentRows.length, alerts: alertRows.length },
         view_counts: { all: incidentRows.length + alertRows.length },
       } }));
     }
@@ -261,7 +262,7 @@ test("unified inbox combines incidents and unlinked signals without losing sourc
   await expect(page.locator(".unified-inbox-card.is-signal")).toContainText("Payment gateway error-rate spike");
   await expect(page.locator(".unified-inbox-card.is-signal")).toContainText("Awaiting correlation");
 
-  await sourceTabs.getByRole("tab", { name: /Signals/ }).click();
+  await sourceTabs.getByRole("tab", { name: /Unlinked signals/ }).click();
   await expect(page.getByRole("table")).toContainText("Payment gateway error-rate spike");
   await expect(page.getByRole("table")).not.toContainText("Checkout latency affecting payments");
   await sourceTabs.getByRole("tab", { name: /^Incidents\b/ }).click();

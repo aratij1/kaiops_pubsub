@@ -63,6 +63,35 @@ def test_gateway_exposes_guarded_evaluation_artifact_routes() -> None:
     assert ("GET", "/evaluations/{evaluation_id}") in routes
     assert ("POST", "/evaluations/autonomy/assess") in routes
     assert ("GET", "/incidents/{incident_id}/operations-state") in routes
+    assert ("GET", "/incidents/{incident_id}/command") in routes
+
+
+@pytest.mark.asyncio
+async def test_incident_command_workspace_composes_canonical_reads(monkeypatch) -> None:
+    module = load_api_gateway_app_module()
+
+    async def guarded_stub(**kwargs):
+        if kwargs["target_base"] == module.settings.monitoring_adapter_url:
+            return {"trace_id": "test-trace", "gateway": {}, "data": {
+                "incident_id": "incident-1", "status": "investigating",
+            }}
+        return {"trace_id": "test-trace", "gateway": {}, "data": {
+            "incident_id": "incident-1",
+            "lifecycle_state": "RCA_READY",
+            "lifecycle_version": 4,
+        }}
+
+    monkeypatch.setattr(module, "guarded_proxy", guarded_stub)
+    result = await module.get_incident_command_workspace(
+        "incident-1",
+        SimpleNamespace(url=SimpleNamespace(path="/incidents/incident-1/command")),
+        tenant_id="tenant-a",
+    )
+
+    assert result["schema_version"] == "kaiops.incident-command.v2"
+    assert result["incident"]["status"] == "investigating"
+    assert result["operations"]["lifecycle_state"] == "RCA_READY"
+    assert len(result["revision"]) == 64
 
 
 @pytest.mark.asyncio
@@ -765,3 +794,11 @@ def test_quality_evaluation_exposes_grounding_and_hallucination_metrics() -> Non
     assert evaluation["grounding_score"] > 0.7
     assert evaluation["hallucination_risk"] < 0.4
     assert evaluation["overall_score"] > 0.7
+def test_linked_documents_uses_bounded_exact_alert_lookup() -> None:
+    source = Path("backend/src/api-gateway/app.py").read_text(encoding="utf-8")
+    route = source.split('@app.get("/alerts/{alert_id}/linked-documents")', 1)[1].split(
+        '@app.get("/alerts/severity-overrides")', 1
+    )[0]
+
+    assert "/processed-result?" in route
+    assert 'alerts_path = f"/alerts/all?' not in route

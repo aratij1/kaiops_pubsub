@@ -243,6 +243,33 @@ def _looks_executable(command: str) -> bool:
     return command.strip().lower().startswith(_EXECUTABLE_PREFIXES)
 
 
+_REGISTERED_CAPABILITY_BINDINGS: dict[tuple[str, str], str] = {
+    ("kubernetes", "restart_pod"): "kubernetes.restart_workload",
+    ("kubernetes", "restart_service"): "kubernetes.restart_workload",
+    ("kubernetes", "rollback_deployment"): "kubernetes.rollback_deployment",
+    ("kubernetes", "scale_service"): "kubernetes.scale_workload",
+    ("kubernetes", "scale_workload"): "kubernetes.scale_workload",
+    ("ssh-linux", "restart_service"): "linux.restart_service",
+    ("windows-powershell", "restart_service"): "windows.restart_service",
+    ("redis", "clear_cache"): "cache.clear_cache",
+    ("mysql", "failover_database"): "database.failover",
+    ("terraform", "terraform_rollback"): "terraform.rollback",
+    ("jenkins", "rollback_deployment"): "jenkins.rollback_deployment",
+    ("custom-api", "api_execution"): "application.invoke_recovery_endpoint",
+    ("api", "restart_service"): "application.restart_service",
+}
+
+
+def _registered_capability_id(*, connector: dict[str, Any], operation: str) -> str:
+    connector_type = str(connector.get("type") or "").strip().lower()
+    capability_id = _REGISTERED_CAPABILITY_BINDINGS.get((connector_type, operation))
+    if not capability_id:
+        raise ValueError(
+            f"catalog operation {operation!r} is not registered for connector type {connector_type!r}"
+        )
+    return capability_id
+
+
 def _safe_remediation_binding(
     *,
     tenant_id: str,
@@ -256,7 +283,7 @@ def _safe_remediation_binding(
 ) -> SafeRemediationBinding:
     connector_id = str(connector.get("connector_id") or "").strip()
     credential_ref = str(connector.get("credential_ref") or connector.get("secret_ref") or "").strip()
-    capability_id = f"{connector_id}:{operation}"
+    capability_id = _registered_capability_id(connector=connector, operation=operation)
     capability = CapabilitySpec(
         capability_id=capability_id,
         connector_id=connector_id,

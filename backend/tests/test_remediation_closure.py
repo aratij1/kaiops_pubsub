@@ -1,3 +1,5 @@
+from datetime import UTC, datetime
+
 import pytest
 from closure_service import ClosureValidationAgent
 from common.models import Approval, ApprovalDecision, RemediationStatus
@@ -14,7 +16,25 @@ def _approved_rollback() -> Approval:
         "plan_id": "33333333-3333-3333-3333-333333333333",
         "actions": [{
             "action_id": "rollback_deployment",
+            "connector_id": "jenkins",
+            "target_resource_id": "payments-api",
             "inputs": {"operation": "rollback_deployment"},
+            "safety_binding": {
+                "capability": {
+                    "capability_id": "jenkins.rollback_deployment",
+                    "connector_id": "jenkins",
+                    "operation": "rollback_deployment",
+                    "allowed_resource_ids": ["payments-api"],
+                },
+                "credential": {
+                    "reference": "vault://test/jenkins",
+                    "tenant_id": "tenant-a",
+                    "connector_id": "jenkins",
+                    "resource_ids": ["payments-api"],
+                },
+                "blast_radius": {"target_resource_id": "payments-api"},
+                "preflight": {"target_resource_id": "payments-api"},
+            },
         }],
         "commands": [],
         "scripts": [],
@@ -29,6 +49,7 @@ def _approved_rollback() -> Approval:
         recommendation_id="22222222-2222-2222-2222-222222222222",
         plan_id=plan["plan_id"],
         plan_fingerprint=plan["plan_fingerprint"],
+        approval_expires_at=datetime(2099, 1, 1, tzinfo=UTC),
         decision=ApprovalDecision.APPROVED,
         approver="sre@example.com",
         comment="Rollback deployment",

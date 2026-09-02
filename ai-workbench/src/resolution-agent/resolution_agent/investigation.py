@@ -16,6 +16,9 @@ from ai_workbench_common.models import Context
 from common.change_intelligence import ChangeCorrelationContext, ChangeEvent, rank_correlated_changes
 from common.evidence_graph import build_incident_evidence_graph
 from resolution_agent.contracts import (
+    ClaimKind,
+    ClaimStatus,
+    EvidenceBoundClaim,
     Hypothesis as HypothesisContract,
     HypothesisStatus,
     InvestigationPlan,
@@ -116,6 +119,43 @@ class IterativeInvestigator:
         "ticket": "history", "tickets": "history", "incident": "history", "rag": "history",
         "mysql": "data", "database": "data",
     }
+
+    @staticmethod
+    def _human_evidence_summary(value: Any) -> str:
+        """Render structured evidence as a concise observation, never raw JSON."""
+        parsed = value
+        if isinstance(value, str):
+            text = value.strip()
+            if text.startswith(("{", "[")):
+                try:
+                    parsed = json.loads(text)
+                except (TypeError, ValueError):
+                    # Canonical evidence deliberately bounds large connector
+                    # payloads.  Preserve the useful observation when a JSON
+                    # metric response was truncated after its query/series.
+                    query_match = re.search(r'\\?"query\\?"\s*:\s*\\?"([^"\\]*(?:\\.[^"\\]*)*)', text)
+                    if query_match and "series" in text:
+                        query = query_match.group(1).replace('\\"', '"').replace('\\\\', '\\')
+                        return f"Prometheus observed matching time series for query: {query[:320]}"
+                    return text[:500]
+            else:
+                return text[:500]
+        if isinstance(parsed, list):
+            return IterativeInvestigator._human_evidence_summary(parsed[0]) if parsed else "Evidence source returned no records."
+        if not isinstance(parsed, dict):
+            return str(parsed or "").strip()[:500]
+        for key in ("summary", "message", "description", "observation", "finding"):
+            candidate = parsed.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()[:500]
+        query = str(parsed.get("query") or "").strip()
+        series = parsed.get("series")
+        if query and isinstance(series, list):
+            return f"Prometheus returned {len(series)} time series for query: {query[:320]}"
+        provenance = parsed.get("provenance") if isinstance(parsed.get("provenance"), dict) else {}
+        source = str(provenance.get("source") or parsed.get("source") or "Connector").strip()
+        status = str(parsed.get("source_status") or parsed.get("status") or "recorded").replace("_", " ")
+        return f"{source} evidence was {status}; inspect the cited evidence record for structured details."
 
     def __init__(self, client: ReadOnlyDiscoveryClient | None = None) -> None:
         self.client = client or ReadOnlyDiscoveryClient()
@@ -236,10 +276,15 @@ class IterativeInvestigator:
         )
 
     @staticmethod
+    def _current_operational(row: dict[str, Any]) -> bool:
+        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        return bool(row.get("current_operational_evidence", metadata.get("current_operational_evidence", True)))
+
+    @staticmethod
     def _incident_window_aligned(row: dict[str, Any]) -> bool:
         return (
             row.get("incident_window_relation") == "during"
-            and row.get("metadata", {}).get("current_operational_evidence", True)
+            and IterativeInvestigator._current_operational(row)
         )
 
     @classmethod
@@ -336,6 +381,82 @@ class IterativeInvestigator:
             })
         return hypotheses[:8]
 
+    @staticmethod
+    def _claim_id(kind: ClaimKind, statement: str) -> str:
+        digest = hashlib.sha256(f"{kind.value}:{statement.strip().casefold()}".encode()).hexdigest()[:20]
+        return f"claim-{kind.value.lower()}-{digest}"
+
+    @classmethod
+    def _build_claims(
+        cls, *, leading: dict[str, Any] | None, outcome: ResolutionOutcome,
+        context: Context, evidence: list[dict[str, Any]],
+    ) -> list[EvidenceBoundClaim]:
+        claims: list[EvidenceBoundClaim] = []
+        if leading:
+            statement = str(leading.get("claim") or "").strip()
+            supporting = list(dict.fromkeys(leading.get("supporting_evidence_ids") or []))
+            contradicting = list(dict.fromkeys(leading.get("contradicting_evidence_ids") or []))
+            falsification = str(
+                (leading.get("falsification_check") or {}).get("objective")
+                or "Collect independent evidence capable of disproving this causal mechanism."
+            )
+            if statement:
+                claim_status = (
+                    ClaimStatus.GROUNDED if outcome == ResolutionOutcome.EVIDENCE_SUPPORTED
+                    else ClaimStatus.REFUTED if str(leading.get("status") or "").lower() == "falsified"
+                    else ClaimStatus.HYPOTHESIS
+                )
+                claims.append(EvidenceBoundClaim(
+                    claim_id=cls._claim_id(ClaimKind.CAUSAL, statement),
+                    kind=ClaimKind.CAUSAL,
+                    status=claim_status,
+                    statement=statement,
+                    supporting_evidence_ids=supporting,
+                    contradicting_evidence_ids=contradicting,
+                    falsification_test=falsification,
+                    limitations=[] if claim_status == ClaimStatus.GROUNDED else [
+                        "This causal claim is not established and cannot authorize remediation."
+                    ],
+                ))
+        alert_text = " ".join((context.alert.name, context.alert.description)).lower()
+        observed_signal = next((
+            row for row in evidence
+            if cls._source(row) in {"telemetry", "logs", "traces", "data"}
+            and bool(row.get("current_operational_evidence", True))
+            and str(row.get("evidence_id") or "").strip()
+        ), None)
+        observed_signal_id = str((observed_signal or {}).get("evidence_id") or "").strip()
+        if observed_signal and "latency" in alert_text:
+            service = str(context.alert.service or "the affected service")
+            detail = cls._human_evidence_summary(
+                observed_signal.get("snippet") or observed_signal.get("summary") or observed_signal.get("relevant_content")
+            )
+            impact_statement = (
+                f"Observed technical impact: elevated latency affected {service}. {detail} "
+                "Customer and business impact are not established by the available evidence."
+            )
+            impact_status = ClaimStatus.OBSERVED
+            impact_support = [observed_signal_id]
+            impact_limitations = ["The metric establishes service degradation, not customer or business impact."]
+        else:
+            impact_statement = "Customer or business impact has not been established by accepted evidence."
+            impact_status = ClaimStatus.NOT_ESTABLISHED
+            impact_support = []
+            impact_limitations = ["An alert signal is not proof of customer or business impact."]
+        claims.append(EvidenceBoundClaim(
+            claim_id=cls._claim_id(ClaimKind.IMPACT, impact_statement),
+            kind=ClaimKind.IMPACT,
+            status=impact_status,
+            statement=impact_statement,
+            supporting_evidence_ids=impact_support,
+            falsification_test=(
+                "Collect direct SLO, availability, transaction, support-ticket, or customer-impact evidence "
+                "for the incident window."
+            ),
+            limitations=impact_limitations,
+        ))
+        return claims
+
     def _coverage(self, evidence: list[dict[str, Any]]) -> dict[str, int]:
         coverage = {source: 0 for source in self.SOURCE_TOOL}
         for row in evidence:
@@ -397,6 +518,13 @@ class IterativeInvestigator:
         required = {"logs", "telemetry", "topology", "dependency", "changes", "runbooks"}
         if any(token in text for token in ("latency", "timeout", "availability", "down", "error", "5xx")):
             required.add("traces")
+        quality = context.metadata.get("context_quality") if isinstance(context.metadata, dict) else {}
+        diagnostic_gaps = quality.get("diagnostic_gaps") if isinstance(quality, dict) else []
+        # When signal/topology collection still has no causal explanation,
+        # inspect implementation evidence instead of exhausting the budget on
+        # additional broad inventory sources.
+        if "causal_or_action" in (diagnostic_gaps if isinstance(diagnostic_gaps, list) else []):
+            required.add("code")
         if any(token in text for token in ("deploy", "release", "config", "traceback", "exception")):
             required.add("code")
         if any(token in text for token in ("database", "mysql", "query", "replica", "table", "data")):
@@ -418,8 +546,8 @@ class IterativeInvestigator:
             context.alert.name, context.alert.description, context.alert.service,
         ]).lower()
         priority = [
-            "logs", "telemetry", "traces", "topology", "dependency", "changes", "runbooks",
-            "code", "history", "data",
+            "logs", "telemetry", "traces", "code", "topology", "dependency", "changes",
+            "runbooks", "history", "data",
         ]
         # Evidence-plane priority must be selected from observed alert facts.
         # Generic candidate hypotheses (for example "a configuration change")
@@ -492,12 +620,13 @@ class IterativeInvestigator:
                 (
                     row for row in evidence
                     if self._source(row) in {"logs", "code", "telemetry", "data"}
+                    and self._current_operational(row)
                     and str(row.get("snippet") or row.get("summary") or "").strip()
                 ),
                 None,
             )
             if diagnostic:
-                snippet = str(diagnostic.get("snippet") or diagnostic.get("summary"))[:500]
+                snippet = self._human_evidence_summary(diagnostic.get("snippet") or diagnostic.get("summary"))
                 hypotheses = [{
                     "hypothesis_id": str(uuid4()),
                     "claim": f"Observed signal requiring causal confirmation: {snippet}",
@@ -555,22 +684,27 @@ class IterativeInvestigator:
                     hypothesis.get("source") != "mechanism_candidate"
                     and (len(overlap) >= 2 or (claim_tokens and len(overlap) / len(claim_tokens) >= 0.35))
                 )
-                current_operational = row.get("metadata", {}).get("current_operational_evidence", True)
+                current_operational = self._current_operational(row)
                 if (structured_support or lexical_support) and current_operational:
                     if evidence_id:
                         support.append(evidence_id)
                     sources.add(self._source(row))
                 structured_contradiction = self._structured_mechanism_contradiction(hypothesis, row)
+                generic_health_contradiction = (
+                    hypothesis.get("source") != "derived_observation"
+                    and any(token in text.lower() for token in ("healthy", "normal", "no errors", "recovered"))
+                    and bool(overlap)
+                )
                 if evidence_id and current_operational and (
                     structured_contradiction
-                    or (any(token in text.lower() for token in ("healthy", "normal", "no errors", "recovered")) and overlap)
+                    or generic_health_contradiction
                 ):
                     contradiction.append(evidence_id)
             supporting_rows = [row for row in evidence if str(row.get("evidence_id") or "") in set(support)]
             fresh_support = [
                 row for row in supporting_rows
                 if (int(row.get("freshness_seconds") or 0) <= 900 or self._incident_window_aligned(row))
-                and row.get("metadata", {}).get("current_operational_evidence", True)
+                and self._current_operational(row)
             ]
             temporal_alignment = len(fresh_support) / max(1, len(supporting_rows))
             topology_support = 1.0 if any(row.get("source_type") in {"topology", "dependency"} for row in supporting_rows) else (
@@ -602,7 +736,7 @@ class IterativeInvestigator:
             fresh_support = [
                 row for row in supporting_rows
                 if (int(row.get("freshness_seconds") or 0) <= 900 or self._incident_window_aligned(row))
-                and row.get("metadata", {}).get("current_operational_evidence", True)
+                and self._current_operational(row)
             ]
             temporal_alignment = len(fresh_support) / max(1, len(supporting_rows))
             topology_support = 1.0 if any(
@@ -630,14 +764,31 @@ class IterativeInvestigator:
                 if supporting_rows else 0.0
             )
             consistency = len(support) / max(1, len(support) + len(contradiction))
-            causal_strength = min(
-                1.0,
-                (0.35 * temporal_alignment)
-                + (0.25 * topology_support)
-                + (0.20 * successful_test_ratio)
-                + (0.20 * change_correlation),
+            causal_observations = [(0.35, temporal_alignment)] if supporting_rows else []
+            if any(row.get("source_type") in {"topology", "dependency"} for row in evidence):
+                causal_observations.append((0.25, topology_support))
+            if tested_rows:
+                causal_observations.append((0.20, successful_test_ratio))
+            if change_events:
+                causal_observations.append((0.20, change_correlation))
+            causal_weight = sum(weight for weight, _ in causal_observations)
+            causal_strength = (
+                sum(weight * value for weight, value in causal_observations) / causal_weight
+                if causal_weight else 0.0
             )
             completeness = sum(1 for source in required_sources if coverage.get(source, 0)) / max(1, len(required_sources))
+            available_components = {
+                "evidence_quality", "evidence_consistency", "causal_strength",
+                "independent_source_corroboration",
+            }
+            if supporting_rows:
+                available_components.add("temporal_alignment")
+            if any(row.get("source_type") in {"topology", "dependency"} for row in evidence):
+                available_components.add("topology_alignment")
+            if historical_similarities:
+                available_components.add("historical_similarity")
+            if tested_rows:
+                available_components.add("successful_test_ratio")
             scored = score_confidence(ConfidenceInputs(
                 evidence_quality=evidence_quality,
                 evidence_consistency=consistency,
@@ -659,6 +810,7 @@ class IterativeInvestigator:
                 degraded_context=bool(context.metadata.get("degraded_context")),
                 unresolved_contradictions=bool(contradiction),
                 ambiguous_target=not bool(str(context.alert.service or "").strip()),
+                available_components=frozenset(available_components),
             ))
             contradiction_ids = list(dict.fromkeys(contradiction))[:20]
             hypothesis["supporting_evidence_ids"] = [
@@ -701,6 +853,35 @@ class IterativeInvestigator:
                 else "candidate"
             )
         return sorted(hypotheses, key=lambda item: float(item.get("confidence") or 0), reverse=True)
+
+    def _source_assessments(
+        self, evidence: list[dict[str, Any]], hypotheses: list[dict[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
+        supporting_ids = {
+            str(evidence_id)
+            for hypothesis in hypotheses
+            for evidence_id in hypothesis.get("supporting_evidence_ids", [])
+        }
+        assessments: dict[str, dict[str, Any]] = {}
+        for source in self.SOURCE_TOOL:
+            rows = [row for row in evidence if self._source(row) == source]
+            eligible = [row for row in rows if self._current_operational(row)]
+            used = [row for row in eligible if str(row.get("evidence_id") or "") in supporting_ids]
+            if not rows:
+                disposition = "not_available"
+            elif not eligible and source in {"logs", "telemetry", "traces", "data", "dependency", "changes"}:
+                disposition = "reviewed_no_incident_aligned_evidence"
+            elif used:
+                disposition = "used_as_hypothesis_support"
+            else:
+                disposition = "reviewed_no_causal_match"
+            assessments[source] = {
+                "retrieved_count": len(rows),
+                "incident_eligible_count": len(eligible),
+                "supporting_count": len(used),
+                "disposition": disposition,
+            }
+        return assessments
 
     async def investigate(self, context: Context, *, persist: PersistEvent | None = None) -> dict[str, Any]:
         investigation_started = monotonic()
@@ -864,6 +1045,7 @@ class IterativeInvestigator:
             factors=dict(confidence_breakdown.get("components") or {}),
             penalties=dict(confidence_breakdown.get("penalties") or {}),
             missing_evidence=missing,
+            claims=self._build_claims(leading=leading, outcome=outcome, context=context, evidence=evidence),
         )
         graph_gaps = [*missing]
         if contradictory:
@@ -898,6 +1080,7 @@ class IterativeInvestigator:
             "evidence_budget": self.max_evidence,
             "evidence_count": len(evidence),
             "source_coverage": coverage,
+            "source_assessments": self._source_assessments(evidence, hypotheses),
             "missing_sources": missing,
             "investigation_plan": investigation_plan.model_dump(mode="json"),
             "steps": steps,

@@ -501,7 +501,7 @@ async def test_unified_inbox_filters_and_paginates_in_database_with_snapshot_con
             ))
             session.add(IncidentProjectionRecord(
                 incident_id=incident_id, tenant_id="tenant-inbox", service="checkout",
-                environment="prod", severity="critical" if index == 0 else "warning",
+                environment="prod", severity="warning" if index == 1 else ("critical" if index == 0 else "high"),
                 status="awaiting_approval" if index == 0 else "investigating",
                 first_seen_at=now - timedelta(minutes=index), projection_payload={},
             ))
@@ -515,14 +515,23 @@ async def test_unified_inbox_filters_and_paginates_in_database_with_snapshot_con
             service="checkout", environment="prod", severity="critical", fingerprint="hidden",
             payload={"project_id": "commerce"},
         ))
+        session.add(AlertRecord(
+            id=uuid4(), tenant_id="tenant-inbox", source="prometheus", name="Linked occurrence",
+            service="checkout", environment="prod", severity="critical", fingerprint="linked",
+            payload={"project_id": "commerce", "metadata": {"deduplication": {
+                "disposition": "duplicate", "canonical_incident_id": str(incident_ids[0]),
+            }}},
+        ))
         await session.commit()
 
     async with sqlite_session_factory() as session:
         repository = IncidentRepository(session)
         first = await repository.list_unified_inbox(
             tenant_id="tenant-inbox", project_id="commerce", service="checkout", limit=2,
+            record_type="all",
         )
-        assert first["total_count"] == first["filtered_count"] == 4
+        assert first["total_count"] == first["filtered_count"] == 3
+        assert first["record_counts"] == {"incidents": 2, "alerts": 1}
         assert first["view_counts"]["needs_me"] == 2
         assert len(first["rows"]) == 2
         assert first["next_cursor"]
@@ -535,20 +544,26 @@ async def test_unified_inbox_filters_and_paginates_in_database_with_snapshot_con
         await session.commit()
         second = await repository.list_unified_inbox(
             tenant_id="tenant-inbox", project_id="commerce", service="checkout", limit=2,
-            cursor=first["next_cursor"],
+            cursor=first["next_cursor"], record_type="all",
         )
         with pytest.raises(ValueError, match="Invalid unified inbox cursor"):
             await repository.list_unified_inbox(
                 tenant_id="tenant-inbox", project_id="commerce", service="checkout",
-                severity="warning", limit=2, cursor=first["next_cursor"],
+                severity="warning", limit=2, cursor=first["next_cursor"], record_type="all",
             )
+        warning_only = await repository.list_unified_inbox(
+            tenant_id="tenant-inbox", project_id="commerce", service="checkout",
+            severity="warning", limit=2, record_type="incidents",
+        )
 
     assert second["snapshot_at"] == snapshot
-    assert second["total_count"] == 4
-    assert len(second["rows"]) == 2
+    assert second["total_count"] == 3
+    assert len(second["rows"]) == 1
     assert {item["row"]["id"] for item in first["rows"]}.isdisjoint(
         {item["row"]["id"] for item in second["rows"]}
     )
+    assert warning_only["rows"] == []
+    assert warning_only["record_counts"]["incidents"] == 0
 
 
 @pytest.mark.asyncio
@@ -592,7 +607,7 @@ async def test_unified_inbox_does_not_starve_new_alerts_behind_older_attention_i
 
     async with sqlite_session_factory() as session:
         page = await IncidentRepository(session).list_unified_inbox(
-            tenant_id="tenant-recency", limit=2,
+            tenant_id="tenant-recency", limit=2, record_type="all",
         )
 
     assert [item["record_type"] for item in page["rows"]] == ["alert", "incident"]

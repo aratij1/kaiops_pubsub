@@ -64,6 +64,23 @@ def test_missing_evidence_strictly_lowers_confidence() -> None:
     assert incomplete.penalties["missing_data"] == 0.3
 
 
+def test_unavailable_optional_dimensions_are_not_scored_as_observed_failures() -> None:
+    result = score_confidence(ConfidenceInputs(
+        evidence_quality=0.8, evidence_consistency=0.8, causal_strength=0.8,
+        independent_source_corroboration=0.8, temporal_alignment=0.8,
+        topology_alignment=0.0, historical_similarity=0.0, successful_test_ratio=0.0,
+        available_components=frozenset({
+            "evidence_quality", "evidence_consistency", "causal_strength",
+            "independent_source_corroboration", "temporal_alignment",
+        }),
+    ))
+
+    assert result.score == 0.8
+    assert "topology_alignment" not in result.components
+    assert "historical_similarity" not in result.components
+    assert "successful_test_ratio" not in result.components
+
+
 def test_ambiguous_target_has_strictest_confidence_ceiling() -> None:
     result = score_confidence(ConfidenceInputs(
         evidence_quality=1.0,

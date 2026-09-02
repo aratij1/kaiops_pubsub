@@ -1,5 +1,19 @@
 import { describe, expect, it } from "vitest";
-import { canonicalIncidentEvidence } from "./incidentEvidence";
+import { canonicalIncidentEvidence, draftEvidenceProvenance } from "./incidentEvidence";
+
+describe("draft evidence provenance", () => {
+  it("uses accepted traceable citations and rejects ungrounded placeholders", () => {
+    expect(draftEvidenceProvenance([
+      { id: "evidence-1", accepted: true, citation: "prometheus://query/up" },
+      { id: "evidence-2", accepted: false, citation: "logs://unreviewed" },
+      { id: "evidence-3", accepted: true, citation: "unknown://missing" },
+    ])).toEqual({ evidenceIds: ["evidence-1"], sourceUris: ["prometheus://query/up"], ready: true });
+  });
+
+  it("does not fabricate provenance when no accepted traceable source exists", () => {
+    expect(draftEvidenceProvenance([{ id: "evidence-1", accepted: true, citation: "context://" }]).ready).toBe(false);
+  });
+});
 
 describe("canonical incident evidence", () => {
   const readyContract = {
@@ -25,6 +39,8 @@ describe("canonical incident evidence", () => {
     expect(result.evidence).toEqual([]);
     expect(result.confidence).toBe(0);
     expect(result.executionReady).toBe(false);
+    expect(result.contractPresent).toBe(false);
+    expect(result.contractError).toBe("Investigation contract has not been published");
   });
 
   it("permits execution navigation only for exact grounded backend readiness", () => {

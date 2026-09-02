@@ -202,19 +202,39 @@ class ClosureValidationAgent(BaseAgent):
         supplied_validators = execution_plan.get("validators") if isinstance(execution_plan.get("validators"), list) else []
         supplied_observations = action.parameters.get("validation_observations")
         supplied_observations = supplied_observations if isinstance(supplied_observations, list) else []
+        supplied_pre_state = action.parameters.get("pre_state_validation_observations")
+        supplied_pre_state = supplied_pre_state if isinstance(supplied_pre_state, list) else []
         observations: list[dict[str, Any]] = []
+        pre_state_observations: list[dict[str, Any]] = []
         validator_results: dict[str, bool] = {}
         passed_kinds: set[str] = set()
         observed_at = datetime.now(timezone.utc)
         stability_required = max(60, min(int(execution_plan.get("stability_window_seconds") or 300), 3600))
         validator_windows_complete = True
         for index, validator in enumerate(governed_validators, start=1):
+            for item in supplied_pre_state:
+                if not isinstance(item, dict) or str(item.get("validator_id") or "") != validator.validator_id:
+                    continue
+                try:
+                    pre_observation = ValidationObservation.model_validate({**item, "phase": "pre_state"})
+                except ValueError:
+                    continue
+                if (
+                    str(pre_observation.execution_id) == str(action.id)
+                    and pre_observation.plan_fingerprint == str(execution_plan.get("plan_fingerprint") or "")
+                    and pre_observation.connector_id == validator.connector_id
+                    and pre_observation.target_resource_id == validator.target_resource_id
+                    and pre_observation.observed_at <= observed_at
+                ):
+                    pre_state_observations.append({
+                        **pre_observation.model_dump(mode="json"), "kind": validator.kind,
+                    })
             samples: list[tuple[datetime, dict[str, Any]]] = []
             for item in supplied_observations:
                 if not isinstance(item, dict) or str(item.get("validator_id") or "") != validator.validator_id:
                     continue
                 try:
-                    observation = ValidationObservation.model_validate(item)
+                    observation = ValidationObservation.model_validate({**item, "phase": "post_state"})
                 except ValueError:
                     continue
                 if (
@@ -420,6 +440,13 @@ class ClosureValidationAgent(BaseAgent):
                 "validation_plan": validation_plan.model_dump(mode="json") if validation_plan else None,
                 "closed_loop_validation": closed_loop_decision.model_dump(mode="json"),
                 "independent_validation_observations": observations,
+                "pre_state_validation_observations": pre_state_observations,
+                "recovery_comparison": {
+                    "pre_state_observation_ids": [str(item.get("result_checksum")) for item in pre_state_observations],
+                    "post_state_observation_ids": [str(item.get("result_checksum")) for item in observations],
+                    "target_resource_id": str(action.target),
+                    "measured": bool(pre_state_observations and observations),
+                },
                 "stability_window": {
                     "required_seconds": stability_required,
                     "elapsed_seconds": round(stability_elapsed, 3),

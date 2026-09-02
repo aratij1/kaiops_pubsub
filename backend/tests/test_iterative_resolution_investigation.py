@@ -91,6 +91,70 @@ def test_generic_change_candidate_does_not_override_latency_evidence_priority() 
     assert datetime.fromisoformat(arguments["end_time"]) > datetime.fromisoformat(arguments["start_time"])
 
 
+def test_unresolved_latency_investigation_queries_code_before_bulk_inventory() -> None:
+    context = make_context()
+    context.alert.name = "CheckoutLatencyHigh"
+    context.alert.description = "checkout p95 latency is above 2 seconds"
+    context.metadata["context_quality"] = {"diagnostic_gaps": ["causal_or_action"]}
+    investigator = IterativeInvestigator(client=FakeDiscoveryClient({}))
+    evidence = investigator._compile_evidence(context, [{
+        "evidence_id": "LOG-IRRELEVANT",
+        "source": "log",
+        "uri": "log://archive/replayed-alert.json",
+        "summary": "historical replayed alert",
+        "observed_at": (context.alert.starts_at - timedelta(days=5)).isoformat(),
+    }, {
+        "evidence_id": "METRIC-LATENCY",
+        "source": "telemetry",
+        "uri": "prometheus://checkout/latency",
+        "summary": "checkout p95 latency is above 2 seconds",
+        "observed_at": context.alert.starts_at.isoformat(),
+    }])
+
+    selection = investigator._select_tool(
+        context=context,
+        evidence=evidence,
+        hypotheses=investigator._revise_hypotheses([], evidence, context=context),
+        tool_counts={"logs.search": 1, "traces.search": 1},
+    )
+
+    assert selection is not None
+    assert selection[0] == "code.search"
+
+
+def test_non_operational_log_cannot_seed_hypothesis_and_source_is_accounted() -> None:
+    investigator = IterativeInvestigator(client=FakeDiscoveryClient({}))
+    context = make_context()
+    evidence = investigator._compile_evidence(context, [{
+        "evidence_id": "LOG-REPLAY",
+        "source": "log",
+        "uri": "log://archive/replayed-alert.json",
+        "summary": "unrelated historical latency alert",
+        "observed_at": (context.alert.starts_at - timedelta(days=5)).isoformat(),
+    }, {
+        "evidence_id": "METRIC-CURRENT",
+        "source": "telemetry",
+        "uri": "prometheus://checkout/pool-timeout",
+        "summary": "checkout connection pool timeout is active",
+        "observed_at": context.alert.starts_at.isoformat(),
+    }, {
+        "evidence_id": "CODE-REVIEWED",
+        "source": "code",
+        "uri": "repository://checkout/handler.py#L10",
+        "summary": "request handler delegates to the pool",
+        "observed_at": context.alert.starts_at.isoformat(),
+        "current_operational_evidence": False,
+    }])
+
+    hypotheses = investigator._revise_hypotheses([], evidence, context=context)
+    assessments = investigator._source_assessments(evidence, hypotheses)
+
+    assert "METRIC-CURRENT" in hypotheses[0]["supporting_evidence_ids"]
+    assert "LOG-REPLAY" not in hypotheses[0]["claim"]
+    assert assessments["logs"]["disposition"] == "reviewed_no_incident_aligned_evidence"
+    assert assessments["code"]["disposition"] == "reviewed_no_causal_match"
+
+
 def test_root_trace_latency_is_not_mistaken_for_a_causal_mechanism() -> None:
     investigator = IterativeInvestigator(client=FakeDiscoveryClient({}))
     hypothesis = {"claim": "An unhealthy downstream dependency is degrading checkout."}
@@ -103,6 +167,43 @@ def test_root_trace_latency_is_not_mistaken_for_a_causal_mechanism() -> None:
     }
 
     assert investigator._structured_mechanism_support(hypothesis, trace) is False
+
+
+def test_healthy_dependency_does_not_contradict_an_observed_latency_signal() -> None:
+    investigator = IterativeInvestigator(client=FakeDiscoveryClient({}))
+    context = make_context()
+    evidence = investigator._compile_evidence(context, [{
+        "evidence_id": "METRIC-LATENCY",
+        "source": "telemetry",
+        "uri": "prometheus://checkout/latency",
+        "observed_at": context.alert.starts_at.isoformat(),
+        "summary": "checkout latency is above 2 seconds",
+    }, {
+        "evidence_id": "DEPENDENCY-HEALTHY",
+        "source": "dependency",
+        "uri": "docker://payments",
+        "observed_at": context.alert.starts_at.isoformat(),
+        "service": "payments",
+        "related_to": "checkout",
+        "healthy": True,
+        "summary": "checkout dependency payments is healthy",
+    }])
+    hypotheses = [{
+        "hypothesis_id": "observation",
+        "claim": "Observed signal requiring causal confirmation: checkout latency is above 2 seconds",
+        "source": "derived_observation",
+        "confidence": 0.3,
+        "supporting_evidence_ids": [],
+        "contradicting_evidence_ids": [],
+        "affected_resource_ids": [], "causal_sequence": [], "confidence_components": {},
+        "falsification_check": {}, "next_evidence_requests": [],
+    }]
+
+    revised = investigator._revise_hypotheses(hypotheses, evidence, context=context)
+    observed = next(row for row in revised if row["hypothesis_id"] == "observation")
+
+    assert observed["supporting_evidence_ids"] == ["METRIC-LATENCY"]
+    assert observed["contradicting_evidence_ids"] == []
 
 
 def test_slow_cross_service_trace_supports_dependency_candidate() -> None:
@@ -181,6 +282,29 @@ def test_structured_trace_binding_includes_traceable_citation() -> None:
     assert bound["supporting_evidence_ids"] == ["TRACE-CITED"]
     assert bound["evidence_bindings"][0]["source_uri"] == "jaeger://trace/cited"
     assert bound["independent_sources"] == ["traces"]
+
+
+def test_structured_metric_evidence_is_summarized_without_raw_json() -> None:
+    summary = IterativeInvestigator._human_evidence_summary({
+        "source_status": "completed",
+        "query": "sum(rate(http_requests_total[5m]))",
+        "series": [{"metric": {"service": "checkout"}, "values": [[1, "2"]]}],
+        "provenance": {"source": "onboarded-prometheus"},
+    })
+
+    assert summary == "Prometheus returned 1 time series for query: sum(rate(http_requests_total[5m]))"
+    assert "source_status" not in summary
+
+
+def test_truncated_structured_metric_evidence_preserves_query_observation() -> None:
+    summary = IterativeInvestigator._human_evidence_summary(
+        '{"query": "histogram_quantile(0.95, rate(latency_bucket[5m])) > 2", "series": [{"metric":'
+    )
+
+    assert summary == (
+        "Prometheus observed matching time series for query: "
+        "histogram_quantile(0.95, rate(latency_bucket[5m])) > 2"
+    )
 
 
 def test_pre_alert_trace_inside_query_envelope_counts_as_operational_evidence() -> None:

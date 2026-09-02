@@ -79,6 +79,25 @@ async def test_client_construction_failure_returns_explicit_evidence_gap(monkeyp
     assert result["report"]["insufficient_evidence"] is True
 
 
+@pytest.mark.asyncio
+async def test_connector_propagates_targeted_mcp_evidence_gap(monkeypatch) -> None:
+    connector = DiscoveryMCPConnector()
+    alert, incident = _alert_and_incident()
+    alert = alert.model_copy(update={
+        "metadata": {"context_requirement_category": "traces"},
+    })
+
+    async def missing_trace(*_args, **_kwargs):
+        return {"evidence": [], "evidence_gap": "TRACE_NOT_FOUND_OR_EXPIRED"}
+
+    monkeypatch.setattr(connector, "_call_mcp", missing_trace)
+
+    result = await connector.fetch(alert, incident)
+
+    assert result["evidence"] == []
+    assert result["evidence_gap"] == "TRACE_NOT_FOUND_OR_EXPIRED"
+
+
 def test_discovery_failure_caps_context_confidence_and_execution_readiness() -> None:
     alert, incident = _alert_and_incident()
     context = Context(

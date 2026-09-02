@@ -30,6 +30,52 @@ CanonicalEvidenceCategory = Literal[
 ]
 
 
+def authorized_enrichment_connectors(
+    *, alert_metadata: dict[str, Any], context_payload: dict[str, Any]
+) -> set[str]:
+    """Return tenant-resolved or canonically proven connectors for gap collection."""
+
+    authorized = {"discovery-mcp", "local-evidence", "vector-db"}
+    resolved = alert_metadata.get("resolved_context_connectors", [])
+    if isinstance(resolved, list):
+        authorized.update(
+            str(item.get("provider") or "").strip().lower()
+            for item in resolved
+            if isinstance(item, dict) and str(item.get("provider") or "").strip()
+        )
+
+    metadata = context_payload.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    graph = metadata.get("context_graph")
+    graph = graph if isinstance(graph, dict) else {}
+    connectors = graph.get("connectors")
+    connectors = connectors if isinstance(connectors, dict) else {}
+    authorized.update(
+        str(name).strip().lower()
+        for name, state in connectors.items()
+        if str(name).strip()
+        and isinstance(state, dict)
+        and str(state.get("status") or "").strip().lower() == "completed"
+    )
+    return authorized
+
+
+def next_authorized_enrichment_connector(
+    *, candidate_connectors: list[str], authorized_connectors: set[str],
+    attempted_connectors: set[str] | None = None,
+) -> str | None:
+    attempted = {str(name).strip().lower() for name in (attempted_connectors or set())}
+    authorized = {str(name).strip().lower() for name in authorized_connectors}
+    return next(
+        (
+            name for name in candidate_connectors
+            if str(name).strip().lower() in authorized
+            and str(name).strip().lower() not in attempted
+        ),
+        None,
+    )
+
+
 class EvidenceRecord(BaseModel):
     """Canonical governed evidence shared by collection, context, RCA, and APIs."""
 
@@ -136,7 +182,10 @@ def normalize_connector_response(
             records=[], metadata={"connector": connector, "endpoint": endpoint, "query": query},
             rejected=[{"code": "EVIDENCE_BINDING_MISMATCH"}],
         )
-    raw_records = wrapper.get("series") or wrapper.get("records") or wrapper.get("evidence") or []
+    raw_records = (
+        wrapper.get("series") or wrapper.get("records") or wrapper.get("evidence")
+        or wrapper.get("matches") or []
+    )
     if not isinstance(raw_records, list):
         raw_records = []
     normalized: list[EvidenceRecord] = []
@@ -203,6 +252,14 @@ def normalize_connector_response(
             if not isinstance(raw, dict):
                 rejected.append({"code": "INVALID_RECORD_TYPE", "record_index": index})
                 continue
+            if category == "knowledge":
+                raw = {
+                    **raw,
+                    "version": raw.get("version") or raw.get("document_version") or raw.get("content_version"),
+                    "approved": raw.get("approved") is True
+                    or str(raw.get("review_status") or "").strip().lower() == "approved",
+                    "source_reference": raw.get("source_reference") or raw.get("source_ref"),
+                }
             if not any(raw.get(field) not in (None, "", [], {}) for field in required_fields[category]):
                 rejected.append({"code": "EVIDENCE_REQUIRED_FIELD_MISSING", "record_index": index,
                                  "category": category})
@@ -267,6 +324,7 @@ RequirementStatus = Literal[
     "collecting",
     "collected",
     "blocked",
+    "assignment_blocked",
     "human_requested",
     "answered",
     "expired",
@@ -543,6 +601,8 @@ class HumanEvidenceResponse(BaseModel):
     responder_id: str = Field(min_length=1, max_length=255)
     source_reference: str | None = Field(default=None, max_length=1536)
     responded_at: datetime
+    allow_manual_claim: bool = False
+    responder_role: str | None = Field(default=None, max_length=128)
 
 
 class HumanEvidenceJiraRequest(BaseModel):
@@ -625,8 +685,11 @@ def build_evidence_requirements(
         mode = (
             "human_required" if category in _HUMAN_CATEGORIES else ("automatic" if connectors else "connector_required")
         )
-        question = str(gap.get("question") or f"Collect {category} evidence for this incident.")
-        identity = f"{tenant}:{incident}:{version}:{category}:{question}"
+        question = " ".join(
+            str(gap.get("question") or f"Collect {category} evidence for this incident.").split()
+        )
+        query_fingerprint = hashlib.sha256(question.casefold().encode()).hexdigest()
+        identity = f"{tenant}:{incident}:{version}:{category}:{query_fingerprint}"
         requirement_id = uuid5(NAMESPACE_URL, identity)
         if requirement_id in seen_requirement_ids:
             continue

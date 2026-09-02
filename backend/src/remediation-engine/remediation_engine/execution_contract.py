@@ -48,6 +48,7 @@ def bind_execution_contract(action: RemediationAction, approval: Approval) -> di
         "execution_id": str(action.id),
         "incident_id": str(action.incident_id),
         "approval_id": str(approval.id),
+        "approval_expires_at": approval.approval_expires_at.isoformat() if approval.approval_expires_at else None,
         "plan_id": str(plan.get("plan_id") or ""),
         "plan_fingerprint": plan_fingerprint,
         "runbook": runbook,
@@ -76,5 +77,7 @@ def verify_execution_contract(action: RemediationAction) -> None:
         raise ValueError("Execution contract fingerprint does not match its immutable plan")
     if str(contract.get("execution_id") or "") != str(action.id):
         raise ValueError("Execution contract identity does not match the remediation action")
+    if str(contract.get("approval_expires_at") or "") != str(action.parameters.get("approval_expires_at") or ""):
+        raise ValueError("Execution contract approval expiry does not match the remediation action")
     if str((contract.get("target") or {}).get("name") or "") != str(action.target):
         raise ValueError("Execution contract target does not match the remediation action")

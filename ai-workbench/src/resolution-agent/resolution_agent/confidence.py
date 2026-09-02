@@ -22,6 +22,10 @@ class ConfidenceInputs:
     degraded_context: bool = False
     unresolved_contradictions: bool = False
     ambiguous_target: bool = False
+    # Dimensions absent from this set are unknown/unavailable, not observed
+    # failures. Their weights are redistributed across the dimensions that
+    # were actually measured.
+    available_components: frozenset[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -41,15 +45,18 @@ def _unit(value: float) -> float:
 def score_confidence(inputs: ConfidenceInputs) -> ConfidenceResult:
     """Calculate confidence from evidence facts, never model self-assessment."""
 
+    weights = {
+        "evidence_quality": 0.18, "evidence_consistency": 0.14,
+        "causal_strength": 0.18, "independent_source_corroboration": 0.14,
+        "temporal_alignment": 0.15, "topology_alignment": 0.10,
+        "historical_similarity": 0.05, "successful_test_ratio": 0.06,
+    }
+    values = {name: _unit(getattr(inputs, name)) for name in weights}
+    available = set(inputs.available_components or weights)
+    active_weight = sum(weight for name, weight in weights.items() if name in available)
     components = {
-        "evidence_quality": 0.18 * _unit(inputs.evidence_quality),
-        "evidence_consistency": 0.14 * _unit(inputs.evidence_consistency),
-        "causal_strength": 0.18 * _unit(inputs.causal_strength),
-        "independent_source_corroboration": 0.14 * _unit(inputs.independent_source_corroboration),
-        "temporal_alignment": 0.15 * _unit(inputs.temporal_alignment),
-        "topology_alignment": 0.10 * _unit(inputs.topology_alignment),
-        "historical_similarity": 0.05 * _unit(inputs.historical_similarity),
-        "successful_test_ratio": 0.06 * _unit(inputs.successful_test_ratio),
+        name: (weight / active_weight) * values[name]
+        for name, weight in weights.items() if name in available and active_weight > 0
     }
     penalties = {
         "contradictions": min(_unit(inputs.contradiction_penalty), 0.35),

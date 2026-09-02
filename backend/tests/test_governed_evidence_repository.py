@@ -13,6 +13,7 @@ from common.database import (
     IncidentProjectionRecord,
     ResolutionOutboxRecord,
 )
+from common.models import Alert, Incident
 from common.repository import IncidentRepository
 from sqlalchemy import func, select
 
@@ -77,6 +78,61 @@ def load_context_app_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_crawled_evidence_builds_complete_source_grounded_draft_bundle():
+    module = load_context_app_module()
+    documents = module._crawled_incident_document_bundle(
+        alert_name="Gateway latency",
+        service="api-gateway",
+        environment="prod",
+        evidence_rows=[{
+            "evidence_id": "evidence-1",
+            "source_uri": "prometheus://query/latency",
+            "content": {"metric_name": "latency_p99", "value": "3.4"},
+        }],
+    )
+
+    assert {item["document_kind"] for item in documents} == set(module.INCIDENT_DOCUMENT_KINDS)
+    runbook = next(item for item in documents if item["document_kind"] == "runbook")
+    assert "evidence-1" in runbook["content"]
+    assert "prometheus://query/latency" in runbook["content"]
+    assert "latency_p99" in runbook["content"]
+    assert "operator verification required" in runbook["content"]
+
+
+@pytest.mark.asyncio
+async def test_crawler_creates_idempotent_drafts_from_verified_snapshot_before_rca_acceptance(
+    sqlite_session_factory,
+):
+    module = load_context_app_module()
+    async with sqlite_session_factory() as session:
+        binding = await seed_binding(session, "tenant-a")
+        recommendation = await session.get(AuditLogRecord, binding["recommendation_id"])
+        recommendation.payload = {**recommendation.payload, "metadata": {
+            **recommendation.payload["metadata"], "evidence_ids": [],
+        }}
+        await session.commit()
+        candidate = {
+            "alert_id": str(binding["alert_id"]), "binding": binding,
+            "snapshot_evidence": [{
+                "evidence_id": "evidence-1", "citation": "prometheus://query/test",
+                "content": {"metric_name": "latency_p99", "value": "3.4"},
+            }],
+        }
+        repo = IncidentRepository(session)
+        alert = Alert(tenant_id="tenant-a", source="prometheus", name="Gateway latency",
+                      service="payments", environment="prod", description="p99 latency is above threshold")
+        incident = Incident(
+            id=binding["incident_id"], tenant_id="tenant-a", service="payments", title="Gateway latency",
+        )
+
+        assert await module._create_crawled_evidence_drafts(
+            repo, tenant_id="tenant-a", candidate=candidate, alert=alert, incident=incident,
+        ) == len(module.INCIDENT_DOCUMENT_KINDS)
+        assert await module._create_crawled_evidence_drafts(
+            repo, tenant_id="tenant-a", candidate=candidate, alert=alert, incident=incident,
+        ) == 0
 
 
 class ConfirmingIndexConnector:
@@ -161,6 +217,41 @@ async def test_evidence_draft_requires_review_approval_before_grounding(sqlite_s
                 tenant_id="tenant-a", draft_id=draft["draft_id"],
                 expected_row_version=1, approved_by="approver",
             )
+
+
+@pytest.mark.asyncio
+async def test_published_ai_evidence_can_be_revised_without_mutating_it(sqlite_session_factory):
+    async with sqlite_session_factory() as session:
+        binding = await seed_binding(session, "tenant-a")
+        repo = IncidentRepository(session)
+        original = (await repo.create_evidence_rag_drafts(
+            tenant_id="tenant-a", created_by="ai-agent", binding=binding,
+            documents=[{"document_kind": "incident", "title": "AI incident evidence",
+                        "content": "Generated evidence grounded in linked source records."}],
+            evidence_ids=binding["evidence_ids"], source_uris=binding["source_uris"],
+        ))[0]
+        reviewed = await repo.review_evidence_rag_draft(
+            tenant_id="tenant-a", draft_id=original["draft_id"], expected_row_version=1,
+            title=original["title"], content=original["content"], review_notes=None,
+            reviewed_by="operator-a",
+        )
+        await repo.approve_evidence_rag_draft(
+            tenant_id="tenant-a", draft_id=original["draft_id"],
+            expected_row_version=reviewed["row_version"], approved_by="approver-a",
+        )
+        revision = await repo.revise_evidence_rag_draft(
+            tenant_id="tenant-a", draft_id=original["draft_id"], created_by="operator-b",
+        )
+        rows = await repo.list_evidence_rag_drafts(
+            tenant_id="tenant-a", alert_id=binding["alert_id"], document_kind="incident",
+        )
+
+    assert revision["draft_id"] != original["draft_id"]
+    assert revision["document_version"] == 2
+    assert revision["status"] == "draft"
+    assert revision["content"] == original["content"]
+    assert revision["evidence_ids"] == original["evidence_ids"]
+    assert {row["status"] for row in rows} == {"approved_pending_index", "draft"}
 
 
 @pytest.mark.asyncio

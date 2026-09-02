@@ -48,6 +48,19 @@ class PlanAction(BaseModel):
     required_permissions: list[str] = Field(default_factory=list)
     safety_binding: SafeRemediationBinding | None = None
 
+    @model_validator(mode="after")
+    def typed_bindings_are_consistent(self) -> PlanAction:
+        if self.safety_binding is None:
+            return self
+        capability = self.safety_binding.capability
+        if self.connector_id != capability.connector_id:
+            raise ValueError("action connector must match its registered capability")
+        if self.target_resource_id != self.safety_binding.blast_radius.target_resource_id:
+            raise ValueError("action target must match its safety binding")
+        if str(self.inputs.get("operation") or "").strip() != capability.operation:
+            raise ValueError("action operation must match its registered capability")
+        return self
+
     @field_validator("action_id", "connector_id", "target_resource_id", "expected_outcome")
     @classmethod
     def require_identity(cls, value: str, info: Any) -> str:
@@ -198,6 +211,13 @@ class ExecutionPlanV2(BaseModel):
             raise ValueError("execution-ready mutation requires typed actions")
         if self.execution_ready and any(action.safety_binding is None for action in self.actions):
             raise ValueError("execution-ready mutation requires safe remediation bindings")
+        catalog_versions = self.classification.get("catalog_versions") if isinstance(self.classification, dict) else {}
+        if self.execution_ready and (
+            not isinstance(catalog_versions, dict)
+            or not str(catalog_versions.get("actions") or "").strip()
+            or str(catalog_versions.get("actions") or "").lower() == "unknown"
+        ):
+            raise ValueError("execution-ready mutation requires an action catalog version")
         if self.execution_ready and (not self.validation or not self.rollback):
             raise ValueError("execution-ready mutation requires validation and rollback")
         if self.execution_ready and self.approval_policy.decision != "hitl_required":

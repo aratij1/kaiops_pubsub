@@ -13,6 +13,10 @@ export default defineConfig({
         // Misplacing scheduler/react-remove-scroll in a generic chunk creates
         // mutual ESM imports and prevents React from mounting in production.
         manualChunks(id) {
+          // Keep the temporary compatibility helper isolated even after all
+          // route-owned modules stop importing it. Otherwise Vite folds the
+          // helper into App.jsx and defeats the shell retirement budget.
+          if (/src[\\/]appHelpers\.jsx$/.test(id)) return "legacy-app-helpers";
           if (!id.includes("node_modules")) return undefined;
           if (id.includes("@tanstack") || id.includes("use-sync-external-store")) return "vendor-tanstack";
           if (id.includes("lucide-react")) return "vendor-icons";

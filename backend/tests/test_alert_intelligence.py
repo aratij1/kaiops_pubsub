@@ -47,6 +47,41 @@ async def test_same_alert_from_replaced_pod_is_an_exact_duplicate() -> None:
 
 
 @pytest.mark.asyncio
+async def test_same_disk_alert_on_different_mount_is_not_a_duplicate() -> None:
+    agent = AlertIntelligenceAgent(correlation_threshold=0.72)
+    original = make_alert("Disk utilization is above 90% on mount /usr/lib/wsl/drivers")
+    original.name = "DiskSpaceLow"
+    original.labels.update({"mountpoint": "/usr/lib/wsl/drivers", "instance": "node-exporter:9100"})
+    original.fingerprint = agent._fingerprint(original)
+    incoming = make_alert("Disk utilization is above 90% on mount /run/desktop/mnt/host/c")
+    incoming.name = "DiskSpaceLow"
+    incoming.labels.update({"mountpoint": "/run/desktop/mnt/host/c", "instance": "node-exporter:9100"})
+
+    enriched = await agent.deduplicate_alerts(incoming, [original])
+
+    assert enriched.deduplicated_count == 1
+    assert enriched.metadata["deduplication"]["disposition"] == "new_incident"
+    assert agent._correlation_score(incoming, original)[0] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_repeated_disk_alert_on_same_mount_is_a_duplicate() -> None:
+    agent = AlertIntelligenceAgent(correlation_threshold=0.72)
+    original = make_alert("Disk utilization is above 90% on mount /data")
+    original.name = "DiskSpaceLow"
+    original.labels["mountpoint"] = "/data"
+    original.fingerprint = agent._fingerprint(original)
+    repeated = make_alert("Disk utilization is above 91% on mount /data")
+    repeated.name = "DiskSpaceLow"
+    repeated.labels["mountpoint"] = "/data"
+
+    enriched = await agent.deduplicate_alerts(repeated, [original])
+
+    assert enriched.deduplicated_count == 2
+    assert enriched.metadata["deduplication"]["disposition"] == "duplicate"
+
+
+@pytest.mark.asyncio
 async def test_alert_intelligence_uses_embedding_correlation() -> None:
     agent = AlertIntelligenceAgent(correlation_threshold=0.2)
     first, _ = await agent.process(make_alert("checkout payment latency high"))

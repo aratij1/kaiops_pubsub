@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -231,9 +231,24 @@ class ValidationObservation(BaseModel):
     validator_id: str
     connector_id: str
     target_resource_id: str
+    phase: Literal["pre_state", "post_state"] = "post_state"
+    observation_window_start: datetime | None = None
+    observation_window_end: datetime | None = None
     observed_at: datetime
     passed: bool
     result_checksum: str
+    measured_value: Any | None = None
+    expected_value: Any | None = None
+
+    @model_validator(mode="after")
+    def validate_observation_window(self) -> "ValidationObservation":
+        if (
+            self.observation_window_start is not None
+            and self.observation_window_end is not None
+            and self.observation_window_end < self.observation_window_start
+        ):
+            raise ValueError("observation window end must not precede its start")
+        return self
 
     @field_validator("plan_fingerprint", "result_checksum")
     @classmethod

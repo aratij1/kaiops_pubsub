@@ -104,6 +104,27 @@ class KaiOpsRemediationWorkflow:
         if status != "validation_failed":
             self._stage(status, action=action)
             return action
+        metadata = approval.get("metadata") if isinstance(approval.get("metadata"), dict) else {}
+        plan = metadata.get("execution_plan") if isinstance(metadata.get("execution_plan"), dict) else {}
+        rollback_commands = plan.get("rollback_commands") if isinstance(plan.get("rollback_commands"), list) else []
+        rollback_authorized = bool(
+            str(approval.get("decision") or "").lower() == "approved"
+            and str(plan.get("rollback_mode") or "").lower() == "automatic"
+            and any(str(command).strip() for command in rollback_commands)
+            and str(approval.get("plan_fingerprint") or "") == str(plan.get("plan_fingerprint") or "")
+        )
+        if not rollback_authorized:
+            escalation = {
+                **action,
+                "status": "manual_intervention_required",
+                "error": "Validation failed, but automatic rollback is not authorized by the approved plan.",
+                "rollback_decision": {
+                    "disposition": "BLOCKED",
+                    "reason_codes": ["approved_automatic_rollback_binding_missing"],
+                },
+            }
+            self._stage("manual_intervention_required", action=escalation, failed_action=action)
+            return escalation
         self._stage("rolling_back", failed_action=action)
         rollback = await workflow.execute_activity(
             "rollback_remediation_action",

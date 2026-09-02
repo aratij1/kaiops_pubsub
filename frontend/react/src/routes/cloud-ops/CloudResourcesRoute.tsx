@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Activity, Boxes, ChevronRight, GitBranch, Layers3, Network, RefreshCw, Search, Server, Workflow, X } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 
-import { useRouteRuntimeSlice } from "../../app/routeRuntime";
+import { useSession } from "../../app/SessionContext";
 import { listResources, serviceTopology, type CloudResource } from "./cloudOpsApi";
 import "./CloudOpsRoute.css";
 
@@ -33,7 +33,7 @@ function readableTime(value?: string) {
 
 export default function CloudResourcesRoute() {
   const navigate = useNavigate();
-  const { accessToken } = useRouteRuntimeSlice("session");
+  const { accessToken } = useSession();
   const [projectId, setProjectId] = useState("demo-project");
   const [serviceId, setServiceId] = useState("");
   const [environment, setEnvironment] = useState("");

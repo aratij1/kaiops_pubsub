@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import json
 import logging
@@ -750,6 +751,50 @@ def _eligible_for_reusable_knowledge(action: RemediationAction, report: Resoluti
     )
 
 
+def _recovery_knowledge_draft(action: RemediationAction, report: ResolutionReport) -> tuple[str, str, dict[str, Any]]:
+    """Create a reviewable draft from immutable recovery records only."""
+    observations = report.metadata.get("independent_validation_observations")
+    observations = observations if isinstance(observations, list) else []
+    comparison = report.metadata.get("recovery_comparison")
+    comparison = comparison if isinstance(comparison, dict) else {}
+    title = f"Verified recovery: {action.target} ({action.action_type})"
+    content = "\n".join((
+        f"# {title}",
+        "",
+        f"- Incident: `{report.incident_id}`",
+        f"- Execution: `{action.id}`",
+        f"- Approved plan: `{report.resolution_plan_id or 'unavailable'}`",
+        f"- Plan fingerprint: `{report.plan_fingerprint or 'unavailable'}`",
+        f"- Root cause recorded: {report.root_cause}",
+        f"- Impact recorded: {report.impact}",
+        f"- Action taken: {report.action_taken}",
+        f"- Alerts cleared: {report.alerts_cleared}",
+        f"- Health restored: {report.health_restored}",
+        f"- Validation checksum: `{report.validation_checksum or 'computed-at-persistence'}`",
+        f"- Post-state observations: {len(observations)}",
+        f"- Measured pre/post comparison available: {comparison.get('measured') is True}",
+        "",
+        "## Lessons recorded",
+        *[f"- {lesson}" for lesson in report.lessons_learned],
+        "",
+        "This is a generated draft. A governance owner must review and approve it before production retrieval.",
+    ))
+    metadata = {
+        "schema_version": "kaims.recovery-knowledge-draft.v1",
+        "incident_id": str(report.incident_id),
+        "report_id": str(report.id),
+        "execution_id": str(action.id),
+        "recommendation_id": str(report.recommendation_id) if report.recommendation_id else None,
+        "resolution_plan_id": str(report.resolution_plan_id) if report.resolution_plan_id else None,
+        "plan_fingerprint": report.plan_fingerprint,
+        "validation_checksum": report.validation_checksum,
+        "observation_ids": [str(item.get("result_checksum")) for item in observations],
+        "recovery_comparison": comparison,
+        "production_retrieval_eligible": False,
+    }
+    return title, content, metadata
+
+
 @app.get("/reconciliation/terminal-actions")
 async def preview_terminal_action_reconciliation(limit: int = 100) -> dict[str, Any]:
     """Read-only visibility into work that startup reconciliation would assess."""
@@ -785,6 +830,9 @@ async def preview_terminal_action_reconciliation(limit: int = 100) -> dict[str, 
 
 async def _validate_and_store(action: RemediationAction) -> ResolutionReport:
     report = await agent.validate(action)
+    if not str(report.validation_checksum or "").strip():
+        material = json.dumps(report.validation, sort_keys=True, separators=(",", ":"))
+        report.validation_checksum = f"sha256:{hashlib.sha256(material.encode()).hexdigest()}"
     if settings.database_enabled:
         async with app.state.session_factory() as session:
             repo = IncidentRepository(session)
@@ -793,7 +841,16 @@ async def _validate_and_store(action: RemediationAction) -> ResolutionReport:
             await repo.save_report(report)
             reviewed_success = _eligible_for_reusable_knowledge(action, report)
             if reviewed_success:
-                await repo.save_knowledge_base(report)
+                title, content, draft_metadata = _recovery_knowledge_draft(action, report)
+                await repo.create_knowledge_rag_draft(
+                    tenant_id=action.tenant_id,
+                    created_by=str(action.parameters.get("outcome_reviewed_by") or "closure-service"),
+                    document_kind="verified_recovery",
+                    source_ref=f"report://{report.id}",
+                    title=title,
+                    content=content,
+                    metadata=draft_metadata,
+                )
             runbook_id = str(action.parameters.get("runbook_id") or "").strip()
             if runbook_id and not bool(action.parameters.get("diagnostic_closure")):
                 await repo.record_runbook_execution_outcome(

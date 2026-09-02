@@ -105,12 +105,62 @@ const IncidentOperationsState = z.object({
   context: JsonRecord, investigation: JsonRecord,
   requirements: RecordList, requirement_history: RecordList,
   resolution: JsonRecord, approval: JsonRecord,
+  execution: z.object({
+    action_id: z.string().uuid().nullable(), status: z.string().min(1),
+    action_type: z.string().nullable(), target: z.string().nullable(),
+    recommendation_id: z.string().uuid().nullable(), plan_id: z.string().uuid().nullable(),
+    plan_fingerprint: z.string().nullable(), approval_id: z.string().uuid().nullable(),
+    updated_at: z.string().or(z.date()).nullable(),
+  }).optional(),
+  validation: z.object({
+    report_id: z.string().uuid().nullable(), status: z.string().min(1),
+    closure_kind: z.string().nullable(), validation_checksum: z.string().nullable(),
+    action_id: z.string().uuid().nullable(), health_restored: z.boolean(),
+    alerts_cleared: z.boolean(), details: JsonRecord,
+    updated_at: z.string().or(z.date()).nullable(),
+  }).optional(),
   investigation_workspace: InvestigationWorkspace.optional(),
   updated_at: z.string().or(z.date()),
 }).passthrough();
 const GatewayIncidentOperationsState = z.union([
   IncidentOperationsState,
   z.object({ data: IncidentOperationsState }).passthrough().transform((payload) => payload.data),
+]);
+export const IncidentCommandWorkspaceSchema = z.object({
+  schema_version: z.literal("kaiops.incident-command.v2"),
+  incident_id: z.string().uuid(),
+  revision: z.string().length(64),
+  incident: JsonRecord,
+  operations: IncidentOperationsState,
+  evidence: z.object({
+    latest_snapshot_id: z.string().nullable(),
+    bound_snapshot_id: z.string().nullable(),
+    binding_consistent: z.boolean(),
+    counts: z.object({
+      latest_context_records: z.number().int().nonnegative(),
+      bound_snapshot_records: z.number().int().nonnegative(),
+      rca_bound_records: z.number().int().nonnegative(),
+      traceable_citations: z.number().int().nonnegative(),
+      unresolved_bindings: z.number().int().nonnegative(),
+      open_requirements: z.number().int().nonnegative(),
+      open_conflicts: z.number().int().nonnegative(),
+    }).strict(),
+    scores: z.array(z.object({
+      key: z.enum(["context_quality", "grounding_coverage", "rca_readiness"]),
+      label: z.string().min(1), percent: z.number().int().min(0).max(100).nullable(),
+      status: z.enum(["available", "blocked", "unavailable"]),
+      ratio: z.object({
+        numerator: z.number().int().nonnegative(), denominator: z.number().int().nonnegative(),
+        percent: z.number().int().min(0).max(100).nullable(),
+      }).strict().nullable(),
+      reason: z.string().min(1), blockers: z.array(z.string()),
+    }).strict()),
+    blockers: z.array(z.string()),
+  }).strict(),
+}).strict();
+const GatewayIncidentCommandWorkspace = z.union([
+  IncidentCommandWorkspaceSchema,
+  z.object({ data: IncidentCommandWorkspaceSchema }).passthrough().transform((payload) => payload.data),
 ]);
 
 type Contract = { method?: string; path: RegExp; schema: ZodTypeAny; name: string };
@@ -125,6 +175,7 @@ const contracts: readonly Contract[] = [
   { method: "GET", path: /^\/api-gateway\/operations\/queue-health$/, schema: QueueHealth, name: "queue-health" },
   { method: "GET", path: /^\/api-gateway\/incidents\/[0-9a-f-]+\/context-gaps$/i, schema: GatewayContextEnrichmentActivity, name: "context-enrichment-activity" },
   { method: "GET", path: /^\/api-gateway\/incidents\/[0-9a-f-]+\/operations-state$/i, schema: GatewayIncidentOperationsState, name: "incident-operations-state" },
+  { method: "GET", path: /^\/api-gateway\/incidents\/[0-9a-f-]+\/command$/i, schema: GatewayIncidentCommandWorkspace, name: "incident-command-workspace" },
   { method: "POST", path: /^\/api-gateway\/evaluations\/by-recommendation\/[0-9a-f-]+\/feedback$/i, schema: EvaluationFeedback, name: "evaluation-feedback" },
   { method: "POST", path: /^\/context-agent\/collect$/, schema: CollectedContext, name: "collected-context" },
   { method: "POST", path: /^\/resolution-agent\/resolve$/, schema: ResolutionRecommendation, name: "resolution-recommendation" },

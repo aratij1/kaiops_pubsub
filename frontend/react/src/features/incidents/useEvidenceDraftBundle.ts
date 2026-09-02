@@ -54,5 +54,12 @@ export function useEvidenceDraftBundle({ fetchJson, authenticatedOptions, unwrap
     );
   }, [authenticatedOptions, fetchJson]);
 
-  return { load, review, approve, conflictMessage };
+  const revise = useCallback(async (draft: EvidenceDraft) => {
+    return fetchJson(
+      `/api-gateway/rag/evidence-drafts/${encodeURIComponent(draft.draft_id)}/revision`,
+      authenticatedOptions({ method: "POST", body: JSON.stringify({}) }),
+    );
+  }, [authenticatedOptions, fetchJson]);
+
+  return { load, review, approve, revise, conflictMessage };
 }

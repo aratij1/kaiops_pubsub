@@ -5,7 +5,36 @@ from uuid import uuid4
 import pytest
 from pydantic import ValidationError
 
-from resolution_agent.contracts import Hypothesis, RCAResult, ResolutionOption, ResolutionOutcome
+from resolution_agent.contracts import (
+    ClaimKind,
+    ClaimStatus,
+    EvidenceBoundClaim,
+    Hypothesis,
+    RCAResult,
+    ResolutionOption,
+    ResolutionOutcome,
+)
+
+
+def test_grounded_claim_requires_independent_evidence() -> None:
+    with pytest.raises(ValidationError, match="at least two"):
+        EvidenceBoundClaim(
+            claim_id="causal-1",
+            kind=ClaimKind.CAUSAL,
+            status=ClaimStatus.GROUNDED,
+            statement="A deployment exhausted the connection pool.",
+            supporting_evidence_ids=["LOG-1"],
+        )
+
+
+def test_unconfirmed_claim_requires_falsification_test() -> None:
+    with pytest.raises(ValidationError, match="falsification test"):
+        EvidenceBoundClaim(
+            claim_id="causal-2",
+            kind=ClaimKind.CAUSAL,
+            status=ClaimStatus.HYPOTHESIS,
+            statement="A deployment may have exhausted the connection pool.",
+        )
 
 
 def test_non_conclusive_rca_cannot_fabricate_a_root_cause() -> None:

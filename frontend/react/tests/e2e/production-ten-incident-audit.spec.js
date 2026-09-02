@@ -54,8 +54,15 @@ test("ten production incident cockpits are read-only and status-consistent", asy
     }
     const cockpit = page.locator(".incident-command");
     await expect(cockpit).toBeVisible({ timeout: 45_000 });
-    await expect(cockpit.locator(".ic-resolution")).toBeVisible({ timeout: 30_000 });
-    await expect(cockpit.getByText("Recommended resolution", { exact: true })).toBeVisible();
+    const resolution = cockpit.locator(".ic-resolution");
+    await expect(resolution).toBeVisible({ timeout: 30_000 });
+    const blockedResolution = resolution.locator(".ic-resolution-blocked");
+    if (await blockedResolution.isVisible()) {
+      await expect(blockedResolution.getByText("Resolution is blocked by the full investigation", { exact: true })).toBeVisible();
+    } else {
+      await expect(resolution.getByText("Governed resolution", { exact: true })).toBeVisible();
+      await expect(resolution.getByText("Ready for review", { exact: true })).toBeVisible();
+    }
     const cockpitText = await cockpit.innerText();
     const terminal = ["closed", "resolved"].includes(beforeStatus);
     if (!terminal) {

@@ -13,7 +13,6 @@ import {
   FileCheck2,
   Gauge,
   GitBranch,
-  History,
   PauseCircle,
   RefreshCw,
   RotateCcw,
@@ -25,6 +24,8 @@ import {
 
 import { useRouteRuntimeSlice, type ApprovalRow, type IncidentRow } from "../../app/routeRuntime";
 import { EmptyState, ErrorState, LoadingState, StatusBadge, TechnicalDetails } from "../../components/design-system";
+import { IncidentCommandWorkspaceSchema } from "../../schemas/apiContracts";
+import { requestValidated } from "../../services/apiClient";
 import ContextEnrichmentPanel, { type EvidenceGap } from "./ContextEnrichmentPanel";
 
 const RELEASE_SHA = String(import.meta.env.VITE_KAIMS_RELEASE_SHA || "dev");
@@ -127,6 +128,14 @@ export default function IncidentCommand() {
     row: IncidentRow | null;
     error: string;
   }>({ loading: false, loaded: false, row: null, error: "" });
+  const [operationsState, setOperationsState] = useState<UnknownRecord>({});
+  const [evidenceReadModel, setEvidenceReadModel] = useState<UnknownRecord>({});
+  const [amendmentOpen, setAmendmentOpen] = useState(false);
+  const [amendmentStatement, setAmendmentStatement] = useState("");
+  const [amendmentReason, setAmendmentReason] = useState("");
+  const [amendmentSource, setAmendmentSource] = useState("");
+  const [amendmentStatus, setAmendmentStatus] = useState("");
+  const [amendmentSubmitting, setAmendmentSubmitting] = useState(false);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -152,25 +161,33 @@ export default function IncidentCommand() {
   useEffect(() => {
     if (!requestedIncidentId) {
       setDirectIncident({ loading: false, loaded: true, row: null, error: "" });
+      setOperationsState({});
+      setEvidenceReadModel({});
       return undefined;
     }
     const controller = new AbortController();
     const loadRequestedIncident = async () => {
       setDirectIncident((current) => ({ ...current, loading: true, loaded: false, error: "" }));
       try {
-        const response = await fetch(`/api-gateway/incidents/${encodeURIComponent(requestedIncidentId)}`, {
+        const workspace = await requestValidated(
+          `/api-gateway/incidents/${encodeURIComponent(requestedIncidentId)}/command`,
+          IncidentCommandWorkspaceSchema,
+          {
           headers: session.accessToken ? { Authorization: `Bearer ${session.accessToken}`, Accept: "application/json" } : { Accept: "application/json" },
           signal: controller.signal,
-        });
-        if (!response.ok) throw new Error(`Incident service returned HTTP ${response.status}`);
-        const payload = record(await response.json() as unknown);
-        const data = Object.keys(record(payload.data)).length ? record(payload.data) : payload;
+          },
+        );
+        const data = record(workspace.incident);
         const match = incidentId(data as IncidentRow).toLowerCase() === requestedIncidentId.toLowerCase()
           ? data as IncidentRow
           : null;
+        setOperationsState(record(workspace.operations));
+        setEvidenceReadModel(record(workspace.evidence));
         setDirectIncident({ loading: false, loaded: true, row: match, error: "" });
       } catch (error) {
         if (controller.signal.aborted) return;
+        setOperationsState({});
+        setEvidenceReadModel({});
         setDirectIncident({ loading: false, loaded: true, row: null, error: String((error as Error).message || error) });
       }
     };
@@ -185,7 +202,22 @@ export default function IncidentCommand() {
   // without the canonical recommendation. Always hydrate the detail route from
   // /incidents/{id}; use the group row only while that request is in flight.
   const row = directRow || scopedRow || undefined;
-  const approval = useMemo(() => row ? approvals.rows.find((candidate) => incidentId(candidate).toLowerCase() === incidentId(row).toLowerCase()) : undefined, [approvals.rows, row]);
+  const approval = useMemo(() => {
+    if (!row) return undefined;
+    const canonical = record(operationsState.approval);
+    const canonicalStatus = text(canonical.status).toLowerCase();
+    const feedRow = approvals.rows.find((candidate) => incidentId(candidate).toLowerCase() === incidentId(row).toLowerCase());
+    if (!canonicalStatus || canonicalStatus === "not_requested") return feedRow;
+    return {
+      ...feedRow,
+      ...canonical,
+      id: text(canonical.approval_id, feedRow?.id),
+      incident_id: text(canonical.incident_id, incidentId(row)),
+      recommendation_id: text(canonical.recommendation_id, feedRow?.recommendation_id),
+      approval_status: canonicalStatus,
+      status: canonicalStatus,
+    } as ApprovalRow;
+  }, [approvals.rows, operationsState.approval, row]);
 
   if (!row && ((incidents.loading && !incidents.rows.length) || directIncident.loading || !directIncident.loaded)) return <LoadingState label="Loading incident command" />;
   if (incidents.error && !incidents.rows.length) return <ErrorState title="Incident data is temporarily unavailable" description="Kai cannot assemble the command workspace until the incident service responds." retry={incidents.refresh} />;
@@ -198,14 +230,21 @@ export default function IncidentCommand() {
   const contextAlert = record(context.alert);
   const source = firstRecord(row.source_alert, projection.source_alert, contextAlert, eventPayload.alert);
   const sourceLabels = record(source.labels);
-  const sourceAnnotations = record(source.annotations);
   const sourceMetadata = record(source.metadata);
   const deduplication = record(sourceMetadata.deduplication);
   const contextMetadata = record(context.metadata);
   const contextSnapshot = firstRecord(row.context_snapshot, projection.context_snapshot);
-  const contextSourceManifest = record(contextSnapshot.source_manifest);
   const recommendation = firstRecord(row.recommendation, projection.recommendation, projection.remediation_recommendation, projection.resolution_plan, eventPayload.recommendation, source.recommendation);
   const recommendationMetadata = record(recommendation.metadata);
+  const investigationWorkspace = record(operationsState.investigation_workspace);
+  const canonicalRca = record(investigationWorkspace.rca);
+  const canonicalImpact = record(investigationWorkspace.impact);
+  const canonicalBinding = record(investigationWorkspace.binding);
+  const canonicalResolution = record(investigationWorkspace.resolution);
+  const typedClaims = Array.isArray(canonicalRca.claims) ? canonicalRca.claims.map(record) : [];
+  const causalClaim = typedClaims.find((claim) => text(claim.kind).toUpperCase() === "CAUSAL") || {};
+  const attachedEvidence = Array.isArray(investigationWorkspace.evidence) ? investigationWorkspace.evidence.map(record) : [];
+  const attachedRequirements = Array.isArray(investigationWorkspace.requirements) ? investigationWorkspace.requirements.map(record) : [];
   const canonicalIncidentId = incidentId(row);
   const canonicalAlertId = text(
     recommendationMetadata.alert_id,
@@ -220,11 +259,17 @@ export default function IncidentCommand() {
     projection.execution_plan,
   );
   const safety = record(executionPlan.safety_envelope || recommendation.safety_envelope || projection.safety_envelope);
-  const validation = record(projection.validation || projection.validation_result || projection.recovery_validation);
-  const before = record(validation.before || validation.pre_state);
-  const after = record(validation.after || validation.post_state);
-  const analysis = firstRecord(projection.analysis, projection.rca, eventPayload.analysis, eventPayload.rca, recommendation.analysis, recommendation.rca, recommendationMetadata.rca_analysis, source.analysis);
-  const rootCause = text(row.root_cause, projection.root_cause, eventPayload.root_cause, analysis.root_cause, analysis.leading_hypothesis, recommendation.root_cause, recommendationMetadata.root_cause, sourceAnnotations.root_cause);
+  const canonicalExecution = record(operationsState.execution);
+  const canonicalValidation = record(operationsState.validation);
+  const executionStatus = text(canonicalExecution.status).toLowerCase();
+  const validation = firstRecord(
+    canonicalValidation.details,
+    projection.validation,
+    projection.validation_result,
+    projection.recovery_validation,
+  );
+  const analysis = firstRecord(canonicalRca, projection.analysis, projection.rca, eventPayload.analysis, eventPayload.rca, recommendation.analysis, recommendation.rca, recommendationMetadata.rca_analysis, source.analysis);
+  const rootCause = text(causalClaim.statement, canonicalRca.hypothesis);
   const confidence = confidenceValue(recommendation.confidence, recommendationMetadata.confidence, analysis.confidence, eventPayload.confidence, projection.confidence, row.confidence);
   const confidenceKind = text(recommendationMetadata.confidence_kind, projection.confidence_kind).toLowerCase();
   const confidenceLabel = confidenceKind === "confirmed_rca" ? "Confirmed RCA confidence" : "Leading hypothesis confidence";
@@ -234,56 +279,52 @@ export default function IncidentCommand() {
     ...arrayOfText(analysis.evidence),
     ...arrayOfText(recommendationMetadata.supporting_evidence),
   ].slice(0, 6);
-  const acceptedEvidenceIds = arrayOfText(
-    analysis.accepted_evidence_ids || recommendationMetadata.accepted_evidence_ids || contextSnapshot.evidence_ids,
-  );
-  const publishedCitationCount = Number(
-    analysis.validated_citation_count
-      ?? analysis.citation_count
-      ?? recommendationMetadata.validated_citation_count
-      ?? recommendationMetadata.citation_count
-      ?? 0,
-  );
-  const validatedCitationCount = Math.max(
-    Number.isFinite(publishedCitationCount) ? publishedCitationCount : 0,
-    arrayOfText(analysis.validated_citations).length,
-    arrayOfText(recommendationMetadata.validated_citations).length,
-  );
-  const contradictions = arrayOfText(analysis.contradictions || analysis.ruled_out || analysis.alternative_causes);
+  const canonicalEvidenceCounts = record(evidenceReadModel.counts);
+  const rcaBoundEvidenceCount = Math.max(0, Number(canonicalEvidenceCounts.rca_bound_records) || 0);
+  const validatedCitationCount = Math.max(0, Number(canonicalEvidenceCounts.traceable_citations) || 0);
+  const contradictions = arrayOfText(causalClaim.contradicting_evidence_ids || analysis.contradictions || analysis.ruled_out || analysis.alternative_causes);
   const declaredGaps: EvidenceGap[] = (Array.isArray(analysis.missing_evidence) ? analysis.missing_evidence : [])
     .map((gap) => typeof gap === "string"
       ? { category: gap }
       : { category: text(record(gap).category, record(gap).type), reason: text(record(gap).reason, record(gap).description) })
     .filter((gap) => gap.category);
-  const status = normalizedStatus(row);
+  const status = text(operationsState.lifecycle_state, normalizedStatus(row)).toLowerCase();
   const inFailure = FAILED.some((value) => status.includes(value));
   const isTerminal = TERMINAL.some((value) => status.includes(value));
-  const analysisStatus = text(analysis.status, analysis.conclusion_status, recommendationMetadata.rca_status).toLowerCase();
+  const analysisStatus = text(causalClaim.status, analysis.status, analysis.conclusion_status, recommendationMetadata.rca_status).toLowerCase();
   const rcaConfirmed = Boolean(rootCause)
     && (confidenceKind === "confirmed_rca" || ["confirmed", "grounded", "conclusive"].includes(analysisStatus))
     && validatedCitationCount > 0;
   const currentJourneyIndex = isTerminal ? 6 : status.includes("validat") || status.includes("verif") ? 5 : status.includes("execut") || status.includes("remediat") || status.includes("rollback") ? 4 : status.includes("approval") ? 3 : rootCause ? 2 : status.includes("investigat") || status.includes("analy") ? 1 : 0;
-  const action = text(recommendation.title, recommendation.action, recommendation.recommended_action, eventPayload.recommended_action, projection.recommended_action);
-  const approvalCandidatePending = Boolean(approval) && !["approved", "rejected", "completed"].includes(text(approval?.approval_status, approval?.status).toLowerCase());
+  const resolutionReady = text(canonicalResolution.status).toLowerCase() === "ready";
+  const action = resolutionReady
+    ? text(canonicalResolution.catalog_operation_id, recommendation.title, recommendation.action, recommendation.recommended_action, eventPayload.recommended_action, projection.recommended_action)
+    : "";
+  const approvalCandidatePending = Boolean(approval) && ![
+    "approved", "rejected", "completed", "expired", "not_requested",
+  ].includes(text(approval?.approval_status, approval?.status).toLowerCase());
   const sourceTimestamp = text(source.received_at, source.created_at, row.created_at);
   const updatedTimestamp = text(row.latest_event_at, row.updated_at, row.created_at);
-  const impact = text(row.customer_impact, row.business_impact, projection.customer_impact, projection.business_impact, projection.impact, eventPayload.impact, recommendation.impact, sourceAnnotations.business_impact);
-  const impactNormalized = impact.toLowerCase();
-  const impactEstablished = Boolean(impact) && ![
-    "unknown", "not established", "no direct customer", "no confirmed customer", "insufficient evidence", "lack of direct evidence",
-  ].some((marker) => impactNormalized.includes(marker));
+  const impact = text(canonicalImpact.statement);
+  const impactEstablished = ["observed", "grounded", "established"].includes(text(canonicalImpact.status).toLowerCase());
   const sourceName = text(row.origin_system, row.source, source.origin_system, source.source, sourceLabels.origin_system, sourceLabels.transport);
   const signalCount = text(row.deduplicated_count, source.deduplicated_count, source.occurrence_count, contextAlert.deduplicated_count, contextAlert.occurrence_count);
   const correlationDetail = text(row.deduplication_reason, deduplication.reason, deduplication.disposition, deduplication.match_type) || "Correlation detail unavailable";
-  const contextEvidenceCount = Object.values(contextSourceManifest).reduce<number>((total, entry) => {
-    const resultCount = Number(record(entry).result_count || record(entry).fresh_count || 0);
-    return total + (Number.isFinite(resultCount) ? resultCount : 0);
-  }, 0);
+  const contextEvidenceCount = Math.max(0, Number(canonicalEvidenceCounts.latest_context_records) || 0);
   const contextCollectedAt = text(contextSnapshot.collected_at, contextMetadata.context_collected_at);
-  const contextQuality = confidenceValue(contextSnapshot.quality_score);
+  const evidenceScores = Array.isArray(evidenceReadModel.scores) ? evidenceReadModel.scores : [];
+  const contextQualityScore = evidenceScores.length
+    ? evidenceScores.map(record).find((score) => score.key === "context_quality")
+    : undefined;
+  const contextQuality = Number.isFinite(Number(contextQualityScore?.percent)) ? Number(contextQualityScore?.percent) : null;
   const executionReady = executionPlan.execution_ready === true;
-  const resolutionAvailable = Boolean(action) && executionReady && rcaConfirmed;
-  const diagnosticSuggestion = Boolean(action) && !resolutionAvailable ? action : "";
+  const resolutionAvailable = resolutionReady && Boolean(action) && executionReady && rcaConfirmed;
+  const resolutionBlocks = arrayOfText(canonicalResolution.blocking_reasons);
+  const governedOperation = text(canonicalResolution.catalog_operation_id);
+  const governedCapability = text(canonicalResolution.capability_id);
+  const governedConnector = text(canonicalResolution.connector_id);
+  const governedTarget = text(canonicalResolution.target_resource_id);
+  const governedPolicy = record(canonicalResolution.policy_decision);
   const executionUnavailableReason = text(
     executionPlan.readiness_reason,
     executionPlan.blocking_reason,
@@ -293,7 +334,16 @@ export default function IncidentCommand() {
       : "The backend has not published an execution-ready governed plan.",
   );
   const approvalPending = executionReady && approvalCandidatePending;
-  const validationAvailable = Object.keys(validation).length > 0;
+  const validationAvailable = text(canonicalValidation.status).toLowerCase() !== "not_started"
+    || Object.keys(validation).length > 0;
+  const preStateObservations = Array.isArray(canonicalValidation.pre_state_observations)
+    ? canonicalValidation.pre_state_observations.map(record) : [];
+  const postStateObservations = Array.isArray(canonicalValidation.post_state_observations)
+    ? canonicalValidation.post_state_observations.map(record) : [];
+  const validationWindow = record(canonicalValidation.observation_window);
+  const outcomeDecision = record(canonicalValidation.outcome_decision);
+  const rollbackDecision = record(outcomeDecision.rollback);
+  const knowledgeDraft = record(canonicalValidation.knowledge_draft);
   const timeline = [
     { at: row.created_at, title: "Incident record created", detail: text(row.source, row.origin_system, source.source) ? `Signal received from ${text(row.source, row.origin_system, source.source)}.` : "Source is not present in the incident record." },
     row.latest_event_type ? { at: row.latest_event_at || row.updated_at, title: text(row.latest_event_type).replaceAll("_", " "), detail: `Latest recorded lifecycle event for ${incidentId(row)}.` } : null,
@@ -303,6 +353,24 @@ export default function IncidentCommand() {
   const refreshIncident = async () => {
     await incidents.refresh();
     setDirectRequestVersion((version) => version + 1);
+  };
+  const submitClaimAmendment = async () => {
+    const claimId = text(causalClaim.claim_id);
+    if (!claimId || !session.accessToken) return;
+    setAmendmentSubmitting(true); setAmendmentStatus("");
+    try {
+      const response = await fetch(`/api-gateway/incidents/${encodeURIComponent(canonicalIncidentId)}/claims/${encodeURIComponent(claimId)}/amend`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${session.accessToken}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ statement: amendmentStatement.trim(), reason: amendmentReason.trim(), source_reference: amendmentSource.trim() }),
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+      setAmendmentStatus("Amendment recorded. The current RCA and approvals are stale while Kai runs fresh analysis.");
+      setAmendmentOpen(false);
+      await refreshIncident();
+    } catch (reason) {
+      setAmendmentStatus((reason as Error).message || "The amendment could not be recorded.");
+    } finally { setAmendmentSubmitting(false); }
   };
   return <article className="incident-command">
     <header className="ic-command-header">
@@ -337,12 +405,29 @@ export default function IncidentCommand() {
         </section>
 
         <section className="ic-section ic-rca">
-          <header><div><span>{rcaConfirmed ? "Confirmed root cause" : "Working hypothesis"}</span><h3>{rootCause || "No causal hypothesis has been published"}</h3></div><StatusBadge tone={rcaConfirmed ? "success" : rootCause ? "warning" : "inactive"}>{rcaConfirmed ? "Grounded" : rootCause ? "Unconfirmed" : "Unavailable"}</StatusBadge></header>
+          <header><div><span>{rcaConfirmed ? "Confirmed root cause" : "Working hypothesis"}{canonicalBinding.rca_version ? ` · RCA v${canonicalBinding.rca_version}` : ""}</span><h3>{rootCause || "No causal hypothesis has been published"}</h3></div><StatusBadge tone={rcaConfirmed ? "success" : rootCause ? "warning" : "inactive"}>{rcaConfirmed ? "Grounded" : rootCause ? text(canonicalRca.status, "Unconfirmed").replaceAll("_", " ") : "Unavailable"}</StatusBadge></header>
           {rootCause ? <>
-            <div className="ic-decision-evidence"><span><strong>{validatedCitationCount}</strong> validated citation{validatedCitationCount === 1 ? "" : "s"}</span><span><strong>{acceptedEvidenceIds.length}</strong> RCA-bound evidence record{acceptedEvidenceIds.length === 1 ? "" : "s"}</span><span><strong>{confidence === null ? "—" : `${confidence}%`}</strong> {confidenceLabel.toLowerCase()}</span></div>
+            <div className="ic-decision-evidence"><span><strong>{validatedCitationCount}</strong> validated citation{validatedCitationCount === 1 ? "" : "s"}</span><span><strong>{rcaBoundEvidenceCount}</strong> RCA-bound evidence record{rcaBoundEvidenceCount === 1 ? "" : "s"}</span><span><strong>{confidence === null ? "—" : `${confidence}%`}</strong> {confidenceLabel.toLowerCase()}</span></div>
             <div className="ic-reasoning"><article><h4>Why Kai thinks this</h4>{supportingReasons.length ? <ul>{supportingReasons.map((reason) => <li key={reason}><CheckCircle2 aria-hidden="true" />{reason}</li>)}</ul> : <p>Supporting reasons were not included in the backend analysis.</p>}</article><article><h4>What Kai ruled out</h4>{contradictions.length ? <ul>{contradictions.map((reason) => <li key={reason}><X aria-hidden="true" />{reason}</li>)}</ul> : <p>No ruled-out hypotheses were included.</p>}</article></div>
-            <TechnicalDetails summary="Why is this gated?"><p>{rcaConfirmed ? "The backend marked this analysis as grounded and supplied validated citations." : "This remains a diagnostic hypothesis. Confidence alone cannot confirm causality or authorize remediation."}</p><p>{validatedCitationCount} validated citation(s), {supportingReasons.length} supporting reason(s), and {contradictions.length} ruled-out item(s) are bound to this view.</p></TechnicalDetails>
+            <TechnicalDetails summary="Why is this gated?"><p>{rcaConfirmed ? "The backend marked this analysis as grounded and supplied validated citations." : "This remains a diagnostic hypothesis. Confidence alone cannot confirm causality or authorize remediation."}</p><p>{validatedCitationCount} validated citation(s), {supportingReasons.length} supporting reason(s), and {contradictions.length} contradicting evidence item(s) are bound to this view.</p>{text(causalClaim.falsification_test) ? <p><strong>Test next:</strong> {text(causalClaim.falsification_test)}</p> : null}</TechnicalDetails>
+            {text(causalClaim.claim_id) ? <div className="ic-amendment">
+              <button type="button" className="button-secondary" onClick={() => { setAmendmentOpen((open) => !open); setAmendmentStatement(rootCause); }}>Correct this AI claim</button>
+              {amendmentOpen ? <div className="ic-amendment-form">
+                <p>This records an operator amendment. It does not become evidence until fresh analysis verifies the cited source.</p>
+                <label>Corrected claim<textarea value={amendmentStatement} onChange={(event) => setAmendmentStatement(event.target.value)} /></label>
+                <label>Why it needs correction<textarea value={amendmentReason} onChange={(event) => setAmendmentReason(event.target.value)} /></label>
+                <label>Source reference<input value={amendmentSource} onChange={(event) => setAmendmentSource(event.target.value)} placeholder="https://ticket, dashboard, trace, or runbook" /></label>
+                <button type="button" className="button-primary" disabled={amendmentSubmitting || amendmentStatement.trim().length < 10 || amendmentReason.trim().length < 10 || !amendmentSource.includes("://")} onClick={() => void submitClaimAmendment()}>{amendmentSubmitting ? "Recording…" : "Record amendment and rerun RCA"}</button>
+              </div> : null}
+              {amendmentStatus ? <p role="status">{amendmentStatus}</p> : null}
+            </div> : null}
           </> : <EmptyState title="Investigation is still forming a hypothesis" description="Kai will show a falsifiable root-cause story when the backend publishes one." />}
+        </section>
+
+        <section className="ic-section ic-investigation-records">
+          <header><div><span>Full investigation</span><h3>Attached evidence and open requirements</h3></div><StatusBadge tone={attachedRequirements.length ? "warning" : "success"}>{attachedEvidence.length} evidence · {attachedRequirements.length} requirements</StatusBadge></header>
+          {attachedEvidence.length ? <ul className="ic-attached-records">{attachedEvidence.map((item, index) => <li key={text(item.evidence_id, index)}><div><strong>{valueOrUnavailable(text(item.category))}</strong><span>{valueOrUnavailable(text(item.connector, item.source_id))}</span></div><p>{valueOrUnavailable(text(item.citation))}</p><small>{item.accepted_for_rca === true ? "Accepted for RCA" : "Attached context"} · {valueOrUnavailable(text(item.freshness))}</small></li>)}</ul> : <p className="ic-unavailable">No canonical evidence records are attached to this investigation.</p>}
+          {attachedRequirements.length ? <div className="ic-open-requirements"><h4>Evidence still required</h4><ul>{attachedRequirements.map((item, index) => <li key={text(item.requirement_id, index)}><strong>{valueOrUnavailable(text(item.category))}</strong><span>{valueOrUnavailable(text(item.question, item.reason))}</span><em>{valueOrUnavailable(text(item.status))}</em></li>)}</ul></div> : null}
         </section>
 
         <ContextEnrichmentPanel
@@ -372,10 +457,13 @@ export default function IncidentCommand() {
             <div className="ic-resolution-facts">
               <Metric label="Risk" value={valueOrUnavailable(text(recommendation.risk_tier, row.risk_tier))} />
               <Metric label="Blast radius" value={valueOrUnavailable(text(recommendation.blast_radius, executionPlan.blast_radius, safety.allowed_scope))} />
-              <Metric label="Target" value={valueOrUnavailable(text(recommendation.target, executionPlan.target, row.service))} />
-              <Metric label="Strategy" value={valueOrUnavailable(text(recommendation.strategy, executionPlan.strategy))} />
+              <Metric label="Target" value={valueOrUnavailable(governedTarget)} />
+              <Metric label="Catalog operation" value={valueOrUnavailable(governedOperation)} />
+              <Metric label="Capability" value={valueOrUnavailable(governedCapability)} />
+              <Metric label="Connector" value={valueOrUnavailable(governedConnector)} />
               <Metric label="Expected duration" value={valueOrUnavailable(text(recommendation.expected_duration, executionPlan.expected_duration))} />
-              <Metric label="Rollback" value={valueOrUnavailable(text(recommendation.rollback, executionPlan.rollback, safety.rollback))} />
+              <Metric label="Execution" value={executionStatus && executionStatus !== "not_started" ? executionStatus.replaceAll("_", " ") : "Not started"} />
+              <Metric label="Rollback" value={canonicalResolution.rollback_bound === true ? "Bound to plan" : "Not bound"} />
             </div>
             <section className="ic-safety-envelope"><header><ShieldCheck aria-hidden="true" /><div><span>Execution safety envelope</span><strong>Backend policy remains authoritative</strong></div></header><dl>{[
               ["Allowed scope", safety.allowed_scope || executionPlan.scope],
@@ -385,19 +473,30 @@ export default function IncidentCommand() {
               ["Approval", safety.approval || row.approval_status || (approvalPending ? "Required" : "Not recorded")],
             ].map(([label, value]) => <div key={String(label)}><dt>{String(label)}</dt><dd>{valueOrUnavailable(Array.isArray(value) ? value.join("; ") : value)}</dd></div>)}</dl></section>
             {approvalPending && approval ? <section className="ic-inline-approval"><header><FileCheck2 aria-hidden="true" /><div><span>Kai needs your decision</span><strong>{action || "Review this production action"}</strong></div></header><p>{text(row.environment).toLowerCase().includes("prod") ? "This action may change Production. Review its scope and stop conditions before approving." : "Policy requires a human decision before Kai can continue."}</p>{approvalExpanded ? <div className="ic-approval-preview"><article><span>What will change</span><p>{action || "Action detail unavailable"}</p></article><article><span>What Kai will watch</span><p>{valueOrUnavailable(safety.stop_conditions || validation.watch_conditions)}</p></article><article><span>When Kai will rollback</span><p>{valueOrUnavailable(safety.rollback_conditions || executionPlan.rollback_conditions)}</p></article></div> : null}<div className="ic-decision-actions"><button type="button" className="button-secondary" onClick={() => setApprovalExpanded((open) => !open)}>{approvalExpanded ? "Hide preview" : "Review safety preview"}</button><button type="button" className="button-secondary" onClick={() => approvals.toggleReject(incidentId(approval))}>Reject</button><button type="button" className="button-primary" disabled={!approvals.ready || approvals.actionLoading} onClick={() => approvals.approve(approval as ApprovalRow)}>{approvals.actionLoading ? "Submitting decision..." : "Approve & let Kai resolve"}</button></div>{approvals.actionError ? <p className="ic-action-error">{approvals.actionError}</p> : null}</section> : <div className="ic-resolution-actions"><button type="button" className="button-secondary" disabled={!executionReady} title={!executionReady ? executionUnavailableReason : undefined} onClick={() => incidents.openTechnical(row, "resolution")}>{executionReady ? "Open technical execution workspace" : "Execution unavailable — collect evidence"}</button>{row.jira_url ? <a className="button-secondary" href={row.jira_url} target="_blank" rel="noreferrer">Open ticket <ExternalLink aria-hidden="true" /></a> : null}</div>}
-          </> : <div className="ic-resolution-blocked"><ShieldCheck aria-hidden="true" /><div><strong>Investigation must establish a grounded RCA first</strong><p>{diagnosticSuggestion ? `The backend proposed “${diagnosticSuggestion}”, but it is shown only as a diagnostic suggestion because it is not bound to a grounded, execution-ready plan.` : "Kai will keep collecting evidence until the backend publishes a grounded RCA and a governed execution plan."}</p><dl><div><dt>Grounded RCA</dt><dd>{rcaConfirmed ? "Passed" : "Required"}</dd></div><div><dt>Validated citations</dt><dd>{validatedCitationCount}</dd></div><div><dt>Execution-ready plan</dt><dd>{executionReady ? "Published" : "Required"}</dd></div></dl></div></div>}
+          </> : <div className="ic-resolution-blocked"><ShieldCheck aria-hidden="true" /><div><strong>Resolution is blocked by the full investigation</strong><p>{resolutionBlocks.length ? `Required before resolution: ${resolutionBlocks.join(", ")}.` : "Kai will keep collecting evidence until the backend publishes a grounded RCA and a governed execution plan."}</p><dl><div><dt>Grounded RCA</dt><dd>{rcaConfirmed ? "Passed" : "Required"}</dd></div><div><dt>Validated citations</dt><dd>{validatedCitationCount}</dd></div><div><dt>Catalog operation</dt><dd>{governedOperation || "Not selected"}</dd></div><div><dt>Registered capability</dt><dd>{governedCapability || "Not bound"}</dd></div><div><dt>Target / connector</dt><dd>{governedTarget && governedConnector ? `${governedTarget} via ${governedConnector}` : "Not bound"}</dd></div><div><dt>Safety bindings</dt><dd>{canonicalResolution.credential_bound === true && canonicalResolution.rollback_bound === true ? "Credential and rollback bound" : "Incomplete"}</dd></div><div><dt>Policy</dt><dd>{text(governedPolicy.decision, governedPolicy.status) || "Not evaluated"}</dd></div><div><dt>Execution-ready plan</dt><dd>{executionReady ? "Published" : "Required"}</dd></div></dl></div></div>}
         </section>
 
         <section className="ic-section ic-validation">
-          <header><div><span>Recovery validation</span><h3>{validationAvailable ? text(validation.status, validation.result, "Validation evidence") : "Validation has not started"}</h3></div>{validationAvailable ? <SearchCheck aria-hidden="true" /> : <Clock3 aria-hidden="true" />}</header>
-          {validationAvailable ? <><div className="ic-validation-grid"><span>Signal</span><span>Before</span><span>After</span><span>Target</span>{Array.from(new Set([...Object.keys(before), ...Object.keys(after)])).slice(0, 8).map((key) => <div className="ic-validation-row" key={key}><strong>{key.replaceAll("_", " ")}</strong><span>{valueOrUnavailable(before[key])}</span><span>{valueOrUnavailable(after[key])}</span><span>{valueOrUnavailable(record(validation.targets)[key])}</span></div>)}</div>{!Object.keys(before).length && !Object.keys(after).length ? <p className="ic-unavailable">A validation status exists, but before/after measurements were not published.</p> : null}</> : <EmptyState title="Waiting for execution evidence" description="Kai will compare the recorded pre-state and post-state when validation begins." />}
+          <header><div><span>Recovery validation</span><h3>{validationAvailable ? text(canonicalValidation.status, validation.status, validation.result, "Validation evidence") : "Validation has not started"}</h3></div>{validationAvailable ? <SearchCheck aria-hidden="true" /> : <Clock3 aria-hidden="true" />}</header>
+          {validationAvailable ? <>
+            <div className="ic-resolution-facts">
+              <Metric label="Outcome" value={valueOrUnavailable(text(outcomeDecision.outcome, canonicalValidation.status))} />
+              <Metric label="Observation window" value={validationWindow.required_seconds ? `${validationWindow.elapsed_seconds || 0}s / ${validationWindow.required_seconds}s` : "Not recorded"} />
+              <Metric label="Pre-state samples" value={String(preStateObservations.length)} />
+              <Metric label="Post-state samples" value={String(postStateObservations.length)} />
+              <Metric label="Rollback decision" value={valueOrUnavailable(text(rollbackDecision.disposition))} />
+              <Metric label="Knowledge draft" value={text(knowledgeDraft.status) || "Not created"} />
+            </div>
+            {postStateObservations.length ? <div className="ic-validation-grid"><span>Validator</span><span>Before</span><span>After</span><span>Target</span>{postStateObservations.slice(0, 8).map((post, index) => { const prior = preStateObservations.find((item) => text(item.validator_id) === text(post.validator_id)); return <div className="ic-validation-row" key={`${text(post.validator_id)}-${index}`}><strong>{text(post.kind, post.validator_id).replaceAll("_", " ")}</strong><span>{prior ? valueOrUnavailable(prior.measured_value ?? prior.passed) : "Not recorded"}</span><span>{valueOrUnavailable(post.measured_value ?? post.passed)}</span><span>{valueOrUnavailable(post.expected_value ?? post.target_resource_id)}</span></div>; })}</div> : <p className="ic-unavailable">Validation exists, but no immutable post-state observations were published.</p>}
+            {knowledgeDraft.status ? <p className="ic-gate-note"><ShieldCheck aria-hidden="true" /> Recovery knowledge is a {text(knowledgeDraft.status)} draft and cannot enter production retrieval until a governance owner reviews and approves it.</p> : null}
+          </> : <EmptyState title="Waiting for execution evidence" description="Kai will compare the recorded pre-state and post-state when validation begins." />}
         </section>
       </main>
 
       <aside className="ic-intelligence">
-        <section className="ic-kai-panel"><header><span><Bot aria-hidden="true" />Kai intelligence</span><i>{inFailure ? "Attention" : isTerminal ? "Recovered" : "Live context"}</i></header><div className="ic-kai-state"><Sparkles aria-hidden="true" /><span><small>Current state</small><strong>{isTerminal ? "Recovery recorded" : status.replaceAll("_", " ")}</strong></span></div><button type="button" onClick={() => incidents.openTechnical(row, "overview")}><SearchCheck aria-hidden="true" /> Open full investigation</button></section>
+        <section className="ic-kai-panel"><header><span><Bot aria-hidden="true" />Kai intelligence</span><i>{inFailure ? "Attention" : isTerminal ? "Recovered" : "Live context"}</i></header><div className="ic-kai-state"><Sparkles aria-hidden="true" /><span><small>Current state</small><strong>{isTerminal ? "Recovery recorded" : status.replaceAll("_", " ")}</strong></span></div></section>
         <section className="ic-narrative"><header><span>Live narrative</span><h3>What Kai knows so far</h3></header>{timeline.length ? <ol>{timeline.map((event, index) => <li key={`${event.title}-${index}`}><time>{dateLabel(event.at)}</time><i /><div><strong>{event.title}</strong><p>{event.detail}</p></div></li>)}</ol> : <p>No timestamped lifecycle events are available.</p>}<small>Only recorded lifecycle events are shown; internal agent activity is not fabricated.</small></section>
-        <section className="ic-evidence"><header><span>Evidence provenance</span><h3>Sources supporting this view</h3></header><article><div><strong>{sourceName || "Incident service"}</strong><em>{sourceTimestamp && Date.now() - new Date(sourceTimestamp).getTime() < 300_000 ? "LIVE" : "RECENT"}</em></div><p>Collected {ageLabel(sourceTimestamp)}</p><small>Evidence ID: {text(row.alert_id, source.id, row.fingerprint, "Unavailable")}</small></article>{Object.keys(context).length || Object.keys(contextSnapshot).length ? <article><div><strong>Kai context record</strong><em>RECORDED</em></div><p>{contextEvidenceCount ? `${contextEvidenceCount} evidence records` : "Context evidence retained"}{contextQuality !== null ? ` · ${contextQuality}% quality` : ""}</p><small>{contextCollectedAt ? `Collected ${ageLabel(contextCollectedAt)}` : contextMetadata.recovered ? "Recovered from durable alert and recommendation records" : `Snapshot: ${text(contextSnapshot.snapshot_id, contextMetadata.context_fingerprint, "persisted")}`}</small></article> : null}{rootCause ? <article><div><strong>Kai analysis</strong><em className="is-inferred">INFERRED</em></div><p>Updated {ageLabel(updatedTimestamp)}</p><small>Inference is visually separated from telemetry.</small></article> : null}<button type="button" onClick={() => incidents.openTechnical(row, "evidence")}><History aria-hidden="true" /> Inspect all technical evidence</button></section>
+        <section className="ic-evidence"><header><span>Evidence provenance</span><h3>Sources supporting this view</h3></header><article><div><strong>{sourceName || "Incident service"}</strong><em>{sourceTimestamp && Date.now() - new Date(sourceTimestamp).getTime() < 300_000 ? "LIVE" : "RECENT"}</em></div><p>Collected {ageLabel(sourceTimestamp)}</p><small>Evidence ID: {text(row.alert_id, source.id, row.fingerprint, "Unavailable")}</small></article>{Object.keys(context).length || Object.keys(contextSnapshot).length ? <article><div><strong>Kai context record</strong><em>RECORDED</em></div><p>{contextEvidenceCount ? `${contextEvidenceCount} evidence records` : "Context evidence retained"}{contextQuality !== null ? ` · ${contextQuality}% quality` : ""}</p><small>{contextCollectedAt ? `Collected ${ageLabel(contextCollectedAt)}` : contextMetadata.recovered ? "Recovered from durable alert and recommendation records" : `Snapshot: ${text(contextSnapshot.snapshot_id, contextMetadata.context_fingerprint, "persisted")}`}</small></article> : null}{rootCause ? <article><div><strong>Kai analysis</strong><em className="is-inferred">INFERRED</em></div><p>Updated {ageLabel(updatedTimestamp)}</p><small>Inference is visually separated from telemetry.</small></article> : null}</section>
         <section className="ic-control"><header><PauseCircle aria-hidden="true" /><div><span>Human control</span><h3>Stay in command</h3></div></header><p>{executionReady ? "Holding, taking control, or rolling back requires an authoritative execution capability." : executionUnavailableReason}</p><button type="button" disabled={!executionReady} title={!executionReady ? executionUnavailableReason : undefined} onClick={() => incidents.openTechnical(row, "resolution")}><Gauge aria-hidden="true" /> {executionReady ? "Take control in governed workspace" : "No execution to control"}</button><button type="button" disabled title="Available only when the backend reports an active, controllable execution"><RotateCcw aria-hidden="true" /> Rollback unavailable</button></section>
       </aside>
     </div>

@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Activity, AlertTriangle, BellRing, Braces, Database, FileCode2, GitMerge, LoaderCircle, RadioTower, RotateCcw, Search, Ticket } from "lucide-react";
-import { compactText, fetchJson, formatIstTimestamp, sourceChannelLabel, statusPillClass } from "../../appHelpers.jsx";
+import { routeJson } from "../../services/routeApi";
+import { compactText, formatIstTimestamp, sourceChannelLabel, statusPillClass } from "../../utils/presentation";
 import { useRouteRuntimeSlice, type AlertStreamFilters, type AlertStreamRow } from "../../app/routeRuntime";
+import { useSession } from "../../app/SessionContext";
 import { OperationsWorkflowNav } from "../../components/operations/OperationsWorkflowNav";
 import "./AlertsRoute.css";
 
@@ -272,7 +274,7 @@ function AlertFlowSummary({ row, workflow, selected, onInspect }: { row: AlertSt
 
 export default function AlertsRoute() {
   const alerts = useRouteRuntimeSlice("alerts");
-  const session = useRouteRuntimeSlice("session");
+  const session = useSession();
   const authenticatedRequest = session.accessToken
     ? { headers: { Authorization: `Bearer ${session.accessToken}` } }
     : {};
@@ -327,13 +329,13 @@ export default function AlertsRoute() {
       setTraceWorkflow({ loading: true, data: null, error: "", alertId, state: "loading" });
       try {
         if (!alertId && activeTraceAlert) {
-          const response = await fetchJson("/api-gateway/alerts/all?limit=150&compact=true", { ...authenticatedRequest, timeoutMs: 12000, maxAttempts: 1 }) as any;
+          const response = await routeJson("/api-gateway/alerts/all?limit=150&compact=true", { ...authenticatedRequest, timeoutMs: 12000, maxAttempts: 1 }) as any;
           const rows = response?.data?.rows || response?.rows || response?.data || [];
           const match = canonicalMatch(activeTraceAlert, Array.isArray(rows) ? rows : []);
           alertId = processedAlertId(match);
         }
         if (!alertId) throw new Error("Canonical alert is still being persisted; processed context is not available yet.");
-        const data = await fetchJson(`/api-gateway/alerts/${encodeURIComponent(alertId)}/processed-result`, { ...authenticatedRequest, timeoutMs: 12000, maxAttempts: 1 });
+        const data = await routeJson(`/api-gateway/alerts/${encodeURIComponent(alertId)}/processed-result`, { ...authenticatedRequest, timeoutMs: 12000, maxAttempts: 1 });
         if (active) setTraceWorkflow({ loading: false, data, error: "", alertId, state: "ready" });
       } catch (error) {
         const message = error instanceof Error ? error.message : "Processed result unavailable";
@@ -346,7 +348,7 @@ export default function AlertsRoute() {
   }, [activeTraceAlert && alertRowKey(activeTraceAlert), session.accessToken]);
   useEffect(() => {
     let active = true;
-    fetchJson("/alert-intelligence/deduplication/config", { timeoutMs: 8000 })
+    routeJson("/alert-intelligence/deduplication/config", { timeoutMs: 8000 })
       .then((value: unknown) => { const payload = value as { window_minutes?: number }; if (active) setDedupWindow(Number(payload.window_minutes || 60)); })
       .catch(() => { if (active) setDedupMessage("Using the configured 60-minute default"); });
     return () => { active = false; };
@@ -355,7 +357,7 @@ export default function AlertsRoute() {
     setDedupSaving(true);
     setDedupMessage("");
     try {
-      const payload = await fetchJson("/alert-intelligence/deduplication/config", {
+      const payload = await routeJson("/alert-intelligence/deduplication/config", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ window_minutes: dedupWindow }),

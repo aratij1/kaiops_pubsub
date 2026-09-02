@@ -2,7 +2,7 @@ import { useMemo, useState } from "react";
 import { Activity, BrainCircuit, GitBranch, ShieldCheck, Wrench } from "lucide-react";
 
 import type { IncidentRow } from "../../app/routeRuntime";
-import { formatIstTimestamp } from "../../appHelpers.jsx";
+import { formatIstTimestamp } from "../../utils/presentation";
 import "./IncidentDecisionWorkspace.css";
 
 type EvidenceKind = "observed_fact" | "verified_topology" | "strong_correlation" | "ai_inferred" | "hypothesis" | "contradiction";

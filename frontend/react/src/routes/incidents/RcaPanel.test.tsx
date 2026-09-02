@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from "vitest";
 import RcaPanel, {
   governedPlanFromWorkflow,
   governedPlanMatchesSelection,
+  humanizeRcaHypothesis,
   resolutionBindingFor,
   resolutionSelectionPayload,
 } from "./RcaPanel";
@@ -13,6 +14,12 @@ import RcaPanel, {
 vi.mock("../../app/routeRuntime", () => ({ useRouteRuntimeSlice: () => ({ accessToken: "test-token" }) }));
 
 describe("RcaPanel canonical evidence gate", () => {
+  it("summarizes legacy structured metric hypotheses without raw JSON", () => {
+    const result = humanizeRcaHypothesis('Observed signal requiring causal confirmation: {"source_status":"completed","query":"sum(rate(http_requests_total[5m]))","series":[{"metric":{"service":"checkout"}}],"provenance":{"source":"onboarded-prometheus"}}');
+    expect(result).toBe("Observed signal requiring causal confirmation: Prometheus returned 1 time series for query: sum(rate(http_requests_total[5m]))");
+    expect(result).not.toContain("source_status");
+  });
+
   it("never substitutes the alert id for the canonical incident id", () => {
     const binding = resolutionBindingFor(
       { incident: { id: "incident-123" }, incident_investigation: { alert_id: "alert-456" } },
@@ -62,7 +69,7 @@ describe("RcaPanel canonical evidence gate", () => {
       selectedAlertTimelineRows={[]} selectedAlertRagDocuments={[]} selectedAlertEvaluation={{}}
       selectedAlertRow={{ service: "api", tenant_id: "tenant-a" }}
       selectedRcaDecision={{ confidence: .91, rootCause: "Speculative cause", action: "Restart" }}
-      selectedAiTrust={{ evidence: [], missing: [], conflicting: [], confidenceReasons: [], sources: {}, confidence: 0, integrityVerified: false, executionReady: false }}
+      selectedAiTrust={{ evidence: [], missing: [], conflicting: [], confidenceReasons: [], sources: {}, confidence: 0, contractPresent: false, contractValid: false, integrityVerified: false, executionReady: false }}
       selectedAlertWorkflow={{ recommendation: { metadata: {} }, context: { metadata: {} } }}
       selectedAlertRegeneration={{ loading: false }} selectedAlertRecommendationId="recommendation-1"
       selectedAlertDocumentContract={null} selectedAlertId="incident-1" aiFeedbackState={{}}
@@ -71,9 +78,12 @@ describe("RcaPanel canonical evidence gate", () => {
       onDownloadRagDocument={vi.fn()} onLoadRagDocumentContent={vi.fn()}
       onSubmitAiRecommendationFeedback={vi.fn()}
     />);
-    expect(screen.getByText("No direct observations are linked.")).toBeInTheDocument();
+    expect(screen.getByText("No observations are bound to this RCA snapshot.")).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: /Summary/ })).toHaveAttribute("aria-selected", "true");
     expect(screen.getByRole("button", { name: "Plan blocked by readiness" })).toBeDisabled();
     expect(screen.getAllByText("0%").length).toBeGreaterThan(0);
+    expect(screen.queryByText(/Investigation contract invalid at root/)).not.toBeInTheDocument();
+    expect(screen.queryByText("Fresh context is required")).not.toBeInTheDocument();
   });
 
   it("separates reusable-context quality from evidence coverage and RCA readiness", () => {
@@ -99,9 +109,35 @@ describe("RcaPanel canonical evidence gate", () => {
     expect(screen.getByText(/reuse quality, not RCA confidence/)).toBeInTheDocument();
     expect(screen.getByText("Evidence-plane coverage")).toBeInTheDocument();
     expect(screen.getByText("38%")).toBeInTheDocument();
-    expect(screen.getByText("RCA readiness")).toBeInTheDocument();
-    expect(screen.getByText("46%")).toBeInTheDocument();
+    expect(screen.getAllByText("RCA readiness").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("46%").length).toBeGreaterThan(0);
     expect(screen.getByText(/RCA is not ready: 46% diagnostic readiness/)).toBeInTheDocument();
+  });
+
+  it("shows collected details but keeps remediation unavailable when RCA is inconclusive", () => {
+    render(<RcaPanel
+      rcaDetailView="evidence" onSetRcaDetailView={vi.fn()} onSetHomeDetailTab={vi.fn()}
+      selectedAlertTimelineRows={[]} selectedAlertRagDocuments={[]} selectedAlertEvaluation={{}}
+      selectedAlertRow={{ service: "api", tenant_id: "tenant-a" }}
+      selectedRcaDecision={{ status: "insufficient-evidence", rootCause: "Investigation inconclusive", action: "Scale deployment" }}
+      selectedAiTrust={{ evidence: [], missing: ["runbooks"], conflicting: [], confidenceReasons: [], sources: {}, confidence: .4, integrityVerified: true, rcaReady: false, executionReady: false }}
+      selectedAlertWorkflow={{ recommendation: { metadata: {} }, context: { metadata: {
+        context_quality: { contract_version: "kaiops.context.v2", quality_score: .79, rca_readiness_score: .49, provenance_score: .97, evidence_count: 1 },
+        context_evidence: { telemetry: [{ evidence_id: "metric-1", source: "prometheus", summary: "p99 latency exceeded 3 seconds", observed_at: "2026-09-01T08:40:00Z" }] },
+      } } }}
+      selectedAlertRegeneration={{ loading: false }} selectedAlertRecommendationId="recommendation-1"
+      selectedAlertDocumentContract={null} selectedAlertId="incident-1" aiFeedbackState={{}}
+      rcaAnalysisMode="smart" onSetRcaAnalysisMode={vi.fn()} onRerunRca={vi.fn()}
+      onRefreshSelectedAlert={vi.fn()} onDownloadRagDocument={vi.fn()}
+      onLoadRagDocumentContent={vi.fn()} onSubmitAiRecommendationFeedback={vi.fn()}
+    />);
+
+    expect(screen.getByText("What the connectors observed")).toBeInTheDocument();
+    expect(screen.getByText("p99 latency exceeded 3 seconds")).toBeInTheDocument();
+    expect(screen.getAllByRole("tab", { name: /Evidence/ }).at(-1)).toHaveAttribute("aria-selected", "true");
+    expect(screen.getAllByText("Open gaps").at(-1)?.nextElementSibling).toHaveTextContent("1");
+    expect(screen.queryByRole("button", { name: "Remediation unavailable" })).not.toBeInTheDocument();
+    expect(screen.queryByText("Scale deployment")).not.toBeInTheDocument();
   });
 
   it("recovers an expired contract with an explicit fresh-context request", () => {

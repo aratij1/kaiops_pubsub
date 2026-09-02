@@ -134,6 +134,9 @@ async def test_regeneration_preserves_prior_snapshot_and_binds_new_generation(sq
     assert len(snapshots) == 2
     assert snapshot_ids[0] != snapshot_ids[1]
     assert {str(row.snapshot_id) for row in snapshots} == set(snapshot_ids)
+    snapshots_by_version = sorted(snapshots, key=lambda row: row.snapshot_version)
+    assert [row.snapshot_version for row in snapshots_by_version] == [1, 2]
+    assert snapshots_by_version[1].parent_snapshot_id == snapshots_by_version[0].snapshot_id
 
 
 @pytest.mark.asyncio
@@ -184,3 +187,47 @@ async def test_snapshot_persists_when_event_publication_is_disabled(sqlite_sessi
     assert exact is not None
     assert exact["context_fingerprint"] == context.metadata["context_fingerprint"]
     assert wrong_tenant is None
+
+
+@pytest.mark.asyncio
+async def test_final_investigation_snapshot_preserves_context_reusability(sqlite_session_factory) -> None:
+    module = load_context_app_module()
+    module.settings.database_enabled = True
+    module.app.state.session_factory = sqlite_session_factory
+    alert = Alert(
+        tenant_id="tenant-a", source="prometheus", name="CheckoutLatency", service="checkout",
+        environment="prod", severity=AlertSeverity.HIGH, description="checkout latency is above 2s",
+    )
+    incident = Incident(
+        tenant_id=alert.tenant_id, service=alert.service, environment=alert.environment,
+        severity=alert.severity, title=alert.name,
+    )
+    context = govern_context(Context(
+        tenant_id=alert.tenant_id,
+        incident_id=incident.id,
+        alert=alert,
+        observability={"query": "checkout_latency_seconds > 2", "series": [{"value": 2.4}]},
+        runbook="Inspect checkout latency before selecting a remediation.",
+    ), tenant_id="tenant-a", subject_fingerprint=context_subject_fingerprint(alert, "tenant-a"))
+    assert context.metadata["context_quality"]["reusable"] is True
+    outgoing = module._build_context_event_payload(
+        alert=alert, incident=incident, context=context,
+        decision={"flow_id": str(incident.id)}, provider_used="rabbitmq",
+    )
+    await module._persist_context_event(
+        app=module.app, alert=alert, incident=incident, context=context,
+        decision={"flow_id": str(incident.id)}, provider_used="rabbitmq",
+        outgoing_payload=outgoing, enqueue_event=False,
+    )
+
+    async with sqlite_session_factory() as session:
+        parent = (await session.execute(select(ContextSnapshotRecord))).scalar_one()
+        final = await IncidentRepository(session).persist_final_investigation_snapshot(
+            context=context,
+            report={"status": "insufficient_evidence", "evidence": []},
+            parent_snapshot_id=parent.snapshot_id,
+        )
+
+    assert parent.reusable is True
+    assert final.reusable is True
+    assert final.snapshot_stage == "investigation_complete"

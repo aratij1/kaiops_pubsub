@@ -18,3 +18,15 @@ export function isExpectedAnalysisVersion(payload: unknown, expectedRecommendati
   const expected = String(expectedRecommendationId || "").trim();
   return expected.length > 0 && recommendationIdFromAnalysis(payload) === expected;
 }
+
+export function canHydrateCompletedAnalysis(
+  statusReady: boolean,
+  payload: unknown,
+  expectedRecommendationId: unknown,
+): boolean {
+  // The request-status projection is authoritative for completion. A governed
+  // analysis may correctly finish as insufficient-evidence with no RCA-bound
+  // evidence; requiring evidence_used here leaves the browser on the previous
+  // recommendation even though the new, safely blocked version is durable.
+  return statusReady && isExpectedAnalysisVersion(payload, expectedRecommendationId);
+}

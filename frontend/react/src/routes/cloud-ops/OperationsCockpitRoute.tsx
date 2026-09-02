@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Activity, AlertTriangle, CheckCircle2, Cloud, Gauge, RefreshCw, ShieldCheck } from "lucide-react";
 
-import { useRouteRuntimeSlice } from "../../app/routeRuntime";
+import { useSession } from "../../app/SessionContext";
 import { approveCloudPlan, compileCloudPlan, executeCloudPlan, listCloudProviderStatus, openMaintenanceWindow, operationsCockpit, recoverExecutionLeases, rollbackCloudExecution, saveExecutionPolicy, simulateCloudPlan, type CloudPlanExecution, type CloudProviderStatus, type CockpitSummary, type CompiledPlan, type PlanSimulation, type ReadinessRow } from "./cloudOpsApi";
 import "./CloudOpsRoute.css";
 
@@ -16,7 +16,7 @@ export function aggregateProjectReadiness(rows: ReadinessRow[]) {
 }
 
 export default function OperationsCockpitRoute() {
-  const { accessToken } = useRouteRuntimeSlice("session");
+  const { accessToken } = useSession();
   const [projectId, setProjectId] = useState("demo-project");
   const [environment, setEnvironment] = useState("");
   const [summary, setSummary] = useState<CockpitSummary | null>(null);

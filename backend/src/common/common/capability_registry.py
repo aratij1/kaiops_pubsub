@@ -210,5 +210,6 @@ def default_capability_registry() -> CapabilityRegistry:
         _definition("jenkins.rollback_deployment", "jenkins", RiskLevel.HIGH, "job.build", rollback="jenkins.rollback_deployment"),
         _definition("terraform.rollback", "terraform", RiskLevel.CRITICAL, "state.apply", blast=BlastRadiusScope.ENVIRONMENT, approval=ApprovalLevel.ADMIN),
         _definition("application.invoke_recovery_endpoint", "custom-api", RiskLevel.MEDIUM, "endpoint.invoke", required=["endpoint_id"]),
+        _definition("application.restart_service", "api", RiskLevel.MEDIUM, "service.restart", rollback="application.restart_service"),
     ]
     return CapabilityRegistry(rows)

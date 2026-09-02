@@ -164,13 +164,11 @@ async def test_redelivered_approval_message_does_not_re_execute_remediation(sqli
         "rollback_commands": ["approved-rollback-action"],
         "readiness_blocks": [],
     }
-    plan["plan_fingerprint"] = canonical_plan_fingerprint(plan)
     approval = Approval(
         tenant_id="tenant-a",
         incident_id="11111111-1111-1111-1111-111111111111",
         recommendation_id="22222222-2222-2222-2222-222222222222",
         plan_id="33333333-3333-3333-3333-333333333333",
-        plan_fingerprint=plan["plan_fingerprint"],
         approval_expires_at=datetime(2099, 1, 1, tzinfo=UTC),
         decision=ApprovalDecision.APPROVED,
         approver="sre@example.com",
@@ -378,6 +376,7 @@ async def test_rollback_requires_governed_original_execution(monkeypatch: pytest
                 "commands": ["approved-connector-action"],
                 "validation_commands": ["approved-validator"],
                 "rollback_commands": ["approved-rollback"],
+                "rollback_mode": "automatic",
                 "remediation_target": "payments-api",
                 "execution_ready": True,
             },

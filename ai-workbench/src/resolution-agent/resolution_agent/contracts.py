@@ -27,6 +27,50 @@ class HypothesisStatus(StrEnum):
     INCONCLUSIVE = "INCONCLUSIVE"
 
 
+class ClaimKind(StrEnum):
+    CAUSAL = "CAUSAL"
+    IMPACT = "IMPACT"
+
+
+class ClaimStatus(StrEnum):
+    OBSERVED = "OBSERVED"
+    HYPOTHESIS = "HYPOTHESIS"
+    GROUNDED = "GROUNDED"
+    REFUTED = "REFUTED"
+    NOT_ESTABLISHED = "NOT_ESTABLISHED"
+
+
+class EvidenceBoundClaim(BaseModel):
+    """One auditable assertion; confidence never substitutes for evidence."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: str = "kaims.evidence-bound-claim.v1"
+    claim_id: str
+    kind: ClaimKind
+    status: ClaimStatus
+    statement: str = Field(min_length=1)
+    source: str = "agent"
+    supporting_evidence_ids: list[str] = Field(default_factory=list)
+    contradicting_evidence_ids: list[str] = Field(default_factory=list)
+    falsification_test: str = ""
+    limitations: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def enforce_grounding(self) -> "EvidenceBoundClaim":
+        overlap = set(self.supporting_evidence_ids) & set(self.contradicting_evidence_ids)
+        if overlap:
+            raise ValueError(f"evidence cannot both support and contradict a claim: {sorted(overlap)}")
+        if self.status == ClaimStatus.GROUNDED:
+            if len(set(self.supporting_evidence_ids)) < 2:
+                raise ValueError("a grounded claim requires at least two supporting evidence items")
+            if self.contradicting_evidence_ids:
+                raise ValueError("a grounded claim cannot retain unresolved contradicting evidence")
+        if self.status in {ClaimStatus.HYPOTHESIS, ClaimStatus.NOT_ESTABLISHED} and not self.falsification_test:
+            raise ValueError("an unconfirmed claim requires a falsification test")
+        return self
+
+
 class InvestigationToolCall(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -118,7 +162,7 @@ class ResolutionOption(BaseModel):
 class RCAResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: str = "kaims.rca-result.v1"
+    schema_version: str = "kaims.rca-result.v2"
     incident_id: UUID
     correlation_id: str
     outcome: ResolutionOutcome
@@ -130,6 +174,7 @@ class RCAResult(BaseModel):
     factors: dict[str, float] = Field(default_factory=dict)
     penalties: dict[str, float] = Field(default_factory=dict)
     missing_evidence: list[str] = Field(default_factory=list)
+    claims: list[EvidenceBoundClaim] = Field(default_factory=list)
     resolution_options: list[ResolutionOption] = Field(default_factory=list)
 
     @model_validator(mode="after")
@@ -139,6 +184,11 @@ class RCAResult(BaseModel):
                 raise ValueError("evidence-supported RCA requires a root cause and leading hypothesis")
             if len(set(self.supporting_evidence_ids)) < 2:
                 raise ValueError("evidence-supported RCA requires at least two supporting evidence items")
+            if self.claims and not any(
+                claim.kind == ClaimKind.CAUSAL and claim.status == ClaimStatus.GROUNDED
+                for claim in self.claims
+            ):
+                raise ValueError("evidence-supported RCA requires a grounded causal claim")
         elif self.root_cause:
             raise ValueError("non-conclusive RCA outcomes must not assert a root cause")
         return self

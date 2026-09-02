@@ -843,6 +843,12 @@ function alertIdentityKeys(row) {
   return keys;
 }
 
+function alertFingerprintValue(row) {
+  const labels = typeof row?.labels === "object" && row?.labels ? row.labels : {};
+  return String(row?.fingerprint || row?.alert_fingerprint || labels?.alert_fingerprint || labels?.fingerprint || "")
+    .trim().toLowerCase();
+}
+
 function alertApplicationCandidate(row) {
   const application = String(row?.application || "").trim();
   const service = String(row?.service || "").trim();
@@ -964,7 +970,15 @@ function dedupeAndConsolidateAlertRows(rows, options = {}) {
     let group = null;
     for (const key of lookupKeys) {
       if (keyToGroup.has(key)) {
-        group = keyToGroup.get(key);
+        const candidate = keyToGroup.get(key);
+        const incomingFingerprint = alertFingerprintValue(row);
+        const candidateFingerprint = alertFingerprintValue(candidate?.row);
+        // Strong, conflicting upstream identities must never be merged merely
+        // because alert name/service/time happen to share a composite key.
+        if (incomingFingerprint && candidateFingerprint && incomingFingerprint !== candidateFingerprint) {
+          continue;
+        }
+        group = candidate;
         break;
       }
     }
@@ -1807,15 +1821,6 @@ function deriveExecutionCommands(workflow, traceRows) {
     const commands = Array.isArray(payload?.commands) ? payload.commands : [];
     commands.forEach((item) => pushUnique(item, "cmd: "));
   });
-
-  if (!derived.length) {
-    const preview = buildPreviewExecutionPlan(safeWorkflow);
-    pushUnique("Pending live executor - no command has been executed yet", "cmd: ");
-    pushUnique(`# recommended_action: ${preview.recommendationText}`, "cmd: ");
-    (preview.plan.commands || []).forEach((item) => pushUnique(item, "cmd: "));
-    (preview.plan.scripts || []).forEach((item) => pushUnique(item, "script: "));
-    (preview.plan.queries || []).forEach((item) => pushUnique(item, "query: "));
-  }
 
   return derived;
 }
@@ -4162,22 +4167,10 @@ function groundedIntelligenceDisplay(label, value, structuredOverride) {
 }
 
 function canonicalIncidentAnalysis(workflow, alertRow = null) {
-  const rowPayload = alertRow?.projection_payload && typeof alertRow.projection_payload === "object"
-    ? alertRow.projection_payload
-    : alertRow?.workflow && typeof alertRow.workflow === "object"
-      ? alertRow.workflow
-      : alertRow?.processed_result && typeof alertRow.processed_result === "object"
-        ? alertRow.processed_result
-        : {};
-  const safeWorkflow = {
-    ...(rowPayload && typeof rowPayload === "object" ? rowPayload : {}),
-    ...(workflow && typeof workflow === "object" ? workflow : {}),
-  };
+  const safeWorkflow = workflow && typeof workflow === "object" ? workflow : {};
   const recommendation = safeWorkflow.recommendation && typeof safeWorkflow.recommendation === "object"
     ? safeWorkflow.recommendation
-    : rowPayload.recommendation && typeof rowPayload.recommendation === "object"
-      ? rowPayload.recommendation
-      : {};
+    : {};
   const metadata = recommendation.metadata && typeof recommendation.metadata === "object"
     ? recommendation.metadata
     : {};
@@ -4195,7 +4188,7 @@ function canonicalIncidentAnalysis(workflow, alertRow = null) {
     ? metadata.remediation_analysis
     : {};
   const confirmedRootCause = cleanRecommendationText(
-    rca.root_cause || recommendation.root_cause || safeWorkflow.root_cause || alertRow?.root_cause || alertRow?.rca,
+    rca.root_cause || recommendation.root_cause || safeWorkflow.root_cause,
     "",
   );
   const hypothesis = hypotheses.find((item) => item && item.cause);
@@ -4207,13 +4200,11 @@ function canonicalIncidentAnalysis(workflow, alertRow = null) {
       || impact.customer_impact
       || impact.service_impact
       || recommendation.impact
-      || safeWorkflow.impact
-      || alertRow?.impact
-      || alertRow?.business_impact,
+      || safeWorkflow.impact,
     "",
   );
   const action = cleanRecommendationText(
-    remediation.recommended_action || recommendation.recommended_action || safeWorkflow.recommended_action || alertRow?.recommended_action,
+    remediation.recommended_action || recommendation.recommended_action || safeWorkflow.recommended_action,
     "",
   );
   const externalKnowledgeUsed = Boolean(

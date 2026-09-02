@@ -93,6 +93,34 @@ def test_stale_operational_evidence_is_not_reusable() -> None:
     assert governed.metadata["context_sources"]["logs"]["status"] == "stale"
 
 
+def test_freshly_retrieved_incident_window_metric_is_historical_not_stale() -> None:
+    context = make_context()
+    context.alert.created_at = datetime.now(UTC) - timedelta(hours=2)
+    context.alert.starts_at = context.alert.created_at
+    context.runbook = None
+    context.metadata["context_collected_at"] = datetime.now(UTC).isoformat()
+    context.metadata["context_evidence"] = {
+        "telemetry": [{
+            "source": "telemetry",
+            "uri": "prometheus://worker/queue-lag?window=incident",
+            "summary": "queue lag was above threshold in the incident window",
+            "observed_at": context.alert.starts_at.isoformat(),
+            "retrieved_at": datetime.now(UTC).isoformat(),
+            "confidence": 0.9,
+        }],
+    }
+
+    governed = govern_context(context, tenant_id="tenant-a")
+    quality = governed.metadata["context_quality"]
+    metric = governed.metadata["context_evidence"]["telemetry"][0]
+
+    assert metric["freshness_score"] == 0.0
+    assert metric["incident_window_aligned"] is True
+    assert quality["stale_sources"] == []
+    assert quality["valid_for_seconds"] > 0
+    assert governed.metadata["context_sources"]["telemetry"]["status"] == "historical"
+
+
 def test_missing_provider_timestamp_is_explicit_and_cannot_claim_full_freshness() -> None:
     context = make_context()
     context.metadata["context_evidence"]["logs"][0].pop("observed_at")
@@ -111,7 +139,7 @@ def test_missing_provider_timestamp_is_explicit_and_cannot_claim_full_freshness(
     assert source["inferred_timestamp_count"] == 1
 
 
-def test_sparse_reusable_context_does_not_claim_high_rca_readiness() -> None:
+def test_partial_traceable_context_can_be_rca_ready_without_every_plane() -> None:
     context = make_context()
     context.runbook = None
     context.metadata["context_evidence"] = {
@@ -137,9 +165,43 @@ def test_sparse_reusable_context_does_not_claim_high_rca_readiness() -> None:
 
     assert quality["source_coverage_score"] == 0.375
     assert quality["coverage_score"] > quality["source_coverage_score"]
-    assert quality["rca_readiness_score"] < 0.70
+    assert quality["rca_readiness_score"] >= 0.70
+    assert quality["rca_ready"] is True
+    assert quality["impact_ready"] is True
+
+
+def test_observed_high_severity_context_is_reusable_but_declares_causal_gap() -> None:
+    context = make_context()
+    context.alert.severity = AlertSeverity.HIGH
+    context.runbook = None
+    context.deployment = None
+    context.dependency_services = []
+    context.metadata["context_evidence"] = {
+        "telemetry": [{
+            "source": "telemetry",
+            "uri": "prometheus://worker/queue-lag",
+            "summary": "queue lag is above threshold",
+            "observed_at": datetime.now(UTC).isoformat(),
+            "confidence": 0.9,
+        }],
+        "topology": [{
+            "source": "topology",
+            "uri": "cmdb://orders/worker",
+            "summary": "worker belongs to orders",
+            "observed_at": datetime.now(UTC).isoformat(),
+            "confidence": 0.9,
+        }],
+    }
+
+    governed = govern_context(context, tenant_id="tenant-a")
+    quality = governed.metadata["context_quality"]
+
+    assert quality["reusable"] is True
+    assert quality["impact_ready"] is True
     assert quality["rca_ready"] is False
-    assert quality["impact_ready"] is False
+    assert quality["missing_required"] == []
+    assert quality["diagnostic_gaps"] == ["causal_or_action"]
+    assert quality["execution_ready"] is False
 
 
 def test_untraceable_connector_rows_are_diagnostic_only() -> None:
@@ -196,3 +258,19 @@ def test_connector_plan_skips_unjustified_change_probes() -> None:
 
     assert set(selected) == {"prometheus", "cmdb", "discovery-mcp", "vector-db"}
     assert "baseline_signal_topology_discovery_knowledge" in reasons
+
+
+def test_connector_plan_requests_bounded_local_evidence_for_latency() -> None:
+    alert = make_context().alert.model_copy(update={
+        "name": "CheckoutLatencyHigh",
+        "description": "checkout p95 latency is above 2 seconds",
+    })
+    available = [
+        "prometheus", "cmdb", "discovery-mcp", "vector-db", "local-evidence",
+        "github", "jenkins", "servicenow", "kubernetes",
+    ]
+
+    selected, reasons = plan_connectors(alert, available)
+
+    assert "local-evidence" in selected
+    assert "bounded_local_evidence_requested" in reasons

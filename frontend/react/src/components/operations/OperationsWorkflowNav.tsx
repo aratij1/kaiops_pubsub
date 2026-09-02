@@ -3,7 +3,7 @@ import { useNavigate } from "react-router-dom";
 
 const steps = [
   { id: "alerts", path: "/alerts", number: "01", label: "Live Alerts", description: "Detect and triage" },
-  { id: "incidents", path: "/incidents", number: "02", label: "Unified Inbox", description: "Triage signals and incidents" },
+  { id: "incidents", path: "/incidents", number: "02", label: "Unified Inbox", description: "Investigate canonical incidents" },
   { id: "approvals", path: "/approvals", number: "03", label: "Decide", description: "Approve or reject safely" },
   { id: "act", path: "/incidents?stage=execution", number: "04", label: "Act", description: "Monitor governed execution" },
   { id: "verify", path: "/closed-incidents", number: "05", label: "Verify", description: "Confirm recovery" },

@@ -4,6 +4,7 @@ import hashlib
 import json
 from copy import deepcopy
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
@@ -53,7 +54,7 @@ def build_idempotency_key(action: RemediationAction, snapshot_hash: str) -> str:
 
 
 def assess_execution_safety(
-    action: RemediationAction, *, allowlisted_actions: set[str]
+    action: RemediationAction, *, allowlisted_actions: set[str], now: datetime | None = None
 ) -> ExecutionSafetyAssessment:
     snapshot = build_pre_execution_snapshot(action)
     snapshot_hash = hash_snapshot(snapshot)
@@ -85,6 +86,41 @@ def assess_execution_safety(
             snapshot_hash,
             idempotency_key,
         )
+    if action.approval_id is not None:
+        approval_expires_at = action.parameters.get("approval_expires_at")
+        if not approval_expires_at:
+            return ExecutionSafetyAssessment(
+                ExecutionSafetyDecision.BLOCK,
+                "APPROVAL_EXPIRY_MISSING",
+                snapshot,
+                snapshot_hash,
+                idempotency_key,
+            )
+        try:
+            expires_at = (
+                approval_expires_at
+                if isinstance(approval_expires_at, datetime)
+                else datetime.fromisoformat(str(approval_expires_at).replace("Z", "+00:00"))
+            )
+            if expires_at.tzinfo is None:
+                raise ValueError("approval expiry must include a timezone")
+        except (TypeError, ValueError):
+            return ExecutionSafetyAssessment(
+                ExecutionSafetyDecision.BLOCK,
+                "APPROVAL_EXPIRY_INVALID",
+                snapshot,
+                snapshot_hash,
+                idempotency_key,
+            )
+        observed_at = now or datetime.now(UTC)
+        if expires_at.astimezone(UTC) <= observed_at.astimezone(UTC):
+            return ExecutionSafetyAssessment(
+                ExecutionSafetyDecision.BLOCK,
+                "APPROVAL_EXPIRED",
+                snapshot,
+                snapshot_hash,
+                idempotency_key,
+            )
     return ExecutionSafetyAssessment(
         ExecutionSafetyDecision.ALLOW,
         "execution safety checks passed",

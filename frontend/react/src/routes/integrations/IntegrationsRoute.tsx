@@ -1,7 +1,7 @@
 import { useState, type FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Pencil, RefreshCw, X } from "lucide-react";
-import { useRouteRuntime } from "../../app/routeRuntime";
+import { useSession } from "../../app/SessionContext";
 import { applicationKeys, applicationsQueryOptions, createApplication, updateApplication } from "../../services/applications";
 import type { Application, ApplicationUpdate, NewApplication } from "../../schemas/applications";
 
@@ -11,7 +11,7 @@ const parseLabels = (value: string) => Object.fromEntries(value.split(",").map((
 const deploymentProviders: Record<string, string> = { cloud_agnostic: "cloud-agnostic", on_prem: "on-prem", private_cloud: "private-cloud", aws_cloud: "aws", azure_cloud: "azure", gcp_cloud: "gcp" };
 
 export default function IntegrationsRoute() {
-  const { session } = useRouteRuntime();
+  const session = useSession();
   const queryClient = useQueryClient();
   const applications = useQuery(applicationsQueryOptions(session.accessToken));
   const [form, setForm] = useState<NewApplication>(initialForm);

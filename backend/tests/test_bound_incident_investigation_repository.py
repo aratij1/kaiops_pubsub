@@ -31,6 +31,7 @@ async def _seed_pair(
     fingerprint: str,
     evidence_id: str,
     expires_at: datetime | None = None,
+    rca_version: int = 1,
 ) -> None:
     now = datetime.now(UTC)
     analysis_request_id = uuid4()
@@ -88,7 +89,7 @@ async def _seed_pair(
                 "context_snapshot_id": str(snapshot_id),
                 "context_fingerprint": fingerprint,
                 "evidence_ids": [evidence_id],
-                "rca_version": 1,
+                "rca_version": rca_version,
                 "rca_status": "grounded",
                 "rca_analysis": {"evidence_used": [evidence_id], "missing_evidence": []},
                 "investigation_report": {
@@ -102,7 +103,7 @@ async def _seed_pair(
         binding_id=recommendation_id, tenant_id=tenant_id, project_id="payments",
         incident_id=incident_id, alert_id=alert_id, analysis_request_id=analysis_request_id,
         context_snapshot_id=snapshot_id, context_fingerprint=fingerprint,
-        recommendation_id=recommendation_id, rca_version=1, resolution_plan_id=None,
+        recommendation_id=recommendation_id, rca_version=rca_version, resolution_plan_id=None,
         plan_fingerprint=None, status="grounded", created_at=now,
         expires_at=expires_at or now + timedelta(hours=1),
     ))
@@ -212,6 +213,52 @@ async def test_processed_result_uses_projection_recommendation_snapshot_and_emit
     assert result["metrics"]["remediation_status"] == "unknown"
     assert result["legacy_lifecycle_records"][0]["record_id"] == str(legacy_action_id)
     assert result["legacy_lifecycle_records"][0]["status"] == "legacy_unbound"
+
+
+@pytest.mark.asyncio
+async def test_processed_result_prefers_newest_binding_over_stale_projection(
+    sqlite_session_factory,
+) -> None:
+    incident_id, alert_id = uuid4(), uuid4()
+    snapshot_v1, recommendation_v1 = uuid4(), uuid4()
+    snapshot_v2, recommendation_v2 = uuid4(), uuid4()
+    now = datetime.now(UTC)
+    async with sqlite_session_factory() as session:
+        await _seed_pair(
+            session, tenant_id="tenant-a", incident_id=incident_id, alert_id=alert_id,
+            snapshot_id=snapshot_v1, recommendation_id=recommendation_v1,
+            fingerprint="1" * 64, evidence_id="evidence-v1",
+            expires_at=now - timedelta(seconds=1), rca_version=1,
+        )
+        await _seed_pair(
+            session, tenant_id="tenant-a", incident_id=incident_id, alert_id=alert_id,
+            snapshot_id=snapshot_v2, recommendation_id=recommendation_v2,
+            fingerprint="2" * 64, evidence_id="evidence-v2", rca_version=2,
+        )
+        session.add(AlertRecord(
+            id=alert_id, tenant_id="tenant-a", source="prometheus", name="LatencyHigh",
+            service="payments", environment="prod", severity="critical", fingerprint="alert-fp",
+            payload={"id": str(alert_id), "tenant_id": "tenant-a", "project_id": "payments", "labels": {}},
+        ))
+        session.add(IncidentRecord(
+            id=incident_id, tenant_id="tenant-a", service="payments", environment="prod",
+            severity="critical", status="investigating", title="Payments latency", ticket_id=None,
+            payload={"id": str(incident_id), "project_id": "payments", "alert_ids": [str(alert_id)]},
+        ))
+        session.add(IncidentProjectionRecord(
+            incident_id=incident_id, alert_id=alert_id, recommendation_id=recommendation_v1,
+            tenant_id="tenant-a", service="payments", environment="prod", severity="critical",
+            status="investigating", first_seen_at=now, projection_payload={},
+        ))
+        await session.commit()
+        result = await IncidentRepository(session).get_processed_result_by_alert_id(
+            str(alert_id), tenant_id="tenant-a",
+        )
+
+    assert result is not None
+    assert result["investigation_integrity"]["status"] == "verified"
+    assert result["incident_investigation"]["recommendation_id"] == str(recommendation_v2)
+    assert result["incident_investigation"]["context_snapshot_id"] == str(snapshot_v2)
 
 
 @pytest.mark.asyncio

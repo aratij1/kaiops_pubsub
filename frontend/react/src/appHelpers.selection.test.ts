@@ -2,6 +2,18 @@ import { describe, expect, it } from "vitest";
 import { capLatestAlertsPerSource, dedupeAndConsolidateAlertRows, ensureMinimumAlertsBySource, filterRowsForMonitor, shouldRetainAlertSelection, resolveCanonicalAlertForRow } from "./appHelpers.jsx";
 
 describe("alert stream and inbox identity", () => {
+  it("does not merge different Alertmanager fingerprints sharing name, service, and time", () => {
+    const rows = dedupeAndConsolidateAlertRows([{
+      id: "mount-a", name: "DiskSpaceLow", service: "node-exporter", severity: "critical",
+      created_at: "2026-09-02T02:36:24Z", labels: { alert_fingerprint: "fingerprint-a", mountpoint: "/usr/lib/wsl/drivers" },
+    }, {
+      id: "mount-b", name: "DiskSpaceLow", service: "node-exporter", severity: "critical",
+      created_at: "2026-09-02T02:36:24Z", labels: { alert_fingerprint: "fingerprint-b", mountpoint: "/run/desktop/mnt/host/c" },
+    }]);
+
+    expect(rows).toHaveLength(2);
+  });
+
   it("keeps canonical identity and incident linkage when a newer landing occurrence wins", () => {
     const alertId = "bbe1b2c1-2542-488c-81d3-f57b38a25296";
     const incidentId = "2a3b34d2-b5e1-453f-924a-04ebe115a518";

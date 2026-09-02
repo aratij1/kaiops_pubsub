@@ -1,6 +1,6 @@
 import { Activity, ArrowRight, Gauge, ShieldCheck, Sparkles } from "lucide-react";
 
-import { HorizontalBarChart, SuccessFailureDonut } from "../../appHelpers.jsx";
+import { HorizontalBarChart, SuccessFailureDonut } from "../../components/charts/ExecutiveCharts";
 import { useRouteRuntime } from "../../app/routeRuntime";
 
 const formatTime = (value?: string) => value

@@ -1,5 +1,6 @@
 ﻿import json
 import pytest
+from datetime import UTC, datetime
 from uuid import uuid4
 from ai_workbench_common.models import Context
 from ai_workbench_common.memory_store import InMemoryStore
@@ -187,6 +188,22 @@ def test_discovery_routes_metric_alerts_without_unrelated_database_or_ticket_que
     assert reasons == ["metric_or_trace_signal"]
 
 
+def test_discovery_routes_trace_requirement_to_targeted_trace_query() -> None:
+    alert = Alert(
+        source="prometheus",
+        name="CheckoutLatencyHigh",
+        service="checkout",
+        severity=AlertSeverity.HIGH,
+        description="p95 latency is above the service objective",
+        metadata={"context_requirement_category": "traces"},
+    )
+
+    selected, reasons = DiscoveryMCPConnector._plan_discovery_tools(alert)
+
+    assert selected == ["traces.search"]
+    assert reasons == ["evidence_requirement"]
+
+
 def test_discovery_expands_route_for_change_database_and_recurring_signals() -> None:
     alert = Alert(
         source="logs",
@@ -314,6 +331,23 @@ def test_vector_db_connector_loads_rag_documents(governed_rag_root) -> None:
     assert any(doc["kind"] == "runbook" for doc in connector.documents)
     assert any(doc["kind"] == "incident" for doc in connector.documents)
     assert any(doc["kind"] == "dependency" for doc in connector.documents)
+
+
+@pytest.mark.asyncio
+async def test_vector_db_connector_reports_empty_approved_corpus(tmp_path) -> None:
+    connector = VectorDBConnector(rag_root=tmp_path)
+    alert = Alert(
+        tenant_id="tenant-a", name="HighLatency", service="api-gateway",
+        severity="critical", source="prometheus", description="Latency exceeded the SLO.",
+        starts_at=datetime.now(UTC),
+    )
+    incident = Incident(tenant_id="tenant-a", service="api-gateway", title="High latency")
+
+    result = await connector.fetch(alert, incident)
+
+    assert result["matches"] == []
+    assert result["document_count"] == 0
+    assert result["evidence_gap"] == "NO_MATCHING_APPROVED_EVIDENCE"
 
 
 def test_context_rag_gate_rejects_weak_untagged_history() -> None:
@@ -570,6 +604,9 @@ async def test_resolution_agent_propagates_readiness_and_blocks_mutation_when_rc
     assert rca["context_readiness"] == {"score": 0.46, "ready": False, "source_coverage": 0.375}
     assert impact["context_readiness"] == {"score": 0.41, "ready": False}
     assert impact["confidence_score"] <= 0.49
+    assert recommendation.impact == (
+        "Observed alert condition indicates latency for payments; customer impact is not established."
+    )
     assert plan["execution_ready"] is False
     assert any("46% RCA-ready" in reason for reason in plan["readiness_blocks"])
 

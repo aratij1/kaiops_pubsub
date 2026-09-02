@@ -1,12 +1,12 @@
 import { useState } from "react";
 import { Gauge, RefreshCw, Route } from "lucide-react";
 
-import { useRouteRuntimeSlice } from "../../app/routeRuntime";
+import { useSession } from "../../app/SessionContext";
 import { service360, type Service360 } from "./cloudOpsApi";
 import "./CloudOpsRoute.css";
 
 export default function Service360Route() {
-  const { accessToken } = useRouteRuntimeSlice("session");
+  const { accessToken } = useSession();
   const [projectId, setProjectId] = useState("demo-project");
   const [serviceId, setServiceId] = useState("checkout-api");
   const [environment, setEnvironment] = useState("prod");

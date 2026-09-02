@@ -22,6 +22,7 @@ describe("useEvidenceDraftBundle", () => {
 
     await result.current.review(draft, "updated reviewed content", "verified");
     await result.current.approve(draft);
+    await result.current.revise(draft);
 
     const reviewOptions = fetchJson.mock.calls[0][1];
     const approveOptions = fetchJson.mock.calls[1][1];
@@ -29,6 +30,11 @@ describe("useEvidenceDraftBundle", () => {
     expect(JSON.parse(approveOptions.body)).toEqual({ expected_row_version: 7 });
     expect(reviewOptions.headers.Authorization).toBe("Bearer token");
     expect(approveOptions.headers.Authorization).toBe("Bearer token");
+    expect(fetchJson).toHaveBeenNthCalledWith(
+      3,
+      "/api-gateway/rag/evidence-drafts/10000000-0000-4000-8000-000000000001/revision",
+      expect.objectContaining({ method: "POST", authenticated: true }),
+    );
   });
 
   it("loads the latest server versions after a conflict", async () => {

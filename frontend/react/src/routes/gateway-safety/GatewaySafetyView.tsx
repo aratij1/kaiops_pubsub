@@ -1,6 +1,6 @@
 import { AlertTriangle, FileClock, LockKeyhole, RefreshCw, ShieldCheck, ShieldX, Siren, Workflow } from "lucide-react";
 
-import { useRouteRuntime } from "../../app/routeRuntime";
+import { useSafetyData } from "../../features/safety/useSafetyData";
 import "./GatewaySafetyView.css";
 
 const formatTime = (value?: string) => value
@@ -8,7 +8,7 @@ const formatTime = (value?: string) => value
   : "-";
 
 export function GatewaySafetyView({ mode = "safety" }: { mode?: "safety" | "audit" }) {
-  const { safety } = useRouteRuntime();
+  const safety = useSafetyData();
   const isAudit = mode === "audit";
   const latestTrace = safety.summary.latest_trace_id || "No trace recorded";
 

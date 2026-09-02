@@ -88,7 +88,7 @@ class Settings(BaseSettings):
     context_strategy: str = Field(default="auto", alias="CONTEXT_STRATEGY")
     # Context uses both this outer snapshot lifetime and stricter per-source
     # freshness windows. Operational signals expire before reviewed knowledge.
-    context_knowledge_ttl_seconds: int = Field(default=3600, alias="CONTEXT_KNOWLEDGE_TTL_SECONDS", ge=60)
+    context_knowledge_ttl_seconds: int = Field(default=14400, alias="CONTEXT_KNOWLEDGE_TTL_SECONDS", ge=60)
     context_min_quality_score: float = Field(default=0.70, alias="CONTEXT_MIN_QUALITY_SCORE", ge=0.0, le=1.0)
     context_max_evidence_per_source: int = Field(default=20, alias="CONTEXT_MAX_EVIDENCE_PER_SOURCE", ge=1, le=100)
     context_collection_budget_seconds: float = Field(default=45.0, alias="CONTEXT_COLLECTION_BUDGET_SECONDS", ge=5.0, le=180.0)

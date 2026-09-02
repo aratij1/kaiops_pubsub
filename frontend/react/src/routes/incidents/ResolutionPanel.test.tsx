@@ -3,96 +3,27 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import ResolutionPanel from "./ResolutionPanel";
-
 afterEach(cleanup);
-
+const base = { alertRow: { service: "payments-api", environment: "prod" }, confidenceScore: .88, onNavigateTab: vi.fn() };
 describe("ResolutionPanel", () => {
-  it("explains the exact change, target, evidence basis, and safety gate", () => {
-    render(
-      <ResolutionPanel
-        workflow={{
-          incident_investigation: { readiness: { approval_ready: true, blocking_reasons: [] }, readiness_blocks: [] },
-          investigation_integrity: { status: "verified", verified: true, blocking_reasons: [] },
-          recommendation: {
-            id: "rec-1",
-            recommended_action: "Restart the payments API",
-            root_cause: "The service process stopped responding",
-            impact: "Payment requests are failing",
-          },
-        }}
-        alertRow={{ service: "payments-api", environment: "prod" }}
-        confidenceScore={0.88}
-        executionPlan={{
-          requiresApproval: true,
-          riskTier: "high",
-          executionMode: "jenkins",
-          target: "payments-api",
-          expectedOutcome: "The payments API passes independent recovery validation.",
-          catalogPlan: { plan_id: "plan-1", plan_fingerprint: `sha256:${"a".repeat(64)}`, recommendation_id: "rec-1" },
-          readinessDecision: { decision_id: "decision-1", signature: "signed-value", state: "execution_eligible", plan_id: "plan-1", plan_fingerprint: `sha256:${"a".repeat(64)}`, recommendation_id: "rec-1" },
-        }}
-        readinessChecks={[
-          { id: "evidence", label: "Grounded evidence", detail: "Evidence threshold met.", passed: true },
-          { id: "rollback", label: "Rollback", detail: "Rollback supplied.", passed: true },
-        ]}
-        onNavigateTab={vi.fn()}
-      />,
-    );
-
-    expect(screen.getByRole("heading", { name: "Remediation recommendation" })).toBeVisible();
-    expect(screen.getByText("Restart the payments API")).toBeVisible();
-    expect(screen.getByText("payments-api")).toBeVisible();
-    expect(screen.getByText("Payment requests are failing")).toBeVisible();
-    expect(screen.getByText("The payments API passes independent recovery validation.")).toBeVisible();
-    expect(screen.getByText("Human approval required")).toBeVisible();
-    expect(screen.getByText("Eligible for guarded approval")).toBeVisible();
-    expect(screen.getByRole("progressbar", { name: "Recommendation confidence" })).toHaveAttribute("aria-valuenow", "88");
+  it("shows exact governed scripts and the reason", () => {
+    render(<ResolutionPanel {...base} workflow={{ investigation_integrity: { verified: true }, recommendation: { id: "rec-1", recommended_action: "Restart the unhealthy revision", root_cause: "Connection pool exhaustion is confirmed." } }} executionPlan={{ requiresApproval: true, riskTier: "high", executionMode: "jenkins", target: "payments-api", expectedOutcome: "Error rate returns below 1%.", catalogPlan: { plan_id: "p1", plan_fingerprint: `sha256:${"a".repeat(64)}`, recommendation_id: "rec-1", commands: ["kubectl rollout restart deployment/payments-api -n prod"], validation_commands: ["kubectl rollout status deployment/payments-api -n prod"], rollback_commands: ["kubectl rollout undo deployment/payments-api -n prod"] }, readinessDecision: { decision_id: "d1", signature: "signed", state: "execution_eligible", plan_id: "p1", plan_fingerprint: `sha256:${"a".repeat(64)}`, recommendation_id: "rec-1" } }} />);
+    expect(screen.getByRole("heading", { name: "Review execution plan" })).toBeVisible();
+    expect(screen.getByText("Connection pool exhaustion is confirmed.", { exact: false })).toBeVisible();
+    expect(screen.getByText("kubectl rollout restart deployment/payments-api -n prod")).toBeVisible();
+    expect(screen.getByText("kubectl rollout status deployment/payments-api -n prod")).toBeVisible();
+    expect(screen.getByText("kubectl rollout undo deployment/payments-api -n prod")).toBeVisible();
   });
-
-  it("does not claim readiness while a safeguard is missing", () => {
-    render(<ResolutionPanel workflow={{ recommendation: { recommended_action: "Restart", root_cause: "Deadlock" } }} alertRow={{ service: "api" }} confidenceScore={0.9} executionPlan={{}} readinessChecks={[{ id: "rollback", label: "Rollback", detail: "No rollback supplied.", passed: false, action: "attach rollback instructions" }]} onNavigateTab={vi.fn()} />);
-    expect(screen.getByText("Backend readiness required")).toBeVisible();
-    expect(screen.getByText(/Not ready/)).toBeVisible();
-    expect(screen.getByText(/attach rollback instructions/)).toBeVisible();
+  it("does not fake a remediation script for evidence collection", () => {
+    render(<ResolutionPanel {...base} workflow={{ recommendation: { recommended_action: "Collect traces evidence for this incident.", root_cause: "Causal confirmation is still required." } }} executionPlan={{ target: "payments-api" }} />);
+    expect(screen.getByText("No executable remediation script is available")).toBeVisible();
+    expect(screen.getByText(/close the evidence gaps/)).toBeVisible();
+    expect(screen.getByRole("button", { name: /Inspect safeguards/ })).toBeDisabled();
   });
-
-  it("never claims approval eligibility from local fields without a signed backend receipt", () => {
-    render(<ResolutionPanel workflow={{ recommendation: { recommended_action: "Restart", root_cause: "Deadlock" } }} alertRow={{ service: "api" }} confidenceScore={0.99} executionPlan={{ target: "api" }} readinessChecks={[{ id: "rollback", label: "Rollback", detail: "Ready.", passed: true }]} onNavigateTab={vi.fn()} />);
-    expect(screen.queryByText("Eligible for guarded approval")).not.toBeInTheDocument();
-    expect(screen.getByText("Signed backend readiness")).toBeVisible();
-  });
-
-  it("renders the typed evidence-to-recovery decision trace without exposing credentials", () => {
-    render(<ResolutionPanel
-      workflow={{
-        recommendation: { recommended_action: "Restart revision", root_cause: "Connection pool exhaustion", metadata: {
-          iterative_investigation: {
-            outcome: "EVIDENCE_SUPPORTED",
-            investigation_plan: { questions_to_answer: ["Did the pool exhaust after the deployment?"] },
-            typed_hypotheses: [{ title: "The new revision exhausted its pool", status: "SUPPORTED", probability: 0.92, reasoning_summary: "Logs and metrics corroborate the causal sequence.", confidence_factors: { causal_strength: 0.18 }, confidence_penalties: {} }],
-          },
-          resolution_options: [{ option_id: "restart-revision", title: "Restart the unhealthy revision", risk_level: "MEDIUM", automation_eligibility: "HITL", reasoning: "Governed catalog match backed by the supported RCA." }],
-        } },
-        remediation_action: { parameters: { preflight_evidence: { status: "PASSED", dry_run_evidence_id: "preflight:abc" } } },
-        resolution_report: { metadata: { outcome_validation: { outcome: "RECOVERED", closure_authorized: true, stability_window_seconds: 300, failed_checks: [], rollback: { disposition: "NOT_REQUIRED" } } } },
-        evaluation: { report: { code_patch_proposals: [{ proposal_id: "patch-1", title: "Bound connection pool growth", explanation: "Review-only code proposal.", executable: false }], preventive_recommendations: [{ recommendation_id: "prevent-1", risk_signal: "Pool pressure rising", mode: "SHADOW", execution_authorized: false, recommended_review: "Review capacity." }], evidence_council: { disposition: "SUPPORTED" }, temporal_service_graph: { edges: [{ edge_id: "edge-1" }] } } },
-      }}
-      alertRow={{ service: "payments-api", environment: "prod" }}
-      confidenceScore={0.92}
-      executionPlan={{ target: "payments-api", catalogPlan: { actions: [{ target_resource_id: "payments-api", safety_binding: { credential: { reference: "vault://tenant-a/prod/remediator" }, blast_radius: { scope: "single-service", verified: true, unknown_dependencies: false }, preflight: { status: "PLANNED" } } }] } }}
-      onNavigateTab={vi.fn()}
-    />);
-
-    expect(screen.getByRole("heading", { name: "Evidence-to-recovery controls" })).toBeVisible();
-    expect(screen.getByText("The new revision exhausted its pool")).toBeVisible();
-    expect(screen.getByText("Restart the unhealthy revision")).toBeInTheDocument();
-    expect(screen.getByText("Scoped reference present")).toBeInTheDocument();
-    expect(screen.queryByText("vault://tenant-a/prod/remediator")).not.toBeInTheDocument();
-    expect(screen.getAllByText("RECOVERED").length).toBeGreaterThan(0);
-    expect(screen.getByText("NOT REQUIRED")).toBeInTheDocument();
-    expect(screen.getByText("Bound connection pool growth")).toBeInTheDocument();
-    expect(screen.getByText("Human review required · not executable")).toBeInTheDocument();
-    expect(screen.getByText("Pool pressure rising")).toBeInTheDocument();
-    expect(screen.getByText("SHADOW · execution not authorized")).toBeInTheDocument();
+  it("labels model commands review-only", () => {
+    render(<ResolutionPanel {...base} workflow={{ recommendation: { recommended_action: "Restart API", root_cause: "API stopped responding", metadata: { model_proposed_execution_plan: { commands: ["systemctl restart api"] } } } }} executionPlan={{ target: "api" }} />);
+    expect(screen.getByText("Review-only model suggestion")).toBeVisible();
+    expect(screen.getByText("systemctl restart api")).toBeInTheDocument();
+    expect(screen.getByText(/not governed and cannot be executed/)).toBeInTheDocument();
   });
 });

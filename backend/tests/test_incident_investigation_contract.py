@@ -131,7 +131,7 @@ def test_repository_normalizes_iterative_status_and_authoritative_evidence_uri()
             "metadata": {
                 "context_quality": expected["context_quality"],
                 "context_sources": {
-                    "metrics": {"status": "fresh", "collected_at": expected["context_collected_at"]},
+                    "metrics": {"status": "fresh", "collected_at": "2026-09-01T12:19:31"},
                     "rag": {"status": "no_matches", "collected_at": expected["context_collected_at"]},
                 },
                 "context_evidence": {"metrics": [evidence]},
@@ -146,6 +146,8 @@ def test_repository_normalizes_iterative_status_and_authoritative_evidence_uri()
     )
 
     assert contract["investigation_status"] == "inconclusive"
+    assert contract["context_sources"][0]["collected_at"] == "2026-09-01T12:19:31Z"
+    assert contract["context_collected_at"].endswith("Z")
     assert contract["context_evidence"][0]["citation"] == evidence["uri"]
     assert [source["status"] for source in contract["context_sources"]] == ["completed", "empty"]
     assert contract["context_quality"]["category_coverage"] == 0.375
