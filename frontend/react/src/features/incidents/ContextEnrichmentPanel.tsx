@@ -135,14 +135,6 @@ export default function ContextEnrichmentPanel({ incidentId, alertId, accessToke
   const citationCount = evidenceSummary?.traceable_citations ?? state?.investigation_workspace?.rca?.traceable_citation_count ?? 0;
   const unresolvedBindings = evidenceSummary?.unresolved_bindings ?? state?.investigation_workspace?.rca?.unresolved_evidence_ids?.length ?? 0;
 
-  const startFromAiDraft = (requirementId: string, category: string) => {
-    const draft = proposedRcaDraft
-      ? `AI hypothesis to verify: ${proposedRcaDraft}\n\nVerified ${category.replaceAll("_", " ")} observation: `
-      : `Verified ${category.replaceAll("_", " ")} observation: `;
-    setAnswers((current) => ({ ...current, [requirementId]: draft }));
-    setAnnouncement("AI draft inserted. Replace the hypothesis with your verified observation and provide its source before submitting.");
-  };
-
   useEffect(() => {
     if (!reviewRequestToken || reviewRequestToken === handledReviewRequest.current) return;
     if (!current.length) {
@@ -221,6 +213,14 @@ export default function ContextEnrichmentPanel({ incidentId, alertId, accessToke
         <div><strong>{item.category.replaceAll("_", " ")}</strong><p>{item.question}</p><small className="context-enrichment-version">{item.rca_version == null ? "RCA version unavailable" : `RCA v${item.rca_version}`}{recordedAt ? ` · updated ${formatUtcTimestamp(recordedAt)}` : ""}</small></div>
         <span>{status.replaceAll("_", " ")}</span>
       </div>
+      <div className="context-enrichment-study-brief">
+        <strong>What KaiMS needs to establish</strong>
+        <p>{item.question}</p>
+        <dl>
+          <div><dt>Why this matters</dt><dd>{item.reason || "Required to test and strengthen the current RCA hypothesis."}</dd></div>
+          <div><dt>Preferred source</dt><dd>{item.suggested_source_reference || `${item.category.replaceAll("_", " ")} dashboard, ticket, catalog, or another attributable source`}</dd></div>
+        </dl>
+      </div>
       {job ? <small>Latest attempt {job.attempt_count || job.attempt || 1} · connector {job.connector_id} · {job.status.replaceAll("_", " ")}</small> : null}
       {item.evidence_ids?.length ? <small className="context-enrichment-evidence">Accepted evidence ({item.evidence_ids.length}): {item.evidence_ids.join(", ")}</small> : null}
       {failure ? <p className="context-enrichment-action" role="status">{failure}</p> : null}
@@ -231,7 +231,7 @@ export default function ContextEnrichmentPanel({ incidentId, alertId, accessToke
         <summary><span>{request?.status === "assignment_blocked" ? "Provide evidence yourself" : "Review and provide evidence"}</span><small>{expandedRequirements.has(item.requirement_id) ? "Hide form" : "Open form"}</small></summary>
         <div className="context-enrichment-response">
         <small>{request?.status === "assignment_blocked" ? "Automated assignment failed. An authorized operator may claim and answer this requirement." : `Assigned to ${request?.expected_responder || "an authorized responder"}${request?.due_at ? ` · due ${formatUtcTimestamp(request.due_at)}` : ""}`}</small>
-        <div className="context-enrichment-ai-draft"><div><strong>Kai can prepare a draft</strong><p>Use it only as a starting point. Keep verified facts and cite their source.</p></div><button type="button" className="button-secondary" onClick={() => startFromAiDraft(item.requirement_id, item.category)}>Insert editable AI draft</button></div>
+        <div className="context-enrichment-ai-draft"><div><strong>AI-generated editable draft</strong><p>KaiMS prepared this from the current incident and RCA. Update it with verified facts and cite their source.</p></div></div>
         <textarea data-requirement-response={item.requirement_id} aria-label={`Response for ${item.category}`} value={answers[item.requirement_id] || ""} onChange={(event) => setAnswers((value) => ({ ...value, [item.requirement_id]: event.target.value }))} placeholder="State the verified factual observation. Remove any AI claim you could not confirm." />
         <input aria-label={`Source reference for ${item.category}`} value={references[item.requirement_id] || ""} onChange={(event) => setReferences((value) => ({ ...value, [item.requirement_id]: event.target.value }))} placeholder="Source reference (ticket, dashboard, or catalog URL)" />
         <button type="button" className="button-primary" disabled={loading || !String(answers[item.requirement_id] || "").trim() || !String(references[item.requirement_id] || "").trim()} onClick={() => void submit(item.requirement_id)}>Submit reviewed evidence and rerun RCA</button>

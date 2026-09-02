@@ -114,7 +114,8 @@ describe("ContextEnrichmentPanel polling", () => {
       onIncidentRefresh: vi.fn().mockResolvedValue(undefined),
     };
     const view = render(<ContextEnrichmentPanel {...props} reviewRequestToken={0} />);
-    expect(await screen.findByText(/Provide the incident-window trace/)).toBeInTheDocument();
+    expect(await screen.findByText("What KaiMS needs to establish")).toBeInTheDocument();
+    expect(screen.getAllByText(/Provide the incident-window trace/).length).toBeGreaterThan(0);
 
     view.rerender(<ContextEnrichmentPanel {...props} reviewRequestToken={1} />);
 
