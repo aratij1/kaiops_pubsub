@@ -14,6 +14,18 @@ const pendingApprovalStates = new Set(["awaiting_approval", "pending_approval", 
 const normalizeState = (value: unknown) => String(value || "").trim().toLowerCase().replaceAll("-", "_").replaceAll(" ", "_");
 export const needsDashboardApproval = (row: IncidentRow) => pendingApprovalStates.has(normalizeState(row.approval_status)) || ["awaiting_approval", "pending_approval", "approval_required"].includes(normalizeState(row.status));
 
+export function dashboardAttentionRows(pending: IncidentRow[], failed: IncidentRow[], critical: IncidentRow[]) {
+  const rows = new Map<string, { row: IncidentRow; action: string }>();
+  const add = (row: IncidentRow, action: string) => {
+    const id = incidentId(row);
+    if (id && !rows.has(id)) rows.set(id, { row, action });
+  };
+  pending.forEach((row) => add(row, "Review decision"));
+  failed.forEach((row) => add(row, "Inspect failure"));
+  critical.forEach((row) => add(row, "Review critical incident"));
+  return [...rows.values()];
+}
+
 function timeAgo(value: unknown) {
   const date = new Date(String(value || ""));
   if (!Number.isFinite(date.getTime())) return "Time unavailable";
@@ -38,11 +50,11 @@ export default function DashboardRoute() {
   const critical = active.filter(isCritical);
   const failed = active.filter(isFailed);
   const pending = approvals.rows.filter(needsDashboardApproval);
-  const pendingIds = new Set(pending.map((row) => incidentId(row)));
-  const attentionIds = new Set([...pending, ...failed, ...critical].map((row) => incidentId(row)).filter(Boolean));
+  const attentionRows = dashboardAttentionRows(pending, failed, critical);
+  const attentionIds = new Set(attentionRows.map(({ row }) => incidentId(row)));
   const kaiHandling = active.filter((row) => !attentionIds.has(incidentId(row)));
   const activeCount = active.length;
-  const attentionCount = attentionIds.size;
+  const attentionCount = attentionRows.length;
   const kaiHandlingCount = kaiHandling.length;
   const recentlyResolved = [...executive.recentlyClosed].sort((left, right) => new Date(String(right.closed_at || right.updated_at || 0)).getTime() - new Date(String(left.closed_at || left.updated_at || 0)).getTime()).slice(0, 4);
   const autoResolved = recentlyResolved.filter((row) => String(row.execution_mode || "").toLowerCase().includes("auto")).length;
@@ -81,7 +93,7 @@ export default function DashboardRoute() {
     <section className="oh-pulse" aria-label="Operations pulse"><header><span>Operations pulse</span><small>Every metric opens its operational source</small></header><div>{pulse.map((metric) => { const Icon = metric.icon; return <button type="button" key={metric.label} onClick={metric.open}><Icon aria-hidden="true" /><span>{metric.label}</span><strong>{metric.value}</strong></button>; })}</div></section>
 
     <div className="oh-attention-grid">
-      <section className="oh-lane needs-you"><header><div><FileCheck2 aria-hidden="true" /><span><small>Needs you</small><strong>Judgment, risk, and exceptions</strong></span></div><em>{attentionCount}</em></header><div>{pending.slice(0, 4).map((row) => <WorkItem key={`approval-${incidentId(row)}`} row={row} action="Review decision" onOpen={() => incidents.open(row)} />)}{failed.filter((row) => !pendingIds.has(incidentId(row))).slice(0, 3).map((row) => <WorkItem key={`failed-${incidentId(row)}`} row={row} action="Inspect failure" onOpen={() => incidents.open(row)} />)}{!attentionCount ? <div className="oh-empty"><CheckCircle2 aria-hidden="true" /><span><strong>Nothing needs your decision</strong><small>Kai has no pending approvals or failed actions in the loaded scope.</small></span></div> : null}</div>{attentionCount ? <button type="button" className="oh-lane-link" onClick={() => dashboard.openSection("approval")}>Open approval inbox <ArrowRight aria-hidden="true" /></button> : null}</section>
+      <section className="oh-lane needs-you"><header><div><FileCheck2 aria-hidden="true" /><span><small>Needs you</small><strong>Judgment, risk, and exceptions</strong></span></div><em>{attentionCount}</em></header><div>{attentionRows.slice(0, 7).map(({ row, action }) => <WorkItem key={`attention-${incidentId(row)}`} row={row} action={action} onOpen={() => incidents.open(row)} />)}{!attentionCount ? <div className="oh-empty"><CheckCircle2 aria-hidden="true" /><span><strong>Nothing needs your decision</strong><small>Kai has no pending approvals, failed actions, or critical incidents in the loaded scope.</small></span></div> : null}</div>{attentionCount ? <button type="button" className="oh-lane-link" onClick={() => dashboard.openSection("approval")}>Open attention queue <ArrowRight aria-hidden="true" /></button> : null}</section>
       <section className="oh-lane kai-handling"><header><div><Bot aria-hidden="true" /><span><small>Kai is handling</small><strong>Investigations and governed action</strong></span></div><em>{kaiHandlingCount}</em></header><div>{kaiHandling.slice(0, 6).map((row) => <WorkItem key={`kai-${incidentId(row)}`} row={row} action={status(row)} onOpen={() => incidents.open(row)} />)}{!kaiHandlingCount ? <div className="oh-empty"><Bot aria-hidden="true" /><span><strong>No in-progress Kai work</strong><small>New investigations will appear from backend incident state.</small></span></div> : null}</div>{activeCount ? <button type="button" className="oh-lane-link" onClick={() => dashboard.openSection("summary")}>Open incident inbox <ArrowRight aria-hidden="true" /></button> : null}</section>
     </div>
 
