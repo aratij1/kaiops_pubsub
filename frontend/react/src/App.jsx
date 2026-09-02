@@ -437,6 +437,10 @@ function KaiMSBrand({ compact = false, inverse = false, onActivate = null }) {
 function visibleManagedApplication(row) {
   const rawName = String(typeof row === "string" ? row : row?.name || row?.application || "").trim();
   const name = rawName.toLowerCase();
+  const status = String(typeof row === "string" ? "" : row?.status || "").trim().toLowerCase();
+  // The applications API is the onboarding system of record. Failed and
+  // deleted registrations must never become selectable workspaces.
+  if (["failed", "deleted"].includes(status)) return null;
   if (["kaims", "kaiops", "kaims-core", "kaiops-core"].includes(name)) return typeof row === "string" ? "KaiMS" : { ...row, name: "KaiMS" };
   if (name === "telemetry") return typeof row === "string" ? "Telemetry" : { ...row, name: "Telemetry" };
   // Alert-derived strings are not authoritative application registrations and
@@ -2039,17 +2043,24 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       // visibility-checked application objects. Running those names through
       // visibleManagedApplication again treats them as untrusted alert-derived
       // strings and removes every non-built-in application.
-      const options = uniqueMonitorApplications([...defaultMonitorApplications, ...registered]);
+      // Before authentication, show only projects returned by the onboarding
+      // registry. Built-in and alert-derived scopes are operational filters,
+      // not proof that a project has been onboarded.
+      const options = uniqueMonitorApplications([
+        ...(preLogin ? [] : defaultMonitorApplications),
+        ...registered,
+      ]);
       setMonitorApplications(options);
       setApplicationToMonitor((current) => (
         options.some((item) => item.toLowerCase() === String(current || "").toLowerCase())
           ? current
-          : options[0] || "KaiMS"
+          : options[0] || ""
       ));
     } catch (_error) {
-      setMonitorApplications(defaultMonitorApplications);
+      const fallback = preLogin ? [] : defaultMonitorApplications;
+      setMonitorApplications(fallback);
       setApplicationToMonitor((current) => (
-        defaultMonitorApplications.includes(current) ? current : "KaiMS"
+        fallback.includes(current) ? current : fallback[0] || ""
       ));
     }
   }
@@ -9942,11 +9953,11 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                 <p>Sign in to your operational command center.</p>
               </div>
             </div>
-            <label className="auth-application-select"><span>Application workspace</span><select aria-label="Application workspace" value={applicationToMonitor} onChange={(event) => setApplicationToMonitor(event.target.value)}>{monitorApplications.map((name) => <option key={name} value={name}>{name}</option>)}</select><small>Your session opens scoped to this application.</small></label>
+            <label className="auth-application-select"><span>Application workspace</span><select aria-label="Application workspace" value={applicationToMonitor} onChange={(event) => setApplicationToMonitor(event.target.value)} disabled={!monitorApplications.length}>{!monitorApplications.length ? <option value="">No onboarded projects available</option> : null}{monitorApplications.map((name) => <option key={name} value={name}>{name}</option>)}</select><small>{monitorApplications.length ? "Your session opens scoped to this onboarded application." : "Ask an administrator to onboard a project before signing in."}</small></label>
             {authConfig.mode === "oidc" ? (
               <div className="form auth-login-form">
                 <p className="auth-sso-note">Enterprise single sign-on is required. Your identity-provider role controls KaiMS access.</p>
-                <button className="button-primary auth-submit" type="button" onClick={oidcLogin} disabled={adminSession.loading || authConfig.loading}>{adminSession.loading ? "Redirecting..." : <><span>Continue with SSO</span><b aria-hidden="true">→</b></>}</button>
+                <button className="button-primary auth-submit" type="button" onClick={oidcLogin} disabled={adminSession.loading || authConfig.loading || !applicationToMonitor}>{adminSession.loading ? "Redirecting..." : <><span>Continue with SSO</span><b aria-hidden="true">→</b></>}</button>
               </div>
             ) : (
               <form className="form auth-login-form" onSubmit={adminLogin}>
@@ -9954,7 +9965,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                 <label className="auth-field"><span>Username</span><div className="auth-input-frame"><b aria-hidden="true">@</b><input autoComplete="username" value={adminAuthForm.username} onChange={(e) => setAdminAuthForm((curr) => ({ ...curr, username: e.target.value }))} /></div></label>
                 <label className="auth-field"><span>Password</span><div className="auth-input-frame"><b className="auth-lock-mark" aria-hidden="true" /><input type={loginPasswordVisible ? "text" : "password"} autoComplete="current-password" value={adminAuthForm.password} onChange={(e) => setAdminAuthForm((curr) => ({ ...curr, password: e.target.value }))} /><button type="button" className="auth-password-toggle" aria-label={loginPasswordVisible ? "Conceal entered value" : "Reveal entered value"} aria-pressed={loginPasswordVisible} onClick={() => setLoginPasswordVisible((visible) => !visible)}>{loginPasswordVisible ? "Hide" : "Show"}</button></div></label>
                 <div className="auth-session-meta"><span><i aria-hidden="true" /> Encrypted session</span><span>Role-scoped access</span></div>
-                <button className="button-primary auth-submit" type="submit" disabled={adminSession.loading}>{adminSession.loading ? <><i className="auth-submit-spinner" aria-hidden="true" /> Signing in...</> : <><span>Sign in securely</span><b aria-hidden="true">→</b></>}</button>
+                <button className="button-primary auth-submit" type="submit" disabled={adminSession.loading || !applicationToMonitor}>{adminSession.loading ? <><i className="auth-submit-spinner" aria-hidden="true" /> Signing in...</> : <><span>Sign in securely</span><b aria-hidden="true">→</b></>}</button>
               </form>
             )}
             {adminSession.error ? <p className="error auth-login-error" role="alert">{adminSession.error}</p> : null}
