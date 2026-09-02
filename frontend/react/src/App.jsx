@@ -2438,6 +2438,26 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   }
   const evidenceDraftApi = useEvidenceDraftBundle({ fetchJson, authenticatedOptions, unwrap });
 
+  function resetNavigationAfterLogin() {
+    // App is intentionally kept mounted while the login screen is visible, so
+    // selections from the previous session would otherwise survive a new
+    // authentication. Reset every persistent workspace to its first tab and
+    // make the router land on the canonical Home page.
+    skipNextActiveTabNavigationRef.current = true;
+    setActiveTab("home");
+    setGlobalOperationsView("search");
+    setIngestionStreamSection("active");
+    setIngestionStreamView("");
+    setHomeDetailTab("evidence");
+    setRcaDetailView("simple");
+    setDiagnosticsDetailTab("pipeline");
+    setAdminWorkspace("users");
+    setAlertKnowledgeView("onboarding");
+    setSelectedAlertId("");
+    setSelectedApprovalIncidentId("");
+    onNavigatePath?.("/");
+  }
+
   async function adminLogin(event) {
     event.preventDefault();
     setAdminSession((current) => ({ ...current, loading: true, error: "" }));
@@ -2459,6 +2479,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       };
       adminSessionRef.current = authenticatedSession; storeSessionTokens(authenticatedSession);
       setAdminSession(authenticatedSession);
+      resetNavigationAfterLogin();
     } catch (error) {
       setAdminSession((current) => ({ ...current, loading: false, error: error.message }));
     }
@@ -4879,6 +4900,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
           const session = { loading: false, accessToken, refreshToken: "", user: me.user || null, error: "" };
           adminSessionRef.current = session; storeSessionTokens(session);
           setAdminSession(session);
+          resetNavigationAfterLogin();
         } else { const session = await restoreStoredSession(config, fetchJson); if (session) { adminSessionRef.current = session; storeSessionTokens(session); setAdminSession(session); } else setAdminSession((current) => ({ ...current, loading: false })); }
       } catch (error) {
         if (!cancelled) { clearStoredSession(); setAuthConfig((current) => ({ ...current, loading: false, error: String(error?.message || error) }));
