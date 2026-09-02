@@ -45,11 +45,8 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Docker Desktop Linux engine is unavailable." }
 
     $optionalServices = @(
-        "zookeeper", "kafka", "mysql-exporter", "node-exporter", "blackbox-exporter",
-        "kafka-exporter", "alertmanager", "fault-lab", "otel-collector", "jaeger",
-        "prometheus", "grafana", "discovery-service",
-        "metrics-validation-agent", "rule-generation-agent", "prometheus-config-service",
-        "validation-agent", "dashboard-generator", "evaluation-service",
+        "zookeeper", "kafka", "kafka-exporter", "fault-lab",
+        "grafana", "evaluation-service",
         "temporal-pilot-worker", "temporal-ui", "jenkins", "ui-dev"
     )
     if ($Profile -eq "lean") {
@@ -70,7 +67,10 @@ try {
     }
     $leanServices = @(
         "mysql", "temporal", "redis", "rabbitmq",
+        "mysql-exporter", "node-exporter", "blackbox-exporter", "alertmanager", "prometheus",
         "monitoring-adapter", "monitoring-ingestion-worker", "application-onboarding", "connector-hub",
+        "discovery-service", "metrics-validation-agent", "rule-generation-agent",
+        "prometheus-config-service", "validation-agent", "dashboard-generator",
         "api-gateway", "alert-intelligence", "orchestrator", "context-agent",
         "discovery-mcp", "docker-socket-proxy", "model-router", "resolution-agent",
         "approval-service", "notification-service", "remediation-engine",

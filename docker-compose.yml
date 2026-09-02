@@ -397,7 +397,6 @@ services:
       start_period: 45s
 
   mysql-exporter:
-    profiles: ["observability", "monitoring-authoring", "full"]
     image: prom/mysqld-exporter:v0.16.0
     restart: unless-stopped
     # Uses a dedicated low-privilege monitoring user (PROCESS, REPLICATION
@@ -416,7 +415,6 @@ services:
       mysql: { condition: service_healthy }
 
   node-exporter:
-    profiles: ["observability", "monitoring-authoring", "full"]
     image: prom/node-exporter:v1.8.1
     restart: unless-stopped
     command:
@@ -431,7 +429,6 @@ services:
     ports: ["9100:9100"]
 
   blackbox-exporter:
-    profiles: ["observability", "monitoring-authoring", "full"]
     image: prom/blackbox-exporter:v0.25.0
     restart: unless-stopped
     command:
@@ -451,7 +448,6 @@ services:
       kafka: { condition: service_healthy }
 
   alertmanager:
-    profiles: ["observability", "monitoring-authoring", "full"]
     image: prom/alertmanager:v0.27.0
     restart: unless-stopped
     command:
@@ -504,7 +500,6 @@ services:
       - "16686:16686"
 
   prometheus:
-    profiles: ["observability", "monitoring-authoring", "full"]
     image: prom/prometheus:v2.54.1
     restart: unless-stopped
     command:
@@ -659,7 +654,6 @@ services:
     ports: ["8028:8000"]
 
   discovery-service:
-    profiles: ["monitoring-authoring", "full"]
     build: *service-build
     restart: unless-stopped
     environment:
@@ -681,7 +675,6 @@ services:
       mysql: { condition: service_healthy }
 
   metrics-validation-agent:
-    profiles: ["monitoring-authoring", "full"]
     build: *service-build
     restart: unless-stopped
     environment: { <<: *service-env, SERVICE_NAME: metrics-validation-agent }
@@ -694,7 +687,6 @@ services:
       mysql: { condition: service_healthy }
 
   rule-generation-agent:
-    profiles: ["monitoring-authoring", "full"]
     build: *service-build
     restart: unless-stopped
     environment: { <<: *service-env, SERVICE_NAME: rule-generation-agent }
@@ -707,7 +699,6 @@ services:
       mysql: { condition: service_healthy }
 
   prometheus-config-service:
-    profiles: ["monitoring-authoring", "full"]
     build: *service-build
     restart: unless-stopped
     environment: { <<: *service-env, SERVICE_NAME: prometheus-config-service }
@@ -723,7 +714,6 @@ services:
       prometheus: { condition: service_started }
 
   validation-agent:
-    profiles: ["monitoring-authoring", "full"]
     build: *service-build
     restart: unless-stopped
     environment: { <<: *service-env, SERVICE_NAME: validation-agent }
@@ -737,7 +727,6 @@ services:
       prometheus: { condition: service_started }
 
   dashboard-generator:
-    profiles: ["monitoring-authoring", "full"]
     build: *service-build
     restart: unless-stopped
     environment: { <<: *service-env, SERVICE_NAME: dashboard-generator }
