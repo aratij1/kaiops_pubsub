@@ -465,6 +465,10 @@ class DiscoveryMCPConnector(BaseConnector):
         "logs.search",
         "tickets.search",
         "code.search",
+        "changes.search",
+        "runbooks.search",
+        "topology.search",
+        "dependency-health.search",
         "mysql.search",
         "telemetry.search",
         "traces.search",
@@ -621,8 +625,11 @@ class DiscoveryMCPConnector(BaseConnector):
             "database": "mysql.search",
             "ticket": "tickets.search",
             "source_code": "code.search",
-            "deployment": "code.search",
-            "change": "code.search",
+            "deployment": "changes.search",
+            "change": "changes.search",
+            "topology": "topology.search",
+            "runbook": "runbooks.search",
+            "validation": "telemetry.search",
         }
         if requirement_category in targeted_tools:
             return [targeted_tools[requirement_category]], ["evidence_requirement"]

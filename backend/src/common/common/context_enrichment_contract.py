@@ -632,17 +632,17 @@ class HumanEvidenceJiraRequest(BaseModel):
 
 
 _REQUIREMENT_CONNECTORS: dict[str, list[str]] = {
-    "metrics": ["prometheus"],
-    "logs": ["opensearch", "discovery-mcp"],
+    "metrics": ["prometheus", "discovery-mcp"],
+    "logs": ["opensearch", "discovery-mcp", "local-evidence"],
     "traces": ["jaeger", "discovery-mcp"],
-    "topology": ["discovery-mcp", "cmdb"],
-    "deployment": ["jenkins", "kubernetes"],
-    "change": ["jira", "github"],
-    "source_code": ["github"],
+    "topology": ["discovery-mcp", "vector-db", "cmdb", "kubernetes", "local-evidence"],
+    "deployment": ["discovery-mcp", "vector-db", "jenkins", "kubernetes", "local-evidence"],
+    "change": ["discovery-mcp", "vector-db", "jira", "github", "local-evidence"],
+    "source_code": ["discovery-mcp", "local-evidence", "github", "vector-db"],
     "database": ["discovery-mcp"],
-    "ticket": ["jira"],
-    "runbook": ["vector-db"],
-    "validation": ["prometheus"],
+    "ticket": ["discovery-mcp", "jira", "vector-db"],
+    "runbook": ["vector-db", "discovery-mcp", "local-evidence"],
+    "validation": ["prometheus", "discovery-mcp"],
 }
 _HUMAN_CATEGORIES = {"ownership", "business_impact"}
 _CATEGORY_ALIASES = {

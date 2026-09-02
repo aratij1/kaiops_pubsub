@@ -167,4 +167,26 @@ describe("ContextEnrichmentPanel polling", () => {
       }),
     ));
   });
+
+  it("offers minimum user input while automated MCP and RAG discovery is running", async () => {
+    fetchJson.mockResolvedValue({
+      schema_version: "kaiops.operations-state.v1",
+      lifecycle_state: "COLLECTING",
+      context: { evidence_ids: [] },
+      requirements: [{
+        requirement_id: "topology-gap", category: "topology",
+        question: "Identify affected dependencies.", status: "identified",
+      }],
+      requirement_history: [],
+    });
+
+    render(<ContextEnrichmentPanel
+      incidentId="incident-1" accessToken="token" declaredGaps={[{ category: "topology" }]}
+      onIncidentRefresh={vi.fn().mockResolvedValue(undefined)}
+    />);
+
+    expect(await screen.findByText(/searching the available MCP and governed knowledge sources/)).toBeInTheDocument();
+    expect(screen.getByLabelText("Response for topology")).toBeInTheDocument();
+    expect(screen.getByLabelText("Source reference for topology")).toBeInTheDocument();
+  });
 });

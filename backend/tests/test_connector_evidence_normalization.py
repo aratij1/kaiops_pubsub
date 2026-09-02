@@ -176,6 +176,6 @@ def test_rca_domain_gap_aliases_create_executable_canonical_requirements() -> No
         now=datetime(2024, 8, 26, 13, 32, tzinfo=UTC),
     )
     assert [(item.category, item.candidate_connectors) for item in requirements] == [
-        ("topology", ["discovery-mcp", "cmdb"]),
-        ("runbook", ["vector-db"]),
+        ("topology", ["discovery-mcp", "vector-db", "cmdb", "kubernetes", "local-evidence"]),
+        ("runbook", ["vector-db", "discovery-mcp", "local-evidence"]),
     ]

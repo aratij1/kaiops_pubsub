@@ -226,13 +226,14 @@ export default function ContextEnrichmentPanel({ incidentId, alertId, accessToke
       {job ? <small>Latest attempt {job.attempt_count || job.attempt || 1} · connector {job.connector_id} · {job.status.replaceAll("_", " ")}</small> : null}
       {item.evidence_ids?.length ? <small className="context-enrichment-evidence">Accepted evidence ({item.evidence_ids.length}): {item.evidence_ids.join(", ")}</small> : null}
       {failure ? <p className="context-enrichment-action" role="status">{failure}</p> : null}
+      {!historical && !complete && !job ? <p className="context-enrichment-action" role="status">KaiMS is searching the available MCP and governed knowledge sources. You can provide a verified observation below while discovery continues.</p> : null}
       {!historical && !complete ? <details className="context-enrichment-response-shell" open={expandedRequirements.has(item.requirement_id)} onToggle={(event) => {
         const open = event.currentTarget.open;
         setExpandedRequirements((values) => { const next = new Set(values); if (open) next.add(item.requirement_id); else next.delete(item.requirement_id); return next; });
       }}>
         <summary><span>{request?.status === "assignment_blocked" ? "Provide evidence yourself" : "Review and provide evidence"}</span><small>{expandedRequirements.has(item.requirement_id) ? "Hide form" : "Open form"}</small></summary>
         <div className="context-enrichment-response">
-        <small>{request?.status === "assignment_blocked" ? "Automated assignment failed. An authorized operator may claim and answer this requirement." : `Assigned to ${request?.expected_responder || "an authorized responder"}${request?.due_at ? ` · due ${formatUtcTimestamp(request.due_at)}` : ""}`}</small>
+        <small>{request?.status === "assignment_blocked" ? "Automated sources returned no attributable evidence and assignment failed. An authorized operator can provide the minimum verified observation here." : request ? `Assigned to ${request.expected_responder || "an authorized responder"}${request.due_at ? ` · due ${formatUtcTimestamp(request.due_at)}` : ""}` : "Automated discovery is still running. A verified user response may be submitted at any time."}</small>
         <div className="context-enrichment-ai-draft"><div><strong>AI-generated editable draft</strong><p>KaiMS prepared this from the current incident and RCA. Update it with verified facts and cite their source.</p></div></div>
         <textarea data-requirement-response={item.requirement_id} aria-label={`Response for ${item.category}`} value={answers[item.requirement_id] || ""} onChange={(event) => setAnswers((value) => ({ ...value, [item.requirement_id]: event.target.value }))} placeholder="State the verified factual observation. Remove any AI claim you could not confirm." />
         <input aria-label={`Source reference for ${item.category}`} value={references[item.requirement_id] || ""} onChange={(event) => setReferences((value) => ({ ...value, [item.requirement_id]: event.target.value }))} placeholder="Source reference (ticket, dashboard, or catalog URL)" />

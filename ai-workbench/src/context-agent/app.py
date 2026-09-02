@@ -2479,10 +2479,6 @@ async def _reconcile_context_enrichment_tenant(
                 activity = await repository.list_context_enrichment_activity(
                     tenant_id=request.tenant_id, incident_id=candidate["incident_id"],
                 )
-                human_requirement_ids = {
-                    str(row["requirement_id"])
-                    for row in activity["human_requests"]
-                }
                 dead_letter_requirement_ids = {
                     str(row["requirement_id"])
                     for row in activity["jobs"]
@@ -2523,25 +2519,49 @@ async def _reconcile_context_enrichment_tenant(
                     alert_metadata=alert.metadata,
                     context_payload=context_payload,
                 )
-                dead_letter_fallbacks = [
-                    row for row in existing
-                    if int(row["rca_version"]) == int(candidate["rca_version"])
-                    and (
-                        str(row.get("status") or "").lower() == "dead_letter"
-                        or str(row["requirement_id"]) in dead_letter_requirement_ids
+                attempted_by_requirement: dict[str, set[str]] = {}
+                for activity_job in activity["jobs"]:
+                    attempted_by_requirement.setdefault(str(activity_job["requirement_id"]), set()).add(
+                        str(activity_job.get("connector_id") or "").strip().lower()
                     )
-                    and str(row["requirement_id"]) not in human_requirement_ids
+                dead_requirements = [
+                    requirement for requirement in requirements
+                    if str(requirement.requirement_id) not in ledger_coverage
+                    and str(requirement.requirement_id) in dead_letter_requirement_ids
                 ]
                 planned: list[tuple[EvidenceRequirement, str | None]] = [
                     (requirement, next((name for name in requirement.candidate_connectors if name in authorized), None))
                     for requirement in work
+                ]
+                recovered_plans = [
+                    (
+                        requirement,
+                        next_authorized_enrichment_connector(
+                            candidate_connectors=requirement.candidate_connectors,
+                            authorized_connectors=authorized,
+                            attempted_connectors=attempted_by_requirement.get(str(requirement.requirement_id), set()),
+                        ),
+                    )
+                    for requirement in dead_requirements
+                ]
+                planned.extend((requirement, connector) for requirement, connector in recovered_plans if connector)
+                recoverable_ids = {
+                    str(requirement.requirement_id)
+                    for requirement, connector in recovered_plans
+                    if connector
+                }
+                dead_letter_fallbacks = [
+                    row for row in existing
+                    if int(row["rca_version"]) == int(candidate["rca_version"])
+                    and str(row["requirement_id"]) in dead_letter_requirement_ids
+                    and str(row["requirement_id"]) not in recoverable_ids
                 ]
                 summary["jobs_scheduled"] += sum(1 for _, connector in planned if connector)
                 summary["human_requests_created"] += (
                     sum(1 for _, connector in planned if not connector)
                     + len(dead_letter_fallbacks)
                 )
-                if not request.dry_run and (work or dead_letter_fallbacks):
+                if not request.dry_run and (planned or dead_letter_fallbacks):
                     await repository.upsert_context_evidence_requirements(requirements)
                     now = datetime.now(UTC).replace(microsecond=0)
                     alert_start = alert.starts_at.astimezone(UTC).replace(microsecond=0)

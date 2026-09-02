@@ -204,6 +204,33 @@ def test_discovery_routes_trace_requirement_to_targeted_trace_query() -> None:
     assert reasons == ["evidence_requirement"]
 
 
+@pytest.mark.parametrize(
+    ("category", "expected_tool"),
+    [
+        ("topology", "topology.search"),
+        ("change", "changes.search"),
+        ("deployment", "changes.search"),
+        ("runbook", "runbooks.search"),
+    ],
+)
+def test_discovery_routes_operational_requirements_to_dedicated_mcp_tools(
+    category: str, expected_tool: str,
+) -> None:
+    alert = Alert(
+        source="prometheus",
+        name="CheckoutLatencyHigh",
+        service="checkout",
+        severity=AlertSeverity.HIGH,
+        description="p95 latency is above the service objective",
+        metadata={"context_requirement_category": category},
+    )
+
+    selected, reasons = DiscoveryMCPConnector._plan_discovery_tools(alert)
+
+    assert selected == [expected_tool]
+    assert reasons == ["evidence_requirement"]
+
+
 def test_discovery_expands_route_for_change_database_and_recurring_signals() -> None:
     alert = Alert(
         source="logs",

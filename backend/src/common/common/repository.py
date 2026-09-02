@@ -8545,6 +8545,20 @@ class ContextEnrichmentRepository(EvaluationRepository):
                     ))).scalar_one_or_none()
                     if existing is None:
                         raise
+            else:
+                # Connector capabilities evolve independently of the stable
+                # requirement identity. Refresh the discovery plan so an open
+                # requirement created by an older release can use newly
+                # available MCP/RAG fallbacks on the next reconciliation.
+                candidate_connectors = list(item.get("candidate_connectors") or [])
+                collection_mode = str(item.get("collection_mode") or "connector_required")
+                if (
+                    list(existing.candidate_connectors or []) != candidate_connectors
+                    or existing.collection_mode != collection_mode
+                ):
+                    existing.candidate_connectors = candidate_connectors
+                    existing.collection_mode = collection_mode
+                    existing.version = int(existing.version or 0) + 1
             rows.append(existing)
         return rows
 
