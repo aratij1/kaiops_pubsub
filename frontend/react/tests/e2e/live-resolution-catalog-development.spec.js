@@ -8,6 +8,9 @@ test("knowledge development exposes safe cold-start catalog candidates", async (
   await page.getByLabel("Username").fill(process.env.KAIOPS_E2E_USERNAME || "admin");
   await page.getByLabel("Password").fill(process.env.KAIOPS_E2E_PASSWORD || "Admin@123456");
   await page.getByRole("button", { name: /sign in/i }).click();
+  await expect(page.getByRole("heading", { name: "AI provider health" })).toBeVisible({ timeout: 45_000 });
+  await expect(page.getByText("Provider health could not be refreshed.")).toHaveCount(0);
+  await expect(page.getByRole("row", { name: /reasoning-standard/ })).toContainText("Healthy");
   await page.getByRole("tab", { name: "Knowledge development" }).click();
 
   await expect(page.getByRole("heading", { name: "Resolution catalog development queue" })).toBeVisible({ timeout: 45_000 });

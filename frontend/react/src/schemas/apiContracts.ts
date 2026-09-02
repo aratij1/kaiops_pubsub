@@ -27,6 +27,24 @@ const QueueHealth = z.object({
   ready: z.number().nonnegative(),
   unacknowledged: z.number().nonnegative(),
 }).passthrough();
+const OperationsQueues = z.object({
+  provider: z.string().min(1),
+  queues: RecordList,
+  summary: JsonRecord,
+}).passthrough();
+const ModelProviderStatus = z.object({
+  providers: z.record(z.object({
+    configured: z.boolean(), healthy: z.boolean(), model: z.string().min(1),
+    circuit_open: z.boolean(), failure_count: z.number().int().nonnegative(),
+    reason: z.string().nullable().optional(),
+  }).passthrough()),
+  selected: JsonRecord,
+  prompt_cache: JsonRecord,
+}).passthrough();
+const GatewayModelProviderStatus = z.union([
+  z.object({ data: ModelProviderStatus }).passthrough().transform((payload) => payload.data),
+  ModelProviderStatus,
+]);
 const EvaluationFeedback = z.object({ updated: z.boolean() }).passthrough();
 const CollectedContext = z.object({
   incident_id: z.string().uuid(),
@@ -177,6 +195,8 @@ const contracts: readonly Contract[] = [
   { path: /^\/api-gateway\/auth\/logout$/, schema: ObjectResponse, name: "logout" },
   { method: "GET", path: /^\/api-gateway\/healthz$/, schema: Health, name: "health" },
   { method: "GET", path: /^\/api-gateway\/operations\/queue-health$/, schema: QueueHealth, name: "queue-health" },
+  { method: "GET", path: /^\/api-gateway\/operations\/queues$/, schema: OperationsQueues, name: "operations-queues" },
+  { method: "GET", path: /^\/api-gateway\/model\/providers\/status$/, schema: GatewayModelProviderStatus, name: "model-provider-status" },
   { method: "GET", path: /^\/api-gateway\/incidents\/[0-9a-f-]+\/context-gaps$/i, schema: GatewayContextEnrichmentActivity, name: "context-enrichment-activity" },
   { method: "GET", path: /^\/api-gateway\/incidents\/[0-9a-f-]+\/operations-state$/i, schema: GatewayIncidentOperationsState, name: "incident-operations-state" },
   { method: "GET", path: /^\/api-gateway\/incidents\/[0-9a-f-]+\/command$/i, schema: GatewayIncidentCommandWorkspace, name: "incident-command-workspace" },

@@ -78,7 +78,7 @@ export function useKnowledgeOverview() {
     setState({
       actual: {
         rows: queueRows.map((row) => ({
-          service: String(row.consumer || row.service || "Broker queue"),
+          service: String(row.consumer_service || row.consumer || row.service || "Broker queue"),
           consumed: String(row.name || "Not reported"),
           published: "Not reported",
           provider: transport,
@@ -93,10 +93,7 @@ export function useKnowledgeOverview() {
       application: String(queuePayload.application || "Platform"),
       providers,
       providersLoading: false,
-      providersError: [
-        providerResult.status === "rejected" ? message(providerResult.reason) : "",
-        queueResult.status === "rejected" ? message(queueResult.reason) : "",
-      ].filter(Boolean).join("; "),
+      providersError: providerResult.status === "rejected" ? message(providerResult.reason) : "",
     });
   }, [accessToken]);
 

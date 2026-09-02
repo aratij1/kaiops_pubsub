@@ -18,6 +18,18 @@ describe("internal API contract registry", () => {
       ready: 2,
       unacknowledged: 0,
     })).toMatchObject({ status: "healthy", healthy: true, queues: 4 });
+    expect(parseInternalApiResponse("/api-gateway/operations/queues", "GET", {
+      provider: "rabbitmq", queues: [{ name: "kaiops.context" }], summary: { queues: 1 },
+    })).toMatchObject({ provider: "rabbitmq", queues: [{ name: "kaiops.context" }] });
+    expect(parseInternalApiResponse("/api-gateway/model/providers/status", "GET", {
+      trace_id: "trace-1",
+      data: {
+        providers: {
+          "azure-openai": { configured: true, healthy: true, model: "gpt-4o", circuit_open: false, failure_count: 0 },
+        },
+        selected: { default: "azure-openai" }, prompt_cache: { enabled: true },
+      },
+    })).toMatchObject({ providers: { "azure-openai": { healthy: true, model: "gpt-4o" } } });
     expect(parseInternalApiResponse("/api-gateway/incidents/metadata?limit=10", "GET", { rows: [] })).toMatchObject({ rows: [] });
     expect(parseInternalApiResponse(
       "/api-gateway/incidents/1f11cbe9-274a-490a-ae4c-aebb3d70e58a/context-gaps",
