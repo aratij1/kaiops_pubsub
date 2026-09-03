@@ -52,3 +52,29 @@ def test_environment_variable_cannot_enable_hotl_in_p0_safety_mode(monkeypatch) 
     decision = evaluate_resolution_policy(_input(risk="low", confidence=0.95))
     assert decision.decision == "hitl"
     assert "hotl_disabled_p0_safety_mode" in decision.reason_codes
+
+
+def test_acknowledged_recovery_strategy_is_execution_eligible_but_still_not_reversible() -> None:
+    # An acknowledged, catalog-declared recovery strategy (docker-compose
+    # restart_service with rollback_mode="not_applicable") makes
+    # rollback_available True upstream in app.py, but reversible must stay
+    # False - this must never be treated as equivalent to a real rollback,
+    # and must still require HITL, never bypass to block or autonomous hotl.
+    decision = evaluate_resolution_policy(
+        _input(rollback_available=True, reversible=False, risk="low", confidence=0.95)
+    )
+    assert decision.decision == "hitl"
+    assert "action_not_reversible" in decision.reason_codes
+    assert "rollback_missing" not in decision.reason_codes
+    assert "hotl_disabled_p0_safety_mode" in decision.reason_codes
+
+
+def test_unacknowledged_missing_rollback_still_blocks_even_with_high_confidence() -> None:
+    # Negative test: without rollback_available being explicitly set True (the
+    # unacknowledged case), a mutating plan must still be blocked - proving
+    # the exemption is not a blanket allowance.
+    decision = evaluate_resolution_policy(
+        _input(rollback_available=False, reversible=False, confidence=0.99)
+    )
+    assert decision.decision == "block"
+    assert "rollback_missing" in decision.reason_codes

@@ -1145,6 +1145,24 @@ class ResolutionIntelligenceAgent(BaseAgent):
             for row in state["gathered_context"].get("discovery_evidence", [])
             if isinstance(row, dict) and row.get("evidence_id")
         ]
+        iterative_investigation = state["gathered_context"].get("iterative_investigation") or {}
+        if isinstance(iterative_investigation, dict) and iterative_investigation.get("conclusive") is True:
+            iterative_conclusion = iterative_investigation.get("conclusion") or {}
+            iterative_evidence_ids = [
+                str(value)
+                for value in (iterative_conclusion.get("evidence_ids") or [])
+                if str(value or "").strip()
+            ]
+            # A conclusive iterative investigation has already independently
+            # corroborated these evidence ids (see resolution_investigations);
+            # recognizing them here only widens what counts as a *valid*
+            # citation target for the model's own evidence_used answer. It
+            # does not fabricate a citation the model never made, and it has
+            # no effect at all when the iterative investigation is not
+            # conclusive, so the non-conclusive path is unchanged.
+            for evidence_id in iterative_evidence_ids:
+                if evidence_id not in ordered_valid_ids:
+                    ordered_valid_ids.append(evidence_id)
         valid_ids = set(ordered_valid_ids)
         cited = self._validated_evidence_ids(parsed.get("evidence_used"), valid_ids)
         code_review = state["gathered_context"].get("code_review")
@@ -1489,6 +1507,15 @@ class ResolutionIntelligenceAgent(BaseAgent):
             readiness_blocks.append("No corrective operation is present; this plan only gathers evidence.")
         if mutating and not validation_commands:
             readiness_blocks.append("No executable recovery validation is defined.")
+        # NOTE: this readiness_blocks list is advisory only (folded into
+        # state["remediation_analysis"], consumed downstream solely for
+        # risk_level derivation, not for the persisted execution plan's
+        # execution_ready gate). The authoritative, catalog-driven readiness
+        # decision - including the narrow recovery_strategy_acknowledged
+        # exemption for docker-compose restart_service - lives in
+        # execution_plan.resolve_execution_plan(). This path has no access to
+        # the action catalog's recovery_strategy field and is left unchanged
+        # to avoid a second, divergent implementation of the same exemption.
         if mutating and not str(default_rollback_plan or "").strip() and not rollback_commands:
             readiness_blocks.append("No rollback or explicit non-reversible recovery strategy is defined.")
         investigation = state.get("investigation_report", {})

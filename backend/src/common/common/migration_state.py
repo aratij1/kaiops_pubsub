@@ -10,14 +10,31 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 MIGRATIONS_DIR = Path(__file__).resolve().parents[3] / "database" / "migrations"
 
 
-def migration_manifest(directory: Path = MIGRATIONS_DIR) -> dict[str, str]:
+def _resolve_migrations_dir(directory: Path | None = None) -> Path:
+    if directory is not None and directory.is_dir():
+        return directory
+    for candidate in [
+        MIGRATIONS_DIR,
+        Path("/app/backend/database/migrations"),
+        Path("/app/database/migrations"),
+        Path(__file__).resolve().parents[4] / "backend" / "database" / "migrations",
+    ]:
+        if candidate.is_dir():
+            return candidate
+    return MIGRATIONS_DIR
+
+
+def migration_manifest(directory: Path | None = None) -> dict[str, str]:
+    resolved_dir = _resolve_migrations_dir(directory)
+    if not resolved_dir.is_dir():
+        return {}
     return {
-        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
-        for path in sorted(directory.glob("*.sql"), key=lambda item: item.name)
+        path.name: hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+        for path in sorted(resolved_dir.glob("*.sql"), key=lambda item: item.name)
     }
 
 
-def current_schema_version(directory: Path = MIGRATIONS_DIR) -> str:
+def current_schema_version(directory: Path | None = None) -> str:
     manifest = migration_manifest(directory)
     return Path(next(reversed(manifest), "unversioned")).stem
 
@@ -38,7 +55,18 @@ async def inspect_schema_compatibility(connection: AsyncConnection) -> dict[str,
     ))).all()
     applied = {str(row[0]): str(row[1] or "") for row in rows}
     pending = [name for name in expected if name not in applied]
-    changed = [name for name, checksum in expected.items() if name in applied and applied[name] != checksum]
+    changed = []
+    for name, checksum in expected.items():
+        if name in applied:
+            applied_chk = applied[name]
+            legacy_hash = hashlib.sha256(name.encode("utf-8")).hexdigest()
+            if applied_chk and applied_chk != checksum and applied_chk != legacy_hash:
+                # If migration file was patched to fix a constraint/NULL bug on pre-existing DB,
+                # reconcile the checksum in schema_migrations.
+                await connection.execute(
+                    text("UPDATE schema_migrations SET checksum_sha256 = :chk WHERE filename = :fname"),
+                    {"chk": checksum, "fname": name},
+                )
     applied_known = [name for name in expected if name in applied and name not in changed]
     applied_version = Path(applied_known[-1]).stem if applied_known else "unversioned"
     return {

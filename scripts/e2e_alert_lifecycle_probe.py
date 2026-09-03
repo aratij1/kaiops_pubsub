@@ -129,7 +129,7 @@ def main() -> int:
 
     suffix = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
     name = f"ServiceDown-E2E-{suffix}"
-    service = "kaiops-discovery-mcp"
+    service = "discovery-mcp"
     # E2E-* environments intentionally share one deduplication family in the
     # product. Use a run-scoped review environment here so each probe exercises
     # a new incident from ingestion through closure instead of attaching to a

@@ -273,7 +273,12 @@ def test_alternative_or_incomplete_mutations_require_operator_resolution() -> No
     assert any("rollback is a procedure" in reason for reason in mysql["readiness_blocks"])
 
 
-def test_docker_compose_restart_without_rollback_is_not_execution_ready(monkeypatch) -> None:
+def test_docker_compose_restart_with_acknowledged_recovery_strategy_is_execution_ready(monkeypatch) -> None:
+    # restart_service_runtime declares an approved recovery_strategy in
+    # action_catalog.json specifically for platforms with no native inverse
+    # (docker-compose). That acknowledged, catalog-declared exemption - never
+    # inferred from the bare absence of a rollback - is what makes this plan
+    # execution_ready while remaining genuinely non-reversible.
     monkeypatch.setenv("REMEDIATION_EXECUTION_PLATFORM", "docker-compose")
     monkeypatch.setenv("REMEDIATION_COMPOSE_PROJECT", "kaiops_azure")
 
@@ -287,16 +292,62 @@ def test_docker_compose_restart_without_rollback_is_not_execution_ready(monkeypa
         )
     )
 
-    assert plan["execution_ready"] is False
+    assert plan["execution_ready"] is True
     assert plan["remediation_target"] == "api-gateway"
-    assert plan["commands"] == []
+    assert plan["commands"] != []
     assert "com.docker.compose.service%3Dapi-gateway" in plan["preflight_commands"][0]
     assert plan["validation_commands"] == [
         "curl --fail --silent --show-error --retry 15 --retry-all-errors --retry-connrefused "
         "--retry-delay 2 http://api-gateway:8000/healthz"
     ]
+    # Genuinely no rollback command exists - no fake rollback is fabricated.
     assert plan["rollback_commands"] == []
     assert plan["rollback_mode"] == "not_applicable"
+    assert plan["recovery_strategy_acknowledged"] is True
+    assert plan["recovery_strategy"]["type"] == "retry_and_escalate"
+    assert "mutating plan has no executable rollback" not in plan["readiness_blocks"]
+    # Every PlanAction must still report reversible=False: execution-eligible
+    # is not the same claim as reversible, and downstream policy must still
+    # see this as non-reversible.
+    assert plan["actions"], "expected at least one remediation action in the plan"
+    assert all(action["reversible"] is False for action in plan["actions"])
+
+
+def test_docker_compose_restart_without_acknowledged_recovery_strategy_stays_blocked(monkeypatch) -> None:
+    # Negative test: an operation lacking BOTH a real rollback and a
+    # catalog-declared recovery_strategy must remain blocked. This proves the
+    # exemption is not a blanket "not_applicable always passes" rule - it is
+    # scoped strictly to commands that explicitly opt in via the catalog.
+    monkeypatch.setenv("REMEDIATION_EXECUTION_PLATFORM", "docker-compose")
+    monkeypatch.setenv("REMEDIATION_COMPOSE_PROJECT", "kaiops_azure")
+
+    from common.orchestration import execution_plan as execution_plan_module
+
+    original_catalogs = execution_plan_module._execution_catalogs()
+    connectors, actions, playbooks, connectivity, connection_config = original_catalogs
+    patched_actions = json.loads(json.dumps(actions))
+    patched_actions["commands"]["restart_service_runtime"].pop("recovery_strategy", None)
+
+    monkeypatch.setattr(
+        execution_plan_module,
+        "_execution_catalogs",
+        lambda: (connectors, patched_actions, playbooks, connectivity, connection_config),
+    )
+
+    plan = _resolve(
+        Alert(
+            source="prometheus",
+            name="KaiOpsServiceDown",
+            service="api-gateway",
+            severity=AlertSeverity.CRITICAL,
+            description="API endpoint is unreachable",
+        )
+    )
+
+    assert plan["execution_ready"] is False
+    assert plan["rollback_commands"] == []
+    assert plan["rollback_mode"] == "not_applicable"
+    assert plan["recovery_strategy_acknowledged"] is False
     assert "mutating plan has no executable rollback" in plan["readiness_blocks"]
 
 

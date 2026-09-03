@@ -76,7 +76,13 @@
       "safety": "restart",
       "approval_required": true,
       "rollback": "kubectl rollout undo deployment/${service} -n ${namespace}",
-      "expected_evidence": ["restart_job_id", "post_health_check"]
+      "expected_evidence": ["restart_job_id", "post_health_check"],
+      "recovery_strategy": {
+        "type": "retry_and_escalate",
+        "applies_when": "rollback_unavailable",
+        "rationale": "A bare process restart has no inverse action under a platform without deployment history (e.g. docker-compose); recovery is independent post-restart health validation plus operator escalation on failure, not a fabricated rollback.",
+        "requires_acknowledgement": true
+      }
     },
     "scale_service_workers": {
       "operation": "scale_service",

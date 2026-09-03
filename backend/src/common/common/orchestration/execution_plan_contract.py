@@ -183,6 +183,12 @@ class ExecutionPlanV2(BaseModel):
     stability_window_seconds: int = Field(default=300, ge=60, le=3600)
     rollback_commands: list[str] = Field(default_factory=list)
     rollback_mode: str
+    # An approved, catalog-declared recovery strategy that stands in for a
+    # literal rollback only when explicitly acknowledged (see
+    # action_catalog.json's recovery_strategy field). Never implies
+    # reversible=True on any PlanAction.
+    recovery_strategy: dict[str, Any] | None = None
+    recovery_strategy_acknowledged: bool = False
     queries: list[str] = Field(default_factory=list)
     scripts: list[str] = Field(default_factory=list)
     parameters: dict[str, Any] = Field(default_factory=dict)
@@ -218,8 +224,13 @@ class ExecutionPlanV2(BaseModel):
             or str(catalog_versions.get("actions") or "").lower() == "unknown"
         ):
             raise ValueError("execution-ready mutation requires an action catalog version")
-        if self.execution_ready and (not self.validation or not self.rollback):
-            raise ValueError("execution-ready mutation requires validation and rollback")
+        recovery_strategy_exempt = (
+            self.rollback_mode == "not_applicable" and self.recovery_strategy_acknowledged
+        )
+        if self.execution_ready and not self.validation:
+            raise ValueError("execution-ready mutation requires validation")
+        if self.execution_ready and not self.rollback and not recovery_strategy_exempt:
+            raise ValueError("execution-ready mutation requires rollback or an acknowledged recovery strategy")
         if self.execution_ready and self.approval_policy.decision != "hitl_required":
             raise ValueError("P0 execution-ready plans require HITL")
         if self.commands != [str(action.inputs.get("catalog_command") or "") for action in self.actions]:

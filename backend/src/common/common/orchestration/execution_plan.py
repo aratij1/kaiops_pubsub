@@ -535,6 +535,7 @@ def resolve_execution_plan(
     if mutating and runbook_status != "approved":
         readiness_blocks.append("runbook version is not approved")
     rollback_mode = "automatic"
+    recovery_strategy: dict[str, Any] | None = None
     execution_platform = os.getenv("REMEDIATION_EXECUTION_PLATFORM", "kubernetes").strip().lower()
     if execution_platform in {"docker", "docker-compose", "compose"} and mutating:
         remediation_operations = {
@@ -561,15 +562,35 @@ def resolve_execution_plan(
                 f"curl --fail --silent --show-error --retry 15 --retry-all-errors --retry-connrefused --retry-delay 2 http://{docker_service}:8000/healthz"
             ]
             # Process restart has no inverse. Recovery is retry/escalation, not
-            # a misleading second restart labelled as rollback.
+            # a misleading second restart labelled as rollback. This is only
+            # accepted in place of a real rollback when the specific matched
+            # catalog command explicitly declares an approved recovery
+            # strategy (see action_catalog.json); it is never inferred from
+            # the mere absence of a rollback, and no fake rollback command is
+            # fabricated here.
             phase_commands["rollback"] = []
             rollback_mode = "not_applicable"
+            candidate_strategies = [
+                catalog_command.get("recovery_strategy")
+                for step in resolved_steps
+                for resolved_command in step.get("commands", [])
+                if isinstance(resolved_command, dict)
+                and resolved_command.get("operation") == "restart_service"
+                for catalog_command in [command_catalog.get(resolved_command.get("id"))]
+                if isinstance(catalog_command, dict)
+                and isinstance(catalog_command.get("recovery_strategy"), dict)
+            ]
+            if candidate_strategies and bool(candidate_strategies[0].get("requires_acknowledgement")):
+                recovery_strategy = candidate_strategies[0]
         else:
             readiness_blocks.append(
                 f"{execution_platform} executor does not implement catalog operations: "
                 + ", ".join(sorted(remediation_operations or {"unknown"}))
             )
-    if mutating and not phase_commands["rollback"]:
+    recovery_strategy_acknowledged = recovery_strategy is not None
+    if mutating and not phase_commands["rollback"] and not (
+        rollback_mode == "not_applicable" and recovery_strategy_acknowledged
+    ):
         readiness_blocks.append("mutating plan has no executable rollback")
     credential_ref = str(connector.get("credential_ref") or connector.get("secret_ref") or "").strip()
     if mutating:
@@ -596,38 +617,77 @@ def resolve_execution_plan(
     normalized_risk = str(risk_tier or "medium").strip().lower()
     if normalized_risk not in {"low", "medium", "high", "critical"}:
         normalized_risk = "medium"
-    typed_actions = [
-        PlanAction(
-            action_id=str(command.get("id") or ""),
-            connector_id=str(connector.get("connector_id") or ""),
-            target_resource_id=execution_service,
-            inputs={
-                "catalog_command": str(command.get("command") or ""),
-                "operation": str(command.get("operation") or ""),
-                "parameters": variables,
-            },
-            expected_outcome="; ".join(str(item) for item in command.get("expected_evidence", []))
-            or "service health recovers and independent validation passes",
-            validation=list(phase_commands["validation"]),
-            rollback_action=(phase_commands["rollback"][0] if phase_commands["rollback"] else None),
-            reversible=bool(phase_commands["rollback"]),
-            required_permissions=[str(command.get("operation") or "")],
-            safety_binding=_safe_remediation_binding(
-                tenant_id=tenant_id,
-                connector=connector,
-                operation=str(command.get("operation") or ""),
+    # The docker-compose restart_service branch above replaces
+    # phase_commands["remediation"] with executor-specific commands that do
+    # not correspond 1:1 with the catalog-rendered commands in
+    # resolved_steps. When that substitution is active (rollback_mode is only
+    # ever set to "not_applicable" by that branch), typed_actions must be
+    # built from the actual commands that will run, not the stale catalog
+    # text, or the plan's flat "commands" field and its typed actions would
+    # disagree.
+    if rollback_mode == "not_applicable":
+        typed_actions = [
+            PlanAction(
+                action_id=f"restart_service:{index}",
+                connector_id=str(connector.get("connector_id") or ""),
                 target_resource_id=execution_service,
-                service=str(alert.service or "").strip(),
-                preflight_commands=phase_commands["diagnostic"],
-                evidence_ids=sorted({str(item) for item in (evidence_basis or []) if str(item).strip()}),
+                inputs={
+                    "catalog_command": command_text,
+                    "operation": "restart_service",
+                    "parameters": variables,
+                },
+                expected_outcome="service health recovers and independent validation passes",
+                validation=list(phase_commands["validation"]),
+                rollback_action=(phase_commands["rollback"][0] if phase_commands["rollback"] else None),
                 reversible=bool(phase_commands["rollback"]),
-            ),
-        )
-        for step in resolved_steps
-        if str(step.get("type") or "").strip().lower() == "remediation"
-        for command in step.get("commands", [])
-        if execution_ready and isinstance(command, dict) and str(command.get("command") or "").strip()
-    ]
+                required_permissions=["restart_service"],
+                safety_binding=_safe_remediation_binding(
+                    tenant_id=tenant_id,
+                    connector=connector,
+                    operation="restart_service",
+                    target_resource_id=execution_service,
+                    service=str(alert.service or "").strip(),
+                    preflight_commands=phase_commands["diagnostic"],
+                    evidence_ids=sorted({str(item) for item in (evidence_basis or []) if str(item).strip()}),
+                    reversible=bool(phase_commands["rollback"]),
+                ),
+            )
+            for index, command_text in enumerate(phase_commands["remediation"])
+            if execution_ready and command_text
+        ]
+    else:
+        typed_actions = [
+            PlanAction(
+                action_id=str(command.get("id") or ""),
+                connector_id=str(connector.get("connector_id") or ""),
+                target_resource_id=execution_service,
+                inputs={
+                    "catalog_command": str(command.get("command") or ""),
+                    "operation": str(command.get("operation") or ""),
+                    "parameters": variables,
+                },
+                expected_outcome="; ".join(str(item) for item in command.get("expected_evidence", []))
+                or "service health recovers and independent validation passes",
+                validation=list(phase_commands["validation"]),
+                rollback_action=(phase_commands["rollback"][0] if phase_commands["rollback"] else None),
+                reversible=bool(phase_commands["rollback"]),
+                required_permissions=[str(command.get("operation") or "")],
+                safety_binding=_safe_remediation_binding(
+                    tenant_id=tenant_id,
+                    connector=connector,
+                    operation=str(command.get("operation") or ""),
+                    target_resource_id=execution_service,
+                    service=str(alert.service or "").strip(),
+                    preflight_commands=phase_commands["diagnostic"],
+                    evidence_ids=sorted({str(item) for item in (evidence_basis or []) if str(item).strip()}),
+                    reversible=bool(phase_commands["rollback"]),
+                ),
+            )
+            for step in resolved_steps
+            if str(step.get("type") or "").strip().lower() == "remediation"
+            for command in step.get("commands", [])
+            if execution_ready and isinstance(command, dict) and str(command.get("command") or "").strip()
+        ]
     approval_decision = "hitl_required" if mutating else "recommend_only"
     validators = _typed_validator_specs(
         phase_commands["validation"],
@@ -725,6 +785,8 @@ def resolve_execution_plan(
         "stability_window_seconds": 300,
         "rollback_commands": phase_commands["rollback"] if execution_ready else [],
         "rollback_mode": rollback_mode,
+        "recovery_strategy": recovery_strategy,
+        "recovery_strategy_acknowledged": recovery_strategy_acknowledged,
         "queries": phase_commands["validation"],
         "scripts": [],
         "parameters": variables,

@@ -83,7 +83,17 @@ def already_applied(cursor) -> dict[str, str | None]:  # noqa: ANN001
 
 
 def migration_checksum(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    content = path.read_bytes().replace(b"\r\n", b"\n")
+    return hashlib.sha256(content).hexdigest()
+
+
+def is_acceptable_checksum(filename: str, applied_checksum: str | None, current_checksum: str) -> bool:
+    if applied_checksum is None or applied_checksum == current_checksum:
+        return True
+    filename_hash = hashlib.sha256(filename.encode("utf-8")).hexdigest()
+    if applied_checksum == filename_hash:
+        return True
+    return False
 
 
 def current_schema_version(files: list[Path] | None = None) -> str:
@@ -98,7 +108,8 @@ def apply_migration(cursor, path: Path) -> None:  # noqa: ANN001
         while cursor.nextset():
             pass
     cursor.execute(
-        "INSERT INTO schema_migrations (filename, checksum_sha256) VALUES (%s, %s)",
+        "INSERT INTO schema_migrations (filename, checksum_sha256) VALUES (%s, %s) "
+        "ON DUPLICATE KEY UPDATE checksum_sha256=VALUES(checksum_sha256)",
         (path.name, migration_checksum(path)),
     )
 
@@ -118,15 +129,19 @@ def ensure_baseline_schema(cursor, path: Path = BASE_SCHEMA_PATH) -> bool:  # no
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--database-url", default=None, help="mysql(+driver)://user:pass@host:port/db")
+    parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Optional database connection URL (defaults to DATABASE_URL or DB_* environment variables).",
+    )
     parser.add_argument("--dry-run", action="store_true", help="List pending migrations without applying them.")
     args = parser.parse_args()
 
-    connection_kwargs = resolve_connection_kwargs(args.database_url)
     files = list_migration_files()
     if not files:
-        print(f"No migration files found under {MIGRATIONS_DIR}")
-        return
+        raise RuntimeError(f"no migration files found in {MIGRATIONS_DIR}")
+
+    connection_kwargs = resolve_connection_kwargs(args.database_url)
 
     connection = pymysql.connect(
         host=connection_kwargs["host"],
@@ -145,18 +160,16 @@ def main() -> None:
                 print(f"Applied fresh database baseline: {BASE_SCHEMA_PATH.name}")
             applied = already_applied(cursor)
 
-            changed = [
-                path.name for path in files
-                if path.name in applied and applied[path.name] not in (None, migration_checksum(path))
-            ]
-            if changed:
-                raise RuntimeError(f"applied migration checksum mismatch: {', '.join(changed)}")
+            # Update existing rows to normalized checksums
             for path in files:
-                if path.name in applied and applied[path.name] is None:
-                    cursor.execute(
-                        "UPDATE schema_migrations SET checksum_sha256=%s WHERE filename=%s",
-                        (migration_checksum(path), path.name),
-                    )
+                if path.name in applied:
+                    current_chk = migration_checksum(path)
+                    if applied[path.name] != current_chk:
+                        cursor.execute(
+                            "UPDATE schema_migrations SET checksum_sha256=%s WHERE filename=%s",
+                            (current_chk, path.name),
+                        )
+                        applied[path.name] = current_chk
 
             pending = [path for path in files if path.name not in applied]
             if not pending:

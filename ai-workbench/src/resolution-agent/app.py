@@ -810,12 +810,19 @@ def _apply_catalog_plan(recommendation: Recommendation, context: Context, decisi
         runbook_status=str(plan.get("runbook_status") or "unregistered"),
         runbook_success_rate=float(plan.get("runbook_success_rate") or 0.0),
         mutating=bool(plan.get("mutating")),
+        # Genuinely reversible only when a real rollback command exists. An
+        # acknowledged non-reversible-but-approved recovery strategy (see
+        # execution_plan.py's recovery_strategy_acknowledged) makes the plan
+        # execution-eligible but must never be reported as reversible=True -
+        # policy.py's action_not_reversible HITL reason must still fire.
         reversible=bool(plan.get("rollback_commands")),
         canary_supported=bool(plan.get("canary_supported")),
         blast_radius=str(plan.get("blast_radius") or "single-service"),
         target_verified=bool(str(plan.get("remediation_target") or "").strip()),
         validation_available=bool(plan.get("validation_commands")),
-        rollback_available=bool(plan.get("rollback_commands")),
+        rollback_available=bool(plan.get("rollback_commands")) or (
+            plan.get("rollback_mode") == "not_applicable" and bool(plan.get("recovery_strategy_acknowledged"))
+        ),
         contradiction_count=len((iterative.get("conclusion") or {}).get("contradicting_evidence_ids") or []),
         database_change=str(connector.get("type") or "").lower() in {"database", "mysql"},
         rca_conclusive=bool(iterative.get("conclusive")),
