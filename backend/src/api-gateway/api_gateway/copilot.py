@@ -1,17 +1,14 @@
-"""Phase 0 Copilot: deterministic intent matching and answer composition.
-
-No LLM/model-router calls here by design -- these three intents are direct
-data lookups against data the existing Capacity/Assignment/Onboarding APIs
-already expose. This module is pure (no I/O, no FastAPI imports) so intent
-matching and answer text can be unit tested without a running app or DB.
-"""
+"""Deterministic, role-safe operational intent routing for Ask Kai."""
 
 from __future__ import annotations
 
 import re
 from typing import Any, Literal
 
-Intent = Literal["capacity", "assignment", "onboarding"]
+Intent = Literal[
+    "capacity", "assignment", "onboarding", "incidents", "alerts",
+    "approvals", "knowledge", "resources", "platform", "audit", "resolution",
+]
 
 _CAPACITY_PATTERNS = (
     re.compile(r"\bcapacity\b", re.IGNORECASE),
@@ -26,6 +23,28 @@ _ONBOARDING_PATTERNS = (
     re.compile(r"\bonboard(ing)?\b", re.IGNORECASE),
     re.compile(r"\bpending\s+.*\bsetup\b", re.IGNORECASE),
 )
+
+_OPERATIONAL_PATTERNS: tuple[tuple[Intent, tuple[str, ...]], ...] = (
+    ("resolution", ("resolution", "resolve", "remediation", "self heal", "runbook", "root cause", "rca")),
+    ("incidents", ("incident", "impact", "investigation", "needs attention")),
+    ("alerts", ("alert", "signal", "warning", "duplicate", "live alert")),
+    ("approvals", ("approval", "approve", "decision", "review queue")),
+    ("knowledge", ("knowledge", "document", "evidence", "catalog", "historical pattern")),
+    ("resources", ("resource", "topology", "dependency", "service 360", "inventory", "cloud")),
+    ("platform", ("platform", "health", "provider", "connector", "integration", "queue")),
+    ("audit", ("audit", "trace", "who changed", "history", "compliance")),
+)
+
+_WORKSPACES: dict[Intent, tuple[str, str, str]] = {
+    "incidents": ("Incidents", "/incidents", "investigate active incidents, customer impact, evidence, and RCA"),
+    "alerts": ("Alert Stream", "/alerts", "triage project-scoped alerts, warnings, duplicates, and unlinked signals"),
+    "approvals": ("Approvals", "/approvals", "review governed decision packets and human approval work"),
+    "knowledge": ("Runbooks & Knowledge", "/knowledge", "discover evidence, develop runbooks, and review resolution catalog candidates"),
+    "resources": ("Resource Inventory", "/cloud-ops/resources", "inspect resources, service mappings, dependencies, and topology"),
+    "platform": ("Platform Health", "/platform", "check connectors, AI providers, queues, integrations, and platform readiness"),
+    "audit": ("Audit Log", "/audit", "inspect traceable changes, decisions, actors, and governance history"),
+    "resolution": ("Incident Resolution", "/incidents", "review RCA, compile a governed plan, approve it, execute safely, and validate recovery"),
+}
 
 # An incident/ticket id in this codebase's test data and UI is either a UUID
 # or a short alphanumeric ticket key (e.g. INC-123, OPS-42). Matched loosely
@@ -54,7 +73,21 @@ def classify_intent(query: str) -> Intent | None:
         return "capacity"
     if any(pattern.search(text) for pattern in _ONBOARDING_PATTERNS):
         return "onboarding"
+    lowered = text.lower()
+    for intent, terms in _OPERATIONAL_PATTERNS:
+        if any(term in lowered for term in terms):
+            return intent
     return None
+
+
+def compose_workspace_answer(intent: Intent) -> dict[str, Any]:
+    label, path, capability = _WORKSPACES[intent]
+    return {
+        "intent": intent,
+        "answer": f"Kai can help you {capability}. Open {label} to continue with the current role-authorized project context.",
+        "data": {"workspace": path, "execution_requires_governance": intent == "resolution"},
+        "links": [{"label": f"Open {label}", "path": path}],
+    }
 
 
 def extract_incident_id(query: str) -> str | None:
@@ -138,14 +171,17 @@ def compose_unsupported_answer(query: str) -> dict[str, Any]:
     return {
         "intent": None,
         "answer": (
-            "I can currently help with three things: who has capacity this week, "
-            "why a specific ticket wasn't assigned, and what's pending in onboarding. "
-            "Try rephrasing your question around one of those."
+            "I can help across incidents, alerts, evidence and RCA, resolution plans, approvals, "
+            "applications and onboarding, resources and topology, knowledge, platform health, "
+            "responder capacity, assignments, and audit. "
+            "Include an incident, ticket, application, service, or resource identifier for a more specific answer."
         ),
         "data": {},
         "links": [
             {"label": "Open Capacity & Assignments", "path": "/approvals"},
             {"label": "Open Onboarding", "path": "/applications?workspace=onboarding"},
+            {"label": "Open Incidents", "path": "/incidents"},
+            {"label": "Open Runbooks & Knowledge", "path": "/knowledge"},
         ],
     }
 

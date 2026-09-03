@@ -8,6 +8,7 @@ from common.context_enrichment_contract import (
     EvidenceRequirement,
     HitlRoutingConfiguration,
     build_evidence_requirements,
+    initial_causal_collection_gaps,
     validate_enrichment_observation,
 )
 from common.database import (
@@ -53,6 +54,20 @@ def test_duplicate_rca_gaps_produce_one_durable_requirement() -> None:
     )
 
     assert len(requirements) == 1
+
+
+def test_initial_causal_collection_wave_is_complete_and_deterministic() -> None:
+    incident_id = uuid4()
+    gaps = initial_causal_collection_gaps()
+    requirements = build_evidence_requirements(
+        tenant_id="tenant-a", incident_id=incident_id, rca_version=1,
+        missing_evidence=gaps, now=datetime.now(UTC),
+    )
+
+    assert [row.category for row in requirements] == ["traces", "topology", "topology"]
+    assert "dependency health" in requirements[1].question.lower()
+    assert len({row.requirement_id for row in requirements}) == 3
+    assert all("discovery-mcp" in row.candidate_connectors for row in requirements)
 
 
 def test_trace_gap_rejects_metric_only_observation() -> None:
@@ -508,6 +523,14 @@ async def test_exhausted_context_job_is_dead_lettered(sqlite_session_factory):
     async with sqlite_session_factory() as session:
         repo = ContextEnrichmentRepository(session)
         await repo.upsert_context_evidence_requirements([requirement])
+        # An RCA rerun may introduce a newer, unrelated requirement while this
+        # collection call is in flight. It must not stale the metric result.
+        newer_unrelated = build_evidence_requirements(
+            tenant_id="tenant-a", incident_id=incident_id, rca_version=2,
+            missing_evidence=[{"category": "topology", "question": "Which dependency is unhealthy?"}],
+            now=now,
+        )[0]
+        await repo.upsert_context_evidence_requirements([newer_unrelated])
         job = await repo.schedule_context_enrichment_job(
             tenant_id="tenant-a", incident_id=incident_id,
             requirement_id=requirement.requirement_id, connector_id="prometheus",
@@ -597,6 +620,11 @@ async def test_atomic_enrichment_persists_exact_evidence_snapshot_and_outbox(
                                           "service": "checkout-api", "title": "latency"}, "decision": {}},
             observation_start=now - timedelta(minutes=5), observation_end=now,
         )
+        newer_requirement = build_evidence_requirements(
+            tenant_id="tenant-a", incident_id=incident_id, rca_version=2,
+            missing_evidence=[{"category": "metrics", "question": "What was latency?"}], now=now,
+        )[0]
+        await repo.upsert_context_evidence_requirements([newer_requirement])
         session.add(ContextSnapshotRecord(
             snapshot_id=uuid4(), tenant_id="tenant-a", incident_id=str(incident_id),
             alert_signature="signature", subject_fingerprint="s" * 64,
@@ -629,6 +657,11 @@ async def test_atomic_enrichment_persists_exact_evidence_snapshot_and_outbox(
             tenant_id="tenant-a", requirement_id=requirement.requirement_id,
         )
         assert requirement_row["status"] == "collected"
+        newer_requirement_row = await repo.context_evidence_requirement(
+            tenant_id="tenant-a", requirement_id=newer_requirement.requirement_id,
+        )
+        assert newer_requirement_row["status"] == "collected"
+        assert newer_requirement_row["evidence_ids"] == [record.evidence_id]
         coverage = await repo.reconcile_requirement_coverage_from_ledger(
             tenant_id="tenant-a", incident_id=incident_id, apply=True,
         )

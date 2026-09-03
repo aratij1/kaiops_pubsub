@@ -747,6 +747,13 @@ async def _context_enrichment_worker(app: FastAPI) -> None:
                         raise RuntimeError(f"connector {job['connector_id']} is not installed")
                     targeted_metadata = dict(alert.metadata)
                     targeted_metadata["context_requirement_category"] = requirement.category
+                    targeted_metadata["context_collection_tool"] = (
+                        "dependency-health.search"
+                        if requirement.category == "topology" and "dependency health" in requirement.question.lower()
+                        else "topology.search"
+                        if requirement.category == "topology"
+                        else ""
+                    )
                     targeted_metadata["context_observation_start"] = job.get("observation_start")
                     targeted_metadata["context_observation_end"] = job.get("observation_end")
                     targeted_alert = alert.model_copy(update={"metadata": targeted_metadata})
@@ -841,6 +848,7 @@ async def _context_enrichment_worker(app: FastAPI) -> None:
                                 job_id=job["job_id"], worker_id=worker_id,
                                 collected=False, error=failure,
                                 retry_after_seconds=min(300, 15 * (2 ** max(0, int(job["attempt_count"]) - 1))),
+                                maximum_attempts=1 if failure == "STALE_EVIDENCE_REQUIREMENT" else 4,
                             )
                         await session.commit()
         except asyncio.CancelledError:

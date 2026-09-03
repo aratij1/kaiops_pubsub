@@ -18,6 +18,7 @@ from common.config import get_settings
 from common.context_enrichment_contract import (
     authorized_enrichment_connectors,
     build_evidence_requirements,
+    initial_causal_collection_gaps,
     next_authorized_enrichment_connector,
 )
 from common.database import RunbookVersionRecord
@@ -1209,13 +1210,36 @@ async def _persist_resolution_event(
             }
             await repo.record_resolution_transition(transition_payload)
         missing = list((metadata.get("rca_analysis") or {}).get("missing_evidence") or [])
+        enrichment_repo = ContextEnrichmentRepository(session)
+        existing_requirements = await enrichment_repo.list_context_evidence_requirements(
+            tenant_id=context.tenant_id, incident_id=incident.id,
+        )
+        existing_questions = {
+            str(row.get("question") or "").strip().casefold() for row in existing_requirements
+        }
+        initial_gaps = [
+            gap for gap in initial_causal_collection_gaps()
+            if str(gap["question"]).strip().casefold() not in existing_questions
+        ]
+        if initial_gaps:
+            missing = [*initial_gaps, *missing]
+            metadata["targeted_causal_collection"] = {
+                "launched": True,
+                "status": "collecting",
+                "sources": ["traces", "dependency_health", "runtime_topology"],
+            }
         if missing:
             rca_version = max(1, int(metadata.get("rca_version") or 1))
-            requirements = build_evidence_requirements(
-                tenant_id=context.tenant_id, incident_id=incident.id,
-                rca_version=rca_version, missing_evidence=missing, now=datetime.now(UTC),
-            )
-            enrichment_repo = ContextEnrichmentRepository(session)
+            requirements = [
+                requirement for requirement in build_evidence_requirements(
+                    tenant_id=context.tenant_id, incident_id=incident.id,
+                    rca_version=rca_version, missing_evidence=missing, now=datetime.now(UTC),
+                )
+                if requirement.question.strip().casefold() not in existing_questions
+            ]
+        else:
+            requirements = []
+        if requirements:
             await enrichment_repo.upsert_context_evidence_requirements(requirements)
             authorized = authorized_enrichment_connectors(
                 alert_metadata=context.alert.metadata,

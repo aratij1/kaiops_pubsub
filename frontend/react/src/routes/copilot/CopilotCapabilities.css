@@ -1,0 +1,7 @@
+.copilot-shortcuts { max-height: 460px; overflow: auto; }
+.copilot-shortcuts-intro { margin: 0 0 .35rem; color: var(--muted); font-size: .72rem; }
+.copilot-shortcuts button { align-items: center; }
+.copilot-shortcuts button > span { display: grid; gap: .15rem; }
+.copilot-shortcuts button strong { font-size: .76rem; }
+.copilot-shortcuts button small { color: var(--muted); font-size: .64rem; line-height: 1.35; }
+.copilot-shortcuts button > b { color: var(--accent); font-size: 1rem; }

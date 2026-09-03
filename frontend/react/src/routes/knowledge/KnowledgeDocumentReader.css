@@ -1,0 +1,22 @@
+.knowledge-document-link { display:flex;align-items:flex-start;gap:9px;width:100%;padding:0;color:inherit;text-align:left;border:0;background:transparent;cursor:pointer; }
+.knowledge-document-link svg { flex:none;margin-top:2px;color:#2563eb; }
+.knowledge-document-link span { display:grid;gap:3px; }
+.knowledge-document-link small { color:var(--muted);font-size:.64rem; }
+.development-record-panel tr.is-selected { background:#edf5ff;box-shadow:inset 3px 0 #2563eb; }
+.knowledge-document-reader { margin:16px;border:1px solid #bfd5f3;border-radius:15px;overflow:hidden;background:#fff;box-shadow:0 12px 32px rgba(32,73,125,.1); }
+.knowledge-document-reader>header { display:flex;align-items:flex-start;justify-content:space-between;gap:20px;padding:18px 20px;border-bottom:1px solid #dce7f4;background:linear-gradient(120deg,#f8fbff,#edf6ff); }
+.knowledge-document-reader h3 { margin:5px 0;color:#162a47;font-size:1.05rem; }
+.knowledge-document-reader header p { margin:0;color:#62738a;font-size:.72rem; }
+.knowledge-document-reader header button { display:inline-flex;align-items:center;gap:6px; }
+.knowledge-document-body { max-height:560px;overflow:auto;padding:22px; }
+.knowledge-document-body pre { margin:0;color:#22344e;font:500 .78rem/1.7 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere; }
+.knowledge-document-reader>footer { display:flex;flex-wrap:wrap;gap:8px 18px;padding:12px 20px;color:#68798f;border-top:1px solid #e0e8f2;background:#f8fafc;font-size:.65rem; }
+.knowledge-document-reader>footer code { overflow-wrap:anywhere; }
+.knowledge-document-reader>footer nav { display:flex;flex-wrap:wrap;gap:8px;margin-left:auto; }
+.knowledge-document-reader>footer a { color:#155eef;font-weight:700; }
+@media(max-width:700px){.knowledge-document-reader{margin:12px 0}.knowledge-document-reader>header{flex-direction:column}.knowledge-document-body{padding:16px}}
+:root[data-ui-theme="dark"] .development-record-panel tr.is-selected { background:#172d4e; }
+:root[data-ui-theme="dark"] .knowledge-document-reader { border-color:#36557c;background:#101d2e; }
+:root[data-ui-theme="dark"] .knowledge-document-reader>header { border-color:#304760;background:linear-gradient(120deg,#122137,#172e4a); }
+:root[data-ui-theme="dark"] .knowledge-document-reader h3,:root[data-ui-theme="dark"] .knowledge-document-body pre { color:#e6eef9; }
+:root[data-ui-theme="dark"] .knowledge-document-reader>footer { border-color:#304760;background:#0d1929; }

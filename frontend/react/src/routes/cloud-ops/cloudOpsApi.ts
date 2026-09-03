@@ -188,13 +188,13 @@ export function discoverConnection(accessToken: string, connectionId: string, pr
   );
 }
 
-export function listResources(accessToken: string, projectId?: string, serviceId?: string, environment?: string) {
+export function listResources(accessToken: string, projectId?: string, serviceId?: string, environment?: string, signal?: AbortSignal) {
   const params = new URLSearchParams();
   if (projectId) params.set("project_id", projectId);
   if (serviceId) params.set("service_id", serviceId);
   if (environment) params.set("environment", environment);
   const query = params.toString();
-  return requestJson<RowsResponse<CloudResource>>(accessToken, `/cloud-ops/resources${query ? `?${query}` : ""}`).then((data) => data.rows);
+  return requestJson<RowsResponse<CloudResource>>(accessToken, `/cloud-ops/resources${query ? `?${query}` : ""}`, { signal }).then((data) => data.rows);
 }
 
 export function service360(accessToken: string, projectId: string, serviceId: string, environment?: string) {

@@ -35,8 +35,6 @@ schedule_config: dict[str, Any] = {
     "minimum_success_rate": 0.80, "minimum_reviewed_incidents": 2,
 }
 configuration_id = uuid5(NAMESPACE_URL, "kaims:knowledge-development:configuration:default")
-state_id = uuid5(NAMESPACE_URL, "kaims:knowledge-development:state:default")
-lock_name = "kaims_knowledge_development_default"
 
 
 class ScheduleConfig(BaseModel):
@@ -59,6 +57,11 @@ class IncidentBootstrapRequest(BaseModel):
     incident: dict[str, Any]
     context: dict[str, Any]
     recommendation: dict[str, Any] = Field(default_factory=dict)
+
+
+class RunRequest(BaseModel):
+    tenant_id: str
+    application_scope: str = Field(default="all", max_length=255)
 
 
 class CatalogPromotionRequest(BaseModel):
@@ -131,16 +134,20 @@ def _quality_gate(pattern: FailurePattern, evidence_by_id: dict[str, IncidentEvi
     }
 
 
-async def _load_state(app: FastAPI) -> dict[str, Any]:
+def _state_id(tenant_id: str) -> UUID:
+    return uuid5(NAMESPACE_URL, f"kaims:knowledge-development:state:{tenant_id}")
+
+
+async def _load_state(app: FastAPI, tenant_id: str = "default") -> dict[str, Any]:
     if not settings.database_enabled:
         return {}
     async with app.state.session_factory() as session:
-        row = await session.get(KnowledgeBaseRecord, state_id)
+        row = await session.get(KnowledgeBaseRecord, _state_id(tenant_id))
         return dict(row.payload) if row and isinstance(row.payload, dict) else {}
 
 
-async def _save_state(session: Any, payload: dict[str, Any]) -> None:
-    await session.merge(KnowledgeBaseRecord(id=state_id, tenant_id="default", service="KaiMS", title="Periodic knowledge development durable state", content=json.dumps(payload, sort_keys=True), embedding_ref=None, payload=payload))
+async def _save_state(session: Any, payload: dict[str, Any], tenant_id: str = "default") -> None:
+    await session.merge(KnowledgeBaseRecord(id=_state_id(tenant_id), tenant_id=tenant_id, service="KaiMS", title="Periodic knowledge development durable state", content=json.dumps(payload, sort_keys=True), embedding_ref=None, payload=payload))
 
 
 async def _draft_candidate(
@@ -365,15 +372,16 @@ def _build_evidence(report: RcaReportRecord, incident: IncidentRecord, latest_ac
     )
 
 
-async def _analyze_locked(app: FastAPI, trigger: str) -> dict[str, Any]:
+async def _analyze_locked(app: FastAPI, trigger: str, *, tenant_id: str = "default", application_scope: str | None = None) -> dict[str, Any]:
     started = datetime.now(timezone.utc)
     cutoff = started - timedelta(days=int(schedule_config["lookback_days"]))
-    previous = await _load_state(app)
+    tenant_id = require_tenant_id(tenant_id, source="knowledge development run")
+    previous = await _load_state(app, tenant_id)
     checkpoint = _utc(datetime.fromisoformat(str(previous["checkpoint_at"]))) if previous.get("checkpoint_at") else None
     checkpoint_id = str(previous.get("checkpoint_id") or "").strip()
-    scope = str(schedule_config["application_scope"]).strip().lower()
+    scope = str(application_scope or schedule_config["application_scope"]).strip().lower()
     async with app.state.session_factory() as session:
-        report_query = select(RcaReportRecord)
+        report_query = select(RcaReportRecord).where(RcaReportRecord.tenant_id == tenant_id)
         if checkpoint and checkpoint_id:
             report_query = report_query.where(
                 or_(
@@ -387,10 +395,10 @@ async def _analyze_locked(app: FastAPI, trigger: str) -> dict[str, Any]:
             report_query = report_query.where(RcaReportRecord.created_at >= cutoff)
         reports = (await session.execute(report_query.order_by(RcaReportRecord.created_at.asc(), RcaReportRecord.id.asc()).limit(batch_size))).scalars().all()
         incident_ids = {row.incident_id for row in reports}
-        incidents = {str(row.id): row for row in (await session.execute(select(IncidentRecord).where(IncidentRecord.id.in_(incident_ids)))).scalars().all()} if incident_ids else {}
+        incidents = {str(row.id): row for row in (await session.execute(select(IncidentRecord).where(IncidentRecord.tenant_id == tenant_id, IncidentRecord.id.in_(incident_ids)))).scalars().all()} if incident_ids else {}
         actions: dict[str, list[ActionRecord]] = {}
         if incident_ids:
-            for row in (await session.execute(select(ActionRecord).where(ActionRecord.incident_id.in_(incident_ids)))).scalars().all():
+            for row in (await session.execute(select(ActionRecord).where(ActionRecord.tenant_id == tenant_id, ActionRecord.incident_id.in_(incident_ids)))).scalars().all():
                 actions.setdefault(str(row.incident_id), []).append(row)
         collected = 0
         document_changes = {"created": 0, "updated": 0, "unchanged": 0}
@@ -406,8 +414,8 @@ async def _analyze_locked(app: FastAPI, trigger: str) -> dict[str, Any]:
                 continue
             action_rows = actions.get(str(report.incident_id), [])
             evidence = _build_evidence(report, incident, max(action_rows, key=lambda row: row.created_at) if action_rows else None)
-            evidence_id = uuid5(NAMESPACE_URL, f"kaims:incident-evidence:default:{evidence.incident_id}")
-            await session.merge(IncidentEvidenceRecord(id=evidence_id, tenant_id="default", incident_id=evidence.incident_id, issue_signature=issue_signature(evidence), service=evidence.service, environment=evidence.environment, alert_type=evidence.alert_type, evidence=evidence.model_dump(mode="json"), reviewed=evidence.reviewed, collected_at=max(evidence.timestamps) if evidence.timestamps else started))
+            evidence_id = uuid5(NAMESPACE_URL, f"kaims:incident-evidence:{tenant_id}:{evidence.incident_id}")
+            await session.merge(IncidentEvidenceRecord(id=evidence_id, tenant_id=tenant_id, incident_id=evidence.incident_id, issue_signature=issue_signature(evidence), service=evidence.service, environment=evidence.environment, alert_type=evidence.alert_type, evidence=evidence.model_dump(mode="json"), reviewed=evidence.reviewed, collected_at=max(evidence.timestamps) if evidence.timestamps else started))
             collected += 1
             report_time = _utc(report.created_at)
             if report_time and (
@@ -418,7 +426,7 @@ async def _analyze_locked(app: FastAPI, trigger: str) -> dict[str, Any]:
                 max_checkpoint = report_time
                 max_checkpoint_id = str(report.id)
         await session.flush()
-        stored = (await session.execute(select(IncidentEvidenceRecord).where(IncidentEvidenceRecord.collected_at >= cutoff).order_by(IncidentEvidenceRecord.collected_at.desc()).limit(5000))).scalars().all()
+        stored = (await session.execute(select(IncidentEvidenceRecord).where(IncidentEvidenceRecord.tenant_id == tenant_id, IncidentEvidenceRecord.collected_at >= cutoff).order_by(IncidentEvidenceRecord.collected_at.desc()).limit(5000))).scalars().all()
         evidence_rows = []
         for row in stored:
             try:
@@ -432,7 +440,7 @@ async def _analyze_locked(app: FastAPI, trigger: str) -> dict[str, Any]:
         # or backfill missing documents while checksum comparison keeps the
         # operation idempotent.
         for evidence in evidence_rows:
-            changes = await _upsert_knowledge_documents(session, evidence, tenant_id="default")
+            changes = await _upsert_knowledge_documents(session, evidence, tenant_id=tenant_id)
             for key, value in changes.items():
                 document_changes[key] += value
         patterns = FailurePatternAnalyzer().analyze(evidence_rows)
@@ -441,37 +449,40 @@ async def _analyze_locked(app: FastAPI, trigger: str) -> dict[str, Any]:
         for pattern in patterns:
             quality = _quality_gate(pattern, evidence_by_id)
             gated += int(not quality["passed"])
-            record_id = uuid5(NAMESPACE_URL, f"kaims:failure-pattern:default:{pattern.issue_signature}")
+            record_id = uuid5(NAMESPACE_URL, f"kaims:failure-pattern:{tenant_id}:{pattern.issue_signature}")
             payload = pattern.model_dump(mode="json")
             payload["evidence_references"] = payload.get("evidence_references", [])[:100]
             payload.update({"knowledge_status": "challenger" if quality["passed"] else "observed", "requires_human_approval": True, "source": "periodic-knowledge-development", "quality_gate": quality})
             summary = {"issue_signature": pattern.issue_signature, "service": pattern.service, "environment": pattern.environment, "alert_type": pattern.alert_type, "probable_causes": pattern.probable_causes, "successful_resolutions": pattern.successful_resolutions, "quality_gate": quality}
-            await session.merge(KnowledgeBaseRecord(id=record_id, tenant_id="default", service=pattern.service, title=f"Recurring failure pattern: {pattern.alert_type}"[:255], content=json.dumps(summary, indent=2), embedding_ref=None, payload=payload))
-            await session.merge(FailurePatternRecord(pattern_id=record_id, tenant_id="default", issue_signature=pattern.issue_signature, service=pattern.service, environment=pattern.environment, analysis=payload, confidence=pattern.confidence, analyzed_at=pattern.analyzed_at))
-            drafts += int(await _draft_candidate(session, pattern, quality))
+            await session.merge(KnowledgeBaseRecord(id=record_id, tenant_id=tenant_id, service=pattern.service, title=f"Recurring failure pattern: {pattern.alert_type}"[:255], content=json.dumps(summary, indent=2), embedding_ref=None, payload=payload))
+            await session.merge(FailurePatternRecord(pattern_id=record_id, tenant_id=tenant_id, issue_signature=pattern.issue_signature, service=pattern.service, environment=pattern.environment, analysis=payload, confidence=pattern.confidence, analyzed_at=pattern.analyzed_at))
+            drafts += int(await _draft_candidate(session, pattern, quality, tenant_id=tenant_id))
         completed = datetime.now(timezone.utc)
         backlog_remaining = len(reports) >= batch_size
         next_delay = 30 if backlog_remaining else int(schedule_config["interval_seconds"])
         result = {"status": "completed", "trigger": trigger, "started_at": started.isoformat(), "completed_at": completed.isoformat(), "duration_seconds": round((completed - started).total_seconds(), 3), "reports_scanned": len(reports), "evidence_collected": collected, "evidence_in_window": len(evidence_rows), "patterns": len(patterns), "quality_gated_patterns": gated, "reviewable_runbook_candidates": drafts, "knowledge_documents": document_changes, "checkpoint_at": _iso(max_checkpoint), "checkpoint_id": max_checkpoint_id, "backlog_remaining": backlog_remaining, "next_run_at": (completed + timedelta(seconds=next_delay)).isoformat(), "application_scope": schedule_config["application_scope"], "lookback_days": schedule_config["lookback_days"], "batch_size": batch_size, "quality_policy": "kaims.knowledge-quality.v2"}
-        await _save_state(session, result)
+        result["tenant_id"] = tenant_id
+        result["application_scope"] = application_scope or schedule_config["application_scope"]
+        await _save_state(session, result, tenant_id)
         await session.commit()
         return result
 
 
-async def analyze_history(app: FastAPI, trigger: str = "manual") -> dict[str, Any]:
+async def analyze_history(app: FastAPI, trigger: str = "manual", *, tenant_id: str = "default", application_scope: str | None = None) -> dict[str, Any]:
     if not settings.database_enabled:
         return {"status": "disabled", "reason": "database is disabled"}
     if run_lock.locked():
         return {"status": "skipped", "reason": "knowledge development cycle already running"}
     async with run_lock:
+        scoped_lock = f"kaims_knowledge_development_{hashlib.sha256(tenant_id.encode()).hexdigest()[:20]}"
         async with app.state.db_engine.connect() as connection:
-            acquired = await connection.scalar(text("SELECT GET_LOCK(:name, 0)"), {"name": lock_name})
+            acquired = await connection.scalar(text("SELECT GET_LOCK(:name, 0)"), {"name": scoped_lock})
             if int(acquired or 0) != 1:
                 return {"status": "skipped", "reason": "another replica owns the knowledge development lease"}
             try:
-                return await _analyze_locked(app, trigger)
+                return await _analyze_locked(app, trigger, tenant_id=tenant_id, application_scope=application_scope)
             finally:
-                await connection.execute(text("SELECT RELEASE_LOCK(:name)"), {"name": lock_name})
+                await connection.execute(text("SELECT RELEASE_LOCK(:name)"), {"name": scoped_lock})
 
 
 async def periodic_loop(app: FastAPI) -> None:
@@ -692,10 +703,10 @@ async def review_catalog_candidate(
 
 
 @app.post("/run")
-async def run_now() -> dict[str, Any]:
+async def run_now(request: RunRequest) -> dict[str, Any]:
     global last_result
     try:
-        last_result = await analyze_history(app, "manual")
+        last_result = await analyze_history(app, "manual", tenant_id=request.tenant_id, application_scope=request.application_scope)
     except Exception as exc:
         last_result = {"status": "failed", "error": str(exc)[:1000], "failed_at": datetime.now(timezone.utc).isoformat()}
     finally:
@@ -754,4 +765,4 @@ async def report(tenant_id: str = "default") -> dict[str, Any]:
         audits.append({"event_id": str(row.event_id), "action": row.action, "actor": row.actor, "resource_type": row.resource_type, "resource_id": row.resource_id, "occurred_at": _iso(row.occurred_at), "payload_sha256": row.payload_sha256, "hash_verified": hashlib.sha256(canonical.encode()).hexdigest() == row.payload_sha256})
     reviewed = sum(bool(row.reviewed) for row in outcomes)
     successful = sum(bool(row.successful) for row in outcomes)
-    return {"status": "ok", "summary": (await _load_state(app)) or last_result, "evidence_count": len(evidence), "outcome_summary": {"total": len(outcomes), "reviewed": reviewed, "successful": successful, "failed": len(outcomes) - successful, "success_rate": round(successful / len(outcomes), 4) if outcomes else None}, "patterns": [{"id": str(row.pattern_id), "service": row.service, "environment": row.environment, "issue_signature": row.issue_signature, "confidence": float(row.confidence), "analyzed_at": _iso(row.analyzed_at), "quality_gate": (row.analysis or {}).get("quality_gate", {})} for row in patterns], "drafts": [{"runbook_id": str(row.runbook_id), "version": row.version, "status": row.approval_status, "owner": row.owner, "risk_level": row.risk_level, "created_at": _iso(row.created_at), "content": row.content or {}, "quality_gate": (row.content or {}).get("knowledge_quality", {})} for row in drafts], "documents": [{"draft_id": str(row.draft_id), "document_kind": row.document_kind, "document_version": row.document_version, "source_ref": row.source_ref, "title": row.title, "status": row.status, "row_version": row.row_version, "metadata": row.metadata_payload or {}, "updated_at": _iso(row.updated_at)} for row in documents], "outcomes": [{"outcome_id": str(row.outcome_id), "incident_id": row.incident_id, "runbook_id": str(row.runbook_id), "runbook_version": row.runbook_version, "reviewed": row.reviewed, "successful": row.successful, "created_at": _iso(row.created_at)} for row in outcomes[:50]], "learning_audit": audits[:50], "recent_evidence": [{"incident_id": row.incident_id, "service": row.service, "environment": row.environment, "alert_type": row.alert_type, "reviewed": row.reviewed, "collected_at": _iso(row.collected_at)} for row in evidence[:20]]}
+    return {"status": "ok", "summary": (await _load_state(app)) or last_result, "evidence_count": len(evidence), "outcome_summary": {"total": len(outcomes), "reviewed": reviewed, "successful": successful, "failed": len(outcomes) - successful, "success_rate": round(successful / len(outcomes), 4) if outcomes else None}, "patterns": [{"id": str(row.pattern_id), "service": row.service, "environment": row.environment, "issue_signature": row.issue_signature, "confidence": float(row.confidence), "analyzed_at": _iso(row.analyzed_at), "quality_gate": (row.analysis or {}).get("quality_gate", {})} for row in patterns], "drafts": [{"runbook_id": str(row.runbook_id), "version": row.version, "status": row.approval_status, "owner": row.owner, "risk_level": row.risk_level, "created_at": _iso(row.created_at), "content": row.content or {}, "quality_gate": (row.content or {}).get("knowledge_quality", {})} for row in drafts], "documents": [{"draft_id": str(row.draft_id), "document_kind": row.document_kind, "document_version": row.document_version, "source_ref": row.source_ref, "title": row.title, "content": row.content, "content_checksum": row.content_checksum, "status": row.status, "row_version": row.row_version, "metadata": row.metadata_payload or {}, "updated_at": _iso(row.updated_at)} for row in documents], "outcomes": [{"outcome_id": str(row.outcome_id), "incident_id": row.incident_id, "runbook_id": str(row.runbook_id), "runbook_version": row.runbook_version, "reviewed": row.reviewed, "successful": row.successful, "created_at": _iso(row.created_at)} for row in outcomes[:50]], "learning_audit": audits[:50], "recent_evidence": [{"incident_id": row.incident_id, "service": row.service, "environment": row.environment, "alert_type": row.alert_type, "reviewed": row.reviewed, "collected_at": _iso(row.collected_at)} for row in evidence[:20]]}

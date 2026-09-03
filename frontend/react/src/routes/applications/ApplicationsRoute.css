@@ -1,0 +1,40 @@
+.applications-workspace { gap: 16px; }
+.applications-hero { display:flex; align-items:center;justify-content:space-between;gap:24px;padding:24px 26px;border:1px solid #cfe0f4;border-radius:18px;background:linear-gradient(125deg,#fff 0%,#f4f9ff 58%,#e8f5ff 100%);box-shadow:0 10px 30px rgba(24,74,130,.08); }
+.applications-hero h1 { margin:5px 0 6px;color:#152844;font-size:clamp(1.55rem,2.5vw,2.15rem);letter-spacing:-.035em; }
+.applications-hero p { max-width:720px;margin:0;color:#5c6f89; }
+.applications-hero-actions { display:flex;flex-wrap:wrap;justify-content:flex-end;gap:9px; }
+.applications-hero-actions button { display:inline-flex;align-items:center;gap:7px;white-space:nowrap; }
+.applications-insights > article { min-height:108px; }
+.applications-insights article > span:last-child { display:grid;gap:2px; }
+.applications-insights em { color:#78879a;font-size:.67rem;font-style:normal; }
+.applications-insights .route-insight-mark.is-ready { color:#087f5b;background:#e4f8ef; }
+.applications-insights .route-insight-mark.is-observed { color:#a15c00;background:#fff3d8; }
+.applications-workspace .route-data-panel { overflow:hidden;padding:0;border-radius:16px; }
+.applications-workspace .route-data-panel > .panel-head { padding:21px 22px 16px;border-bottom:1px solid #e2eaf4; }
+.applications-toolbar { display:flex;align-items:center;justify-content:space-between;gap:16px;padding:13px 18px;background:#f7faff;border-bottom:1px solid #dfe8f3; }
+.applications-toolbar label { display:flex;align-items:center;width:min(560px,100%);gap:9px;padding:0 12px;color:#61748e;border:1px solid #ccd9e9;border-radius:10px;background:#fff; }
+.applications-toolbar input { width:100%;min-height:40px;padding:0;border:0;outline:0;background:transparent; }
+.applications-toolbar > span { color:#697b92;font-size:.72rem;white-space:nowrap; }
+.applications-workspace .route-data-panel .table-wrap { margin:0;border:0;border-radius:0; }
+.applications-workspace .route-data-panel th { padding:11px 13px;background:#f0f5fb;color:#53677f;font-size:.66rem;letter-spacing:.045em;text-transform:uppercase; }
+.applications-workspace .route-data-panel td { padding:13px;vertical-align:middle; }
+.applications-workspace .route-data-panel tbody tr { transition:background-color .15s ease,box-shadow .15s ease; }
+.applications-workspace .route-data-panel tbody tr:hover { background:#f7fbff; }
+.applications-workspace .route-data-panel tbody tr.row-selected { background:#edf6ff;box-shadow:inset 3px 0 #2478db; }
+.application-name-button { display:flex;align-items:center;gap:10px;min-width:210px;padding:0;text-align:left;border:0;background:transparent;color:inherit;cursor:pointer; }
+.application-name-button:disabled { cursor:default;opacity:1; }
+.application-name-button > span:first-child { display:grid;width:34px;height:34px;flex:0 0 34px;place-items:center;color:#1769cf;border-radius:9px;background:#e8f2ff; }
+.application-name-button > span:last-child { display:grid;gap:2px;min-width:0; }
+.application-name-button strong { color:#152844;overflow-wrap:anywhere; }
+.application-name-button small { color:#7a899b;font-size:.64rem; }
+.application-empty { display:grid;justify-items:center;gap:6px;padding:34px;color:#728197;text-align:center; }
+.application-empty strong { color:#263c59; }
+.application-form-panel,.application-detail-panel { padding:22px;border-radius:16px;scroll-margin-top:90px; }
+.application-detail-panel > section { margin-top:16px;padding:18px;border:1px solid #dfe8f2;border-radius:13px;background:#fbfdff; }
+.application-detail-panel > section > h3 { margin:0 0 12px;color:#213854; }
+.application-detail-panel .project-stepper-panel { padding:20px; }
+@media (max-width:760px) { .applications-hero{align-items:flex-start;flex-direction:column;padding:20px}.applications-hero-actions{width:100%;justify-content:flex-start}.applications-toolbar{align-items:stretch;flex-direction:column}.applications-toolbar>span{white-space:normal} }
+:root[data-ui-theme="dark"] .applications-hero { border-color:#30445e;background:linear-gradient(125deg,#101d2e,#132840); }
+:root[data-ui-theme="dark"] .applications-hero h1,:root[data-ui-theme="dark"] .application-name-button strong,:root[data-ui-theme="dark"] .application-empty strong { color:#edf5ff; }
+:root[data-ui-theme="dark"] .applications-toolbar,:root[data-ui-theme="dark"] .application-detail-panel > section { border-color:#2c4058;background:#101d2e; }
+:root[data-ui-theme="dark"] .applications-toolbar label { border-color:#39506a;background:#132338; }

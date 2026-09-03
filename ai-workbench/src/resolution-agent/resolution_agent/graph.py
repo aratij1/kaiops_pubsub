@@ -848,7 +848,15 @@ class ResolutionIntelligenceAgent(BaseAgent):
             for row in context_evidence.get("rag", [])
             if isinstance(row, dict)
         ] if isinstance(context_evidence.get("rag"), list) else []
-        for source_name in ("logs", "code", "tickets", "telemetry", "database"):
+        # Context enrichment stores evidence by requirement category. Keep the
+        # legacy names, but also ingest every category produced by the current
+        # collector; otherwise successfully collected metrics/traces/topology
+        # are frozen into the snapshot yet invisible to RCA grounding.
+        for source_name in (
+            "logs", "code", "tickets", "telemetry", "database",
+            "metrics", "traces", "topology", "changes", "change", "runbook",
+            "dependencies", "deployment", "configuration",
+        ):
             rows = context_evidence.get(source_name)
             if isinstance(rows, list):
                 raw_evidence.extend(row for row in rows if isinstance(row, dict))
@@ -868,20 +876,23 @@ class ResolutionIntelligenceAgent(BaseAgent):
         for item in raw_evidence:
             if not isinstance(item, dict):
                 continue
-            evidence_text = self._norm(
-                " ".join(
-                    str(item.get(key) or "")
-                    for key in ("evidence_id", "source", "uri", "path", "snippet", "service")
+            content = item.get("content") if isinstance(item.get("content"), dict) else {}
+            content_text = json.dumps(content, sort_keys=True, default=str)[:2000] if content else ""
+            evidence_text = self._norm(" ".join(
+                str(item.get(key) or "")
+                for key in (
+                    "evidence_id", "source", "source_id", "connector", "category",
+                    "uri", "path", "source_reference", "snippet", "summary", "service", "resource",
                 )
-            )
+            ) + " " + content_text)
             if service_terms and not any(term in evidence_text for term in service_terms):
                 continue
             relevant_evidence.append(
                 {
                     "evidence_id": item.get("evidence_id"),
-                    "source": item.get("source"),
-                    "uri": item.get("uri") or item.get("path"),
-                    "snippet": str(item.get("snippet") or "")[:500],
+                    "source": item.get("source") or item.get("connector") or item.get("category"),
+                    "uri": item.get("uri") or item.get("path") or item.get("source_reference"),
+                    "snippet": str(item.get("snippet") or item.get("summary") or content_text)[:500],
                     "diagnostic_signals": item.get("diagnostic_signals", []),
                     "signal_counts": item.get("signal_counts", {}),
                     "supporting_evidence": item.get("supporting_evidence", []),

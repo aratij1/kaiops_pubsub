@@ -618,6 +618,7 @@ class DiscoveryMCPConnector(BaseConnector):
         reasons: list[str] = []
 
         requirement_category = str(metadata.get("context_requirement_category") or "").strip().lower()
+        requested_collection_tool = str(metadata.get("context_collection_tool") or "").strip()
         targeted_tools = {
             "metrics": "telemetry.search",
             "logs": "logs.search",
@@ -631,6 +632,8 @@ class DiscoveryMCPConnector(BaseConnector):
             "runbook": "runbooks.search",
             "validation": "telemetry.search",
         }
+        if requested_collection_tool in cls._DISCOVERY_TOOL_ORDER:
+            return [requested_collection_tool], ["evidence_requirement"]
         if requirement_category in targeted_tools:
             return [targeted_tools[requirement_category]], ["evidence_requirement"]
 

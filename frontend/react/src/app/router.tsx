@@ -1,5 +1,5 @@
 import { Suspense, type ComponentType } from "react";
-import { createBrowserRouter, Navigate } from "react-router-dom";
+import { createBrowserRouter, Navigate, useParams } from "react-router-dom";
 
 import { LegacyApplicationShell } from "./LegacyApplicationShell";
 import { LEGACY_REDIRECTS, NAVIGATION_ITEMS, type NavigationId } from "./navigation";
@@ -9,7 +9,6 @@ import { RouteErrorBoundary } from "./RouteErrorBoundary";
 const DashboardRoute = resilientLazy(() => import("../routes/dashboard/DashboardRoute"));
 const AlertsRoute = resilientLazy(() => import("../routes/alerts/AlertsRoute"));
 const IncidentsRoute = resilientLazy(() => import("../routes/incidents/IncidentsRoute"));
-const IncidentCommandRoute = resilientLazy(() => import("../features/incidents/IncidentCommand"));
 const ApprovalsRoute = resilientLazy(() => import("../routes/approvals/ApprovalsRoute"));
 const CopilotRoute = resilientLazy(() => import("../routes/copilot/CopilotRoute"));
 const AgentFlowRoute = resilientLazy(() => import("../routes/agent-flow/AgentFlowRoute"));
@@ -34,6 +33,12 @@ function routeElement(RouteComponent: ComponentType) {
       <RouteComponent />
     </Suspense>
   );
+}
+
+function RetiredIncidentDetailRedirect() {
+  const { incidentId = "" } = useParams();
+  const query = incidentId ? `?incident_id=${encodeURIComponent(incidentId)}` : "";
+  return <Navigate to={`/incidents${query}`} replace />;
 }
 
 const ROUTE_COMPONENTS: Readonly<Record<NavigationId, ComponentType>> = {
@@ -65,8 +70,8 @@ export const router = createBrowserRouter([
     element: <LegacyApplicationShell />,
     errorElement: <RouteErrorBoundary />,
     children: [
-      { path: "/incidents/:incidentId", element: routeElement(IncidentCommandRoute) },
-      { path: "/incidents/*", element: routeElement(IncidentCommandRoute) },
+      { path: "/incidents/:incidentId", element: <RetiredIncidentDetailRedirect /> },
+      { path: "/incidents/*", element: <Navigate to="/incidents" replace /> },
       { path: "/applications/:applicationId", element: routeElement(ApplicationsRoute) },
       ...NAVIGATION_ITEMS.map((item) => ({ path: item.path, element: routeElement(ROUTE_COMPONENTS[item.id]) })),
       ...LEGACY_REDIRECTS.map((redirect) => ({ path: redirect.from, element: <Navigate to={redirect.to} replace /> })),

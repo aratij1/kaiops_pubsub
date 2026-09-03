@@ -726,6 +726,38 @@ def build_evidence_requirements(
     return requirements
 
 
+def initial_causal_collection_gaps() -> list[dict[str, Any]]:
+    """Return the mandatory first-pass observations used to test causality.
+
+    These are deliberately observations, not prerequisites for claiming that an
+    incident exists.  A missing source remains an explicit gap and never becomes
+    fabricated evidence.
+    """
+    return [
+        {
+            "category": "traces",
+            "question": "Collect fresh distributed traces for the affected service and incident window.",
+            "reason": "Identify the slow or failing span and its upstream-to-downstream causal path.",
+            "priority": "critical",
+            "candidate_connectors": ["discovery-mcp", "jaeger"],
+        },
+        {
+            "category": "topology",
+            "question": "Collect fresh dependency health telemetry for the affected service.",
+            "reason": "Determine whether an unhealthy downstream dependency explains the observed signal.",
+            "priority": "critical",
+            "candidate_connectors": ["discovery-mcp", "cmdb", "kubernetes"],
+        },
+        {
+            "category": "topology",
+            "question": "Collect the current runtime topology for the affected service.",
+            "reason": "Bind the signal and trace path to the exact workloads and dependencies in scope.",
+            "priority": "high",
+            "candidate_connectors": ["discovery-mcp", "cmdb", "kubernetes"],
+        },
+    ]
+
+
 class HitlJiraRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

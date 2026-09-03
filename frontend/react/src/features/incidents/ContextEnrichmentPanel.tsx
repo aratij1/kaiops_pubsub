@@ -207,7 +207,7 @@ export default function ContextEnrichmentPanel({ incidentId, alertId, accessToke
   const card = (item: Requirement, historical = false) => {
     const request = item.active_human_request; const job = item.latest_job;
     const complete = ["collected", "answered", "satisfied"].includes(item.status.toLowerCase());
-    const status = request?.status || job?.status || item.status; const failure = actionableFailure(item);
+    const status = job?.status || request?.status || item.status; const failure = actionableFailure(item);
     const recordedAt = item.updated_at || item.created_at;
     return <article key={item.requirement_id} className={historical ? "is-historical" : undefined}>
       <div className="context-enrichment-item-heading">
@@ -245,7 +245,7 @@ export default function ContextEnrichmentPanel({ incidentId, alertId, accessToke
 
   return <section ref={panelRef} className="context-enrichment-panel" aria-labelledby="context-enrichment-title">
     <div className="sr-only" aria-live="polite">{announcement}</div>
-    <header><div><span className="discovery-eyebrow">Evidence workbench</span><h3 id="context-enrichment-title">Close the evidence gap</h3><p>See exactly what was collected, what the current RCA used, and what needs attention next.</p></div><button ref={refreshButtonRef} type="button" className="button-secondary" onClick={() => void load(true)} disabled={loading}><RefreshCw size={15} className={loading ? "is-spinning" : ""} /> Refresh evidence</button></header>
+    <header><div><span className="discovery-eyebrow">Missing evidence</span><h3 id="context-enrichment-title">Automated evidence collection</h3><p>KaiMS searches fresh telemetry, traces, topology, changes, and governed knowledge first. Add a verified observation only when automation cannot establish the fact.</p></div><button ref={refreshButtonRef} type="button" className="button-secondary" onClick={() => void load(true)} disabled={loading}><RefreshCw size={15} className={loading ? "is-spinning" : ""} /> Reload status</button></header>
     {announcement ? <p className="context-enrichment-action" role="status">{announcement}</p> : null}
     {state ? <section className="context-evidence-ledger" aria-labelledby="evidence-ledger-title">
       <div className="context-evidence-ledger-heading"><div><span>Evidence accounting</span><h4 id="evidence-ledger-title">Current RCA evidence funnel</h4></div><strong>{lifecycleLabel(state.lifecycle_state, latestContextCount)}</strong></div>
@@ -262,10 +262,10 @@ export default function ContextEnrichmentPanel({ incidentId, alertId, accessToke
     {!alertId && declaredGaps.length ? <p className="context-enrichment-error" role="status"><CircleAlert size={17} />Canonical alert binding is missing. Backend orchestration will regenerate analysis after a governed snapshot is committed.</p> : null}
     {!error && state && !current.length ? <p className="context-enrichment-empty">{declaredGaps.length ? "Evidence requirements have not been projected yet. KaiMS will continue monitoring this incident." : "No unresolved evidence gaps are declared."}</p> : null}
     {current.length ? <section className="context-enrichment-current" aria-labelledby="current-evidence-title"><div className="context-enrichment-group-heading"><div><span>Active evidence work</span><h4 id="current-evidence-title">{rcaVersion ? `Current RCA · v${rcaVersion}` : "Current investigation"}</h4></div><small>{current.length} requirement{current.length === 1 ? "" : "s"}</small></div>
-      <div className="context-enrichment-tabs" role="tablist" aria-label="Evidence documents">{current.map((item) => <button key={item.requirement_id} type="button" role="tab" aria-selected={item.requirement_id === activeRequirementId} onClick={() => {
+      <div className="context-enrichment-tabs" role="tablist" aria-label="Evidence collection tasks">{current.map((item) => <button key={item.requirement_id} type="button" role="tab" aria-selected={item.requirement_id === activeRequirementId} onClick={() => {
         setActiveRequirementId(item.requirement_id);
         setExpandedRequirements((values) => new Set([...values, item.requirement_id]));
-      }}><strong>{item.category.replaceAll("_", " ")}</strong><span>{(item.active_human_request?.status || item.latest_job?.status || item.status).replaceAll("_", " ")}</span></button>)}</div>
+      }}><strong>{item.category.replaceAll("_", " ")}</strong><span>{(item.latest_job?.status || item.active_human_request?.status || item.status).replaceAll("_", " ")}</span></button>)}</div>
       <div className="context-enrichment-list">{current.filter((item) => item.requirement_id === activeRequirementId).map((item) => card(item))}</div>
     </section> : null}
     {history.length ? <details className="context-enrichment-history"><summary>Previous RCA versions <span>{history.length} archived requirement{history.length === 1 ? "" : "s"}</span></summary><p>Retained for audit history. Responses can only be submitted against active backend-projected work.</p><div className="context-enrichment-list">{history.map((item) => card(item, true))}</div></details> : null}

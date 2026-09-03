@@ -6504,6 +6504,47 @@ class IncidentRepository:
             "record_type": str(record_type or "all").strip().lower(),
             "severity": str(severity or "").strip().lower(),
         }
+        project_aliases = {normalized["project_id"]} if normalized["project_id"] else set()
+        # KaiMS is the built-in platform workspace, while its canonical
+        # incident ownership records use deployable component identities.
+        # Keep this mapping explicit so project scoping remains fail-closed and
+        # never pulls customer applications such as Online Boutique.
+        if normalized["project_id"] in {"kaims", "kaiops", "kaims-core", "kaiops-core"}:
+            project_aliases.update({
+                "kaims", "kaiops", "api-gateway", "kaiops-platform", "mysql",
+                "monitoring-adapter", "context-agent", "resolution-agent",
+                "remediation-engine", "orchestrator", "approval-service",
+                "closure-service", "discovery-mcp", "rabbitmq",
+            })
+        if normalized["project_id"]:
+            application = (
+                await self.session.execute(
+                    select(ApplicationRecord).where(
+                        ApplicationRecord.tenant_id == tenant_id,
+                        func.lower(ApplicationRecord.name) == normalized["project_id"],
+                    ).limit(1)
+                )
+            ).scalar_one_or_none()
+            if application is not None:
+                payload = application.payload if isinstance(application.payload, dict) else {}
+                labels = payload.get("labels") if isinstance(payload.get("labels"), dict) else {}
+                project_aliases.update(
+                    str(value or "").strip().lower()
+                    for value in (
+                        application.name,
+                        application.namespace,
+                        payload.get("project_id"),
+                        payload.get("project"),
+                        payload.get("project_name"),
+                        payload.get("application"),
+                        labels.get("project_id"),
+                        labels.get("project"),
+                        labels.get("project_name"),
+                        labels.get("application"),
+                        labels.get("service"),
+                    )
+                    if str(value or "").strip()
+                )
         views = ("all", "needs_me", "kai_handling", "critical", "watching", "resolved")
         if normalized["inbox_view"] not in views:
             raise ValueError("Unsupported inbox view")
@@ -6549,9 +6590,14 @@ class IncidentRepository:
             .group_by(IncidentCorrelationOwnershipRecord.correlation_family_id)
             .subquery()
         )
+        incident_severity = func.lower(func.coalesce(
+            IncidentProjectionRecord.severity,
+            IncidentRecord.severity,
+            "",
+        ))
         incident_score = case(
             (IncidentCorrelationOwnershipRecord.lifecycle_state.in_(attention), 200), else_=100,
-        ) + case((func.lower(func.coalesce(IncidentProjectionRecord.severity, "")) == "critical", 80), else_=0)
+        ) + case((incident_severity == "critical", 80), else_=0)
         incident_query = (
             select(
                 literal("incident").label("record_type"),
@@ -6559,7 +6605,7 @@ class IncidentRepository:
                 IncidentCorrelationOwnershipRecord.last_seen_at.label("observed_at"),
                 incident_score.label("score"),
                 IncidentCorrelationOwnershipRecord.lifecycle_state.label("row_status"),
-                func.lower(func.coalesce(IncidentProjectionRecord.severity, "")).label("row_severity"),
+                incident_severity.label("row_severity"),
             )
             .join(latest_generation, and_(
                 latest_generation.c.family_id == IncidentCorrelationOwnershipRecord.correlation_family_id,
@@ -6569,22 +6615,31 @@ class IncidentRepository:
                 IncidentProjectionRecord.incident_id == IncidentCorrelationOwnershipRecord.canonical_incident_id,
                 IncidentProjectionRecord.tenant_id == tenant_id,
             ))
+            .outerjoin(IncidentRecord, and_(
+                IncidentRecord.id == IncidentCorrelationOwnershipRecord.canonical_incident_id,
+                IncidentRecord.tenant_id == tenant_id,
+            ))
             .where(
                 IncidentCorrelationOwnershipRecord.tenant_id == tenant_id,
                 IncidentCorrelationOwnershipRecord.last_seen_at <= snapshot,
                 # The unified inbox is an operator action queue, not an alert
                 # history. Warning/info incidents remain available by direct
                 # incident lookup and in Live Alerts, but are not admitted here.
-                func.lower(func.coalesce(IncidentProjectionRecord.severity, "")).in_(
+                incident_severity.in_(
                     ("high", "critical", "p1", "p2", "sev1", "sev2")
                 ),
             )
         )
         if normalized["project_id"]:
+            platform_component = and_(
+                normalized["project_id"] in {"kaims", "kaiops", "kaims-core", "kaiops-core"},
+                func.lower(IncidentCorrelationOwnershipRecord.service).like("kaiops-%"),
+            )
             incident_query = incident_query.where(
                 or_(
-                    func.lower(IncidentCorrelationOwnershipRecord.project_id) == normalized["project_id"],
-                    func.lower(IncidentCorrelationOwnershipRecord.service) == normalized["project_id"],
+                    func.lower(IncidentCorrelationOwnershipRecord.project_id).in_(project_aliases),
+                    func.lower(IncidentCorrelationOwnershipRecord.service).in_(project_aliases),
+                    platform_component,
                 )
             )
         if normalized["service"]:
@@ -6597,7 +6652,7 @@ class IncidentRepository:
             )
         if normalized["severity"]:
             incident_query = incident_query.where(
-                func.lower(IncidentProjectionRecord.severity) == normalized["severity"]
+                incident_severity == normalized["severity"]
             )
         projection_filters = (
             ("risk_tier", IncidentProjectionRecord.risk_tier),
@@ -6653,8 +6708,8 @@ class IncidentRepository:
         )
         if normalized["project_id"]:
             alert_query = alert_query.where(or_(
-                alert_project == normalized["project_id"],
-                alert_service_scope == normalized["project_id"],
+                alert_project.in_(project_aliases),
+                alert_service_scope.in_(project_aliases),
             ))
         if normalized["service"]:
             alert_query = alert_query.where(func.lower(AlertRecord.service) == normalized["service"])
@@ -6735,6 +6790,15 @@ class IncidentRepository:
             incident_ids=incident_ids,
         )
         projection_by_id = {str(row.get("incident_id") or row.get("id")): row for row in projections}
+        incident_records = (
+            (await self.session.execute(select(IncidentRecord).where(
+                IncidentRecord.tenant_id == tenant_id,
+                IncidentRecord.id.in_(incident_ids),
+            ))).scalars().all()
+            if incident_ids
+            else []
+        )
+        incident_by_id = {str(row.id): row for row in incident_records}
         alert_rows = (
             (await self.session.execute(select(AlertRecord).where(AlertRecord.id.in_(alert_ids)))).scalars().all()
             if alert_ids
@@ -6763,6 +6827,24 @@ class IncidentRepository:
             )
             row.setdefault("id", record_id)
             if item["record_type"] == "incident":
+                canonical = incident_by_id.get(record_id)
+                canonical_payload = dict(canonical.payload or {}) if canonical is not None and isinstance(canonical.payload, dict) else {}
+                if canonical is not None:
+                    row.setdefault("service", canonical.service)
+                    row.setdefault("environment", canonical.environment)
+                    row.setdefault("severity", canonical.severity)
+                    row.setdefault("title", canonical.title)
+                    row.setdefault("ticket_id", canonical.ticket_id)
+                    source_alert = canonical_payload.get("source_alert") if isinstance(canonical_payload.get("source_alert"), dict) else {}
+                    canonical_alert_id = (
+                        canonical_payload.get("alert_id")
+                        or canonical_payload.get("source_alert_id")
+                        or source_alert.get("alert_id")
+                        or source_alert.get("id")
+                    )
+                    if canonical_alert_id:
+                        row.setdefault("alert_id", str(canonical_alert_id))
+                    row.setdefault("source_alert", source_alert or None)
                 row.update({"incident_id": record_id, "status": item["row_status"]})
             rows.append(
                 {
@@ -8825,7 +8907,17 @@ class ContextEnrichmentRepository(EvaluationRepository):
                     ),
                 ),
             ),
-        ).order_by(ContextEnrichmentJobRecord.available_at.asc()).limit(max(1, min(limit, 50)))
+        ).order_by(
+            # New work should visibly start before the worker spends its whole
+            # batch draining historical retries. Retry work remains durable and
+            # is processed as soon as the scheduled queue is empty.
+            case(
+                (ContextEnrichmentJobRecord.status == "scheduled", 0),
+                (ContextEnrichmentJobRecord.status == "collecting", 1),
+                else_=2,
+            ),
+            ContextEnrichmentJobRecord.available_at.asc(),
+        ).limit(max(1, min(limit, 50)))
         if self.session.bind and self.session.bind.dialect.name != "sqlite":
             statement = statement.with_for_update(skip_locked=True)
         rows = (await self.session.execute(statement)).scalars().all()
@@ -8869,14 +8961,20 @@ class ContextEnrichmentRepository(EvaluationRepository):
         ).with_for_update())).scalar_one_or_none()
         if requirement is None or requirement.tenant_id != job.tenant_id:
             raise RuntimeError("enrichment requirement binding is invalid")
-        latest_version = (await self.session.execute(select(func.max(
-            ContextEvidenceRequirementRecord.rca_version,
-        )).where(
+        # RCA versions commonly advance while a connector is collecting. The
+        # observation remains valid for the same incident and equivalent gap;
+        # rejecting it here caused successful telemetry calls to loop through
+        # retry/dead-letter while successive RCAs kept recreating the gap.
+        # Lock the newest equivalent requirement and satisfy both revisions
+        # after all tenant/incident/provenance checks below have passed.
+        latest_equivalent = (await self.session.execute(select(
+            ContextEvidenceRequirementRecord,
+        ).where(
             ContextEvidenceRequirementRecord.tenant_id == job.tenant_id,
             ContextEvidenceRequirementRecord.incident_id == job.incident_id,
-        ))).scalar_one_or_none()
-        if latest_version is not None and requirement.rca_version != int(latest_version):
-            raise RuntimeError("STALE_EVIDENCE_REQUIREMENT")
+            ContextEvidenceRequirementRecord.category == requirement.category,
+            ContextEvidenceRequirementRecord.question == requirement.question,
+        ).order_by(ContextEvidenceRequirementRecord.rca_version.desc()).limit(1).with_for_update())).scalar_one_or_none()
         attempt_key = f"{job.job_id}:{job.attempt_count}"
         accepted_ids: list[str] = []
         accepted_payloads: list[dict[str, Any]] = []
@@ -8999,6 +9097,13 @@ class ContextEnrichmentRepository(EvaluationRepository):
         requirement.status = "collected"
         requirement.evidence_ids = evidence_ids
         requirement.version += 1
+        if latest_equivalent is not None and latest_equivalent.requirement_id != requirement.requirement_id:
+            latest_equivalent.status = "collected"
+            latest_equivalent.evidence_ids = list(dict.fromkeys([
+                *(latest_equivalent.evidence_ids or []), *evidence_ids,
+            ]))
+            latest_equivalent.retry_after = None
+            latest_equivalent.version += 1
         job.status = "collected"; job.last_error = None; job.version += 1
         job.lease_owner = None; job.lease_expires_at = None
         await self.session.flush()

@@ -451,7 +451,7 @@ export default function RcaPanel({
 
       {rcaDetailView === "simple" ? <details className="investigation-section investigation-attention" open={reviewRequired}>
         <summary><span><strong>What needs attention</strong><small>{reviewRequired ? `${investigationChecks.filter((check) => !check.passed).length} investigation checks need work` : "All investigation checks passed"}</small></span><b>Show or hide</b></summary>
-        <div className="investigation-section-body"><DecisionReadinessPanel title="Investigation readiness" checks={investigationChecks} eligibleLabel="Evidence ready for operator review" onReviewEvidence={() => setReviewEvidenceRequest((value) => value + 1)} />
+        <div className="investigation-section-body"><DecisionReadinessPanel title="Investigation readiness" checks={investigationChecks} eligibleLabel="Evidence ready for operator review" onReviewEvidence={() => { onSetRcaAnalysisMode("fresh"); void onRerunRca("fresh"); setReviewEvidenceRequest((value) => value + 1); }} />
 
       {resolutionBinding.incident_id ? <ContextEnrichmentPanel
         incidentId={resolutionBinding.incident_id}

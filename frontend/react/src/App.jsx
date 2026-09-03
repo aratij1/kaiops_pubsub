@@ -9,7 +9,7 @@ import { RouteRuntimeProvider } from "./app/routeRuntime";
 import { projectIdentityFromAlert } from "./domain/projectIdentity";
 import { canHydrateCompletedAnalysis } from "./domain/analysisVersion";
 import { analysisFailureMessage, analysisRequestOutcome } from "./domain/analysisRequestStatus";
-import { durableIncidentPath, effectiveExecutionStatus, effectiveIncidentStatus, executionProcessPresentation, incidentStatusLabel } from "./domain/incidentStatus";
+import { effectiveExecutionStatus, effectiveIncidentStatus, executionProcessPresentation, incidentStatusLabel } from "./domain/incidentStatus";
 import { resolveResolutionControl } from "./domain/resolutionControl";
 import { incidentDraftHasSubstantiveContent, simpleIncidentReport } from "./domain/incidentReport";
 import { approvalFlowFromPayload, approvalFlowId, approvalIncidentId, approvalRecommendationFromPayload, approvalRecommendationId, approvalTraceId } from "./domain/approvalContext";
@@ -454,6 +454,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   const [selectedApprovalIncidentId, setSelectedApprovalIncidentId] = useState("");
   const [selectedAlertData, setSelectedAlertData] = useState({ loading: false, payload: null, error: "", alertId: "" });
   const [selectedAlertRegeneration, setSelectedAlertRegeneration] = useState({ loading: false, message: "", error: "" });
+  const [selectedCatalogStatus, setSelectedCatalogStatus] = useState({ loading: false, incidentId: "", data: null, error: "" });
   const [rcaAnalysisMode, setRcaAnalysisMode] = useState("smart");
   const [aiFeedbackState, setAiFeedbackState] = useState({ loading: false, decision: "", message: "", error: "" });
   const [selectedAlertDocumentLinks, setSelectedAlertDocumentLinks] = useState({
@@ -2236,6 +2237,9 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       } catch (_error) {
         // Analysis completion remains authoritative if catalog status is
         // temporarily unavailable; the scheduled learner provides recovery.
+      }
+      if (catalogStatus) {
+        setSelectedCatalogStatus({ loading: false, incidentId: acceptedIncidentId, data: catalogStatus, error: "" });
       }
       const catalogProgress = catalogStatus?.candidate_stage
         ? ` Catalog: ${String(catalogStatus.candidate_stage).replaceAll("_", " ")} with ${Number(catalogStatus.evidence_sources || 0)} independent source(s).${catalogStatus.execution_eligible ? " Execution eligible." : " Safety review remains required."}`
@@ -5183,11 +5187,18 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   }, [adminSession.accessToken, activeTab, adminWorkspace]);
 
   useEffect(() => {
-    if (monitorApplications.includes(applicationToMonitor)) {
+    const canonical = monitorApplications.find(
+      (item) => item.toLowerCase() === String(applicationToMonitor || "").trim().toLowerCase()
+    );
+    if (canonical) {
+      if (canonical !== applicationToMonitor) setApplicationToMonitor(canonical);
       return;
     }
-    setApplicationToMonitor(monitorApplications[0] || REAL_USE_CASE_SCOPE);
-  }, [alerts.rows, monitorApplications, applicationToMonitor]);
+    // Do not silently cross a tenant/project boundary while the authenticated
+    // registry is refreshing. loadMonitorApplications owns explicit fallback
+    // selection once its authoritative response is available.
+    if (!adminSession.accessToken) setApplicationToMonitor(monitorApplications[0] || "");
+  }, [adminSession.accessToken, monitorApplications, applicationToMonitor]);
 
   useEffect(() => {
     if (!adminSession.accessToken || activeTab !== "admin") {
@@ -5824,6 +5835,24 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       || ""
     ).trim();
   }, [selectedAlertWorkflow, selectedAlertRow]);
+
+  useEffect(() => {
+    if (!selectedIncidentId || !adminSession?.accessToken) {
+      setSelectedCatalogStatus({ loading: false, incidentId: selectedIncidentId, data: null, error: "" });
+      return undefined;
+    }
+    const controller = new AbortController();
+    setSelectedCatalogStatus({ loading: true, incidentId: selectedIncidentId, data: null, error: "" });
+    fetchJson(
+      `/api-gateway/knowledge-development/incidents/${encodeURIComponent(selectedIncidentId)}/catalog-status`,
+      authenticatedOptions({ signal: controller.signal, timeoutMs: 15000, maxAttempts: 1, staleTimeMs: 0 }),
+    ).then((response) => {
+      if (!controller.signal.aborted) setSelectedCatalogStatus({ loading: false, incidentId: selectedIncidentId, data: unwrap(response), error: "" });
+    }).catch((error) => {
+      if (!controller.signal.aborted) setSelectedCatalogStatus({ loading: false, incidentId: selectedIncidentId, data: null, error: String(error?.message || error) });
+    });
+    return () => controller.abort();
+  }, [selectedIncidentId, adminSession?.accessToken, selectedAlertData.payload]);
 
   const selectedIncidentMetadataRow = useMemo(() => {
     if (!selectedIncidentId) {
@@ -6479,6 +6508,9 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   const executionEndpointValid = !executionEndpoint || /^https?:\/\/[^\s/$.?#].[^\s]*$/i.test(executionEndpoint);
   const jenkinsExecutorSelected = remediationPlanEditor.executor_type === "jenkins" || remediationPlanEditor.connection_type === "jenkins";
   const liveExecutionPlanAvailable = executionPlanLines.length > 0 && !executionIsReadOnly;
+  const catalogStage = String(selectedCatalogStatus.data?.candidate_stage || "").trim().toLowerCase();
+  const catalogCandidateAvailable = ["diagnostic_candidate", "resolution_candidate"].includes(catalogStage);
+  const catalogReviewRequired = catalogCandidateAvailable && !selectedCatalogStatus.data?.execution_eligible;
   const executionConfirmationPhrase = `EXECUTE ${String(selectedGovernedExecutionTarget || "GOVERNED-TARGET").toUpperCase()}`;
   const executionConfirmationValid = !dangerousProductionAction || executionConfirmationText.trim() === executionConfirmationPhrase;
 
@@ -10173,6 +10205,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
             },
             copilot: {
               isAdministrator,
+              role: currentRole,
               projectCount: onboardingState.rows.length,
               alertDocumentCount: ragDocs.rows.length,
               userCount: adminUsers.rows.length,
@@ -10264,10 +10297,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
               query: ingestionStreamQuery,
               refresh: () => { loadRecentAlerts({ background: true }); loadLandingPadRecent(); },
               open: openAlertDetails,
-              openIncident: (row) => {
-                const path = durableIncidentPath(row);
-                if (path && typeof onNavigatePath === "function") onNavigatePath(path);
-              },
+              openIncident: (row) => openAlertDetailsFromIncident(row, "rca"),
               togglePaused: () => setIngestionStreamPaused((current) => !current),
               setSection: setIngestionStreamSection,
               setView: setIngestionStreamView,
@@ -10310,7 +10340,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
               incidents: monitorScopedIncidentMetadata,
               recentlyClosed: executiveClosedSummary.recentRows,
               application: applicationToMonitor,
-              openIncident: (row) => { const path = durableIncidentPath(row); if (path && typeof onNavigatePath === "function") onNavigatePath(path); },
+              openIncident: (row) => openAlertDetailsFromIncident(row, "rca"),
             },
             approvals: {
               guidanceQuery,
@@ -11538,14 +11568,14 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                         </details> : null}
                         <section className="execution-guided-flow" aria-labelledby="guided-execution-heading">
                           <div className="execution-guided-head"><div><span className="discovery-eyebrow">Guarded execution</span><h3 id="guided-execution-heading">{executionAutoCloses ? "Watch-only completion" : manualEscalationRecorded ? "Manual remediation requested" : "Complete the current step"}</h3><p>{executionAutoCloses ? "This alert is explicitly watch-only. KaiOps is recording the observation and closing it without execution." : manualEscalationRecorded ? "Automation remains safely locked while an operator handles the incident manually." : executionActivationMessage}</p></div><span className={`pill ${executionAllowed || manualEscalationRecorded || (executionAutoCloses && ["closed", "resolved"].includes(selectedCanonicalIncidentStatus)) ? "pill-success" : "pill-warning"}`}>{executionAutoCloses ? (["closed", "resolved"].includes(selectedCanonicalIncidentStatus) ? "Closed" : "Auto-closing") : manualEscalationRecorded ? "Escalated" : executionAllowed ? "Ready" : !cockpitApprovalAccepted ? "Decision required" : executionSetupBlocked || executionCapabilityBlocked ? "Blocked" : "In progress"}</span></div>
-                          {executionAutoCloses ? <ol className="execution-stepper" aria-label="Watch-only completion progress"><li className={["closed", "resolved"].includes(selectedCanonicalIncidentStatus) ? "is-complete" : "is-current"}><span>✓</span><div><strong>Record observation and close</strong><small>{["closed", "resolved"].includes(selectedCanonicalIncidentStatus) ? "Completed" : "In progress"}</small></div></li></ol> : !liveExecutionPlanAvailable ? <ol className="execution-stepper" aria-label="Automated plan development"><li className="is-current"><span>1</span><div><strong>Collect and verify evidence</strong><small>Automated evidence work active</small></div></li><li><span>2</span><div><strong>Compile governed plan</strong><small>Waiting for sufficient evidence</small></div></li><li><span>3</span><div><strong>Review and execute</strong><small>Safety locked</small></div></li></ol> : <ol className="execution-stepper" aria-label="Execution progress">
+                          {executionAutoCloses ? <ol className="execution-stepper" aria-label="Watch-only completion progress"><li className={["closed", "resolved"].includes(selectedCanonicalIncidentStatus) ? "is-complete" : "is-current"}><span>✓</span><div><strong>Record observation and close</strong><small>{["closed", "resolved"].includes(selectedCanonicalIncidentStatus) ? "Completed" : "In progress"}</small></div></li></ol> : !liveExecutionPlanAvailable ? <ol className="execution-stepper" aria-label="Automated plan development"><li className={catalogCandidateAvailable ? "is-complete" : "is-current"}><span>{catalogCandidateAvailable ? "✓" : "1"}</span><div><strong>Collect and verify evidence</strong><small>{catalogCandidateAvailable ? `${Number(selectedCatalogStatus.data?.evidence_sources || 0)} independent sources collected` : "Automated evidence work active"}</small></div></li><li className={catalogReviewRequired ? "is-current" : ""}><span>2</span><div><strong>Compile governed plan</strong><small>{catalogReviewRequired ? "Candidate ready for catalog review" : "Waiting for sufficient evidence"}</small></div></li><li><span>3</span><div><strong>Review and execute</strong><small>Safety locked</small></div></li></ol> : <ol className="execution-stepper" aria-label="Execution progress">
                             <li className={cockpitApprovalAccepted ? "is-complete" : "is-current"}><span>1</span><div><strong>Approve</strong><small>{cockpitApprovalAccepted ? "Recorded" : "Pending"}</small></div></li>
                             <li className={cockpitApprovalAccepted && executionConfirmationValid ? "is-complete" : cockpitApprovalAccepted ? "is-current" : ""}><span>2</span><div><strong>Confirm</strong><small>{cockpitApprovalAccepted && executionConfirmationValid ? "Complete" : "Pending"}</small></div></li>
                             <li className={remediationExecutionState.loading || executionAllowed ? "is-current" : ""}><span>3</span><div><strong>Execute</strong><small>{remediationExecutionState.loading ? "Running" : executionAllowed ? "Ready" : executionCapabilityBlocked ? "Executor required" : "Locked"}</small></div></li>
                           </ol>}
                           <div className="execution-current-step">
                             {manualEscalationRecorded ? <div className="execution-step-form" role="status"><div><strong>Escalation recorded</strong><p>The incident remains open for manual remediation. Automated execution stays locked because no reviewed corrective action or recovery check is available.</p></div><button type="button" className="button-secondary" onClick={regenerateSelectedAlertAnalysis} disabled={selectedAlertRegeneration.loading}>{selectedAlertRegeneration.loading ? "Regenerating…" : "Generate a corrective plan instead"}</button></div> : <>
-                            {executionAutoCloses ? <div className="execution-step-form"><div><strong>{["closed", "resolved"].includes(selectedCanonicalIncidentStatus) ? "Watch-only observation recorded — incident closed" : "Automatic watch-only closure in progress"}</strong><p>No approval or execution is required because the resolution explicitly classified this alert as watch-only.</p></div></div> : !liveExecutionPlanAvailable ? <div className="execution-step-form"><div><strong>KaiMS is developing the governed resolution plan</strong><p>Evidence collection and runbook development started automatically. Execution stays locked until the plan contains a verified target, corrective action, recovery validation, rollback, and the required approval.</p>{selectedAlertRegeneration.message ? <p role="status">{selectedAlertRegeneration.message}</p> : null}{selectedAlertRegeneration.error ? <p className="error" role="alert">{selectedAlertRegeneration.error}</p> : null}</div><div className="button-row"><button type="button" className="button-primary" onClick={regenerateSelectedAlertAnalysis} disabled={selectedAlertRegeneration.loading}>{selectedAlertRegeneration.loading ? "Refreshing evidence and analysis…" : "Refresh automated investigation"}</button></div><details><summary>Manual fallback</summary><label>Escalation reason<textarea rows={2} value={approvalForm.comment} placeholder="Explain why automated investigation cannot continue." onChange={(event) => setApprovalForm((current) => ({ ...current, action: "reject", comment: event.target.value }))} /></label><button type="button" className="button-secondary" onClick={() => void approveCockpitRemediationPlan("reject")} disabled={approvalState.loading}>{approvalState.loading ? "Recording escalation…" : "Escalate for manual remediation"}</button></details></div> : !cockpitApprovalAccepted ? <div className="execution-step-form"><div className="credential-method-grid"><label>Decision<select value={approvalForm.action} onChange={(event) => setApprovalForm((current) => ({ ...current, action: event.target.value }))}><option value="approve">Approve immutable plan</option><option value="reject">Reject automation and escalate</option></select></label><label>Approver<input value={adminSession?.user?.username || "Authenticated operator"} readOnly /></label></div><label>Decision reason<textarea rows={2} value={approvalForm.comment} placeholder={approvalForm.action === "reject" ? "Why must this incident be escalated for manual remediation?" : "Why is this plan safe and appropriate?"} onChange={(event) => setApprovalForm((current) => ({ ...current, comment: event.target.value }))} /></label><button type="button" className="button-primary" onClick={() => void approveCockpitRemediationPlan()} disabled={approvalState.loading}>{approvalState.loading ? (approvalWillAutoExecute ? "Approving and starting…" : "Recording decision…") : approvalForm.action === "reject" ? "Reject and escalate" : approvalWillAutoExecute ? "Approve and start remediation" : "Approve and continue"}</button><small className="execution-action-explainer">{approvalWillAutoExecute ? "This lower-risk non-production plan starts immediately after approval." : dangerousProductionAction ? "Production execution requires a separate typed confirmation after approval." : "Approval is recorded first; any missing executor setup is shown next."}</small></div> : executionSetupBlocked ? <div className="execution-step-form"><div><strong>Approval recorded — complete required setup</strong><p>{blockingPreflightFailures.map((check) => check.label).join(", ")}</p></div>{!jenkinsExecutorSelected ? <button type="button" className="button-primary" onClick={buildRequiredExecutor}>Build required process</button> : null}</div> : dangerousProductionAction && !executionConfirmationValid ? <div className="execution-step-form"><label className="typed-execution-confirmation">Approval recorded. Type <code>{executionConfirmationPhrase}</code> to confirm production execution<input value={executionConfirmationText} autoComplete="off" autoFocus onChange={(event) => setExecutionConfirmationText(event.target.value)} /></label></div> : executionCapabilityBlocked ? <div className="execution-step-form"><div><strong>Approval recorded — live execution is not configured</strong><p>This plan has no reviewed corrective capability. Regenerate it after adding a matching catalog playbook.</p></div></div> : <><div><strong>Approval and all safety gates passed</strong><p>{selectedGovernedExecutionTarget} · {selectedApplicationConnection.environment} · {selectedExecutionPlan.riskTier || "unknown risk"}</p></div><button type="button" className="button-primary execution-primary-action" onClick={confirmAndExecuteRemediationPlan} disabled={!executionAllowed}>{remediationExecutionState.loading ? "Executing…" : "Execute approved plan"}</button></>}
+                            {executionAutoCloses ? <div className="execution-step-form"><div><strong>{["closed", "resolved"].includes(selectedCanonicalIncidentStatus) ? "Watch-only observation recorded — incident closed" : "Automatic watch-only closure in progress"}</strong><p>No approval or execution is required because the resolution explicitly classified this alert as watch-only.</p></div></div> : !liveExecutionPlanAvailable ? <div className="execution-step-form"><div><strong>{catalogReviewRequired ? "A catalog candidate is ready for review" : "KaiMS is developing the governed resolution plan"}</strong><p>{catalogReviewRequired ? `KaiMS collected ${Number(selectedCatalogStatus.data?.evidence_sources || 0)} independent sources and compiled a ${catalogStage.replaceAll("_", " ")}. Review and complete its corrective action, validation, and rollback before it can become executable.` : "Evidence collection and runbook development started automatically. Execution stays locked until the plan contains a verified target, corrective action, recovery validation, rollback, and the required approval."}</p>{selectedAlertRegeneration.message ? <p role="status">{selectedAlertRegeneration.message}</p> : null}{selectedAlertRegeneration.error ? <p className="error" role="alert">{selectedAlertRegeneration.error}</p> : null}</div><div className="button-row">{catalogReviewRequired ? <button type="button" className="button-primary" onClick={() => setActiveTab("knowledge")}>Review catalog candidate</button> : null}<button type="button" className={catalogReviewRequired ? "button-secondary" : "button-primary"} onClick={regenerateSelectedAlertAnalysis} disabled={selectedAlertRegeneration.loading}>{selectedAlertRegeneration.loading ? "Refreshing evidence and analysis…" : "Refresh automated investigation"}</button></div><details><summary>Manual fallback</summary><label>Escalation reason<textarea rows={2} value={approvalForm.comment} placeholder="Explain why automated investigation cannot continue." onChange={(event) => setApprovalForm((current) => ({ ...current, action: "reject", comment: event.target.value }))} /></label><button type="button" className="button-secondary" onClick={() => void approveCockpitRemediationPlan("reject")} disabled={approvalState.loading}>{approvalState.loading ? "Recording escalation…" : "Escalate for manual remediation"}</button></details></div> : !cockpitApprovalAccepted ? <div className="execution-step-form"><div className="credential-method-grid"><label>Decision<select value={approvalForm.action} onChange={(event) => setApprovalForm((current) => ({ ...current, action: event.target.value }))}><option value="approve">Approve immutable plan</option><option value="reject">Reject automation and escalate</option></select></label><label>Approver<input value={adminSession?.user?.username || "Authenticated operator"} readOnly /></label></div><label>Decision reason<textarea rows={2} value={approvalForm.comment} placeholder={approvalForm.action === "reject" ? "Why must this incident be escalated for manual remediation?" : "Why is this plan safe and appropriate?"} onChange={(event) => setApprovalForm((current) => ({ ...current, comment: event.target.value }))} /></label><button type="button" className="button-primary" onClick={() => void approveCockpitRemediationPlan()} disabled={approvalState.loading}>{approvalState.loading ? (approvalWillAutoExecute ? "Approving and starting…" : "Recording decision…") : approvalForm.action === "reject" ? "Reject and escalate" : approvalWillAutoExecute ? "Approve and start remediation" : "Approve and continue"}</button><small className="execution-action-explainer">{approvalWillAutoExecute ? "This lower-risk non-production plan starts immediately after approval." : dangerousProductionAction ? "Production execution requires a separate typed confirmation after approval." : "Approval is recorded first; any missing executor setup is shown next."}</small></div> : executionSetupBlocked ? <div className="execution-step-form"><div><strong>Approval recorded — complete required setup</strong><p>{blockingPreflightFailures.map((check) => check.label).join(", ")}</p></div>{!jenkinsExecutorSelected ? <button type="button" className="button-primary" onClick={buildRequiredExecutor}>Build required process</button> : null}</div> : dangerousProductionAction && !executionConfirmationValid ? <div className="execution-step-form"><label className="typed-execution-confirmation">Approval recorded. Type <code>{executionConfirmationPhrase}</code> to confirm production execution<input value={executionConfirmationText} autoComplete="off" autoFocus onChange={(event) => setExecutionConfirmationText(event.target.value)} /></label></div> : executionCapabilityBlocked ? <div className="execution-step-form"><div><strong>Approval recorded — live execution is not configured</strong><p>This plan has no reviewed corrective capability. Regenerate it after adding a matching catalog playbook.</p></div></div> : <><div><strong>Approval and all safety gates passed</strong><p>{selectedGovernedExecutionTarget} · {selectedApplicationConnection.environment} · {selectedExecutionPlan.riskTier || "unknown risk"}</p></div><button type="button" className="button-primary execution-primary-action" onClick={confirmAndExecuteRemediationPlan} disabled={!executionAllowed}>{remediationExecutionState.loading ? "Executing…" : "Execute approved plan"}</button></>}
                             </>}
                           </div>
                           {remediationExecutionState.error ? <p className="error">{remediationExecutionState.error}</p> : null}

@@ -3327,8 +3327,13 @@ async def update_knowledge_development_configuration(request: Request, payload: 
 
 
 @app.post("/knowledge-development/run")
-async def run_knowledge_development(request: Request, x_trace_id: str | None = Header(default=None)) -> dict[str, Any]:
-    return await guarded_proxy(request=request, method="POST", path="/run", target_base=settings.knowledge_development_url, payload={}, trace_id=trace_id_from_header(x_trace_id), timeout_seconds=180)
+async def run_knowledge_development(
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
+) -> dict[str, Any]:
+    return await guarded_proxy(request=request, method="POST", path="/run", target_base=settings.knowledge_development_url, payload={**payload, "tenant_id": auth.tenant_id}, trace_id=trace_id_from_header(x_trace_id), timeout_seconds=180)
 
 
 @app.get("/knowledge-development/report")
@@ -3395,12 +3400,37 @@ async def get_queue_health() -> dict[str, Any]:
             response.raise_for_status()
         rows = response.json()
         queues = rows if isinstance(rows, list) else []
-        messages = sum(int(row.get("messages") or 0) for row in queues if isinstance(row, dict))
-        ready = sum(int(row.get("messages_ready") or 0) for row in queues if isinstance(row, dict))
-        unacknowledged = sum(int(row.get("messages_unacknowledged") or 0) for row in queues if isinstance(row, dict))
-        idle_consumers = sum(1 for row in queues if isinstance(row, dict) and int(row.get("consumers") or 0) == 0 and int(row.get("messages") or 0) > 0)
-        status = "attention" if unacknowledged > 0 or idle_consumers > 0 else "healthy"
-        return {"status": status, "provider": "rabbitmq", "healthy": status == "healthy", "queues": len(queues), "messages": messages, "ready": ready, "unacknowledged": unacknowledged, "queues_without_consumers": idle_consumers}
+        queue_rows = [row for row in queues if isinstance(row, dict)]
+        primary_rows = [row for row in queue_rows if not str(row.get("name") or "").endswith(".dlq")]
+        dead_letter_rows = [row for row in queue_rows if str(row.get("name") or "").endswith(".dlq")]
+        messages = sum(int(row.get("messages") or 0) for row in primary_rows)
+        ready = sum(int(row.get("messages_ready") or 0) for row in primary_rows)
+        unacknowledged = sum(int(row.get("messages_unacknowledged") or 0) for row in primary_rows)
+        idle_consumers = sum(
+            1 for row in primary_rows
+            if int(row.get("consumers") or 0) == 0 and int(row.get("messages_ready") or 0) > 0
+        )
+        dead_letters = sum(int(row.get("messages") or 0) for row in dead_letter_rows)
+        # In-flight deliveries prove that consumers are working; they are not a
+        # readiness failure. DLQs are separate operational debt, not primary backlog.
+        intake_healthy = idle_consumers == 0
+        status = "attention" if not intake_healthy else "degraded" if dead_letters else "healthy"
+        readiness_score = 40 if not intake_healthy else 85 if dead_letters else 100
+        reason = (
+            f"{idle_consumers} primary queue(s) have ready messages but no consumer."
+            if not intake_healthy
+            else f"Primary event flow is operational; {dead_letters} dead-letter message(s) need review."
+            if dead_letters
+            else "Primary event flow is operational with no dead-letter backlog."
+        )
+        return {
+            "status": status, "provider": "rabbitmq",
+            "healthy": intake_healthy and dead_letters == 0,
+            "intake_healthy": intake_healthy, "readiness_score": readiness_score, "reason": reason,
+            "queues": len(primary_rows), "dead_letter_queues": len(dead_letter_rows),
+            "messages": messages, "ready": ready, "unacknowledged": unacknowledged,
+            "dead_letters": dead_letters, "queues_without_consumers": idle_consumers,
+        }
     except (httpx.HTTPError, ValueError, TypeError) as exc:
         logger.warning("RabbitMQ management health probe failed: %s", exc)
         return {"status": "unreachable", "provider": "rabbitmq", "healthy": False, "queues": 0, "messages": 0, "ready": 0, "unacknowledged": 0}

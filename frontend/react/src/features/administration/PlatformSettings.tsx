@@ -60,6 +60,11 @@ function probeTone(error: string, healthy: boolean): StatusTone {
   return healthy ? "success" : "warning";
 }
 
+function boundedScore(value: unknown, fallback: number): number {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? Math.max(0, Math.min(100, numeric)) : fallback;
+}
+
 export default function PlatformSettings() {
   const session = useSession();
   const safety = useSafetyData();
@@ -115,12 +120,13 @@ export default function PlatformSettings() {
     });
     const configuredProviders = providerRows.filter((provider) => Boolean(provider.configured));
     const healthyProviders = configuredProviders.filter((provider) => provider.healthy && !provider.circuitOpen);
+    const queueIntakeHealthy = Boolean(queue.intake_healthy ?? queue.healthy);
     const queueHealthy = Boolean(queue.healthy);
     const contextReady = String(context.default || "").length > 0 && Array.isArray(context.supported);
     const aiReady = configuredProviders.length > 0 && healthyProviders.length === configuredProviders.length;
     const gatewayHealthy = !safety.summaryError;
     const scores = {
-      intake: state.probes.queue.error ? 0 : queueHealthy ? 100 : 55,
+      intake: state.probes.queue.error ? 0 : boundedScore(queue.readiness_score, queueHealthy ? 100 : 55),
       catalog: state.probes.applications.error ? 0 : applicationRows.length ? 100 : 60,
       context: state.probes.context.error ? 0 : contextReady ? 100 : 55,
       ai: state.probes.models.error ? 0 : aiReady ? 100 : configuredProviders.length ? 55 : 35,
@@ -136,6 +142,7 @@ export default function PlatformSettings() {
       configuredProviders,
       healthyProviders,
       queueHealthy,
+      queueIntakeHealthy,
       contextReady,
       aiReady,
       gatewayHealthy,
@@ -188,7 +195,7 @@ export default function PlatformSettings() {
 
     <section className="pcp-kpis" aria-label="Platform readiness summary">
       <article><Boxes aria-hidden="true" /><div><span>Observed estate</span><strong>{view.applicationRows.length}</strong><small>registered application{view.applicationRows.length === 1 ? "" : "s"}</small></div></article>
-      <article><Activity aria-hidden="true" /><div><span>Event backbone</span><strong>{view.queueHealthy ? "Ready" : "Attention"}</strong><small>{Number(view.queue.messages || 0)} queued · {Number(view.queue.unacknowledged || 0)} in flight</small></div></article>
+      <article><Activity aria-hidden="true" /><div><span>Event backbone</span><strong>{view.queueIntakeHealthy ? "Ready" : "Attention"}</strong><small>{Number(view.queue.messages || 0)} queued · {Number(view.queue.unacknowledged || 0)} in flight · {Number(view.queue.dead_letters || 0)} dead-lettered</small></div></article>
       <article><Bot aria-hidden="true" /><div><span>AI providers</span><strong>{view.healthyProviders.length}/{view.configuredProviders.length}</strong><small>configured providers healthy</small></div></article>
       <article><Users aria-hidden="true" /><div><span>Decision capacity</span><strong>{view.activeReviewers}</strong><small>active reviewer profile{view.activeReviewers === 1 ? "" : "s"}</small></div></article>
     </section>
@@ -206,7 +213,7 @@ export default function PlatformSettings() {
             <article>
               <span className="pcp-capability-icon"><Activity /></span>
               <div><strong>Telemetry and event intake</strong><p>RabbitMQ queue health, backlog, and consumer flow from the running data plane.</p></div>
-              <div className="pcp-capability-state"><StatusBadge tone={probeTone(state.probes.queue.error, view.queueHealthy)}>{state.probes.queue.error || (view.queueHealthy ? "Operational" : String(view.queue.status || "Attention"))}</StatusBadge><small>{Number(view.queue.queues || 0)} queues observed</small></div>
+              <div className="pcp-capability-state"><StatusBadge tone={probeTone(state.probes.queue.error, view.queueHealthy)}>{state.probes.queue.error || (view.queueHealthy ? "Operational" : String(view.queue.status || "Attention"))}</StatusBadge><small title={String(view.queue.reason || "")}>{String(view.queue.reason || `${Number(view.queue.queues || 0)} primary queues observed`)}</small></div>
             </article>
             <article>
               <span className="pcp-capability-icon"><Database /></span>

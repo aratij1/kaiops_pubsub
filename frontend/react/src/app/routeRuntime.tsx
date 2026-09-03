@@ -3,6 +3,7 @@ import type { FormEvent } from "react";
 
 export interface CopilotRouteRuntime {
   isAdministrator: boolean;
+  role: string;
   projectCount: number;
   alertDocumentCount: number;
   userCount: number;

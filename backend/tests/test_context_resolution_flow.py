@@ -429,6 +429,42 @@ async def test_resolution_does_not_treat_rag_history_as_current_observation() ->
 
 
 @pytest.mark.asyncio
+async def test_resolution_ingests_current_enrichment_evidence_categories() -> None:
+    alert = Alert(
+        tenant_id="tenant-a", source="prometheus", name="kaiops-platform-target-down",
+        service="kaiops-platform", severity=AlertSeverity.CRITICAL,
+        description="Prometheus reports the target as down.",
+    )
+    incident = Incident(service="kaiops-platform", severity=AlertSeverity.CRITICAL, title=alert.name)
+    context = Context(
+        tenant_id=alert.tenant_id, incident_id=incident.id, alert=alert,
+        metadata={"context_evidence": {
+            "metrics": [{
+                "evidence_id": "METRIC-DOWN-1", "category": "metrics",
+                "connector": "prometheus", "service": "kaiops-platform",
+                "source_reference": "prometheus://query?expr=up",
+                "content": {"metric_name": "up", "value": 0},
+            }],
+            "topology": [{
+                "evidence_id": "TOPOLOGY-1", "category": "topology",
+                "connector": "discovery-mcp", "service": "kaiops-platform",
+                "source_reference": "catalog://services/kaiops-platform",
+                "content": {"deployment": "api-gateway", "environment": "prod"},
+            }],
+        }},
+    )
+
+    state = await ResolutionIntelligenceAgent(model_router=static_router()).collect_context({"context": context})
+    evidence = {row["evidence_id"]: row for row in state["gathered_context"]["discovery_evidence"]}
+
+    assert "METRIC-DOWN-1" in evidence
+    assert "TOPOLOGY-1" in evidence
+    assert evidence["METRIC-DOWN-1"]["source"] == "prometheus"
+    assert evidence["METRIC-DOWN-1"]["uri"] == "prometheus://query?expr=up"
+    assert '"value": 0' in evidence["METRIC-DOWN-1"]["snippet"]
+
+
+@pytest.mark.asyncio
 async def test_resolution_builds_application_crawl_and_historical_hypotheses() -> None:
     alert = Alert(
         tenant_id="tenant-a",

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Boxes, CheckCircle2, CircleDot, Plus, RefreshCw, Search, ServerCog } from "lucide-react";
 import { useLocation } from "react-router-dom";
 import { useRouteRuntime } from "../../app/routeRuntime";
 import { ConfirmationDialog, ReadinessScore } from "../../components/design-system";
@@ -17,6 +18,7 @@ import type {
   ApplicationUpdate,
   NewApplication,
 } from "../../schemas/applications";
+import "./ApplicationsRoute.css";
 
 const editableFields = [
   "name",
@@ -393,6 +395,7 @@ export default function ApplicationsRoute() {
     newApplication(requestedApplicationName),
   );
   const [registrationMessage, setRegistrationMessage] = useState("");
+  const [portfolioQuery, setPortfolioQuery] = useState("");
   const rows = useMemo(() => {
     const registered = applications.data || [];
     const names = new Set(
@@ -415,6 +418,12 @@ export default function ApplicationsRoute() {
       });
     return [...registered, ...observed];
   }, [applications.data, dashboard.observedProjects]);
+  const visibleRows = useMemo(() => {
+    const query = portfolioQuery.trim().toLowerCase();
+    if (!query) return rows;
+    return rows.filter((row) => [row.name, row.environment, row.owner_team, row.technology, row.status]
+      .some((value) => String(value || "").toLowerCase().includes(query)));
+  }, [portfolioQuery, rows]);
   useEffect(() => {
     if (selectedId && rows.some((row) => String(row.id) === selectedId)) return;
     setSelectedId(
@@ -596,31 +605,26 @@ export default function ApplicationsRoute() {
   if (legacyKnowledgeWorkspace) return null;
   return (
     <section className="grid single-col operational-route applications-workspace">
-      <section className="route-insight-strip" aria-label="Application portfolio summary">
-        <article><span className="route-insight-mark">A</span><span><small>Applications in scope</small><strong>{rows.length}</strong></span></article>
-        <article><span className="route-insight-mark">R</span><span><small>Registered</small><strong>{rows.filter((row) => !String(row.id).startsWith("observed:")).length}</strong></span></article>
-        <article><span className="route-insight-mark">O</span><span><small>Observed only</small><strong>{rows.filter((row) => String(row.id).startsWith("observed:")).length}</strong></span></article>
+      <header className="applications-hero">
+        <div><span className="discovery-eyebrow">Application operations</span><h1>Application portfolio</h1><p>Manage ownership, onboarding, observability, and operational readiness from one governed workspace.</p></div>
+        <div className="applications-hero-actions">{copilot.isAdministrator ? <button className="button-primary" type="button" onClick={() => openRegistration()}><Plus size={17} /> Register application</button> : null}<button className="button-secondary" type="button" onClick={refresh} disabled={applications.isFetching}><RefreshCw className={applications.isFetching ? "spin" : ""} size={16} /> {applications.isFetching ? "Refreshing..." : "Refresh"}</button></div>
+      </header>
+      <section className="route-insight-strip applications-insights" aria-label="Application portfolio summary">
+        <article><span className="route-insight-mark"><Boxes size={19} /></span><span><small>Applications in scope</small><strong>{rows.length}</strong><em>Current governed workspace</em></span></article>
+        <article><span className="route-insight-mark is-ready"><CheckCircle2 size={19} /></span><span><small>Registered</small><strong>{rows.filter((row) => !String(row.id).startsWith("observed:")).length}</strong><em>Managed through onboarding</em></span></article>
+        <article><span className="route-insight-mark is-observed"><CircleDot size={19} /></span><span><small>Observed only</small><strong>{rows.filter((row) => String(row.id).startsWith("observed:")).length}</strong><em>Detected but not onboarded</em></span></article>
       </section>
       <article className="panel route-data-panel">
         <div className="panel-head">
           <div>
             <span className="discovery-eyebrow">Managed estate</span>
-            <h2>Application portfolio</h2>
+            <h2>Managed estate</h2>
             <p>
               Onboarded applications, managed platform services, and services
               observed in live alerts.
             </p>
           </div>
           <div className="button-row">
-            {copilot.isAdministrator ? (
-              <button
-                className="button-primary"
-                type="button"
-                onClick={() => openRegistration()}
-              >
-                Register application
-              </button>
-            ) : null}
             {copilot.isAdministrator ? (
               <ConfirmationDialog
                 trigger={
@@ -641,16 +645,9 @@ export default function ApplicationsRoute() {
                 onConfirm={bulkRemove}
               />
             ) : null}
-            <button
-              className="button-secondary"
-              type="button"
-              onClick={refresh}
-              disabled={applications.isFetching}
-            >
-              {applications.isFetching ? "Refreshing..." : "Refresh portfolio"}
-            </button>
           </div>
         </div>
+        <div className="applications-toolbar"><label><Search size={17} /><span className="sr-only">Search applications</span><input value={portfolioQuery} onChange={(event) => setPortfolioQuery(event.target.value)} placeholder="Search application, owner, technology, or environment" /></label><span>{visibleRows.length} of {rows.length} applications</span></div>
         {bulkOutcomes.length ? (
           <div className="bulk-action-results" role="status">
             <strong>Bulk removal results</strong>
@@ -690,7 +687,7 @@ export default function ApplicationsRoute() {
               </tr>
             </thead>
             <tbody>
-              {rows.map((row) => {
+              {visibleRows.map((row) => {
                 const id = String(row.id);
                 const observed = id.startsWith("observed:");
                 const managed = Boolean(
@@ -706,9 +703,7 @@ export default function ApplicationsRoute() {
                         <input type="checkbox" aria-label={`Select ${row.name}`} checked={checkedIds.has(id)} onChange={() => toggleRow(id)} />
                       ) : null}
                     </td>
-                    <td>
-                      <strong>{row.name}</strong>
-                    </td>
+                    <td><button className="application-name-button" type="button" onClick={() => !observed && inspect(id)} disabled={observed}><span><ServerCog size={17} /></span><span><strong>{row.name}</strong><small>{managed ? "Platform managed" : observed ? "Discovery candidate" : `ID ${id}`}</small></span></button></td>
                     <td>{row.environment || "-"}</td>
                     <td>{row.owner_team || "-"}</td>
                     <td>{row.technology || "-"}</td>
@@ -749,10 +744,10 @@ export default function ApplicationsRoute() {
                   </tr>
                 );
               })}
-              {!applications.isLoading && !rows.length ? (
+              {!applications.isLoading && !visibleRows.length ? (
                 <tr>
                   <td colSpan={7}>
-                    No applications have been registered or observed.
+                    <div className="application-empty"><Boxes size={24} /><strong>{rows.length ? "No applications match your search" : "No applications are available"}</strong><span>{rows.length ? "Try a different name, owner, technology, or environment." : "Register an application to begin discovery and onboarding."}</span></div>
                   </td>
                 </tr>
               ) : null}
@@ -761,7 +756,7 @@ export default function ApplicationsRoute() {
         </div>
       </article>
       {showRegistration ? (
-        <article className="panel" ref={registrationRef} aria-labelledby="application-registration-title">
+        <article className="panel application-form-panel" ref={registrationRef} aria-labelledby="application-registration-title">
           <div className="panel-head">
             <div>
               <h2 id="application-registration-title">Register application</h2>
@@ -793,7 +788,7 @@ export default function ApplicationsRoute() {
         </article>
       ) : null}
       {selected && form ? (
-        <article className="panel" ref={detailRef}>
+        <article className="panel application-detail-panel" ref={detailRef}>
           <div className="panel-head">
             <div>
               <h2>{selected.name}</h2>

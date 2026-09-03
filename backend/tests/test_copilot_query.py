@@ -11,6 +11,7 @@ from api_gateway.copilot import (
     compose_capacity_answer,
     compose_forbidden_onboarding_answer,
     compose_onboarding_answer,
+    compose_workspace_answer,
     compose_unsupported_answer,
     extract_incident_id,
 )
@@ -27,6 +28,20 @@ def test_classify_intent_recognizes_assignment_question() -> None:
 
 def test_classify_intent_recognizes_onboarding_question() -> None:
     assert classify_intent("What's pending in onboarding?") == "onboarding"
+
+
+def test_classify_intent_covers_operational_workspaces() -> None:
+    assert classify_intent("show critical incidents") == "incidents"
+    assert classify_intent("find duplicate alerts") == "alerts"
+    assert classify_intent("why is the RCA blocked") == "resolution"
+    assert classify_intent("show topology dependencies") == "resources"
+    assert classify_intent("review the audit history") == "audit"
+
+
+def test_workspace_answer_links_to_operational_surface() -> None:
+    result = compose_workspace_answer("knowledge")
+    assert result["intent"] == "knowledge"
+    assert result["links"][0]["path"] == "/knowledge"
 
 
 def test_classify_intent_returns_none_for_unsupported_question() -> None:

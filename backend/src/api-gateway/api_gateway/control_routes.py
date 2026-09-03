@@ -13,6 +13,7 @@ from api_gateway.copilot import (
     compose_capacity_answer,
     compose_forbidden_onboarding_answer,
     compose_onboarding_answer,
+    compose_workspace_answer,
     compose_unsupported_answer,
     extract_incident_id,
 )
@@ -401,6 +402,8 @@ def build_control_router(
                     await fetch_rows("/assignments", settings.approval_service_url, trace_id),
                     extract_incident_id(query),
                 )
+            elif intent in {"incidents", "alerts", "approvals", "knowledge", "resources", "platform", "audit", "resolution"}:
+                result = compose_workspace_answer(intent)
             else:
                 result = compose_unsupported_answer(query)
         except httpx.HTTPError:
